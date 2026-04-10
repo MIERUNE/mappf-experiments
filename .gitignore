@@ -1,0 +1,7 @@
+.DS_Store
+/target
+/k8s
+log*
+data/
+.claude/settings.local.json
+/ishikari-todo-spec.md

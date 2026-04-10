@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: map-demo
+
+resources:
+  - healthcheck.yaml
+  - httproute.yaml
+  - podmonitoring.yaml
+  - ../../base
+
+images:
+  - name: ishikari
+    newName: asia-northeast1-docker.pkg.dev/mappf-experiment/ishikari/ishikari
+    digest: sha256:afd1a0866c7221ae1d33dffda7dbefd87141cd0148c6e22033c5e11c06336014
+
+patches:
+  - path: patch-serviceaccount.yaml
+  - path: patch-deployment.yaml

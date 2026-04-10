@@ -1,0 +1,12 @@
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: ishikari
+spec:
+  selector:
+    matchLabels:
+      app: ishikari
+  endpoints:
+    - port: internal
+      path: /_internal/metrics
+      interval: 30s

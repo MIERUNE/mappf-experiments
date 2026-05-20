@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: biei-gossip
+  labels:
+    app: biei
+spec:
+  # Headless service used purely for gossip seed discovery
+  clusterIP: None
+  # Lets the pods discover each other at cold start instead of deadlocking.
+  publishNotReadyAddresses: true
+  selector:
+    app: biei
+  ports:
+    - name: gossip
+      port: 7946
+      targetPort: gossip

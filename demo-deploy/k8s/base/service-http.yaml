@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: biei
+  labels:
+    app: biei
+spec:
+  type: ClusterIP
+  selector:
+    app: biei
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

@@ -1,0 +1,26 @@
+#   gcloud builds submit --config demo-deploy/cloudbuild.yaml \
+#     --substitutions=_IMAGE=asia-northeast1-docker.pkg.dev/mappf-experiment/biei/biei:dev .
+
+substitutions:
+  _IMAGE: asia-northeast1-docker.pkg.dev/mappf-experiment/biei/biei:dev
+
+options:
+  machineType: E2_HIGHCPU_8
+  diskSizeGb: 30
+
+timeout: 1800s
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    env:
+      - DOCKER_BUILDKIT=1 # required for the `# syntax` + --mount=cache directives
+    args:
+      - build
+      - -f
+      - demo-deploy/Dockerfile
+      - -t
+      - ${_IMAGE}
+      - .
+
+images:
+  - ${_IMAGE}

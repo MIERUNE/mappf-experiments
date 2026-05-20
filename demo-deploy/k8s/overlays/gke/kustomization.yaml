@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: map-demo
+
+resources:
+  - healthcheck.yaml
+  - httproute.yaml
+  - podmonitoring.yaml
+  - ../../base
+
+images:
+  - name: biei
+    newName: asia-northeast1-docker.pkg.dev/mappf-experiment/biei/biei
+    digest: sha256:89e8f98c3ee19de4867b550b07b412dd9544b7a790a8b2c0378fbf65b0608b00
+
+patches:
+  - path: patch-deployment.yaml

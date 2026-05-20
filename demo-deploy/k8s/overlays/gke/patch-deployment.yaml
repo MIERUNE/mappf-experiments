@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: biei
+spec:
+  replicas: 3
+  template:
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-spot: "true"
+      tolerations:
+        - key: cloud.google.com/gke-spot
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: biei
+          imagePullPolicy: Always
+          env:
+            - name: BIEI_STYLE_TEMPLATES
+              value: "http://ishikari:8080/styles/{style_id}/style.json"
+            - name: BIEI_TILESET_URL_TEMPLATE
+              value: "http://ishikari:8080/tilesets/{tileset_id}"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "2Gi"
+            limits:
+              cpu: "4"
+              memory: "4Gi"

@@ -1,0 +1,130 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: biei
+  labels:
+    app: biei
+spec:
+  # 3-node gossip cluster.
+  # Deployment (not StatefulSet): chitchat gossip is dynamic-membership,
+  # so pods need no stable identity or ordered startup.
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: biei
+  template:
+    metadata:
+      labels:
+        app: biei
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 25
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: biei
+      containers:
+        - name: biei
+          image: biei:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+            # Cluster-internal listener: /_internal/*, metrics, peer forwarding.
+            # Not fronted by the Gateway; reachable only in-cluster.
+            - name: internal
+              containerPort: 9090
+            - name: gossip
+              containerPort: 7946
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: BIEI_CLUSTER
+              value: "true"
+            - name: BIEI_NODE_ID
+              value: "$(POD_NAME)"
+            - name: BIEI_HTTP_BIND
+              value: "0.0.0.0:8080"
+            - name: BIEI_GOSSIP_BIND
+              value: "0.0.0.0:7946"
+            - name: BIEI_INTERNAL_PORT
+              value: "9090"
+            # Peers forward /_internal/* to the internal port, never the public
+            # port.
+            - name: BIEI_INTERNAL_ADVERTISE_ADDR
+              value: "$(POD_IP):9090"
+            - name: BIEI_GOSSIP_SEEDS
+              value: "biei-gossip:7946"
+            - name: BIEI_STYLE_TEMPLATES
+              value: "carto=https://basemaps.cartocdn.com/gl/{style_id}/style.json;mierune=https://maps.mierune.co.jp/styles/{style_id}/style.json"
+            # Only used by `addlayer` tileset references; unused by the basic demo
+            - name: BIEI_TILESET_URL_TEMPLATE
+              value: "https://tiles.example.invalid/{tileset_id}/tileset.json"
+            - name: BIEI_CORES
+              value: "2"
+            # Point MapLibre's ambient tile/glyph cache at the mounted volume
+            # below; without this it falls back to /tmp and the volume is unused.
+            - name: BIEI_MAPLIBRE_CACHE_PATH
+              value: "/var/cache/biei/maplibre-ambient-cache.sqlite"
+            - name: RUST_LOG
+              value: "info"
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 10"]
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: maplibre-cache
+              mountPath: /var/cache/biei
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: maplibre-cache
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

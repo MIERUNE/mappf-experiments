@@ -1,0 +1,6 @@
+.git/
+target/
+**/*.png
+**/*.jpg
+**/*.webp
+.DS_Store

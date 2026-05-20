@@ -1,0 +1,763 @@
+//! Tier 1/2/3 routing decision + drain-ETA SLA check.
+
+use std::cmp::Reverse;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use rand::SeedableRng;
+use rand::distr::{Distribution, weighted::WeightedIndex};
+use rand_xoshiro::Xoshiro256PlusPlus;
+use tokio::time::Instant;
+
+use crate::activity::ProfileActivityTracker;
+use crate::config::{CostConfig, RoutingConfig, Tier1Strategy};
+use crate::hrw::hrw_weight;
+use crate::types::{
+    ClusterView, Decision, ForwardCandidate, InternalTask, NodeId, NodeStateView, RejectionReason,
+    RouteTier, WorkerId, WorkerProfile, WorkerView,
+};
+
+const DEFAULT_FORWARD_CANDIDATES: usize = 2;
+
+type Tier3SortKey = (bool, bool, Reverse<usize>, Option<Instant>);
+
+struct WarmCandidate<'a> {
+    node: &'a NodeStateView,
+    warm_count: u32,
+    style_spare_bl: usize,
+}
+
+pub struct Dispatcher {
+    pub node_id: NodeId,
+    pub config: RoutingConfig,
+    pub costs: CostConfig,
+    pub bl_capacity: usize,
+    pub queue_capacity: usize,
+    pub activity: Arc<ProfileActivityTracker>,
+    rng: Mutex<Xoshiro256PlusPlus>,
+}
+
+pub struct DispatcherSpawn {
+    pub node_id: NodeId,
+    pub config: RoutingConfig,
+    pub costs: CostConfig,
+    pub bl_capacity: usize,
+    pub queue_capacity: usize,
+    pub activity: Arc<ProfileActivityTracker>,
+    pub seed: u64,
+}
+
+impl Dispatcher {
+    pub fn new(spec: DispatcherSpawn) -> Self {
+        let DispatcherSpawn {
+            node_id,
+            config,
+            costs,
+            bl_capacity,
+            queue_capacity,
+            activity,
+            seed,
+        } = spec;
+
+        Self {
+            node_id,
+            config,
+            costs,
+            bl_capacity,
+            queue_capacity: queue_capacity.max(bl_capacity),
+            activity,
+            rng: Mutex::new(Xoshiro256PlusPlus::seed_from_u64(seed)),
+        }
+    }
+
+    /// Estimate drain ETA at this worker for a task with given target profile.
+    /// Pessimistic: assumes each queued task ahead pays a profile swap + render.
+    fn estimate_drain_eta(&self, w: &WorkerView, task_profile: &WorkerProfile) -> Duration {
+        let p = self.costs.render_cost.mid();
+        let s = self.costs.style_setup_cost.mid();
+        let per_ahead = p + s;
+        let queue_wait = per_ahead
+            .checked_mul(w.queue_depth as u32)
+            .unwrap_or(Duration::MAX);
+        let own = if w.loaded_profile.as_ref() == Some(task_profile) {
+            p
+        } else {
+            s + p
+        };
+        queue_wait.saturating_add(own)
+    }
+
+    pub fn decide(&self, task: &InternalTask, view: ClusterView) -> Decision {
+        let profile = task.worker_profile();
+
+        // ---- Tier 1: warm tracking (over propagated states only) ----
+        let warm: Vec<WarmCandidate<'_>> = view
+            .states
+            .values()
+            .filter_map(|n| warm_candidate(n, &profile, self.bl_capacity))
+            .collect();
+
+        if !warm.is_empty() {
+            let target_id = match self.config.tier1_strategy {
+                Tier1Strategy::WeightedRandom => {
+                    let weights: Vec<u32> = warm.iter().map(|n| n.warm_count).collect();
+                    let mut rng = self.rng.lock().expect("dispatcher rng poisoned");
+                    let dist = WeightedIndex::new(&weights).expect("non-empty positive weights");
+                    warm[dist.sample(&mut *rng)].node.id.clone()
+                }
+                Tier1Strategy::PowerOfTwo => {
+                    let mut rng = self.rng.lock().expect("dispatcher rng poisoned");
+                    if warm.len() == 1 {
+                        warm[0].node.id.clone()
+                    } else {
+                        use rand::RngExt as _;
+                        let a = rng.random_range(0..warm.len());
+                        let mut b = rng.random_range(0..warm.len());
+                        while b == a {
+                            b = rng.random_range(0..warm.len());
+                        }
+                        // Prefer the node with more spare BL for this style.
+                        let pick = if warm[a].style_spare_bl >= warm[b].style_spare_bl {
+                            a
+                        } else {
+                            b
+                        };
+                        warm[pick].node.id.clone()
+                    }
+                }
+            };
+            return self.materialize_route(task, target_id, RouteTier::Tier1WarmTracking, None);
+        }
+
+        // ---- Tier 2: HRW over static members, optimistic when state missing ----
+        // HRW input is stable style id + render mode + scale (not the style
+        // revision version) so version bumps do not reshuffle routing. Tier 4
+        // reuses the same ordering.
+        let mut hrw_nodes = view.members.clone();
+        hrw_nodes.sort_by_key(|id| std::cmp::Reverse(hrw_weight(&profile, id)));
+        let tier2_candidates: Vec<_> = hrw_nodes
+            .iter()
+            .filter(|id| {
+                view.states
+                    .get(id)
+                    .map(|n| n.has_capacity(self.bl_capacity))
+                    .unwrap_or(true)
+            })
+            .take(DEFAULT_FORWARD_CANDIDATES)
+            .map(|id| ForwardCandidate {
+                node_id: id.clone(),
+                drain_worker: None,
+            })
+            .collect();
+        if !tier2_candidates.is_empty() {
+            return self.materialize_candidates(task, RouteTier::Tier2HrwBl, tier2_candidates);
+        }
+
+        // ---- Tier 3: drain-and-swap ----
+        if self.config.tier3_enabled {
+            let tier3_candidates = self.tier3_candidates(&view, task, DEFAULT_FORWARD_CANDIDATES);
+            if !tier3_candidates.is_empty() {
+                return self.materialize_candidates(
+                    task,
+                    RouteTier::Tier3DrainSwap,
+                    tier3_candidates,
+                );
+            }
+        }
+
+        // ---- Tier 4: overflow queue admission ----
+        let tier4_candidates: Vec<_> = hrw_nodes
+            .iter()
+            .filter(|id| {
+                view.states
+                    .get(id)
+                    .map(|n| n.has_admission_capacity(self.queue_capacity))
+                    .unwrap_or(true)
+            })
+            .take(DEFAULT_FORWARD_CANDIDATES)
+            .map(|id| ForwardCandidate {
+                node_id: id.clone(),
+                drain_worker: None,
+            })
+            .collect();
+        if !tier4_candidates.is_empty() {
+            return self.materialize_candidates(task, RouteTier::Tier4Overflow, tier4_candidates);
+        }
+
+        Decision::Reject {
+            reason: RejectionReason::NoCapacity,
+        }
+    }
+
+    fn tier3_candidates(
+        &self,
+        view: &ClusterView,
+        task: &InternalTask,
+        limit: usize,
+    ) -> Vec<ForwardCandidate> {
+        let now = Instant::now();
+        let drain_max = self.config.drain_max_queue;
+        let sla_deadline = task.arrived_at.checked_add(self.costs.sla);
+
+        let task_profile = task.worker_profile();
+        // Count by WorkerProfile (style revision + render mode + scale), so
+        // Static/Tile and @1x/@2x allocations stay independent.
+        let mut cluster_counts: HashMap<WorkerProfile, usize> = HashMap::new();
+        let mut candidates: Vec<(NodeId, &WorkerView)> = Vec::new();
+        for (nid, node) in &view.states {
+            for worker in &node.workers {
+                if let Some(profile) = &worker.loaded_profile {
+                    *cluster_counts.entry(profile.clone()).or_insert(0) += 1;
+                }
+                let is_candidate = worker.queue_depth < drain_max
+                    && match &worker.loaded_profile {
+                        None => true,
+                        // Tier 3 is an eviction path. Do not pick an already
+                        // warm worker for the incoming profile.
+                        Some(profile) if profile == &task_profile => false,
+                        Some(_) => true,
+                    };
+                if is_candidate {
+                    candidates.push((nid.clone(), worker));
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        // Prefer over-allocated profiles first. Within that group, reuse the
+        // same renderer shape (mode + scale), then fall back to count/age.
+        candidates.sort_by_key(|(_, w)| {
+            self.tier3_sort_key(w.loaded_profile.as_ref(), &task_profile, &cluster_counts)
+        });
+
+        let mut selected = Vec::new();
+        for (nid, w) in &candidates {
+            let eta = self.estimate_drain_eta(w, &task_profile);
+            if sla_deadline.is_none_or(|deadline| {
+                now.checked_add(eta)
+                    .is_some_and(|candidate_deadline| candidate_deadline <= deadline)
+            }) {
+                selected.push(ForwardCandidate {
+                    node_id: nid.clone(),
+                    drain_worker: Some(w.id),
+                });
+                if selected.len() >= limit {
+                    break;
+                }
+            }
+        }
+        selected
+    }
+
+    fn tier3_sort_key(
+        &self,
+        loaded_profile: Option<&WorkerProfile>,
+        task_profile: &WorkerProfile,
+        cluster_counts: &HashMap<WorkerProfile, usize>,
+    ) -> Tier3SortKey {
+        let Some(profile) = loaded_profile else {
+            // Fresh workers have no profile to protect and no activity age.
+            return (false, true, Reverse(usize::MAX), None);
+        };
+        let count = cluster_counts.get(profile).copied().unwrap_or(0);
+        let shape_mismatch =
+            profile.render_mode != task_profile.render_mode || profile.scale != task_profile.scale;
+        let last_seen = self.activity.last_seen(profile);
+        (count <= 1, shape_mismatch, Reverse(count), last_seen)
+    }
+
+    fn materialize_route(
+        &self,
+        task: &InternalTask,
+        target: NodeId,
+        tier: RouteTier,
+        worker_hint: Option<WorkerId>,
+    ) -> Decision {
+        self.materialize_candidates(
+            task,
+            tier,
+            vec![ForwardCandidate {
+                node_id: target,
+                drain_worker: worker_hint,
+            }],
+        )
+    }
+
+    fn materialize_candidates(
+        &self,
+        task: &InternalTask,
+        tier: RouteTier,
+        candidates: Vec<ForwardCandidate>,
+    ) -> Decision {
+        let Some(first) = candidates.first() else {
+            return Decision::Reject {
+                reason: RejectionReason::NoCapacity,
+            };
+        };
+
+        if first.node_id == self.node_id {
+            Decision::Local {
+                route_tier: tier,
+                worker_hint: first.drain_worker,
+            }
+        } else if task.forwarding_hops >= 1 {
+            // Chained forwarding banned — process locally; cannot honor the
+            // cluster-wide worker hint here.
+            Decision::Local {
+                route_tier: tier,
+                worker_hint: None,
+            }
+        } else {
+            let candidates = candidates
+                .into_iter()
+                .filter(|candidate| candidate.node_id != self.node_id)
+                .collect();
+            Decision::Forward {
+                route_tier: tier,
+                candidates,
+            }
+        }
+    }
+}
+
+fn warm_candidate<'a>(
+    node: &'a NodeStateView,
+    profile: &WorkerProfile,
+    bl: usize,
+) -> Option<WarmCandidate<'a>> {
+    let mut warm_count = 0;
+    let mut style_spare_bl = 0;
+    let mut has_soft_capacity = false;
+
+    for worker in &node.workers {
+        if worker.queue_depth < bl {
+            has_soft_capacity = true;
+        }
+        if worker.loaded_profile.as_ref() == Some(profile) {
+            warm_count += 1;
+            style_spare_bl += bl.saturating_sub(worker.queue_depth);
+        }
+    }
+
+    (warm_count > 0 && has_soft_capacity).then_some(WarmCandidate {
+        node,
+        warm_count,
+        style_spare_bl,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use crate::activity::ProfileActivityTracker;
+    use crate::config::{CostRange, RoutingConfig, Tier1Strategy};
+    use crate::types::{
+        ClusterView, ImageFormat, NodeStateView, PixelRatio, RenderMode, RenderRequest, Scale,
+        StyleId, StyleRevision, WorkerProfile, WorkerView,
+    };
+
+    use super::*;
+
+    fn rev(id: u32) -> StyleRevision {
+        StyleRevision {
+            id: StyleId(format!("style-{}", id)),
+            version: 0,
+        }
+    }
+
+    fn profile(id: u32) -> WorkerProfile {
+        profile_with(id, RenderMode::Tile, Scale::X1)
+    }
+
+    fn profile_with(id: u32, render_mode: RenderMode, scale: Scale) -> WorkerProfile {
+        WorkerProfile {
+            style: rev(id),
+            render_mode,
+            scale,
+        }
+    }
+
+    fn dispatcher(activity: Arc<ProfileActivityTracker>) -> Dispatcher {
+        dispatcher_with_caps(activity, 1, 1)
+    }
+
+    fn dispatcher_with_caps(
+        activity: Arc<ProfileActivityTracker>,
+        bl_capacity: usize,
+        queue_capacity: usize,
+    ) -> Dispatcher {
+        Dispatcher::new(DispatcherSpawn {
+            node_id: NodeId::from_index(0),
+            config: RoutingConfig {
+                tier1_strategy: Tier1Strategy::WeightedRandom,
+                tier3_enabled: true,
+                drain_max_queue: 10,
+            },
+            costs: CostConfig {
+                style_setup_cost: CostRange::fixed(Duration::from_millis(100)),
+                source_load_cost: CostRange::fixed(Duration::ZERO),
+                render_cost: CostRange::fixed(Duration::from_millis(10)),
+                hop_latency: Duration::ZERO,
+                sla: Duration::from_secs(10),
+            },
+            bl_capacity,
+            queue_capacity,
+            activity,
+            seed: 0,
+        })
+    }
+
+    fn view(workers: Vec<WorkerView>) -> ClusterView {
+        let node_id = NodeId::from_index(0);
+        ClusterView {
+            members: vec![node_id.clone()],
+            states: [(
+                node_id.clone(),
+                NodeStateView {
+                    id: node_id,
+                    workers,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            generated_at: Instant::now(),
+        }
+    }
+
+    fn make_task(style_index: u32, arrived_at: Instant) -> InternalTask {
+        InternalTask {
+            id: 1,
+            request_id: crate::types::RequestId::from_string("dispatcher-test"),
+            style: rev(style_index),
+            source: None,
+            request: RenderRequest::Tile {
+                z: 14,
+                x: 0,
+                y: 0,
+                tile_size: 256,
+            },
+            pixel_ratio: PixelRatio::X1,
+            output_format: ImageFormat::Png,
+            arrived_at,
+            deadline: arrived_at + Duration::from_secs(10),
+            forwarding_hops: 0,
+        }
+    }
+
+    fn production_profile(style_id: &str) -> WorkerProfile {
+        WorkerProfile {
+            style: StyleRevision {
+                id: StyleId(style_id.to_string()),
+                version: 1,
+            },
+            render_mode: RenderMode::Tile,
+            scale: Scale::X1,
+        }
+    }
+
+    fn production_task(style_id: &str, now: Instant) -> InternalTask {
+        InternalTask {
+            id: 1,
+            request_id: crate::types::RequestId::from_string("dispatcher-production-test"),
+            style: StyleRevision {
+                id: StyleId(style_id.to_string()),
+                version: 1,
+            },
+            source: None,
+            request: RenderRequest::Tile {
+                z: 14,
+                x: 0,
+                y: 0,
+                tile_size: 256,
+            },
+            pixel_ratio: PixelRatio::X1,
+            output_format: ImageFormat::Png,
+            arrived_at: now,
+            deadline: now + Duration::from_secs(10),
+            forwarding_hops: 0,
+        }
+    }
+
+    #[test]
+    fn tier3_allows_eviction_when_cluster_has_multiple_workers() {
+        let activity = Arc::new(ProfileActivityTracker::new());
+        let now = Instant::now();
+        activity.record(profile(1), now);
+        activity.record(profile(2), now - Duration::from_secs(20));
+        let d = dispatcher(activity);
+
+        let task = make_task(9, now);
+        let picked = d.tier3_candidates(
+            &view(vec![
+                WorkerView {
+                    id: 0,
+                    loaded_profile: Some(profile(1)),
+                    queue_depth: 1,
+                },
+                WorkerView {
+                    id: 1,
+                    loaded_profile: Some(profile(1)),
+                    queue_depth: 1,
+                },
+                WorkerView {
+                    id: 2,
+                    loaded_profile: Some(profile(2)),
+                    queue_depth: 1,
+                },
+            ]),
+            &task,
+            1,
+        );
+
+        assert_eq!(
+            picked,
+            vec![ForwardCandidate {
+                node_id: NodeId::from_index(0),
+                drain_worker: Some(0),
+            }]
+        );
+    }
+
+    #[test]
+    fn tier3_does_not_pick_incoming_profile_as_eviction_candidate() {
+        let activity = Arc::new(ProfileActivityTracker::new());
+        let now = Instant::now();
+        activity.record(profile(9), now);
+        let d = dispatcher(activity);
+
+        let task = make_task(9, now);
+        let picked = d.tier3_candidates(
+            &view(vec![
+                WorkerView {
+                    id: 0,
+                    loaded_profile: Some(profile(9)),
+                    queue_depth: 1,
+                },
+                WorkerView {
+                    id: 1,
+                    loaded_profile: Some(profile(9)),
+                    queue_depth: 1,
+                },
+            ]),
+            &task,
+            1,
+        );
+
+        assert!(picked.is_empty());
+    }
+
+    #[test]
+    fn tier3_can_fall_back_to_single_worker_other_style() {
+        let activity = Arc::new(ProfileActivityTracker::new());
+        let now = Instant::now();
+        activity.record(profile(1), now);
+        let d = dispatcher(activity);
+
+        let task = make_task(9, now);
+        let picked = d.tier3_candidates(
+            &view(vec![WorkerView {
+                id: 0,
+                loaded_profile: Some(profile(1)),
+                queue_depth: 1,
+            }]),
+            &task,
+            1,
+        );
+
+        assert_eq!(
+            picked,
+            vec![ForwardCandidate {
+                node_id: NodeId::from_index(0),
+                drain_worker: Some(0),
+            }]
+        );
+    }
+
+    #[test]
+    fn tier3_prefers_same_renderer_shape_within_over_allocated_profiles() {
+        let activity = Arc::new(ProfileActivityTracker::new());
+        let now = Instant::now();
+        activity.record(
+            profile_with(1, RenderMode::Static, Scale::X1),
+            now - Duration::from_secs(20),
+        );
+        activity.record(profile(2), now);
+        let d = dispatcher(activity);
+
+        let task = make_task(9, now);
+        let picked = d.tier3_candidates(
+            &view(vec![
+                WorkerView {
+                    id: 0,
+                    loaded_profile: Some(profile_with(1, RenderMode::Static, Scale::X1)),
+                    queue_depth: 1,
+                },
+                WorkerView {
+                    id: 1,
+                    loaded_profile: Some(profile(2)),
+                    queue_depth: 1,
+                },
+                WorkerView {
+                    id: 2,
+                    loaded_profile: Some(profile_with(1, RenderMode::Static, Scale::X1)),
+                    queue_depth: 1,
+                },
+                WorkerView {
+                    id: 3,
+                    loaded_profile: Some(profile(2)),
+                    queue_depth: 1,
+                },
+            ]),
+            &task,
+            1,
+        );
+
+        assert_eq!(
+            picked,
+            vec![ForwardCandidate {
+                node_id: NodeId::from_index(0),
+                drain_worker: Some(1),
+            }]
+        );
+    }
+
+    #[test]
+    fn tier3_uses_activity_for_production_style_ids() {
+        let activity = Arc::new(ProfileActivityTracker::new());
+        let streets = StyleId("demo/streets-v12".to_string());
+        let satellite = StyleId("demo/satellite-v9".to_string());
+        let incoming = StyleId("demo/outdoors-v12".to_string());
+
+        let now = Instant::now();
+        activity.record(production_profile(streets.as_str()), now);
+        activity.record(
+            production_profile(satellite.as_str()),
+            now - Duration::from_secs(20),
+        );
+        let d = dispatcher(activity);
+        let task = production_task(incoming.as_str(), now);
+
+        let picked = d.tier3_candidates(
+            &view(vec![
+                WorkerView {
+                    id: 0,
+                    loaded_profile: Some(production_profile(streets.as_str())),
+                    queue_depth: 1,
+                },
+                WorkerView {
+                    id: 1,
+                    loaded_profile: Some(production_profile(satellite.as_str())),
+                    queue_depth: 1,
+                },
+            ]),
+            &task,
+            1,
+        );
+
+        assert_eq!(
+            picked,
+            vec![ForwardCandidate {
+                node_id: NodeId::from_index(0),
+                drain_worker: Some(1),
+            }]
+        );
+    }
+
+    #[test]
+    fn decide_uses_overflow_when_tier3_is_too_slow_but_hard_capacity_remains() {
+        let activity = Arc::new(ProfileActivityTracker::new());
+        let now = Instant::now();
+        activity.record(profile(9), now);
+        let d = dispatcher_with_caps(activity, 1, 4);
+
+        let task = make_task(9, now);
+
+        let decision = d.decide(
+            &task,
+            view(vec![WorkerView {
+                id: 0,
+                loaded_profile: Some(profile(9)),
+                queue_depth: 1,
+            }]),
+        );
+
+        assert!(matches!(
+            decision,
+            Decision::Local {
+                route_tier: RouteTier::Tier4Overflow,
+                worker_hint: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn decide_forwards_top_two_candidates_when_remote_capacity_exists() {
+        let activity = Arc::new(ProfileActivityTracker::new());
+        let now = Instant::now();
+        let d = dispatcher_with_caps(activity, 2, 8);
+        let task = make_task(9, now);
+        let view = ClusterView {
+            members: vec![
+                NodeId::from_index(1),
+                NodeId::from_index(2),
+                NodeId::from_index(3),
+            ],
+            states: [
+                (
+                    NodeId::from_index(1),
+                    NodeStateView {
+                        id: NodeId::from_index(1),
+                        workers: vec![WorkerView {
+                            id: 0,
+                            loaded_profile: Some(profile(1)),
+                            queue_depth: 0,
+                        }],
+                    },
+                ),
+                (
+                    NodeId::from_index(2),
+                    NodeStateView {
+                        id: NodeId::from_index(2),
+                        workers: vec![WorkerView {
+                            id: 0,
+                            loaded_profile: Some(profile(2)),
+                            queue_depth: 0,
+                        }],
+                    },
+                ),
+                (
+                    NodeId::from_index(3),
+                    NodeStateView {
+                        id: NodeId::from_index(3),
+                        workers: vec![WorkerView {
+                            id: 0,
+                            loaded_profile: Some(profile(3)),
+                            queue_depth: 0,
+                        }],
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            generated_at: now,
+        };
+
+        let decision = d.decide(&task, view);
+        let Decision::Forward {
+            route_tier,
+            candidates,
+        } = decision
+        else {
+            panic!("expected forward decision");
+        };
+        assert_eq!(route_tier, RouteTier::Tier2HrwBl);
+        assert_eq!(candidates.len(), DEFAULT_FORWARD_CANDIDATES);
+        assert!(candidates.iter().all(|c| c.drain_worker.is_none()));
+    }
+}

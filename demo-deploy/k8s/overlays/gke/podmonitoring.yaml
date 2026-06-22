@@ -1,0 +1,15 @@
+# Google Managed Prometheus scrape of biei's in-process metrics. Scrapes pods
+# directly (not via the Gateway), so the internal `/_internal/metrics` endpoint
+# is reachable on the pod's HTTP port. Matches ishikari's PodMonitoring.
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: biei
+spec:
+  selector:
+    matchLabels:
+      app: biei
+  endpoints:
+    - port: http
+      path: /_internal/metrics
+      interval: 30s

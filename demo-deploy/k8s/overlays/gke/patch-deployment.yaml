@@ -3,7 +3,6 @@ kind: Deployment
 metadata:
   name: biei
 spec:
-  replicas: 3
   template:
     spec:
       nodeSelector:

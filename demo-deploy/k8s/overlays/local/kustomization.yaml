@@ -4,6 +4,7 @@ kind: Kustomization
 namespace: biei-demo
 
 resources:
+  - namespace.yaml
   - ../../base
 
 patches:

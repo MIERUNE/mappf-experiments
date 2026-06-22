@@ -6,6 +6,7 @@ namespace: map-demo
 resources:
   - healthcheck.yaml
   - httproute.yaml
+  - podmonitoring.yaml
   - ../../base
 
 images:

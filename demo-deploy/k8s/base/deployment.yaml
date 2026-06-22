@@ -9,6 +9,13 @@ spec:
   # Deployment (not StatefulSet): chitchat gossip is dynamic-membership,
   # so pods need no stable identity or ordered startup.
   replicas: 3
+  # Surge a new pod before removing an old one so the 3-node cluster never
+  # drops below quota during a rollout (matches ishikari).
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: biei
@@ -26,6 +33,15 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       terminationGracePeriodSeconds: 25
+      # Spread the 3 replicas across nodes so a single node (Spot) preemption
+      # cannot take out the whole cluster (matches ishikari).
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: biei
       containers:
         - name: biei
           image: biei:dev

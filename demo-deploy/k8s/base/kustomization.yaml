@@ -1,8 +1,11 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
+# The shared `map-demo` namespace (GKE) is owned by ishikari's `k8s/platform`
+# (applied once per cluster). The local overlay supplies its own `biei-demo`
+# namespace. So base does not own a Namespace object.
 resources:
-  - namespace.yaml
   - deployment.yaml
+  - biei-pdb.yaml
   - service-gossip.yaml
   - service-http.yaml

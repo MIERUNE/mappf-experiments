@@ -1,0 +1,11 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: biei
+spec:
+  # Keep at least 2 of 3 renderers available during voluntary disruptions
+  # (node drains, Spot preemptions). Matches ishikari.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: biei

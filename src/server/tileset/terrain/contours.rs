@@ -26,7 +26,7 @@ use super::dem::DemNeighborhood;
 /// cross product), i.e. an area of 12 squared MVT units. That removes
 /// deviations under ≈1.5 units — about a fifth of a source pixel, invisible at
 /// render time.
-const SIMPLIFY_MIN_CROSS: u64 = 24;
+const SIMPLIFY_MIN_CROSS: u64 = 64;
 
 type EdgePoint = (i32, i32);
 type Segment = ([i32; 2], [i32; 2]);
@@ -51,12 +51,15 @@ impl Fragment {
 /// Elevation intervals modeled after maplibre-contour's documented profile.
 /// The first value is the generated interval; later values classify major lines.
 pub(super) fn levels_for_zoom(zoom: u8) -> &'static [i32] {
+    // maplibre-contour-style [minor, major] profile; each entry applies at its
+    // zoom and up to the next. Major (index/label) intervals stay values that
+    // actually occur (500/200/100/50), unlike the old 2500 m at low zoom.
     match zoom {
-        0..=10 => &[500, 2_500],
-        11 => &[200, 1_000],
-        12..=13 => &[100, 500],
-        14 => &[50, 200],
-        _ => &[20, 100],
+        0..=10 => &[250, 500],
+        11 => &[100, 500],
+        12 => &[50, 200],
+        13 => &[20, 100],
+        _ => &[10, 50],
     }
 }
 
@@ -444,9 +447,9 @@ mod tests {
 
     #[test]
     fn zoom_profile_gets_more_detailed() {
-        assert_eq!(levels_for_zoom(10), &[500, 2_500]);
-        assert_eq!(levels_for_zoom(12), &[100, 500]);
-        assert_eq!(levels_for_zoom(15), &[20, 100]);
+        assert_eq!(levels_for_zoom(10), &[250, 500]);
+        assert_eq!(levels_for_zoom(12), &[50, 200]);
+        assert_eq!(levels_for_zoom(15), &[10, 50]);
     }
 
     #[test]

@@ -16,8 +16,9 @@ use std::collections::{BTreeMap, VecDeque};
 
 use anyhow::{Context, Result};
 use fast_mvt::{MvtCoord, MvtFeature, MvtGeometry, MvtLayer, MvtLineString, MvtPolygon, MvtTile};
+use image::{ExtendedColorType, ImageEncoder, codecs::webp::WebPEncoder};
 
-use super::{dem::DemNeighborhood, topology::trace_shared_rings};
+use super::{dem::DemNeighborhood, topology::trace_interpolated_shared_rings};
 
 /// Illumination grid resolution. Matching the 512 px source keeps band
 /// boundaries at 1-source-pixel precision (8 MVT units), the main lever for
@@ -32,7 +33,7 @@ const GRID_BUFFER: i32 = 1;
 /// 24 total (roughly 16 shadow + 8 highlight): 18 proved too few once the
 /// first band is pinned near the JND — the exponential growth left the deep
 /// bands 7-10 L* wide and visibly flattened steep terrain.
-const TOTAL_TONE_LEVELS: u8 = 18;
+const TOTAL_TONE_LEVELS: u8 = 32;
 /// Keep the first shadow band close to the just-noticeable contrast around the
 /// reference background, then let later bands grow progressively wider.
 const FIRST_SHADOW_LEVEL_DELTA_L: f64 = 2.5;
@@ -50,9 +51,10 @@ const SHADOW_SRGB: [u8; 3] = [0x25, 0x30, 0x33];
 const ACCENT_SRGB: [u8; 3] = [0x65, 0x70, 0x74];
 const BACKGROUND_SRGB: [u8; 3] = [0xc9, 0xcc, 0xca];
 const HIGHLIGHT_SRGB: [u8; 3] = [0xff, 0xff, 0xff];
-/// The MVT extent equals the illumination grid, so every coordinate delta is a
-/// small integer: same geometry, roughly a third fewer bytes than extent 4096.
-const HILLSHADE_EXTENT: u32 = GRID_SIZE as u32;
+/// Half-pixel fixed-point coordinates retain useful continuous threshold
+/// crossings without paying the larger deltas of a conventional 4096 extent.
+const HILLSHADE_COORD_SCALE: i32 = 2;
+const HILLSHADE_EXTENT: u32 = GRID_SIZE as u32 * HILLSHADE_COORD_SCALE as u32;
 /// Physically-true slopes nearly vanish at low zooms (a z7 pixel spans ~500 m,
 /// so almost everything falls inside the neutral band and tiles come out almost
 /// empty). MapLibre's raster hillshade solves this in its prepare shader by
@@ -78,6 +80,9 @@ fn zoom_exaggeration(zoom: u8) -> f64 {
 struct ShadeGrid {
     /// Signed tone levels: negative darkens (shadow), positive lightens.
     labels: Vec<i8>,
+    /// Continuous signed level codes aligned with `labels`. Topology comes from
+    /// the labels; these values only position each shared boundary sub-pixel.
+    tones: Vec<f32>,
     width: usize,
     height: usize,
     origin: i32,
@@ -197,18 +202,29 @@ fn solve_compression_mu(span: f64, levels: u8, first_level_delta: f64) -> f64 {
 }
 
 pub(super) fn generate(neighborhood: &DemNeighborhood, zoom: u8, tile_y: u32) -> Result<Vec<u8>> {
+    let started = std::time::Instant::now();
     let mut grid = illumination_labels(neighborhood, zoom, tile_y);
-    remove_speckles(&mut grid.labels, grid.width, grid.height);
+    let labels_elapsed = started.elapsed();
 
-    let extent = fast_mvt::MvtExtent::new(HILLSHADE_EXTENT).expect("valid extent");
-    let mut layer = MvtLayer::new("hillshade", extent);
-    for (shade, polygons) in polygonize(
+    let speckles_started = std::time::Instant::now();
+    remove_speckles(&mut grid.labels, grid.width, grid.height);
+    let speckles_elapsed = speckles_started.elapsed();
+
+    let polygonize_started = std::time::Instant::now();
+    let polygons_by_shade = polygonize(
         &grid.labels,
+        &grid.tones,
         grid.width,
         grid.height,
         grid.origin,
         GRID_SIZE,
-    ) {
+    );
+    let polygonize_elapsed = polygonize_started.elapsed();
+
+    let encode_started = std::time::Instant::now();
+    let extent = fast_mvt::MvtExtent::new(HILLSHADE_EXTENT).expect("valid extent");
+    let mut layer = MvtLayer::new("hillshade", extent);
+    for (shade, polygons) in polygons_by_shade {
         let class = if shade < 0 { "shadow" } else { "highlight" };
         let level = shade.unsigned_abs();
         for polygon in polygons {
@@ -221,7 +237,106 @@ pub(super) fn generate(neighborhood: &DemNeighborhood, zoom: u8, tile_y: u32) ->
 
     let mut tile = MvtTile::new();
     tile.add_layer(layer);
-    tile.encode().context("encode hillshade MVT")
+    let encoded = tile.encode().context("encode hillshade MVT");
+    tracing::debug!(
+        labels_ms = labels_elapsed.as_millis() as u64,
+        speckles_ms = speckles_elapsed.as_millis() as u64,
+        polygonize_ms = polygonize_elapsed.as_millis() as u64,
+        encode_ms = encode_started.elapsed().as_millis() as u64,
+        "hillshade stages"
+    );
+    encoded
+}
+
+/// Bytes per unit tone code in the neutral shade raster. The signed tone code
+/// is stored as `128 + code * SHADE_CODE_SCALE` in a grayscale (R=G=B) pixel,
+/// so the data stays palette-neutral and a style-side `color-relief` ramp does
+/// the coloring. The preview decodes it with the standard Terrarium unpack
+/// (`color-relief`'s custom encoding does not evaluate in the GPU shader);
+/// because the pixel is gray, Terrarium's high-byte sensitivity is harmless
+/// even under lossy codecs — a small byte error is a small, sub-level error.
+pub(super) const SHADE_CODE_SCALE: f64 = 5.0;
+
+fn shade_byte(code: f64) -> u8 {
+    (128.0 + code * SHADE_CODE_SCALE).round().clamp(0.0, 255.0) as u8
+}
+
+/// Grayscale RGB where every pixel carries the signed tone code (see
+/// [`SHADE_CODE_SCALE`]). `continuous` reads the un-rounded field (best for
+/// lossy codecs, no banding); otherwise the quantized levels (best for lossless
+/// codecs, few distinct values).
+fn shade_raster_rgb(grid: &ShadeGrid, continuous: bool) -> Vec<u8> {
+    let offset = GRID_BUFFER as usize;
+    let mut rgb = vec![0u8; GRID_SIZE * GRID_SIZE * 3];
+    for y in 0..GRID_SIZE {
+        for x in 0..GRID_SIZE {
+            let index = (y + offset) * grid.width + (x + offset);
+            let code = if continuous {
+                f64::from(grid.tones[index])
+            } else {
+                f64::from(grid.labels[index])
+            };
+            let byte = shade_byte(code);
+            let base = (y * GRID_SIZE + x) * 3;
+            rgb[base] = byte;
+            rgb[base + 1] = byte;
+            rgb[base + 2] = byte;
+        }
+    }
+    rgb
+}
+
+/// Neutral shade raster as lossless WebP over the quantized levels. Losslessly
+/// compressing a few dozen discrete values is compact and exact; recolor is
+/// deferred to a style-side `color-relief` ramp. Trade vs vector: fixed
+/// resolution (blurs when overzoomed) for far fewer bytes on rough terrain.
+pub(super) fn generate_raster(
+    neighborhood: &DemNeighborhood,
+    zoom: u8,
+    tile_y: u32,
+) -> Result<Vec<u8>> {
+    let grid = illumination_labels(neighborhood, zoom, tile_y);
+    let rgb = shade_raster_rgb(&grid, false);
+    let mut buffer = Vec::new();
+    WebPEncoder::new_lossless(&mut buffer)
+        .write_image(&rgb, GRID_SIZE as u32, GRID_SIZE as u32, ExtendedColorType::Rgb8)
+        .context("encode hillshade raster WebP (lossless)")?;
+    Ok(buffer)
+}
+
+/// Neutral shade raster as lossy WebP over the continuous field. A lossy coder
+/// carries the full un-banded shade at a fraction of the bytes; its errors are
+/// sub-JND tone deviations, not artifacts, because a continuous ramp — not
+/// exact codes — drives the coloring. WebP keeps edges cleaner than JPEG.
+pub(super) fn generate_raster_webp_lossy(
+    neighborhood: &DemNeighborhood,
+    zoom: u8,
+    tile_y: u32,
+    quality: u8,
+) -> Result<Vec<u8>> {
+    let grid = illumination_labels(neighborhood, zoom, tile_y);
+    let rgb = shade_raster_rgb(&grid, true);
+    let encoded = webp::Encoder::from_rgb(&rgb, GRID_SIZE as u32, GRID_SIZE as u32)
+        .encode(f32::from(quality));
+    Ok(encoded.to_vec())
+}
+
+/// Neutral shade raster as lossy JPEG over the continuous field: the size floor
+/// proxy (WebP/AVIF lossy beat it, and JPEG has no alpha). Same continuous,
+/// un-banded shade as [`generate_raster_webp_lossy`].
+pub(super) fn generate_raster_jpeg(
+    neighborhood: &DemNeighborhood,
+    zoom: u8,
+    tile_y: u32,
+    quality: u8,
+) -> Result<Vec<u8>> {
+    let grid = illumination_labels(neighborhood, zoom, tile_y);
+    let rgb = shade_raster_rgb(&grid, true);
+    let mut buffer = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buffer, quality)
+        .write_image(&rgb, GRID_SIZE as u32, GRID_SIZE as u32, ExtendedColorType::Rgb8)
+        .context("encode hillshade raster JPEG")?;
+    Ok(buffer)
 }
 
 fn illumination_labels(neighborhood: &DemNeighborhood, zoom: u8, tile_y: u32) -> ShadeGrid {
@@ -236,27 +351,57 @@ fn illumination_labels(neighborhood: &DemNeighborhood, zoom: u8, tile_y: u32) ->
     let azimuth = f64::from(SUN_AZIMUTH_DEGREES.to_radians()) + std::f64::consts::PI;
     let grid_width = (GRID_SIZE as i32 + 2 * GRID_BUFFER) as usize;
     let grid_height = grid_width;
-    let mut labels = vec![0; grid_width * grid_height];
     let tone_profile = ToneProfile::new();
 
+    let field_buffer = GRID_BUFFER;
+    let field_width = grid_width;
+    let mut field = vec![f64::NAN; field_width * field_width];
+    let sampling_started = std::time::Instant::now();
+
+    // Sample the DEM directly, as maplibre's raster hillshade shader does: a
+    // [1 2 1]^2 pre-blur before the derivatives visibly softened the result
+    // against the raster reference. The memoized grid keeps the eight Sobel
+    // taps of neighboring field cells from re-reading pixels through the
+    // neighborhood indirection.
+    let tap = sample_step;
+    let source_x_at = |grid: i32| ((grid as f32 + 0.5) * step_x).floor() as i32;
+    let source_y_at = |grid: i32| ((grid as f32 + 0.5) * step_y).floor() as i32;
+    let elevation_min_x = source_x_at(-field_buffer) - tap;
+    let elevation_max_x = source_x_at(GRID_SIZE as i32 - 1 + field_buffer) + tap;
+    let elevation_min_y = source_y_at(-field_buffer) - tap;
+    let elevation_max_y = source_y_at(GRID_SIZE as i32 - 1 + field_buffer) + tap;
+    let elevation_width = (elevation_max_x - elevation_min_x + 1) as usize;
+    let mut elevation_grid =
+        vec![f32::NAN; elevation_width * (elevation_max_y - elevation_min_y + 1) as usize];
+    for y in elevation_min_y..=elevation_max_y {
+        let row = (y - elevation_min_y) as usize * elevation_width;
+        for x in elevation_min_x..=elevation_max_x {
+            elevation_grid[row + (x - elevation_min_x) as usize] = neighborhood.get(x, y);
+        }
+    }
+    let elevation_at = |x: i32, y: i32| -> f32 {
+        elevation_grid
+            [(y - elevation_min_y) as usize * elevation_width + (x - elevation_min_x) as usize]
+    };
+
     let exaggeration = zoom_exaggeration(zoom);
-    for local_y in 0..grid_height {
-        let grid_y = local_y as i32 - GRID_BUFFER;
+    for local_y in 0..field_width {
+        let grid_y = local_y as i32 - field_buffer;
         let source_y = ((grid_y as f32 + 0.5) * step_y).floor() as i32;
         let meters_per_pixel = meters_per_pixel(zoom, tile_y, source_y, height);
         let denominator = 8.0 * meters_per_pixel * f64::from(sample_step) / exaggeration;
-        for local_x in 0..grid_width {
-            let grid_x = local_x as i32 - GRID_BUFFER;
+        for local_x in 0..field_width {
+            let grid_x = local_x as i32 - field_buffer;
             let source_x = ((grid_x as f32 + 0.5) * step_x).floor() as i32;
             let s = sample_step;
-            let tl = blurred(neighborhood, source_x - s, source_y - s);
-            let top = blurred(neighborhood, source_x, source_y - s);
-            let tr = blurred(neighborhood, source_x + s, source_y - s);
-            let left = blurred(neighborhood, source_x - s, source_y);
-            let right = blurred(neighborhood, source_x + s, source_y);
-            let bl = blurred(neighborhood, source_x - s, source_y + s);
-            let bottom = blurred(neighborhood, source_x, source_y + s);
-            let br = blurred(neighborhood, source_x + s, source_y + s);
+            let tl = elevation_at(source_x - s, source_y - s);
+            let top = elevation_at(source_x, source_y - s);
+            let tr = elevation_at(source_x + s, source_y - s);
+            let left = elevation_at(source_x - s, source_y);
+            let right = elevation_at(source_x + s, source_y);
+            let bl = elevation_at(source_x - s, source_y + s);
+            let bottom = elevation_at(source_x, source_y + s);
+            let br = elevation_at(source_x + s, source_y + s);
             if ![tl, top, tr, left, right, bl, bottom, br]
                 .into_iter()
                 .all(f32::is_finite)
@@ -266,37 +411,34 @@ fn illumination_labels(neighborhood: &DemNeighborhood, zoom: u8, tile_y: u32) ->
 
             let dz_dx = f64::from(tr + 2.0 * right + br - tl - 2.0 * left - bl) / denominator;
             let dz_dy = f64::from(bl + 2.0 * bottom + br - tl - 2.0 * top - tr) / denominator;
-            labels[local_y * grid_width + local_x] = quantize(dz_dx, dz_dy, azimuth, tone_profile);
+            field[local_y * field_width + local_x] =
+                composite_lightness_delta(dz_dx, dz_dy, azimuth, tone_profile);
+        }
+    }
+    let field_elapsed = sampling_started.elapsed();
+    tracing::debug!(
+        field_ms = field_elapsed.as_millis() as u64,
+        "hillshade field stages"
+    );
+
+    let mut labels = vec![0; grid_width * grid_height];
+    let mut tones = vec![f32::NAN; grid_width * grid_height];
+    for local_y in 0..grid_height {
+        for local_x in 0..grid_width {
+            let index = local_y * grid_width + local_x;
+            let value = field[index];
+            if value.is_finite() {
+                tones[index] = signed_code(value, tone_profile) as f32;
+                labels[index] = quantize_lightness_delta(value, tone_profile);
+            }
         }
     }
     ShadeGrid {
         labels,
+        tones,
         width: grid_width,
         height: grid_height,
         origin: -GRID_BUFFER,
-    }
-}
-
-/// A compact [1 2 1] x [1 2 1] pre-filter suppresses DEM pixel noise before
-/// derivatives; field-space smoothing avoids spending output vertices on it.
-fn blurred(neighborhood: &DemNeighborhood, x: i32, y: i32) -> f32 {
-    let weights = [1.0_f32, 2.0, 1.0];
-    let mut sum = 0.0;
-    let mut weight_sum = 0.0;
-    for (dy, wy) in (-1..=1).zip(weights) {
-        for (dx, wx) in (-1..=1).zip(weights) {
-            let value = neighborhood.get(x + dx, y + dy);
-            if value.is_finite() {
-                let weight = wx * wy;
-                sum += value * weight;
-                weight_sum += weight;
-            }
-        }
-    }
-    if weight_sum == 0.0 {
-        f32::NAN
-    } else {
-        sum / weight_sum
     }
 }
 
@@ -384,6 +526,7 @@ pub(super) fn opacity_stops(shadow: bool) -> Vec<(u8, f64)> {
         .collect()
 }
 
+#[cfg(test)]
 fn quantize(dz_dx: f64, dz_dy: f64, azimuth: f64, profile: ToneProfile) -> i8 {
     quantize_lightness_delta(
         composite_lightness_delta(dz_dx, dz_dy, azimuth, profile),
@@ -567,13 +710,24 @@ fn neighbors4(x: usize, y: usize, width: usize, height: usize) -> [Option<usize>
 
 fn polygonize(
     labels: &[i8],
+    tones: &[f32],
     width: usize,
     height: usize,
     origin: i32,
     tile_size: usize,
 ) -> BTreeMap<i8, Vec<MvtPolygon>> {
-    let rings = trace_shared_rings(labels, width, height, origin, tile_size as i32);
-    let scale = (HILLSHADE_EXTENT as i32 / tile_size as i32).max(1);
+    let trace_started = std::time::Instant::now();
+    let rings = trace_interpolated_shared_rings(
+        labels,
+        tones,
+        width,
+        height,
+        origin,
+        tile_size as i32,
+        HILLSHADE_COORD_SCALE,
+    );
+    let trace_elapsed = trace_started.elapsed();
+    let assembly_started = std::time::Instant::now();
     let mut result = BTreeMap::new();
     for (shade, rings) in rings {
         let mut outers: Vec<(Vec<MvtCoord>, Vec<Vec<MvtCoord>>)> = Vec::new();
@@ -582,13 +736,7 @@ fn polygonize(
             if ring.len() < 4 {
                 continue;
             }
-            let ring: Vec<MvtCoord> = ring
-                .into_iter()
-                .map(|(x, y)| MvtCoord {
-                    x: x * scale,
-                    y: y * scale,
-                })
-                .collect();
+            let ring: Vec<MvtCoord> = ring.into_iter().map(|(x, y)| MvtCoord { x, y }).collect();
             match signed_area(&ring) {
                 0 => continue,
                 area if area > 0 => outers.push((ring, Vec::new())),
@@ -620,6 +768,11 @@ fn polygonize(
             result.insert(shade, polygons);
         }
     }
+    tracing::debug!(
+        trace_ms = trace_elapsed.as_millis() as u64,
+        assembly_ms = assembly_started.elapsed().as_millis() as u64,
+        "hillshade polygonize stages"
+    );
     result
 }
 
@@ -658,7 +811,11 @@ mod tests {
         width: usize,
         height: usize,
     ) -> BTreeMap<i8, Vec<MvtPolygon>> {
-        polygonize(&labels, width, height, 0, width)
+        let tones = labels
+            .iter()
+            .map(|label| f32::from(*label))
+            .collect::<Vec<_>>();
+        polygonize(&labels, &tones, width, height, 0, width)
     }
 
     #[test]
@@ -810,10 +967,10 @@ mod tests {
         // The staircase collapsed: the shade-1 triangle needs only a handful of
         // vertices (the raw staircase boundary alone has ~15).
         let verts: usize = polygons[&1].iter().map(|p| p.exterior().0.len()).sum();
-        assert!(verts <= 8, "staircase not simplified: {verts} vertices");
+        assert!(verts <= 10, "staircase not simplified: {verts} vertices");
 
         // Every non-border edge is shared: emitted identically by both bands.
-        let scale = (HILLSHADE_EXTENT as i32 / 8).max(1);
+        let scale = HILLSHADE_COORD_SCALE;
         let max = 8 * scale;
         let on_border = |e: &(i32, i32, i32, i32)| {
             (e.0 == 0 && e.2 == 0)
@@ -921,6 +1078,12 @@ mod tests {
                     grid_left.labels[row * grid_left.width + column_left],
                     grid_right.labels[row * grid_right.width + column_right],
                     "column {grid_x_left} row {row}"
+                );
+                let left_tone = grid_left.tones[row * grid_left.width + column_left];
+                let right_tone = grid_right.tones[row * grid_right.width + column_right];
+                assert!(
+                    (left_tone - right_tone).abs() < 1e-5,
+                    "continuous tone differs at column {grid_x_left} row {row}: {left_tone} vs {right_tone}"
                 );
                 compared += 1;
             }

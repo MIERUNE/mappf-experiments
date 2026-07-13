@@ -10,10 +10,6 @@ pub(crate) mod dem;
 mod hillshade;
 mod topology;
 
-/// Bump whenever derived tile semantics change. Keeping this in generated
-/// URLs prevents browser and CDN caches from mixing tiles from two algorithms.
-pub(super) const DERIVED_TILE_REVISION: u8 = 15;
-
 use std::io::Write;
 
 use axum::{
@@ -46,10 +42,26 @@ pub(super) fn hillshade_opacity_stops(shadow: bool) -> Vec<(u8, f64)> {
     hillshade::opacity_stops(shadow)
 }
 
+/// Bytes-per-tone-code of the neutral shade raster, so the preview's
+/// `color-relief` custom encoding recovers the signed code.
+pub(super) fn hillshade_shade_code_scale() -> f64 {
+    hillshade::SHADE_CODE_SCALE
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum DerivedProduct {
     Contours,
     Hillshade,
+    /// Experimental: the hillshade shade field as a quantized WebP raster
+    /// instead of vector polygons, for the raster-vs-vector size/quality
+    /// Pareto comparison. Fixed palette/sun.
+    HillshadeRaster,
+    /// Experimental: continuous shade as lossy WebP (neutral grayscale, colored
+    /// by a style-side color-relief ramp).
+    HillshadeWebpLossy,
+    /// Experimental: continuous (un-quantized) shade as lossy JPEG — the size
+    /// floor for fixed-palette delivery, with no tone banding.
+    HillshadeJpeg,
 }
 
 impl DerivedProduct {
@@ -57,6 +69,9 @@ impl DerivedProduct {
         match value {
             "contours" => Ok(Self::Contours),
             "hillshade" => Ok(Self::Hillshade),
+            "hillshade-raster" => Ok(Self::HillshadeRaster),
+            "hillshade-webp-lossy" => Ok(Self::HillshadeWebpLossy),
+            "hillshade-jpeg" => Ok(Self::HillshadeJpeg),
             _ => Err((StatusCode::NOT_FOUND, "derived product not found".into())),
         }
     }
@@ -65,7 +80,17 @@ impl DerivedProduct {
         match self {
             Self::Contours => "contours",
             Self::Hillshade => "hillshade",
+            Self::HillshadeRaster => "hillshade-raster",
+            Self::HillshadeWebpLossy => "hillshade-webp-lossy",
+            Self::HillshadeJpeg => "hillshade-jpeg",
         }
+    }
+
+    fn is_raster(self) -> bool {
+        matches!(
+            self,
+            Self::HillshadeRaster | Self::HillshadeWebpLossy | Self::HillshadeJpeg
+        )
     }
 
     fn layer(self) -> &'static str {
@@ -138,11 +163,15 @@ async fn serve_tilejson(
     let fields = match product {
         DerivedProduct::Contours => json!({ "ele": "Number", "level": "Number" }),
         DerivedProduct::Hillshade => json!({ "class": "String", "level": "Number" }),
+        // Raster product has no vector layer; the TileJSON is not used for it.
+        DerivedProduct::HillshadeRaster
+        | DerivedProduct::HillshadeWebpLossy
+        | DerivedProduct::HillshadeJpeg => json!({}),
     };
     let document = json!({
         "tilejson": "3.0.0",
         "tiles": [format!(
-            "{base_url}/tilesets/{tileset_id}/derived/{}/{{z}}/{{x}}/{{y}}{suffix}?v={DERIVED_TILE_REVISION}",
+            "{base_url}/tilesets/{tileset_id}/derived/{}/{{z}}/{{x}}/{{y}}{suffix}",
             product.path(),
         )],
         "vector_layers": [{
@@ -237,6 +266,13 @@ async fn serve_derived_tile(
         .await
         .map_err(|error| (*error).clone())?;
 
+    // The raster product is a WebP image; MLT transcoding only applies to the
+    // vector products, so it is always served as stored.
+    let format = if product.is_raster() {
+        RequestedTileFormat::AsStored
+    } else {
+        format
+    };
     let response = match format {
         RequestedTileFormat::AsStored => {
             state.metrics.add_egress_bytes(generated.bytes.len() as u64);
@@ -334,9 +370,16 @@ async fn generate_tile(
             )
         })?;
         let decode_elapsed = cpu_started.elapsed();
-        let mvt = match product {
+        let payload = match product {
             DerivedProduct::Contours => contours::generate(&neighborhood, z),
             DerivedProduct::Hillshade => hillshade::generate(&neighborhood, z, y),
+            DerivedProduct::HillshadeRaster => hillshade::generate_raster(&neighborhood, z, y),
+            DerivedProduct::HillshadeWebpLossy => {
+                hillshade::generate_raster_webp_lossy(&neighborhood, z, y, 80)
+            }
+            DerivedProduct::HillshadeJpeg => {
+                hillshade::generate_raster_jpeg(&neighborhood, z, y, 85)
+            }
         }
         .map_err(|error| {
             (
@@ -344,7 +387,21 @@ async fn generate_tile(
                 format!("generate {}: {error:#}", product.path()),
             )
         })?;
-        let bytes = gzip(&mvt)?;
+        // Vector products gzip well and declare it; the raster WebP is already
+        // compressed, so it is served as-is with its image content type.
+        let (bytes, content_type, content_encoding) = if product.is_raster() {
+            let content_type = match product {
+                DerivedProduct::HillshadeJpeg => TileType::Jpeg.content_type(),
+                _ => TileType::Webp.content_type(),
+            };
+            (Bytes::from(payload.clone()), content_type, None)
+        } else {
+            (
+                Bytes::from(gzip(&payload)?),
+                TileType::Mvt.content_type(),
+                Some("gzip"),
+            )
+        };
         // Splits the cold-tile cost so slow serving is attributable: neighbor
         // fetch (object store / peers) vs local CPU (WebP decode, generation).
         debug!(
@@ -357,13 +414,13 @@ async fn generate_tile(
             decode_ms = decode_elapsed.as_millis() as u64,
             decoded_tiles,
             generate_ms = cpu_started.elapsed().saturating_sub(decode_elapsed).as_millis() as u64,
-            mvt_bytes = mvt.len(),
+            payload_bytes = payload.len(),
             "generated terrain tile"
         );
         Ok(TileData {
-            bytes: Bytes::from(bytes),
-            content_type: TileType::Mvt.content_type(),
-            content_encoding: Some("gzip"),
+            bytes,
+            content_type,
+            content_encoding,
         })
     })
     .await

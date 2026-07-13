@@ -145,7 +145,7 @@
                 style: "__STYLE_URL__",
                 hash: true,
             });
-            map.showTileBoundaries = !TERRAIN_PRODUCTS;
+            window.__map = map;
             const popup = new maplibregl.Popup({
                 closeButton: false,
                 closeOnClick: false,
@@ -168,8 +168,37 @@
                 segmented.setAttribute("aria-label", "Terrain display");
                 controls.appendChild(segmented);
 
-                let terrainMode = "hillshade";
-                let isolinesEnabled = false;
+                // Persist the chosen terrain mode (and isolines) in the URL
+                // query so a view is shareable and survives reload. MapLibre's
+                // `hash: true` owns the `#...` fragment; the query is separate,
+                // so the two coexist.
+                const TERRAIN_MODES = [
+                    "hillshade",
+                    "vector",
+                    "raster-lossless",
+                    "raster-lossy",
+                    "raster-jpeg",
+                    "raw",
+                ];
+                const initialParams = new URLSearchParams(window.location.search);
+                const requestedMode = initialParams.get("hillshade");
+                let terrainMode = TERRAIN_MODES.includes(requestedMode)
+                    ? requestedMode
+                    : "hillshade";
+                let isolinesEnabled = initialParams.get("isolines") === "true";
+                const syncUrl = () => {
+                    const params = new URLSearchParams(window.location.search);
+                    if (terrainMode === "hillshade") params.delete("hillshade");
+                    else params.set("hillshade", terrainMode);
+                    if (isolinesEnabled) params.set("isolines", "true");
+                    else params.delete("isolines");
+                    const query = params.toString();
+                    const next =
+                        window.location.pathname +
+                        (query ? "?" + query : "") +
+                        window.location.hash;
+                    window.history.replaceState(window.history.state, "", next);
+                };
                 const modeButtons = [];
                 const layerVisibility = (layerId, visible) => {
                     if (map.getLayer(layerId)) {
@@ -181,6 +210,9 @@
                     layerVisibility("raster-hillshade", terrainMode === "hillshade");
                     layerVisibility("vector-hillshade-shadow", terrainMode === "vector");
                     layerVisibility("vector-hillshade-highlight", terrainMode === "vector");
+                    layerVisibility("shade-webp-lossless", terrainMode === "raster-lossless");
+                    layerVisibility("shade-webp-lossy", terrainMode === "raster-lossy");
+                    layerVisibility("shade-jpeg", terrainMode === "raster-jpeg");
                     layerVisibility("isolines", isolinesEnabled);
                     layerVisibility("isoline-labels", isolinesEnabled);
                     modeButtons.forEach((button) =>
@@ -191,6 +223,9 @@
                 for (const [mode, label] of [
                     ["hillshade", "Hillshade"],
                     ["vector", "Vector hillshade"],
+                    ["raster-lossless", "Raster (WebP lossless)"],
+                    ["raster-lossy", "Raster (WebP lossy)"],
+                    ["raster-jpeg", "Raster (JPEG)"],
                     ["raw", "Raw raster"],
                 ]) {
                     const button = document.createElement("button");
@@ -201,6 +236,7 @@
                     button.addEventListener("click", () => {
                         terrainMode = mode;
                         applyTerrainDisplay();
+                        syncUrl();
                     });
                     modeButtons.push(button);
                     segmented.appendChild(button);
@@ -210,15 +246,34 @@
                 isolineSwitch.className = "preview-switch";
                 const isolineInput = document.createElement("input");
                 isolineInput.type = "checkbox";
+                isolineInput.checked = isolinesEnabled;
                 isolineInput.addEventListener("change", () => {
                     isolinesEnabled = isolineInput.checked;
                     applyTerrainDisplay();
+                    syncUrl();
                 });
                 isolineSwitch.append(isolineInput, document.createTextNode("Isolines"));
                 controls.appendChild(isolineSwitch);
                 overlay.appendChild(controls);
                 map.on("load", applyTerrainDisplay);
             }
+
+            const overlay = document.querySelector(".overlay") || document.body;
+            const debugControls = document.createElement("div");
+            debugControls.className = "preview-controls";
+            const tileBoundarySwitch = document.createElement("label");
+            tileBoundarySwitch.className = "preview-switch";
+            const tileBoundaryInput = document.createElement("input");
+            tileBoundaryInput.type = "checkbox";
+            tileBoundaryInput.checked = true;
+            const applyTileBoundaries = () => {
+                map.showTileBoundaries = tileBoundaryInput.checked;
+            };
+            tileBoundaryInput.addEventListener("change", applyTileBoundaries);
+            tileBoundarySwitch.append(tileBoundaryInput, document.createTextNode("Tile boundaries"));
+            debugControls.appendChild(tileBoundarySwitch);
+            overlay.appendChild(debugControls);
+            applyTileBoundaries();
 
             // MVT/MLT tile-format toggle (vector previews only). Reloads the
             // style with the source pointed at `?encoding=mvt|mlt`.

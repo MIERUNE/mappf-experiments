@@ -219,10 +219,7 @@ fn preview_html(
         return render_preview_html(&title, &style_url, "", true, false);
     }
     if is_mapterhorn {
-        let style_url = format!(
-            "/tilesets/{tileset_id}/preview.json?v={}",
-            super::terrain::DERIVED_TILE_REVISION
-        );
+        let style_url = format!("/tilesets/{tileset_id}/preview.json");
         return render_preview_html(&title, &style_url, "", false, true);
     }
     // Raster / raster-dem: `encoding` selects the DEM hillshade scheme, no toggle.
@@ -285,14 +282,74 @@ fn preview_style_mapterhorn(
     let highlight_opacity = shade_opacity(false);
     let terrain_tiles = format!("{base_url}/tilesets/{tileset_id}/{{z}}/{{x}}/{{y}}.webp");
     let derived_tiles = |product: &str| {
-        format!(
-            "{base_url}/tilesets/{tileset_id}/derived/{product}/{{z}}/{{x}}/{{y}}.mvt?v={}",
-            super::terrain::DERIVED_TILE_REVISION
-        )
+        format!("{base_url}/tilesets/{tileset_id}/derived/{product}/{{z}}/{{x}}/{{y}}.mvt")
+    };
+    // Neutral shade rasters (image tiles, no `.mvt`): the byte carries the
+    // signed tone code, recolored client-side by the color-relief ramp below.
+    let shade_tiles = |product: &str| {
+        format!("{base_url}/tilesets/{tileset_id}/derived/{product}/{{z}}/{{x}}/{{y}}")
+    };
+    // The shade byte is a grayscale (R=G=B) value; decode it through the
+    // standard Terrarium unpack (color-relief's custom encoding does not
+    // evaluate correctly in the GPU shader). Because all channels are equal,
+    // Terrarium's high-byte sensitivity is harmless even for lossy codecs: a
+    // small byte error maps to a small, sub-level elevation error.
+    let scale = super::terrain::hillshade_shade_code_scale();
+    let terrarium_elevation = |code: f64| -> f64 {
+        let byte = (128.0 + code * scale).round().clamp(0.0, 255.0);
+        byte * 256.0 + byte + byte / 256.0 - 32768.0
+    };
+    let raster_dem_shade = |product: &str| {
+        json!({
+            "type": "raster-dem",
+            "tiles": [shade_tiles(product)],
+            "minzoom": info.header.min_zoom,
+            "maxzoom": maxzoom,
+            "tileSize": 512,
+            "encoding": "terrarium"
+        })
+    };
+    // Reproduce the vector fills' appearance from a single ramp over the signed
+    // tone code: shadow color fading in toward negative codes, transparent at
+    // neutral, highlight (white) toward positive. Opacities are the same CIE
+    // L*-derived stops the vector style uses.
+    let color_relief_color = {
+        // Stops are placed at each level's Terrarium-decoded elevation, so the
+        // ramp reproduces the vector fills' CIE L*-derived opacities.
+        let mut stops: Vec<(f64, String)> = Vec::new();
+        for (level, opacity) in super::terrain::hillshade_opacity_stops(true) {
+            stops.push((
+                terrarium_elevation(-f64::from(level)),
+                format!("rgba(37, 48, 51, {opacity})"),
+            ));
+        }
+        stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut expression = vec![json!("interpolate"), json!(["linear"]), json!(["elevation"])];
+        for (elevation, color) in &stops {
+            expression.push(json!(elevation));
+            expression.push(json!(color));
+        }
+        expression.push(json!(terrarium_elevation(0.0)));
+        expression.push(json!("rgba(201, 204, 202, 0)"));
+        for (level, opacity) in super::terrain::hillshade_opacity_stops(false) {
+            expression.push(json!(terrarium_elevation(f64::from(level))));
+            expression.push(json!(format!("rgba(255, 255, 255, {opacity})")));
+        }
+        Value::Array(expression)
+    };
+    let color_relief_layer = |id: &str, source: &str| {
+        json!({
+            "id": id,
+            "type": "color-relief",
+            "source": source,
+            "layout": { "visibility": "none" },
+            "paint": { "color-relief-opacity": 1, "color-relief-color": color_relief_color }
+        })
     };
     json!({
         "version": 8,
         "name": format!("preview - {tileset_id}"),
+        "glyphs": "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
         "center": [info.header.center_longitude, info.header.center_latitude],
         "zoom": info.header.center_zoom,
         "sources": {
@@ -317,6 +374,9 @@ fn preview_style_mapterhorn(
                 "minzoom": info.header.min_zoom,
                 "maxzoom": maxzoom
             },
+            "shade-webp-lossless": raster_dem_shade("hillshade-raster"),
+            "shade-webp-lossy": raster_dem_shade("hillshade-webp-lossy"),
+            "shade-jpeg": raster_dem_shade("hillshade-jpeg"),
             "isolines": {
                 "type": "vector",
                 "tiles": [derived_tiles("contours")],
@@ -379,6 +439,9 @@ fn preview_style_mapterhorn(
                     "fill-antialias": true
                 }
             },
+            color_relief_layer("shade-webp-lossless", "shade-webp-lossless"),
+            color_relief_layer("shade-webp-lossy", "shade-webp-lossy"),
+            color_relief_layer("shade-jpeg", "shade-jpeg"),
             {
                 "id": "isolines",
                 "type": "line",
@@ -386,8 +449,8 @@ fn preview_style_mapterhorn(
                 "source-layer": "contours",
                 "layout": { "visibility": "none" },
                 "paint": {
-                    "line-color": "#273238",
-                    "line-opacity": 0.82,
+                    "line-color": "#9a5236",
+                    "line-opacity": 0.85,
                     "line-width": ["match", ["get", "level"], 1, 1.35, 0.7]
                 }
             },
@@ -400,17 +463,20 @@ fn preview_style_mapterhorn(
                 "layout": {
                     "visibility": "none",
                     "symbol-placement": "line",
-                    "symbol-spacing": 180,
+                    "symbol-spacing": 120,
                     "text-field": ["concat", ["to-string", ["get", "ele"]], " m"],
-                    "text-font": ["Noto Sans", "Arial", "Helvetica", "sans-serif"],
-                    "text-size": 11,
-                    "text-max-angle": 35,
+                    "text-font": ["Noto Sans Regular"],
+                    // Smaller text at low zoom (rings are tiny) and a generous
+                    // max-angle let index labels place on small, tightly curved
+                    // contours; at 11px/45deg low-zoom rings got no labels.
+                    "text-size": ["interpolate", ["linear"], ["zoom"], 8, 9, 13, 11],
+                    "text-max-angle": 70,
                     "text-padding": 4,
                     "text-keep-upright": true
                 },
                 "paint": {
-                    "text-color": "#20292c",
-                    "text-halo-color": "rgba(235, 238, 236, 0.9)",
+                    "text-color": "#6f3a24",
+                    "text-halo-color": "rgba(238, 233, 228, 0.9)",
                     "text-halo-width": 1.25,
                     "text-halo-blur": 0.5
                 }
@@ -820,10 +886,7 @@ mod tests {
         assert_eq!(style["sources"]["vector-hillshade"]["maxzoom"], 17);
         assert_eq!(
             style["sources"]["isolines"]["tiles"][0],
-            format!(
-                "https://ishikari.example/tilesets/mapterhorn/planet/derived/contours/{{z}}/{{x}}/{{y}}.mvt?v={}",
-                super::super::terrain::DERIVED_TILE_REVISION
-            )
+            "https://ishikari.example/tilesets/mapterhorn/planet/derived/contours/{z}/{x}/{y}.mvt"
         );
         let layer_ids = style["layers"]
             .as_array()
@@ -855,7 +918,7 @@ mod tests {
             layer("isoline-labels")["filter"],
             json!(["==", ["get", "level"], 1])
         );
-        assert_eq!(layer("isoline-labels")["layout"]["symbol-spacing"], 180);
+        assert_eq!(layer("isoline-labels")["layout"]["symbol-spacing"], 120);
         let mut level_counts = Vec::new();
         for layer_id in ["vector-hillshade-shadow", "vector-hillshade-highlight"] {
             let layer = layer(layer_id);
@@ -886,7 +949,7 @@ mod tests {
 
         assert!(mapterhorn.contains("const TERRAIN_PRODUCTS = true"));
         assert!(mapterhorn.contains("Vector hillshade"));
-        assert!(mapterhorn.contains("let terrainMode = \"hillshade\""));
+        assert!(mapterhorn.contains("params.set(\"hillshade\", terrainMode)"));
         let hillshade = mapterhorn.find("[\"hillshade\", \"Hillshade\"]").unwrap();
         let raw = mapterhorn.find("[\"raw\", \"Raw raster\"]").unwrap();
         let vector = mapterhorn
@@ -894,5 +957,10 @@ mod tests {
             .unwrap();
         assert!(hillshade < vector && vector < raw);
         assert!(ordinary.contains("const TERRAIN_PRODUCTS = false"));
+        for preview in [&mapterhorn, &ordinary] {
+            assert!(preview.contains("Tile boundaries"));
+            assert!(preview.contains("map.showTileBoundaries = tileBoundaryInput.checked"));
+        }
+        assert!(mapterhorn.contains("tileBoundaryInput.checked = true"));
     }
 }

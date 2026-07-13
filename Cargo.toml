@@ -16,7 +16,7 @@ clap = { version = "4.6", features = ["derive", "env"] }
 fast_hilbert = "2"
 fast-mvt = { version = "0.4", default-features = false, features = ["writer"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
-image = { version = "0.25", default-features = false, features = ["webp"] }
+image = { version = "0.25", default-features = false, features = ["webp", "jpeg"] }
 internment = { version = "0.8", default-features = false, features = ["arc"] }
 mlt-core = { version = "0.12", default-features = false }
 moka = { version = "0.12", features = ["sync", "future"] }
@@ -31,6 +31,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 twox-hash = "2"
 url = "2"
+webp = { version = "0.3", default-features = false }
 zstd = "0.13"
 
 [profile.dev.package."*"]

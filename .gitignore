@@ -2,6 +2,6 @@
 /target
 /k8s
 log*
-data/
-.claude/settings.local.json
-/ishikari-todo-spec.md
+/data/
+ishikari-sim/data/
+ishikari-sim/data/census_2020_1km_population.geojson

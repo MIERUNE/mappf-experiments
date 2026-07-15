@@ -7,6 +7,7 @@ resources:
   - healthcheck.yaml
   - httproute.yaml
   - podmonitoring.yaml
+  - hpa.yaml
   - ../../base
 
 images:
@@ -17,3 +18,11 @@ images:
 patches:
   - path: patch-serviceaccount.yaml
   - path: patch-deployment.yaml
+  # The HPA owns replica count; drop the base Deployment's fixed replicas so
+  # `kubectl apply` doesn't reset the autoscaler's decision on every deploy.
+  - target:
+      kind: Deployment
+      name: ishikari
+    patch: |-
+      - op: remove
+        path: /spec/replicas

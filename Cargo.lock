@@ -1505,6 +1505,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ishikari-sim"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "chitchat",
+ "clap",
+ "ishikari",
+ "moka",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

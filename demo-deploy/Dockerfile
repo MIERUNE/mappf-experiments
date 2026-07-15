@@ -18,8 +18,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
-COPY src src
-RUN cargo build --release --locked \
+COPY ishikari/Cargo.toml ishikari/Cargo.toml
+COPY ishikari-sim/Cargo.toml ishikari-sim/Cargo.toml
+COPY ishikari/src ishikari/src
+COPY ishikari-sim/src ishikari-sim/src
+RUN cargo build --release --locked -p ishikari \
     && cp target/release/ishikari /ishikari
 
 FROM gcr.io/distroless/cc-debian13:nonroot

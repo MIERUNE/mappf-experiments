@@ -5,13 +5,23 @@ on:
     branches:
       - main
     paths:
-      - "services/ishikari/**"
-      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/ishikari-core/**"
+      - "crates/mmpf-terrain/**"
+      - "servers/ishikari/**"
+      - "sims/ishikari-sim/**"
+      - "demo-deploy/ishikari/**"
       - ".github/workflows/ishikari-ci.yml"
   pull_request:
     paths:
-      - "services/ishikari/**"
-      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/ishikari-core/**"
+      - "crates/mmpf-terrain/**"
+      - "servers/ishikari/**"
+      - "sims/ishikari-sim/**"
+      - "demo-deploy/ishikari/**"
       - ".github/workflows/ishikari-ci.yml"
 
 permissions:
@@ -20,10 +30,6 @@ permissions:
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
-defaults:
-  run:
-    working-directory: services/ishikari
 
 jobs:
   rust:
@@ -37,12 +43,16 @@ jobs:
       # GitHub-hosted runners. Pin the v2 action to an immutable commit.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          workspaces: services/ishikari -> target
+          workspaces: . -> target
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: >-
+          cargo clippy -p ishikari-core -p ishikari -p ishikari-sim
+          -p mmpf-terrain --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --workspace --all-targets
+        run: >-
+          cargo test -p ishikari-core -p ishikari -p ishikari-sim
+          -p mmpf-terrain --all-targets --locked
       - name: Test Ishikari without simulator support
-        run: cargo test -p ishikari --all-targets --no-default-features
+        run: cargo test -p ishikari-core --all-targets --no-default-features --locked

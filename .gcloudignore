@@ -1,0 +1,12 @@
+.git/
+.github/
+target/
+**/target/
+**/*.pmtiles
+**/*.png
+**/*.jpg
+**/*.webp
+.DS_Store
+issues/
+specs/
+integration/

@@ -1,0 +1,14 @@
+[package]
+name = "mmpf-terrain"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+description = "MIERUNE Map Platform DEM decoding and derived contour and hillshade generation"
+repository = "https://github.com/MIERUNE/biei"
+
+[dependencies]
+anyhow.workspace = true
+fast-mvt.workspace = true
+image = { version = "0.25", default-features = false, features = ["webp", "jpeg"] }
+tracing.workspace = true
+webp.workspace = true

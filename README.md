@@ -1,71 +1,65 @@
-# Biei + Ishikari
+# MIERUNE Map Platform rendering stack
 
-This repository contains the two services that make up the map rendering
-stack:
+This monorepo contains Biei, Ishikari, their simulators, and the reusable map
+processing libraries behind them.
 
-- [Biei](services/biei/README.md) is the distributed MapLibre Native renderer.
-- [Ishikari](services/ishikari/README.md) serves and caches PMTiles, styles,
+- [Biei](servers/biei/README.md) is the distributed MapLibre Native renderer.
+- [Ishikari](servers/ishikari/README.md) serves and caches PMTiles, styles,
   glyphs, sprites, and derived terrain products.
 
-Biei resolves its production map resources through Ishikari, while both
-services keep independent cluster membership, scaling, release, and failure
-policies.
+Biei resolves production map resources through Ishikari. The services share a
+repository and Cargo lockfile, while retaining separate binaries, deployment
+lifecycle, cluster membership, scaling policy, and failure semantics.
 
 ## Repository layout
 
 ```text
-services/
-  biei/       # Biei Cargo workspace, simulator, and deployment
-  ishikari/   # Ishikari Cargo workspace, simulator, terrain crate, and deployment
-crates/       # Reserved for small, proven cross-service primitives
-integration/  # Cross-service contract and smoke tests
+crates/
+  biei-core/       # renderer, scheduling, and Biei runtime
+  ishikari-core/   # PMTiles/resource serving and routing
+  mmpf-terrain/    # MIERUNE Map Platform terrain products
+servers/
+  biei/            # thin Biei executable
+  ishikari/        # Ishikari composition root and executable
+sims/
+  biei-sim/
+  ishikari-sim/
+demo-deploy/       # per-service images/manifests and combined deployment docs
+issues/            # service-scoped engineering backlogs
+specs/             # service-scoped specifications
+integration/       # cross-service contract and manifest checks
+.github/workflows/ # service-scoped and stack CI
+Cargo.toml          # one Cargo workspace
+Cargo.lock          # one reproducible dependency graph
 ```
 
-The service directories are deliberately separate Cargo workspaces with their
-own `Cargo.lock`. Biei enables HTTP decompression and a native compression
-backend that Ishikari intentionally does not use; combining the packages into
-one Cargo workspace would make workspace-wide feature unification a correctness
-risk for Ishikari's representation-preserving proxy path.
+The dependency direction is `servers/sims -> crates`. Domain policy stays in
+its owning core crate; similarly named membership, routing, drain, metrics, and
+fetch modules are not assumed to have identical semantics.
 
 ## Development
 
-Run commands from the service workspace being changed:
+Run a service slice without compiling the unrelated native stack:
 
 ```sh
-cd services/biei
-cargo test --workspace
-
-cd ../ishikari
-cargo test --workspace --all-targets
+cargo test -p biei-core -p biei -p biei-sim
+cargo test -p ishikari-core -p ishikari -p ishikari-sim -p mmpf-terrain --all-targets
 ```
 
-The root GitHub workflows are path-scoped. A service-only change runs that
-service's CI; changes under `crates/` run both. Cross-service behavior belongs
-in `integration/` rather than in either service's unit-test suite.
+`cargo test --workspace` is also supported. Biei enables reqwest transfer
+decompression, while Ishikari explicitly disables it on representation-
+preserving clients so workspace feature unification cannot alter proxy bytes.
 
 ## Build and deployment
 
-Each service retains its own image, BuildKit cache, and deployment lifecycle:
+Each service keeps its own image and BuildKit cache:
 
 ```sh
-cd services/ishikari
-gcloud builds submit --config demo-deploy/cloudbuild.yaml .
-
-cd ../biei
-gcloud builds submit --config demo-deploy/cloudbuild.yaml .
+gcloud builds submit --config demo-deploy/ishikari/runtime/cloudbuild.yaml .
+gcloud builds submit --config demo-deploy/biei/runtime/cloudbuild.yaml .
 ```
 
-The root `kustomization.yaml` composes the shared Gateway and both service GKE
-overlays. Existing service-local deployment paths remain authoritative for
-independent rollouts; see [deploy/README.md](deploy/README.md) for the combined
-stack workflow.
-
-## Shared-code policy
-
-Monorepo placement does not by itself make similarly named code equivalent.
-Only behavior-neutral primitives with shared tests should move into `crates/`.
-Membership state schemas, routing keys, metrics, internal wire protocols, and
-cache/fetch policy remain service-owned unless their contracts are explicitly
-aligned first.
+The root `kustomization.yaml` composes the shared Gateway and both GKE service
+overlays. See [demo-deploy/README.md](demo-deploy/README.md).
 
 LICENSE: MIT OR Apache-2.0

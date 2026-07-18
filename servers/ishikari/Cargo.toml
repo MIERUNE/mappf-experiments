@@ -1,0 +1,15 @@
+[package]
+name = "ishikari"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+description = "The Ishikari tile and map resource server"
+repository = "https://github.com/MIERUNE/biei"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+ishikari-core.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

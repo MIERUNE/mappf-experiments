@@ -5,6 +5,6 @@ kind: Kustomization
 # deployable; this root only composes their current pinned revisions with the
 # shared namespace and Gateway.
 resources:
-  - services/ishikari/demo-deploy/k8s/platform
-  - services/ishikari/demo-deploy/k8s/overlays/gke
-  - services/biei/demo-deploy/k8s/overlays/gke
+  - demo-deploy/ishikari/runtime/k8s/platform
+  - demo-deploy/ishikari/runtime/k8s/overlays/gke
+  - demo-deploy/biei/runtime/k8s/overlays/gke

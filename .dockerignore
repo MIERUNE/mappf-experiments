@@ -1,0 +1,15 @@
+.git
+.github
+.claude
+target
+**/target
+.DS_Store
+**/*.png
+**/*.jpg
+**/*.webp
+**/*.pmtiles
+data
+log*
+issues
+specs
+integration

@@ -1,8 +1,9 @@
-# Shared crates
+# Library crates
 
-This directory is reserved for small cross-service primitives whose behavior
-has first been aligned and covered by shared contract tests. It is not a home
-for service policy or a generic `node` grab bag.
+- `biei-core`: renderer, scheduling, membership, and Biei HTTP runtime
+- `ishikari-core`: PMTiles/resource serving, caching, membership, and routing
+- `mmpf-terrain`: MIERUNE Map Platform terrain decoding and derived products
 
-The Biei and Ishikari workspaces may depend on a crate here by path while
-retaining separate lockfiles and feature resolution.
+Executables live in `servers/` and `sims/`; dependency direction is always from
+those binaries into these libraries. Cross-service primitives may be extracted
+later, but similarly named policy is not treated as equivalent by default.

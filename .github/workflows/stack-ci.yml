@@ -6,8 +6,7 @@ on:
       - "kustomization.yaml"
       - "deploy/**"
       - "integration/**"
-      - "services/biei/demo-deploy/k8s/**"
-      - "services/ishikari/demo-deploy/k8s/**"
+      - "demo-deploy/**/runtime/k8s/**"
       - ".github/workflows/stack-ci.yml"
   push:
     branches:
@@ -16,8 +15,7 @@ on:
       - "kustomization.yaml"
       - "deploy/**"
       - "integration/**"
-      - "services/biei/demo-deploy/k8s/**"
-      - "services/ishikari/demo-deploy/k8s/**"
+      - "demo-deploy/**/runtime/k8s/**"
       - ".github/workflows/stack-ci.yml"
 
 permissions:

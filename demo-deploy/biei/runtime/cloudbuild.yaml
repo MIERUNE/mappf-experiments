@@ -1,0 +1,29 @@
+#   gcloud builds submit --config demo-deploy/biei/runtime/cloudbuild.yaml \
+#     --substitutions=_IMAGE=asia-northeast1-docker.pkg.dev/mappf-experiment/biei/biei:dev .
+
+substitutions:
+  _IMAGE: asia-northeast1-docker.pkg.dev/mappf-experiment/biei/biei:dev
+  # A separate package keeps large compiler-cache manifests out of the runtime
+  # image history and lets Artifact Registry clean stale cache generations.
+  _CACHE_IMAGE: asia-northeast1-docker.pkg.dev/mappf-experiment/biei/biei-buildcache:latest
+
+options:
+  machineType: E2_HIGHCPU_8
+  diskSizeGb: 30
+
+timeout: 1800s
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        docker buildx create --driver docker-container --use --name biei-builder
+        docker buildx build \
+          --file demo-deploy/biei/runtime/Dockerfile \
+          --tag "${_IMAGE}" \
+          --cache-from "type=registry,ref=${_CACHE_IMAGE}" \
+          --cache-to "type=registry,ref=${_CACHE_IMAGE},mode=max,oci-mediatypes=true,image-manifest=true" \
+          --push \
+          .

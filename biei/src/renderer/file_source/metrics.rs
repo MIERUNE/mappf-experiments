@@ -5,11 +5,10 @@ use std::sync::OnceLock;
 use maplibre_native::file_source::{
     ErrorReason, Priority, ResourceKind, ResourceRequest, Response, Usage,
 };
-use prometheus::{
-    HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
-};
+use prometheus::{HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Registry};
 
 use super::cache;
+use crate::util::{counter_vec, gauge_vec, histogram_vec};
 
 /// Process-global metrics for the network file source. Kept in a module-local
 /// registry (the source itself is process-global, unlike per-node
@@ -20,6 +19,8 @@ pub(super) struct FsMetrics {
     pub(super) requests_total: IntCounterVec,
     pub(super) response_bytes_total: IntCounterVec,
     pub(super) retries_total: IntCounterVec,
+    pub(super) retry_sequences_inflight: IntGauge,
+    pub(super) slow_attempts_inflight: IntGauge,
     pub(super) negative_cache_total: IntCounterVec,
     pub(super) singleflight_total: IntCounterVec,
     pub(super) refresh_deferred_total: IntCounterVec,
@@ -36,122 +37,92 @@ pub(super) struct FsMetrics {
 impl FsMetrics {
     fn new() -> Self {
         let registry = Registry::new();
-        let requests_total = IntCounterVec::new(
-            Opts::new(
-                "biei_mln_resource_requests_total",
-                "Resource requests handled by the Rust network FileSource.",
-            ),
+        let requests_total = counter_vec(
+            "biei_mln_resource_requests_total",
+            "Resource requests handled by the Rust network FileSource.",
             &["kind", "priority", "usage", "outcome"],
-        )
-        .expect("valid fs counter");
-        let response_bytes_total = IntCounterVec::new(
-            Opts::new(
-                "biei_mln_resource_response_bytes_total",
-                "Resource response bytes returned to MapLibre Native by the Rust network FileSource.",
-            ),
+        );
+        let response_bytes_total = counter_vec(
+            "biei_mln_resource_response_bytes_total",
+            "Resource response bytes returned to MapLibre Native by the Rust network FileSource.",
             &["kind", "outcome"],
-        )
-        .expect("valid fs byte counter");
-        let retries_total = IntCounterVec::new(
-            Opts::new(
-                "biei_mln_resource_retries_total",
-                "Upstream resource request retries by resource kind and reason.",
-            ),
+        );
+        let retries_total = counter_vec(
+            "biei_mln_resource_retries_total",
+            "Upstream resource request retries by resource kind and reason.",
             &["kind", "reason"],
+        );
+        let retry_sequences_inflight = IntGauge::new(
+            "biei_mln_resource_retry_sequences_inflight",
+            "Render-blocking resource requests currently retrying a transient upstream failure.",
         )
-        .expect("valid fs retry counter");
-        let negative_cache_total = IntCounterVec::new(
-            Opts::new(
-                "biei_mln_resource_negative_cache_total",
-                "Negative resource cache operations by resource kind.",
-            ),
+        .expect("valid retry-sequence gauge");
+        let slow_attempts_inflight = IntGauge::new(
+            "biei_mln_resource_slow_attempts_inflight",
+            "Render-blocking upstream attempts still in flight after the provider-health threshold.",
+        )
+        .expect("valid slow-attempt gauge");
+        let negative_cache_total = counter_vec(
+            "biei_mln_resource_negative_cache_total",
+            "Negative resource cache operations by resource kind.",
             &["kind", "operation"],
-        )
-        .expect("valid fs negative cache counter");
-        let singleflight_total = IntCounterVec::new(
-            Opts::new(
-                "biei_mln_resource_singleflight_total",
-                "Cross-renderer resource single-flight participation by role.",
-            ),
+        );
+        let singleflight_total = counter_vec(
+            "biei_mln_resource_singleflight_total",
+            "Cross-renderer resource single-flight participation by role.",
             &["kind", "role"],
-        )
-        .expect("valid fs single-flight counter");
-        let refresh_deferred_total = IntCounterVec::new(
-            Opts::new(
-                "biei_mln_resource_refresh_deferred_total",
-                "Fresh cache hits whose network refresh was deferred until expiry.",
-            ),
+        );
+        let refresh_deferred_total = counter_vec(
+            "biei_mln_resource_refresh_deferred_total",
+            "Fresh cache hits whose network refresh was deferred until expiry.",
             &["kind"],
-        )
-        .expect("valid fs deferred refresh counter");
-        let refresh_deferred_inflight = IntGaugeVec::new(
-            Opts::new(
-                "biei_mln_resource_refresh_deferred_inflight",
-                "Network FileSource requests currently sleeping until cache expiry.",
-            ),
+        );
+        let refresh_deferred_inflight = gauge_vec(
+            "biei_mln_resource_refresh_deferred_inflight",
+            "Network FileSource requests currently sleeping until cache expiry.",
             &["kind"],
-        )
-        .expect("valid fs deferred refresh gauge");
-        let duration_seconds = HistogramVec::new(
-            HistogramOpts::new(
-                "biei_mln_resource_request_duration_seconds",
-                "Rust network FileSource request duration by resource kind.",
-            ),
+        );
+        let duration_seconds = histogram_vec(
+            "biei_mln_resource_request_duration_seconds",
+            "Rust network FileSource request duration by resource kind.",
             &["kind"],
-        )
-        .expect("valid fs histogram");
-        let admission_wait_seconds = HistogramVec::new(
-            HistogramOpts::new(
-                "biei_mln_resource_admission_wait_seconds",
-                "Time spent waiting for a Rust network FileSource admission permit.",
-            ),
+        );
+        let admission_wait_seconds = histogram_vec(
+            "biei_mln_resource_admission_wait_seconds",
+            "Time spent waiting for a Rust network FileSource admission permit.",
             &["kind", "priority"],
-        )
-        .expect("valid fs admission histogram");
-        let body_wait_seconds = HistogramVec::new(
-            HistogramOpts::new(
-                "biei_mln_resource_body_wait_seconds",
-                "Time spent waiting for a shared FileSource response-body permit.",
-            ),
+        );
+        let body_wait_seconds = histogram_vec(
+            "biei_mln_resource_body_wait_seconds",
+            "Time spent waiting for a shared FileSource response-body permit.",
             &["kind"],
-        )
-        .expect("valid fs body wait histogram");
-        let upstream_attempts_total = IntCounterVec::new(
-            Opts::new(
-                "biei_mln_resource_upstream_attempts_total",
-                "Actual upstream HTTP attempts made by the Rust network FileSource.",
-            ),
+        );
+        let upstream_attempts_total = counter_vec(
+            "biei_mln_resource_upstream_attempts_total",
+            "Actual upstream HTTP attempts made by the Rust network FileSource.",
             &["kind", "priority", "outcome"],
-        )
-        .expect("valid upstream attempt counter");
-        let upstream_attempt_duration_seconds = HistogramVec::new(
-            HistogramOpts::new(
-                "biei_mln_resource_upstream_attempt_duration_seconds",
-                "Actual upstream HTTP attempt duration, excluding admission and retry backoff.",
-            ),
+        );
+        let upstream_attempt_duration_seconds = histogram_vec(
+            "biei_mln_resource_upstream_attempt_duration_seconds",
+            "Actual upstream HTTP network-pending duration (send and response chunks), excluding lane/body admission and retry backoff.",
             &["kind", "priority"],
-        )
-        .expect("valid upstream attempt histogram");
-        let inflight = IntGaugeVec::new(
-            Opts::new(
-                "biei_mln_resource_inflight",
-                "Upstream resource fetches currently in flight.",
-            ),
+        );
+        let inflight = gauge_vec(
+            "biei_mln_resource_inflight",
+            "Upstream resource fetches currently in flight.",
             &["priority"],
-        )
-        .expect("valid fs gauge");
-        let bodies_inflight = IntGaugeVec::new(
-            Opts::new(
-                "biei_mln_resource_bodies_inflight",
-                "Resource response bodies currently being downloaded under a body permit.",
-            ),
+        );
+        let bodies_inflight = gauge_vec(
+            "biei_mln_resource_bodies_inflight",
+            "Resource response bodies currently being downloaded under a body permit.",
             &["kind"],
-        )
-        .expect("valid fs body gauge");
+        );
         for collector in [
             Box::new(requests_total.clone()) as Box<dyn prometheus::core::Collector>,
             Box::new(response_bytes_total.clone()),
             Box::new(retries_total.clone()),
+            Box::new(retry_sequences_inflight.clone()),
+            Box::new(slow_attempts_inflight.clone()),
             Box::new(negative_cache_total.clone()),
             Box::new(singleflight_total.clone()),
             Box::new(refresh_deferred_total.clone()),
@@ -171,6 +142,8 @@ impl FsMetrics {
             requests_total,
             response_bytes_total,
             retries_total,
+            retry_sequences_inflight,
+            slow_attempts_inflight,
             negative_cache_total,
             singleflight_total,
             refresh_deferred_total,
@@ -291,7 +264,7 @@ impl Drop for RequestObservation {
 pub(super) struct UpstreamAttemptObservation {
     kind: &'static str,
     priority: &'static str,
-    started: std::time::Instant,
+    network_duration: std::time::Duration,
     pub(super) outcome: &'static str,
 }
 
@@ -300,9 +273,13 @@ impl UpstreamAttemptObservation {
         Self {
             kind: kind_label(request.kind),
             priority: priority_label(request.priority),
-            started: std::time::Instant::now(),
+            network_duration: std::time::Duration::ZERO,
             outcome: "cancelled",
         }
+    }
+
+    pub(super) fn add_network_duration(&mut self, duration: std::time::Duration) {
+        self.network_duration = self.network_duration.saturating_add(duration);
     }
 }
 
@@ -316,7 +293,7 @@ impl Drop for UpstreamAttemptObservation {
         metrics
             .upstream_attempt_duration_seconds
             .with_label_values(&[self.kind, self.priority])
-            .observe(self.started.elapsed().as_secs_f64());
+            .observe(self.network_duration.as_secs_f64());
     }
 }
 

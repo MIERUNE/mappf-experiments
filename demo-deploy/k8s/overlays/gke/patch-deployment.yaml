@@ -23,6 +23,11 @@ spec:
               value: "http://ishikari:8080/tilesets/{tileset_id}"
             - name: BIEI_MLN_RESOURCE_PRIVATE_HOSTS
               value: "ishikari"
+            # Absorb the raster-preview tile fan-out while the CPU HPA creates
+            # new pods. Soft routing remains one task per slot; only the hard
+            # overflow boundary grows from two to three tasks per slot.
+            - name: BIEI_QUEUE_CAPACITY_MULTIPLIER
+              value: "3"
           resources:
             requests:
               cpu: "2"

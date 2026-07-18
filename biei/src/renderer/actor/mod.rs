@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use tokio::sync::oneshot;
@@ -32,6 +32,7 @@ use crate::types::{
     ImageFormat, InternalTask, PixelRatio, RenderRequest, RendererError, SourceRef, StyleRevision,
     TaskId, WorkerId,
 };
+use crate::util::lock_unpoisoned;
 
 // Native renderer destruction flushes backend state and may take a few tens of
 // milliseconds even when no render is in flight. Keep shutdown bounded, but
@@ -56,6 +57,24 @@ struct RendererActorSupervisorInner {
     replacements_succeeded: AtomicU64,
     replacements_exhausted: AtomicU64,
     replacements_failed: AtomicU64,
+    provider_health: crate::renderer::file_source::ProviderHealthTracker,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RendererHealth {
+    Full,
+    ExternalDegraded,
+    InternalUnrecoverable,
+}
+
+impl RendererHealth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::ExternalDegraded => "external_degraded",
+            Self::InternalUnrecoverable => "internal_unrecoverable",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,10 +85,21 @@ pub struct RendererActorHealthSnapshot {
     pub replacements_succeeded: u64,
     pub replacements_exhausted: u64,
     pub replacements_failed: u64,
+    pub health: RendererHealth,
 }
 
 impl RendererActorSupervisor {
     pub fn new(total_slots: usize) -> Self {
+        Self::with_provider_health(
+            total_slots,
+            crate::renderer::file_source::ProviderHealthTracker::new(),
+        )
+    }
+
+    pub(crate) fn with_provider_health(
+        total_slots: usize,
+        provider_health: crate::renderer::file_source::ProviderHealthTracker,
+    ) -> Self {
         let total_slots = total_slots.max(1);
         Self {
             inner: Arc::new(RendererActorSupervisorInner {
@@ -84,31 +114,51 @@ impl RendererActorSupervisor {
                 replacements_succeeded: AtomicU64::new(0),
                 replacements_exhausted: AtomicU64::new(0),
                 replacements_failed: AtomicU64::new(0),
+                provider_health,
             }),
         }
     }
 
     pub fn is_ready(&self) -> bool {
+        !matches!(self.health(), RendererHealth::InternalUnrecoverable)
+    }
+
+    /// Per-slot render capacity: true while any slot is available, even when
+    /// `ExternalDegraded`. Gating on `Full` would let one lost slot stop every
+    /// healthy slot; a systemic outage self-limits via the orphan budget.
+    pub fn can_start_render(&self) -> bool {
         self.inner.available_slots.load(Ordering::Acquire) > 0
     }
 
-    /// Whether in-process recovery can restore full capacity. False once any
-    /// slot is unavailable AND the orphan budget is exhausted: renders cannot
-    /// be cancelled (engine constraint), no replacement can be spawned, and a
-    /// partially dead process could otherwise stay ready forever. Liveness
-    /// should fail so the orchestrator restores the missing capacity.
-    pub fn is_livable(&self) -> bool {
-        self.inner.available_slots.load(Ordering::Acquire) == self.inner.total_slots
-            || self.inner.orphaned_threads.load(Ordering::Acquire) < self.inner.max_orphaned_threads
+    /// A `can_start_render` closure for `Node::set_render_admission_probe`, so
+    /// the ingress and peer-forward wiring share one construction.
+    pub(crate) fn render_admission_probe(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let supervisor = self.clone();
+        Arc::new(move || supervisor.can_start_render())
     }
 
-    /// Test hook: consume the entire orphan budget to simulate the
-    /// unrecoverable state (`is_livable() == false` once any slot is unavailable).
-    #[cfg(test)]
-    pub(crate) fn exhaust_orphan_budget_for_test(&self) {
-        self.inner
-            .orphaned_threads
-            .store(self.inner.max_orphaned_threads, Ordering::Release);
+    /// External provider degradation is not repaired by restarting this
+    /// process, so it remains live while an actual FileSource retry sequence is
+    /// active. An unavailable slot without that evidence is an internal
+    /// failure; autonomous repair gets the probe grace before process restart.
+    pub fn is_livable(&self) -> bool {
+        !matches!(self.health(), RendererHealth::InternalUnrecoverable)
+    }
+
+    pub fn health(&self) -> RendererHealth {
+        if self.inner.available_slots.load(Ordering::Acquire) == self.inner.total_slots {
+            return RendererHealth::Full;
+        }
+
+        // Elapsed time cannot turn a provider outage into an internal fault:
+        // restarting still cannot repair the provider and destroys warm cache.
+        // Slow-attempt evidence is promoted only after admission and a network
+        // threshold, so normal fast traffic does not mask a renderer loss.
+        if self.inner.provider_health.has_external_evidence() {
+            RendererHealth::ExternalDegraded
+        } else {
+            RendererHealth::InternalUnrecoverable
+        }
     }
 
     pub fn snapshot(&self) -> RendererActorHealthSnapshot {
@@ -119,6 +169,7 @@ impl RendererActorSupervisor {
             replacements_succeeded: self.inner.replacements_succeeded.load(Ordering::Relaxed),
             replacements_exhausted: self.inner.replacements_exhausted.load(Ordering::Relaxed),
             replacements_failed: self.inner.replacements_failed.load(Ordering::Relaxed),
+            health: self.health(),
         }
     }
 
@@ -286,7 +337,7 @@ impl RendererActor {
         Self::spawn_with_backend_supervised(config, RendererActorSupervisor::new(1), backend)
     }
 
-    fn spawn_with_backend_supervised<B>(
+    pub(crate) fn spawn_with_backend_supervised<B>(
         config: RendererActorConfig,
         supervisor: RendererActorSupervisor,
         backend: B,
@@ -456,12 +507,6 @@ impl Drop for ActorThreadExit {
             self.supervisor.release_orphan(self.worker_id);
         }
     }
-}
-
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 async fn await_actor_reply<T>(
@@ -1476,20 +1521,127 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_orphan_budget_does_not_leave_a_partially_dead_node_livable() {
+    fn unavailable_slot_sheds_readiness_before_process_recovery() {
         let supervisor = RendererActorSupervisor::new(2);
         let mut first_slot_available = true;
 
         supervisor.set_slot_available(&mut first_slot_available, false);
-        supervisor.exhaust_orphan_budget_for_test();
 
         assert!(
-            supervisor.is_ready(),
-            "one healthy slot still serves readiness"
+            !supervisor.is_ready(),
+            "a degraded pod must stop accepting new work before restart"
         );
         assert!(
             !supervisor.is_livable(),
             "a permanently lost slot at exhausted budget needs process recovery"
+        );
+    }
+
+    #[test]
+    fn one_lost_slot_with_budget_remaining_requires_process_recovery() {
+        // A hot worker may consume only its own orphan allowance while global
+        // budget remains. If it wedges again, replacement is still impossible
+        // for that slot. Readiness sheds the pod even though other slots remain;
+        // liveness may eventually restore capacity after its recovery grace.
+        let supervisor = RendererActorSupervisor::new(16);
+        let mut lost_slot_available = true;
+
+        // First wedge orphaned one thread; the second wedge on the same worker
+        // is refused a replacement and marks the slot unavailable.
+        assert!(supervisor.try_reserve_orphan(3));
+        supervisor.set_slot_available(&mut lost_slot_available, false);
+
+        let health = supervisor.snapshot();
+        assert_eq!(health.available_slots, 15);
+        assert_eq!(health.orphaned_threads, 1);
+        assert!(
+            !supervisor.is_ready(),
+            "one unavailable slot must shed traffic before liveness restarts the pod"
+        );
+        assert!(
+            !supervisor.is_livable(),
+            "an unavailable slot must not remain hidden behind unused global orphan budget"
+        );
+    }
+
+    #[test]
+    fn health_distinguishes_active_provider_failure_from_internal_loss() {
+        let provider = crate::renderer::file_source::ProviderHealthTracker::new();
+        let supervisor = RendererActorSupervisor::with_provider_health(2, provider.clone());
+        assert_eq!(supervisor.health(), RendererHealth::Full);
+        assert!(supervisor.can_start_render());
+
+        let mut slot_available = true;
+        supervisor.set_slot_available(&mut slot_available, false);
+        assert_eq!(supervisor.health(), RendererHealth::InternalUnrecoverable);
+        assert!(!supervisor.is_ready());
+        assert!(!supervisor.is_livable());
+
+        let retry = provider.begin_retry();
+        assert_eq!(supervisor.health(), RendererHealth::ExternalDegraded);
+        assert!(
+            supervisor.is_ready(),
+            "external degradation must keep cached responses reachable"
+        );
+        assert!(supervisor.is_livable());
+        assert!(
+            supervisor.can_start_render(),
+            "the remaining healthy slot still renders while externally degraded"
+        );
+
+        drop(retry);
+        assert_eq!(supervisor.health(), RendererHealth::InternalUnrecoverable);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuing_provider_evidence_never_becomes_restart_pressure() {
+        let provider = crate::renderer::file_source::ProviderHealthTracker::new();
+        let supervisor = RendererActorSupervisor::with_provider_health(2, provider.clone());
+        // Hold a process-global provider retry for the whole test.
+        let _retry = provider.begin_retry();
+        let mut slot_available = true;
+        supervisor.set_slot_available(&mut slot_available, false);
+
+        assert_eq!(supervisor.health(), RendererHealth::ExternalDegraded);
+        assert!(supervisor.is_livable());
+
+        tokio::time::advance(std::time::Duration::from_secs(24 * 60 * 60)).await;
+        assert_eq!(supervisor.health(), RendererHealth::ExternalDegraded);
+        assert!(
+            supervisor.is_livable(),
+            "elapsed time alone must not cause a cache-destroying restart"
+        );
+
+        supervisor.set_slot_available(&mut slot_available, true);
+        assert_eq!(supervisor.health(), RendererHealth::Full);
+    }
+
+    #[test]
+    fn one_lost_slot_does_not_stop_the_remaining_healthy_slots() {
+        let supervisor = RendererActorSupervisor::new(3);
+        assert!(supervisor.can_start_render());
+
+        // One slot is lost: the pod is no longer `Full`, but the two healthy
+        // slots must keep accepting renders. Gating on `Full` would amplify one
+        // slot's fault into a whole-pod render outage, blocking even renders
+        // that only touch already-cached resources.
+        let mut a = true;
+        supervisor.set_slot_available(&mut a, false);
+        assert_ne!(supervisor.health(), RendererHealth::Full);
+        assert!(
+            supervisor.can_start_render(),
+            "healthy slots keep rendering while one slot is down"
+        );
+
+        // All slots lost: only now, with no capacity at all, does admission
+        // close.
+        let mut b = true;
+        supervisor.set_slot_available(&mut b, false);
+        let mut c = true;
+        supervisor.set_slot_available(&mut c, false);
+        assert!(
+            !supervisor.can_start_render(),
+            "with no slot available the pod finally stops starting native work"
         );
     }
 

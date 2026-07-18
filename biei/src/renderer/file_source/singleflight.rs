@@ -8,6 +8,7 @@ use maplibre_native::file_source::{ResourceRequest, Response};
 use tokio::sync::Notify;
 
 use super::ResourceRequestKey;
+use crate::util::lock_unpoisoned;
 
 /// Per-key serialization is enough; sharding prevents unrelated resource
 /// misses from contending on one mutex.
@@ -134,10 +135,4 @@ fn remove_flight(flights: &FlightMap, key: &FlightKey, flight: &Arc<Flight>) {
     {
         flights.remove(key);
     }
-}
-
-pub(super) fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }

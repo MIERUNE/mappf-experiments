@@ -1,6 +1,6 @@
 //! Request-local `addlayer` installation for static renders.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::renderer::overlay::{OverlaySlotPool, render_static_with_overlays};
@@ -56,7 +56,7 @@ struct InstalledAddLayer {
 const ADDLAYER_SOURCE_CACHE_CAPACITY: usize = 64;
 
 pub(super) struct AddLayerSourceCache {
-    ids: HashSet<String>,
+    entries: HashMap<String, AddLayerSource>,
     lru: VecDeque<String>,
     capacity: usize,
 }
@@ -64,7 +64,7 @@ pub(super) struct AddLayerSourceCache {
 impl AddLayerSourceCache {
     pub(super) fn new() -> Self {
         Self {
-            ids: HashSet::new(),
+            entries: HashMap::new(),
             lru: VecDeque::new(),
             capacity: ADDLAYER_SOURCE_CACHE_CAPACITY,
         }
@@ -75,20 +75,25 @@ impl AddLayerSourceCache {
         style: &mut maplibre_native::StyleRef<'_, maplibre_native::Static>,
         source: &AddLayerSource,
     ) -> Result<(String, bool), maplibre_native::StyleError> {
-        let id = source.stable_source_id();
-        if self.ids.contains(&id) {
+        if let Some(id) = self
+            .entries
+            .iter()
+            .find_map(|(id, cached)| (cached == source).then(|| id.clone()))
+        {
             self.touch(&id);
             return Ok((id, false));
         }
-        while self.ids.len() >= self.capacity
+        while self.entries.len() >= self.capacity
             && let Some(evicted) = self.lru.pop_front()
         {
-            self.ids.remove(&evicted);
+            self.entries.remove(&evicted);
             style.remove_source(&evicted);
         }
+        let base_id = source.stable_source_id();
+        let id = self.vacant_id(&base_id);
         let any_source = maplibre_native::AnySource::from_json_str(&id, &source.json)?;
         style.add_source(any_source)?;
-        self.ids.insert(id.clone());
+        self.entries.insert(id.clone(), source.clone());
         self.lru.push_back(id.clone());
         Ok((id, true))
     }
@@ -98,7 +103,7 @@ impl AddLayerSourceCache {
         style: &mut maplibre_native::StyleRef<'_, maplibre_native::Static>,
         id: &str,
     ) {
-        if !self.ids.remove(id) {
+        if self.entries.remove(id).is_none() {
             return;
         }
         self.lru.retain(|cached| cached != id);
@@ -108,6 +113,16 @@ impl AddLayerSourceCache {
     fn touch(&mut self, id: &str) {
         self.lru.retain(|cached| cached != id);
         self.lru.push_back(id.to_string());
+    }
+
+    fn vacant_id(&self, base_id: &str) -> String {
+        if !self.entries.contains_key(base_id) {
+            return base_id.to_owned();
+        }
+        (1_u32..)
+            .map(|suffix| format!("{base_id}_{suffix}"))
+            .find(|candidate| !self.entries.contains_key(candidate))
+            .expect("bounded addlayer source cache always has a vacant suffix")
     }
 }
 

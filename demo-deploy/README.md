@@ -66,6 +66,43 @@ kubectl apply -k demo-deploy/k8s/overlays/gke
 kubectl -n map-demo rollout status deploy/biei
 ```
 
+Cloud Build exports a BuildKit `mode=max` cache to the separate
+`biei-buildcache:latest` Artifact Registry package. `cargo-chef` keeps dependency
+compilation reusable when only Rust sources change, and the final image stage
+copies only the production sources (plus workspace manifests) so simulator,
+docs, and deploy-only source changes do not rebuild the biei binary. The first
+build populates the cache; subsequent builds import
+it. Install the narrowly scoped cleanup policy once so superseded, untagged
+cache manifests do not grow indefinitely:
+
+BuildKit pushes the runtime image directly to Artifact Registry to avoid a
+local `--load` followed by Cloud Build's second push. Consequently the final
+Cloud Build summary shows `IMAGES: -`; the `${_IMAGE}` tag in Artifact Registry
+is the build output and the build log records its digest.
+
+```sh
+gcloud artifacts repositories set-cleanup-policies biei \
+  --location=asia-northeast1 \
+  --policy=demo-deploy/artifact-cleanup-policy.json
+```
+
+The GKE demo also has an explicit low-cost observability profile:
+
+```sh
+bash demo-deploy/configure-gke-observability.sh
+```
+
+It retains mandatory system metrics and the explicit biei/ishikari Prometheus
+scrapes, but disables the unused cAdvisor/Kubelet/kube-state/DCGM packages.
+Autopilot retains advanced datapath metrics and requires image streaming even
+though the demo images are small and same-region, so a narrow exclusion drops
+its informational `gcfsd`/snapshotter noise instead of trying to disable the
+feature. The same exclusion covers INFO-only kubelet/runtime noise plus serial
+port 3/debug; warnings/errors and serial port 1 remain stored. On Standard GKE,
+the script also disables advanced datapath metrics and image streaming because
+node provisioning, rather than same-region image transfer, dominates this
+demo's scale-out latency.
+
 The shared Gateway uses the Certificate Manager map
 `mappf-demo-cert-map`. Add Biei's hostname to that map once:
 
@@ -103,17 +140,18 @@ serves the render namespaces plus top-level `/livez` `/readyz`. `/_internal/*`,
 nothing internal is reachable publicly. The shared Gateway listens on HTTPS
 only.
 
-**Trust boundary:** the internal port is not network-isolated. With no
-NetworkPolicy, any pod anywhere in the cluster (not just the `map-demo`
-namespace) that can route to a pod IP can reach `:9090/_internal/*` and gossip
-`:7946`. The demo cluster is assumed to host only trusted workloads. Add a
-NetworkPolicy restricting `:9090`/`:7946` ingress to peer pods if you need
-in-cluster isolation.
+**Trust boundary:** the GKE overlay installs `biei-internal-boundary`: public
+`:8080` remains reachable, while peer forwarding on TCP `:9090` and gossip on
+UDP `:7946` are limited to biei pods in `map-demo`; the managed Prometheus
+collector may scrape `:9090`. If you deploy the base or another overlay, install
+an equivalent NetworkPolicy or service-mesh policy—the application protocol has
+no peer authentication of its own.
 
 ## Checks
 
 ```sh
-# Render the GKE overlay offline and verify its portable CPU-only HPA policy.
+# Render the GKE overlay offline and verify CPU HPA, UDP gossip, and the
+# internal NetworkPolicy invariants.
 bash demo-deploy/check-hpa.sh
 
 kubectl -n map-demo port-forward deploy/biei 8080:8080
@@ -126,7 +164,14 @@ curl 'http://localhost:8080/carto/voyager-gl-style/8/227/100.webp' -o tile.webp
 # example styles/mierune/jp_mierune_streets/style.json for the URL below.
 curl 'http://localhost:8080/mierune/jp_mierune_streets/static/139.767,35.681,11/512x384.webp' -o ishikari.webp
 
-# Readiness/liveness are top-level on the public port.
+# Readiness/liveness are top-level on the public port. A slot loss correlated
+# with an active FileSource retry stays eligible for cache hits and routing
+# misses to healthy peers;
+# unrelated renderer loss fails the probes and is repaired autonomously or by
+# the normal Kubernetes liveness window.
+# Degraded pods also gossip `renderer.accepting=false`: healthy peers stop
+# selecting them for new renders after gossip convergence, while direct exact
+# output-cache hits remain reachable through the public Service.
 curl -s localhost:8080/readyz
 curl -s localhost:8080/livez
 
@@ -144,3 +189,7 @@ curl -s localhost:9090/_internal/metrics
   discover each other during cold start.
 - Rendering combines CPU work with in-render provider I/O. Tune `BIEI_CORES`
   and CPU limits together, but do not infer queue health from CPU alone.
+- The GKE overlay keeps `minReplicas: 2` for cost and sets
+  `BIEI_QUEUE_CAPACITY_MULTIPLIER=3` so each three-slot pod can buffer nine
+  tasks while scale-out catches up. The soft routing limit and five-second SLA
+  remain unchanged.

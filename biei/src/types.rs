@@ -345,9 +345,10 @@ pub struct AddLayer {
     /// `AnyLayer::from_json_str` after rewriting the user-supplied `id`
     /// to the biei-internal namespace.
     pub json: String,
-    /// Stable hash of the user-supplied layer JSON. Used as part of the
-    /// render cache key so two requests with different addlayer JSON do
-    /// not collide on a single cache entry.
+    /// Stable hash of the user-supplied layer JSON. Used for lightweight
+    /// affinity/debug identity only; correctness-sensitive render and source
+    /// caches compare the bounded canonical content and do not trust this
+    /// 64-bit value to be collision-free.
     pub hash: u64,
     /// Optional source definition carried by this addlayer.
     #[serde(default)]
@@ -516,6 +517,13 @@ impl InternalTask {
 /// Per-node KV namespace as carried in `ClusterView` between gossip backends.
 pub type NodeKvs = BTreeMap<String, String>;
 
+/// Node-level admission state published alongside per-worker gossip.
+///
+/// Absence is interpreted as `true` for rolling compatibility with nodes that
+/// predate this key. An explicit `false` means the node may still serve exact
+/// output-cache hits, but must not be selected for new native renders.
+pub(crate) const RENDER_ADMISSION_GOSSIP_KEY: &str = "renderer.accepting";
+
 /// Reconstructed worker info as the dispatcher sees it (decoded from gossip
 /// KVs).
 #[derive(Clone, Debug)]
@@ -535,6 +543,7 @@ pub struct WorkerView {
 #[derive(Clone, Debug)]
 pub struct NodeStateView {
     pub id: NodeId,
+    pub accepts_new_renders: bool,
     pub workers: Vec<WorkerView>,
 }
 
@@ -564,9 +573,17 @@ impl NodeStateView {
             queue_depth: Option<usize>,
         }
         let mut by_worker: BTreeMap<WorkerId, Builder> = BTreeMap::new();
+        // Old nodes do not publish this key. Keep them routable during a
+        // rolling upgrade; once the key is present, fail closed on malformed
+        // values rather than feeding work to a node with ambiguous health.
+        let mut accepts_new_renders = true;
         for (key, value) in kvs {
             let key = key.as_ref();
             let value = value.as_ref();
+            if key == RENDER_ADMISSION_GOSSIP_KEY {
+                accepts_new_renders = value == "true";
+                continue;
+            }
             let Some(rest) = key.strip_prefix("worker.") else {
                 continue;
             };
@@ -619,20 +636,28 @@ impl NodeStateView {
                 })
             })
             .collect();
-        Self { id, workers }
+        Self {
+            id,
+            accepts_new_renders,
+            workers,
+        }
     }
 
     /// At least one worker has soft-limit headroom for SLA-oriented routing.
     pub fn has_capacity(&self, bl_capacity_per_worker: usize) -> bool {
-        self.workers
-            .iter()
-            .any(|w| w.queue_depth < bl_capacity_per_worker)
+        self.accepts_new_renders
+            && self
+                .workers
+                .iter()
+                .any(|w| w.queue_depth < bl_capacity_per_worker)
     }
 
     pub fn has_admission_capacity(&self, queue_capacity_per_worker: usize) -> bool {
-        self.workers
-            .iter()
-            .any(|w| w.queue_depth < queue_capacity_per_worker)
+        self.accepts_new_renders
+            && self
+                .workers
+                .iter()
+                .any(|w| w.queue_depth < queue_capacity_per_worker)
     }
 }
 
@@ -842,6 +867,9 @@ pub enum ProcessError {
     // size proportional to the smaller variant, which matters because this
     // type is returned by value from every pool dispatch.
     QueueFull(Box<InternalTask>),
+    /// Node health changed after cache/dispatch/profile preparation but before
+    /// worker admission. Preserve the task for normal peer failover.
+    RenderAdmissionClosed(Box<InternalTask>),
     QueueDisconnected,
 }
 
@@ -957,6 +985,39 @@ mod tests {
             Some(profile("style-3", 0, RenderMode::Tile, Scale::X2))
         );
         assert_eq!(view.workers[0].queue_depth, 2);
+    }
+
+    #[test]
+    fn from_kvs_defaults_old_nodes_to_renderable_but_honors_explicit_degradation() {
+        let old = NodeStateView::from_kvs(
+            NodeId::from_index(0),
+            kvs([("worker.0.style", ""), ("worker.0.queue", "0")]),
+        );
+        assert!(
+            old.accepts_new_renders,
+            "missing node-level state stays compatible during a rolling upgrade"
+        );
+
+        let degraded = NodeStateView::from_kvs(
+            NodeId::from_index(0),
+            kvs([
+                (RENDER_ADMISSION_GOSSIP_KEY, "false"),
+                ("worker.0.style", ""),
+                ("worker.0.queue", "0"),
+            ]),
+        );
+        assert!(!degraded.accepts_new_renders);
+        assert!(!degraded.has_capacity(1));
+        assert!(!degraded.has_admission_capacity(1));
+
+        let malformed = NodeStateView::from_kvs(
+            NodeId::from_index(0),
+            kvs([(RENDER_ADMISSION_GOSSIP_KEY, "maybe")]),
+        );
+        assert!(
+            !malformed.accepts_new_renders,
+            "an advertised but malformed state must fail closed"
+        );
     }
 
     #[test]

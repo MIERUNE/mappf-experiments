@@ -14,6 +14,7 @@ use axum::response::Response;
 use bytes::BytesMut;
 use futures_util::{StreamExt, stream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 
 use crate::drain::DrainController;
 use crate::http::{REQUEST_ID_HEADER, request_id_from_headers};
@@ -59,7 +60,25 @@ impl InternalForwardEndpoint {
         Self::with_drain_and_limit(node, drain, 1)
     }
 
+    #[cfg(test)]
     pub fn with_drain_and_limit(node: Node, drain: DrainController, limit: usize) -> Self {
+        Self {
+            node,
+            drain: Some(drain),
+            admission: Arc::new(Semaphore::new(limit.max(1))),
+        }
+    }
+
+    pub(crate) fn with_renderer_health_and_limit(
+        node: Node,
+        drain: DrainController,
+        renderer_supervisor: crate::renderer::actor::RendererActorSupervisor,
+        limit: usize,
+    ) -> Self {
+        // Wire the node's render-admission probe so the peer path sheds renders
+        // even in a peer-only deployment with no public ingress. The node's
+        // OnceLock ignores a redundant install from the ingress.
+        node.set_render_admission_probe(renderer_supervisor.render_admission_probe());
         Self {
             node,
             drain: Some(drain),
@@ -76,6 +95,9 @@ impl InternalForwardEndpoint {
     }
 
     pub(crate) fn try_admit(&self) -> Option<OwnedSemaphorePermit> {
+        // Degraded shedding is decided in the node (after the cache key is
+        // decoded), so forwarded hits stay reachable. This is the concurrency
+        // gate only, matching the public path's ordering.
         Arc::clone(&self.admission).try_acquire_owned().ok()
     }
 
@@ -83,7 +105,7 @@ impl InternalForwardEndpoint {
         &self,
         headers: &HeaderMap,
         body: Bytes,
-        _permit: OwnedSemaphorePermit,
+        permit: OwnedSemaphorePermit,
     ) -> Response {
         if !is_json_content_type(headers) {
             return response(
@@ -92,7 +114,7 @@ impl InternalForwardEndpoint {
                 "text/plain",
             );
         }
-        let _drain_permit = match &self.drain {
+        let drain_permit = match &self.drain {
             Some(drain) => match drain.try_acquire() {
                 Some(permit) => Some(permit),
                 None => {
@@ -119,7 +141,26 @@ impl InternalForwardEndpoint {
             forwarded.task.request_id = request_id;
         }
         let style_id = forwarded.task.style.id.clone();
-        let outcome = self.node.handle_forwarded(forwarded).await;
+        let node = self.node.clone();
+        let outcome = match tokio::spawn(async move {
+            // A peer may disconnect before a native render returns. Keep both
+            // admission guards and outcome recording alive with the render.
+            let _permit = permit;
+            let _drain_permit = drain_permit;
+            node.handle_forwarded(forwarded).await
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::error!(%error, "forwarded render task terminated unexpectedly");
+                return response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    b"forwarded render task failed".to_vec(),
+                    "text/plain",
+                );
+            }
+        };
         let (outcome, output) = OutcomeHeader::from_task_outcome(outcome, style_id);
         response_from_outcome(outcome, output)
     }
@@ -143,6 +184,10 @@ impl HttpTransport {
     pub fn new(resolver: Arc<dyn PeerResolver>) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(1))
+            // Peer forwarding is an in-cluster trust boundary. Never leak its
+            // request metadata/image traffic to an environment-configured
+            // HTTP proxy or let that proxy impersonate a peer response.
+            .no_proxy()
             .build()
             .context("build HTTP forward client")?;
         Ok(Self { client, resolver })
@@ -154,18 +199,53 @@ impl Transport for HttpTransport {
     async fn send(
         &self,
         target: NodeId,
-        fwd: ForwardRequest,
+        mut fwd: ForwardRequest,
     ) -> Result<ForwardResponse, ForwardError> {
-        let Some(addr) = self.resolver.advertise_addr_of(&target).await else {
-            return Err(ForwardError::Retryable(format!(
-                "no advertise address for node {target}"
-            )));
+        let response_budget_ms = if fwd.origin_response_budget_ms == 0 {
+            // Rolling compatibility with requests produced before the origin
+            // response budget became a separate wire field.
+            fwd.task.remaining_budget_ms
+        } else {
+            fwd.origin_response_budget_ms
         };
-        let body = serde_json::to_vec(&fwd)
-            .map_err(|err| ForwardError::Fatal(format!("encode forwarded request: {err}")))?;
-        let timeout = Duration::from_millis(fwd.task.remaining_budget_ms as u64)
+        let timeout = Duration::from_millis(response_budget_ms as u64)
             .min(MAX_FORWARD_TIMEOUT)
             .max(Duration::from_millis(1));
+        let send_started_at = Instant::now();
+        let deadline = send_started_at + timeout;
+        let addr = tokio::time::timeout_at(deadline, self.resolver.advertise_addr_of(&target))
+            .await
+            .map_err(|_| {
+                ForwardError::Retryable(format!(
+                    "peer address resolution exceeded origin response budget for {target}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ForwardError::Retryable(format!("no advertise address for node {target}"))
+            })?;
+        // `remaining_budget_ms` is reconstructed from the receiver's arrival
+        // time. If we serialized the original value after a slow successful
+        // resolution, the receiver would grant that elapsed time again and an
+        // uncancellable native render could outlive the origin request.
+        let resolution_ms = duration_millis_ceil(send_started_at.elapsed());
+        fwd.task.remaining_budget_ms = fwd.task.remaining_budget_ms.saturating_sub(resolution_ms);
+        if fwd.task.remaining_budget_ms == 0 {
+            return Err(ForwardError::Retryable(format!(
+                "peer address resolution exhausted remote execution budget for {target}"
+            )));
+        }
+        if fwd.origin_response_budget_ms != 0 {
+            fwd.origin_response_budget_ms =
+                fwd.origin_response_budget_ms.saturating_sub(resolution_ms);
+        }
+        let body = serde_json::to_vec(&fwd)
+            .map_err(|err| ForwardError::Fatal(format!("encode forwarded request: {err}")))?;
+        let expected_task_id = fwd.task.id;
+        let expected_request_id = fwd.task.request_id.clone();
+        let expected_style_id = fwd.task.style.id.clone();
+        let expected_output_format = fwd.task.output_format;
+        let expected_had_source =
+            fwd.task.source.is_some() || fwd.task.request.has_addlayer_source();
         let url = format!("http://{addr}/_internal/forward");
         let response = self
             .client
@@ -173,7 +253,11 @@ impl Transport for HttpTransport {
             .header(CONTENT_TYPE, JSON_CONTENT_TYPE)
             .header(REQUEST_ID_HEADER, fwd.task.request_id.as_str())
             .body(body)
-            .timeout(timeout)
+            .timeout(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(1)),
+            )
             .send()
             .await
             .map_err(|err| {
@@ -186,6 +270,11 @@ impl Transport for HttpTransport {
 
         let status = response.status();
         if !is_biei_response_content_type(response.headers()) {
+            if retryable_peer_status(status) {
+                return Err(ForwardError::Retryable(format!(
+                    "peer returned retryable HTTP status {status}"
+                )));
+            }
             return Err(ForwardError::Fatal(format!(
                 "peer returned {status} without {BIEI_RESPONSE_CONTENT_TYPE} response body"
             )));
@@ -213,6 +302,18 @@ impl Transport for HttpTransport {
         let (outcome, image_bytes) = decode_response_bytes(body.freeze())
             .map_err(|err| ForwardError::Fatal(format!("decode forward response body: {err}")))?;
 
+        if outcome.task_id != expected_task_id
+            || outcome.request_id != expected_request_id
+            || outcome.style_id != expected_style_id
+            || outcome.had_source != expected_had_source
+        {
+            return Err(ForwardError::Fatal(format!(
+                "peer response identity mismatch for task {expected_task_id} request {} style {}",
+                expected_request_id.as_str(),
+                expected_style_id.as_str(),
+            )));
+        }
+
         if !status.is_success() {
             match &outcome.result {
                 OutcomeResult::Rejected { .. } | OutcomeResult::Failed { .. } => {
@@ -230,6 +331,16 @@ impl Transport for HttpTransport {
         }
 
         let output = match outcome.completed_format() {
+            Some(format) if format != expected_output_format => {
+                return Err(ForwardError::Fatal(format!(
+                    "peer response output format mismatch: expected {expected_output_format:?}, got {format:?}"
+                )));
+            }
+            Some(_) if image_bytes.is_empty() => {
+                return Err(ForwardError::Fatal(
+                    "peer returned completed outcome with an empty image body".to_string(),
+                ));
+            }
             Some(format) => Some(RenderOutput {
                 bytes: image_bytes,
                 format,
@@ -242,6 +353,16 @@ impl Transport for HttpTransport {
         };
         Ok(ForwardResponse { outcome, output })
     }
+}
+
+fn duration_millis_ceil(duration: Duration) -> u32 {
+    let whole = duration.as_millis();
+    let rounded = if duration.subsec_nanos().is_multiple_of(1_000_000) {
+        whole
+    } else {
+        whole.saturating_add(1)
+    };
+    rounded.min(u32::MAX as u128) as u32
 }
 
 fn response(status: StatusCode, body: Vec<u8>, content_type: &'static str) -> Response {
@@ -324,6 +445,12 @@ fn is_biei_response_content_type(headers: &HeaderMap) -> bool {
         })
 }
 
+fn retryable_peer_status(status: StatusCode) -> bool {
+    status.is_server_error()
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +503,19 @@ mod tests {
         }
     }
 
+    struct SlowResolver {
+        addr: SocketAddr,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl PeerResolver for SlowResolver {
+        async fn advertise_addr_of(&self, _node_id: &NodeId) -> Option<SocketAddr> {
+            tokio::time::sleep(self.delay).await;
+            Some(self.addr)
+        }
+    }
+
     fn forward_request() -> ForwardRequest {
         ForwardRequest {
             task: WireTask {
@@ -399,6 +539,7 @@ mod tests {
             },
             route_tier: RouteTier::Tier2HrwBl,
             drain_worker: Some(0),
+            origin_response_budget_ms: 1_500,
         }
     }
 
@@ -433,7 +574,7 @@ mod tests {
     }
 
     async fn spawn_framed_rejection_server() -> SocketAddr {
-        let app = Router::new().fallback(|request: Request<Body>| async move {
+        let app = Router::new().fallback(move |request: Request<Body>| async move {
             assert_eq!(
                 request.headers().get(CONTENT_TYPE).expect("content type"),
                 JSON_CONTENT_TYPE
@@ -478,8 +619,17 @@ mod tests {
         addr
     }
 
-    async fn spawn_raw_image_server() -> SocketAddr {
-        let app = Router::new().fallback(|request: Request<Body>| async move {
+    async fn spawn_raw_image_server(mismatch_identity: bool, delay: Duration) -> SocketAddr {
+        spawn_raw_image_server_with_options(mismatch_identity, delay, ImageFormat::Png, None).await
+    }
+
+    async fn spawn_raw_image_server_with_options(
+        mismatch_identity: bool,
+        delay: Duration,
+        response_format: ImageFormat,
+        maximum_remote_budget_ms: Option<u32>,
+    ) -> SocketAddr {
+        let app = Router::new().fallback(move |request: Request<Body>| async move {
             assert_eq!(
                 request.headers().get(CONTENT_TYPE).expect("content type"),
                 JSON_CONTENT_TYPE
@@ -495,12 +645,26 @@ mod tests {
                 .await
                 .expect("request body");
             let fwd: ForwardRequest = serde_json::from_slice(&bytes).expect("decode request");
+            if let Some(maximum) = maximum_remote_budget_ms {
+                assert!(
+                    fwd.task.remaining_budget_ms <= maximum,
+                    "slow successful resolution must be removed from the remote execution budget: got {}ms, maximum {maximum}ms",
+                    fwd.task.remaining_budget_ms,
+                );
+            }
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             let outcome = OutcomeHeader {
-                task_id: fwd.task.id,
+                task_id: if mismatch_identity {
+                    fwd.task.id.saturating_add(1)
+                } else {
+                    fwd.task.id
+                },
                 request_id: fwd.task.request_id,
                 style_id: fwd.task.style.id,
                 had_source: false,
-                image_format: Some(ImageFormat::Png),
+                image_format: Some(response_format),
                 result: OutcomeResult::Completed {
                     node_id: NodeId::from("peer-a"),
                     worker_id: Some(2),
@@ -576,6 +740,12 @@ mod tests {
         loaded: Option<crate::types::WorkerProfile>,
     }
 
+    struct GatedRenderer {
+        started: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+        loaded: Option<crate::types::WorkerProfile>,
+    }
+
     impl FakeRenderer {
         fn new(bytes: Vec<u8>) -> Self {
             Self {
@@ -609,6 +779,36 @@ mod tests {
             }
             Ok(RenderOutput {
                 bytes: self.bytes.clone().into(),
+                format: task.output_format,
+            }
+            .into())
+        }
+    }
+
+    #[async_trait]
+    impl Renderer for GatedRenderer {
+        async fn setup_profile(
+            &mut self,
+            task: &InternalTask,
+            _prepared: Option<crate::renderer::PreparedProfile>,
+        ) -> Result<(), RendererError> {
+            self.loaded = Some(task.worker_profile());
+            Ok(())
+        }
+
+        async fn ensure_source(&mut self, _hash: SourceHash) -> Result<(), RendererError> {
+            Ok(())
+        }
+
+        async fn render(&mut self, task: &InternalTask) -> Result<RendererOutput, RendererError> {
+            self.started.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .expect("test release semaphore remains open")
+                .forget();
+            Ok(RenderOutput {
+                bytes: vec![1].into(),
                 format: task.output_format,
             }
             .into())
@@ -735,7 +935,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_transport_returns_raw_image_bytes_from_framed_body() {
-        let addr = spawn_raw_image_server().await;
+        let addr = spawn_raw_image_server(false, Duration::ZERO).await;
         let transport = HttpTransport::new(Arc::new(StaticResolver { addr })).expect("transport");
 
         let response = transport
@@ -749,16 +949,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_transport_treats_unframed_service_unavailable_as_fatal() {
+    async fn http_transport_uses_origin_response_budget_not_remote_execution_budget() {
+        let addr = spawn_raw_image_server(false, Duration::from_millis(50)).await;
+        let transport = HttpTransport::new(Arc::new(StaticResolver { addr })).expect("transport");
+        let mut request = forward_request();
+        request.task.remaining_budget_ms = 20;
+        request.origin_response_budget_ms = 200;
+
+        let response = transport
+            .send(NodeId::from("peer-a"), request)
+            .await
+            .expect("origin keeps waiting after the smaller remote budget");
+
+        assert!(response.output.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http_transport_budget_includes_peer_address_resolution() {
+        let transport = HttpTransport::new(Arc::new(SlowResolver {
+            addr: "127.0.0.1:9".parse().expect("test address"),
+            delay: Duration::from_secs(10),
+        }))
+        .expect("transport");
+        let mut request = forward_request();
+        request.origin_response_budget_ms = 50;
+
+        let send =
+            tokio::spawn(async move { transport.send(NodeId::from("peer-a"), request).await });
+        tokio::time::advance(Duration::from_millis(51)).await;
+        let error = send
+            .await
+            .expect("send task")
+            .expect_err("resolver must share the origin response budget");
+
+        assert!(
+            matches!(error, ForwardError::Retryable(message) if message.contains("address resolution"))
+        );
+    }
+
+    #[tokio::test]
+    async fn http_transport_subtracts_slow_successful_resolution_from_remote_budget() {
+        let addr =
+            spawn_raw_image_server_with_options(false, Duration::ZERO, ImageFormat::Png, Some(199))
+                .await;
+        let transport = HttpTransport::new(Arc::new(SlowResolver {
+            addr,
+            delay: Duration::from_millis(25),
+        }))
+        .expect("transport");
+        let mut request = forward_request();
+        request.task.remaining_budget_ms = 200;
+        request.origin_response_budget_ms = 500;
+
+        let response = transport
+            .send(NodeId::from("peer-a"), request)
+            .await
+            .expect("slow successful resolution still leaves a remote budget");
+        assert!(response.output.is_some());
+    }
+
+    #[tokio::test]
+    async fn http_transport_rejects_mismatched_peer_response_identity() {
+        let addr = spawn_raw_image_server(true, Duration::ZERO).await;
+        let transport = HttpTransport::new(Arc::new(StaticResolver { addr })).expect("transport");
+
+        let error = transport
+            .send(NodeId::from("peer-a"), forward_request())
+            .await
+            .expect_err("a response for another task must not be cached or returned");
+
+        assert!(
+            matches!(error, ForwardError::Fatal(message) if message.contains("identity mismatch"))
+        );
+    }
+
+    #[tokio::test]
+    async fn http_transport_rejects_mismatched_peer_output_format() {
+        let addr =
+            spawn_raw_image_server_with_options(false, Duration::ZERO, ImageFormat::Webp, None)
+                .await;
+        let transport = HttpTransport::new(Arc::new(StaticResolver { addr })).expect("transport");
+
+        let error = transport
+            .send(NodeId::from("peer-a"), forward_request())
+            .await
+            .expect_err("a peer must not poison a PNG cache key with WebP bytes");
+
+        assert!(
+            matches!(error, ForwardError::Fatal(message) if message.contains("output format mismatch"))
+        );
+    }
+
+    #[tokio::test]
+    async fn http_transport_treats_unframed_service_unavailable_as_retryable() {
         let addr = spawn_status_server(StatusCode::SERVICE_UNAVAILABLE).await;
         let transport = HttpTransport::new(Arc::new(StaticResolver { addr })).expect("transport");
 
         let err = transport
             .send(NodeId::from("peer-a"), forward_request())
             .await
-            .expect_err("unframed 503 should be fatal");
+            .expect_err("unframed 503 should trigger peer failover");
 
-        assert!(matches!(err, ForwardError::Fatal(_)));
+        assert!(matches!(err, ForwardError::Retryable(_)));
     }
 
     #[tokio::test]
@@ -848,5 +1140,122 @@ mod tests {
         assert!(endpoint.try_admit().is_none());
         drop(permit);
         assert!(endpoint.try_admit().is_some());
+    }
+
+    #[tokio::test]
+    async fn degraded_renderer_admits_forward_then_node_sheds_the_render() {
+        let node_id = NodeId::from("peer-a");
+        let node = spawn_test_node(
+            node_id.clone(),
+            vec![Box::new(FakeRenderer::new(vec![1])) as BoxRenderer],
+            Arc::new(StaticGossip {
+                view: peer_only_view(node_id),
+            }),
+            Arc::new(UnexpectedTransport),
+            test_catalog(),
+        );
+        // Single slot: losing it leaves no capacity, so the node must shed the
+        // render rather than run it on a still-healthy slot. (A multi-slot pod
+        // would keep rendering on its remaining slots — see
+        // `can_start_render`.)
+        let supervisor = crate::renderer::actor::RendererActorSupervisor::new(1);
+        let endpoint = InternalForwardEndpoint::with_renderer_health_and_limit(
+            node,
+            crate::drain::DrainController::new(),
+            supervisor.clone(),
+            1,
+        );
+
+        // Degraded-render shedding is no longer decided at internal admission:
+        // forwarded requests must reach the node so exact output-cache hits
+        // stay reachable over the gossip path (which bypasses Kubernetes
+        // Service readiness). `try_admit` reflects only the concurrency
+        // semaphore now.
+        let permit = endpoint
+            .try_admit()
+            .expect("degraded endpoint still admits forwards so cache hits stay reachable");
+
+        // Simulate the renderer becoming degraded while axum is buffering the
+        // request body, after the pre-body concurrency admission succeeded.
+        // The decoded Node path must observe the current state rather than the
+        // stale state from `try_admit`.
+        let mut slot_available = true;
+        supervisor.set_slot_available(&mut slot_available, false);
+
+        // This forward is a cache miss, so the node sheds the would-be render
+        // (a forward-retryable 503) rather than starting native work on a
+        // degraded renderer. A FakeRenderer would return 200 if the shed had
+        // not happened, so the status distinguishes shed from render.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            JSON_CONTENT_TYPE.parse().expect("content type"),
+        );
+        let body = Bytes::from(serde_json::to_vec(&forward_request()).expect("forward request"));
+        let response = endpoint.handle_admitted(&headers, body, permit).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "degraded node sheds the forwarded render instead of starting native work"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_disconnect_does_not_cancel_render_or_release_drain_early() {
+        let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let node_id = NodeId::from("peer-a");
+        let node = spawn_test_node(
+            node_id.clone(),
+            vec![Box::new(GatedRenderer {
+                started: started.clone(),
+                release: release.clone(),
+                loaded: None,
+            }) as BoxRenderer],
+            Arc::new(StaticGossip {
+                view: peer_only_view(node_id),
+            }),
+            Arc::new(UnexpectedTransport),
+            test_catalog(),
+        );
+        let metrics = node.metrics();
+        let drain = crate::drain::DrainController::new();
+        let endpoint = InternalForwardEndpoint::with_drain_and_limit(node, drain.clone(), 1);
+        let permit = endpoint.try_admit().expect("forward is admitted");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            JSON_CONTENT_TYPE.parse().expect("content type"),
+        );
+        let body = Bytes::from(serde_json::to_vec(&forward_request()).expect("forward request"));
+
+        let caller =
+            tokio::spawn(async move { endpoint.handle_admitted(&headers, body, permit).await });
+        started
+            .acquire()
+            .await
+            .expect("renderer start semaphore remains open")
+            .forget();
+        assert_eq!(drain.in_flight(), 1);
+
+        caller.abort();
+        let _ = caller.await;
+        assert_eq!(
+            drain.in_flight(),
+            1,
+            "dropping the HTTP response future must not hide native work"
+        );
+
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while drain.in_flight() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached render completes and releases drain admission");
+        assert!(metrics.render_prometheus().contains(
+            "biei_tasks_completed_total{route_tier=\"tier2_hrw_bl\",scope=\"forwarded\"} 1"
+        ));
     }
 }

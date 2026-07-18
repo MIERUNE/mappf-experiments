@@ -7,13 +7,14 @@ resources:
   - healthcheck.yaml
   - httproute.yaml
   - podmonitoring.yaml
+  - networkpolicy.yaml
   - hpa.yaml
   - ../../base
 
 images:
   - name: biei
     newName: asia-northeast1-docker.pkg.dev/mappf-experiment/biei/biei
-    digest: sha256:0a7b2cc46e030a821375ab3f0b8ad9cbb556e70fbe4a7e402d1812c84f61b329
+    digest: sha256:951155f92aed52f8cc48af69f689c3b23c6144fe5d6824ef9b4609b01fcc3b4d
 
 patches:
   - path: patch-deployment.yaml

@@ -1,8 +1,17 @@
 # Autoscale the render pool on standard Kubernetes CPU metrics so this portable
-# example needs no Prometheus/custom-metrics adapter. A 50% target keeps roughly
-# one of the two requested cores available for a new render. This is a baseline,
-# not a sufficient production signal: provider-latency-bound workloads need
-# queue/admission-wait scaling because queues can grow while CPU stays low.
+# example needs no Prometheus/custom-metrics adapter. Utilization is measured
+# against the CPU *request*, which this overlay sets to 2 (== BIEI_CORES); a
+# 50% target therefore scales out with roughly one of those two guaranteed
+# cores still free for a new render. This is a baseline, not a sufficient
+# production signal: provider-latency-bound workloads need queue/admission-wait
+# scaling because queues can grow while CPU stays low.
+#
+# Degraded pods keep rendering on healthy slots, but a fully wedged pod can be
+# ready for cache hits while using almost no CPU. A CPU-only HPA cannot gate on
+# that state, so its scale-down stabilization covers the complete FileSource
+# retry window. This preserves warm pods through bounded provider incidents;
+# production should additionally gate scale-down on `biei_renderer_health` via
+# a custom-metrics adapter.
 #
 # The GKE overlay drops the Deployment's fixed `spec.replicas` (see
 # kustomization.yaml) so repeated `kubectl apply` does not fight the HPA.
@@ -26,9 +35,9 @@ spec:
           averageUtilization: 50
   behavior:
     scaleDown:
-      # Renders are short; drain + preStop make scale-down safe, but avoid
-      # flapping on bursty traffic.
-      stabilizationWindowSeconds: 300
+      # Match the 10-minute FileSource retry window: do not delete warm pods
+      # while a bounded provider incident can have driven render CPU to zero.
+      stabilizationWindowSeconds: 600
       policies:
         - type: Pods
           value: 1

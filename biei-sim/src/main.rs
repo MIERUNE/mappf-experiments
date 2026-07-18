@@ -131,6 +131,10 @@ enum CalibrationCommand {
         execution_permits_per_node: usize,
         #[arg(long)]
         native_render_permits_per_node: usize,
+        /// Maximum request concurrency in the captured workload. Use 1 for a
+        /// CPU-reference window; the importer rejects concurrent references.
+        #[arg(long)]
+        capture_concurrency: usize,
         /// Free-form provenance note; do not place credentials here.
         #[arg(long)]
         notes: Option<String>,
@@ -192,6 +196,7 @@ async fn main() -> Result<()> {
                 renderer_slots_per_node,
                 execution_permits_per_node,
                 native_render_permits_per_node,
+                capture_concurrency,
                 notes,
                 timeout_seconds,
                 output,
@@ -213,6 +218,7 @@ async fn main() -> Result<()> {
                         renderer_slots_per_node,
                         execution_permits_per_node,
                         native_render_permits_per_node,
+                        capture_concurrency: Some(capture_concurrency),
                         notes,
                     },
                 })

@@ -38,6 +38,11 @@ pub struct CalibrationProvenance {
     pub renderer_slots_per_node: usize,
     pub execution_permits_per_node: usize,
     pub native_render_permits_per_node: usize,
+    /// Maximum public-request concurrency used to capture this window. CPU
+    /// reference profiles require `Some(1)` so service-wall measurements do
+    /// not already contain scheduler contention that the simulator reapplies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_concurrency: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
 }
@@ -126,6 +131,15 @@ const METRIC_SPECS: &[MetricSpec] = &[
     MetricSpec {
         metric: "biei_render_duration_seconds",
         group_labels: &["render_mode", "scale", "format", "size", "state"],
+        ingress_only: true,
+    },
+    // A positive sample count means the successful render histogram is
+    // right-censored by timeouts and must not be treated as a complete service
+    // distribution when calibrating production defaults. A present zero series
+    // proves the current instrumentation was exposed during the window.
+    MetricSpec {
+        metric: "biei_render_timeout_lower_bound_seconds",
+        group_labels: &[],
         ingress_only: true,
     },
     MetricSpec {
@@ -262,6 +276,13 @@ fn validate_export_options(options: &CalibrationExportOptions) -> Result<()> {
     if options.timeout.is_zero() {
         bail!("Prometheus request timeout must be non-zero");
     }
+    for unsafe_label in ["pod", "instance"] {
+        if options.match_labels.contains_key(unsafe_label) {
+            bail!(
+                "calibration matcher {unsafe_label:?} is not allowed: ingress outcomes and forwarded FileSource work may occur on different pods; export a cluster-wide deployment window"
+            );
+        }
+    }
     let provenance = &options.provenance;
     for (label, value) in [
         (
@@ -299,6 +320,9 @@ fn validate_export_options(options: &CalibrationExportOptions) -> Result<()> {
     }
     if provenance.native_render_permits_per_node > provenance.renderer_slots_per_node {
         bail!("native-render permits per node must not exceed renderer slots per node");
+    }
+    if provenance.capture_concurrency == Some(0) {
+        bail!("calibration capture concurrency must be non-zero when recorded");
     }
     Ok(())
 }
@@ -607,7 +631,7 @@ mod tests {
         CalibrationExportOptions, CalibrationProfile, CalibrationProvenance, METRIC_SPECS,
         PrometheusSample, build_histogram_query, decode_prometheus_response, disjoint_counts,
         export_calibration_profile, histogram_series, parse_match_label, parse_match_labels,
-        prometheus_query_endpoint,
+        prometheus_query_endpoint, validate_export_options,
     };
 
     #[test]
@@ -744,6 +768,33 @@ mod tests {
     }
 
     #[test]
+    fn exporter_rejects_pod_scoped_matchers_that_split_forwarded_work() {
+        let options = CalibrationExportOptions {
+            prometheus_url: "http://prometheus.test".to_owned(),
+            start_unix_seconds: 1,
+            end_unix_seconds: 2,
+            match_labels: BTreeMap::from([("pod".to_owned(), "biei-0".to_owned())]),
+            bearer_token: None,
+            timeout: Duration::from_secs(1),
+            provenance: CalibrationProvenance {
+                deployment_revision: "test".to_owned(),
+                architecture: "x86_64".to_owned(),
+                hardware_profile: "test-node".to_owned(),
+                cpu_cores_per_node: 2,
+                renderer_slots_per_node: 2,
+                execution_permits_per_node: 2,
+                native_render_permits_per_node: 2,
+                capture_concurrency: Some(1),
+                notes: None,
+            },
+        };
+
+        let error = validate_export_options(&options)
+            .expect_err("pod-scoped calibration must not mix ingress and forwarded work");
+        assert!(error.to_string().contains("cluster-wide deployment window"));
+    }
+
+    #[test]
     fn calibration_snapshot_schema_roundtrips_and_refuses_overwrite() {
         let profile = CalibrationProfile {
             schema_version: CALIBRATION_PROFILE_SCHEMA_VERSION,
@@ -767,6 +818,7 @@ mod tests {
                 renderer_slots_per_node: 3,
                 execution_permits_per_node: 2,
                 native_render_permits_per_node: 2,
+                capture_concurrency: Some(1),
                 notes: None,
             },
             histograms: Vec::new(),
@@ -845,6 +897,7 @@ mod tests {
                 renderer_slots_per_node: 3,
                 execution_permits_per_node: 2,
                 native_render_permits_per_node: 2,
+                capture_concurrency: Some(1),
                 notes: None,
             },
         })
@@ -898,6 +951,7 @@ mod tests {
                 renderer_slots_per_node: 3,
                 execution_permits_per_node: 2,
                 native_render_permits_per_node: 2,
+                capture_concurrency: Some(1),
                 notes: None,
             },
         })

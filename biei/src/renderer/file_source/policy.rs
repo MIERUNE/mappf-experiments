@@ -7,12 +7,12 @@ use std::sync::Arc;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
 #[derive(Clone)]
-pub(super) struct ResourceUrlPolicy {
+pub(crate) struct ResourceUrlPolicy {
     private_hosts: Arc<[String]>,
 }
 
 impl ResourceUrlPolicy {
-    pub(super) fn new(private_hosts: Vec<String>) -> Self {
+    pub(crate) fn new(private_hosts: Vec<String>) -> Self {
         Self {
             private_hosts: private_hosts
                 .into_iter()
@@ -22,7 +22,7 @@ impl ResourceUrlPolicy {
         }
     }
 
-    pub(super) fn permits_url_without_dns(&self, url: &url::Url) -> bool {
+    pub(crate) fn permits_url_without_dns(&self, url: &url::Url) -> bool {
         if !matches!(url.scheme(), "http" | "https") {
             return false;
         }

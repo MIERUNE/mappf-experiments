@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use moka::sync::Cache;
@@ -14,6 +14,7 @@ use crate::types::{
     PathOverlay, PinOverlay, PinSize, Positioning, RenderOutput, RenderRequest, RouteTier, Scale,
     SourceHash, StaticOverlay, TaskOutcome, TaskResult,
 };
+use crate::util::lock_unpoisoned;
 
 // Rendered output freshness is independent from the style revision: base
 // tiles and other referenced resources may change at stable URLs. Keep the
@@ -152,12 +153,6 @@ impl Drop for RenderFlightLeader {
     }
 }
 
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct RenderCacheKey {
     style_id: String,
@@ -202,12 +197,36 @@ enum RenderRequestKey {
         overlays: Vec<StaticOverlayKey>,
         before_layer: Option<String>,
         padding: crate::types::Padding,
-        /// Hash of the request's `addlayer` JSON, or `None` when no
-        /// `addlayer` was provided. Including the hash here is what keeps
-        /// two requests that differ only in their addlayer JSON from
-        /// colliding on the same render cache entry.
-        addlayer_hash: Option<u64>,
+        /// Canonical identity of the request's `addlayer` — its effective
+        /// layer JSON plus any request-local source content — or `None` when
+        /// absent. Carrying the bounded JSON itself rather than a 64-bit hash
+        /// of it keeps two requests that differ only in their addlayer from
+        /// colliding on one render cache entry without depending on hash
+        /// uniqueness (a collision would otherwise return the wrong image).
+        addlayer: Option<Arc<str>>,
     },
+}
+
+/// Collision-free render-cache identity for an addlayer: its effective layer
+/// JSON plus any request-local source content. Each component is length-framed
+/// (`<byte-len>:<bytes>`), which is unambiguous for *any* content — the encoding
+/// stays injective (distinct component tuples → distinct strings, including a
+/// different component count) without assuming a separator byte is absent from
+/// canonical JSON or validated ids. All components are length-bounded at
+/// ingress. Never depend on a forbidden-byte separator for cache-correctness
+/// identity, which a future component change could silently break.
+fn addlayer_identity(addlayer: &crate::types::AddLayer) -> Arc<str> {
+    use std::fmt::Write as _;
+    let mut identity = String::new();
+    let mut frame = |component: &str| {
+        let _ = write!(identity, "{}:{}", component.len(), component);
+    };
+    frame(&addlayer.json);
+    if let Some(source) = &addlayer.source {
+        frame(&source.tileset_id);
+        frame(&source.json);
+    }
+    Arc::from(identity.as_str())
 }
 
 impl RenderRequestKey {
@@ -217,6 +236,7 @@ impl RenderRequestKey {
             Self::StaticImage {
                 overlays,
                 before_layer,
+                addlayer,
                 ..
             } => overlays
                 .len()
@@ -227,7 +247,8 @@ impl RenderRequestKey {
                         .map(StaticOverlayKey::heap_size_bytes)
                         .sum::<usize>(),
                 )
-                .saturating_add(before_layer.as_ref().map_or(0, String::len)),
+                .saturating_add(before_layer.as_ref().map_or(0, String::len))
+                .saturating_add(addlayer.as_ref().map_or(0, |identity| identity.len())),
         }
     }
 }
@@ -256,7 +277,7 @@ impl From<&RenderRequest> for RenderRequestKey {
                 overlays: overlays.iter().map(StaticOverlayKey::from).collect(),
                 before_layer: before_layer.clone(),
                 padding: *padding,
-                addlayer_hash: addlayer.as_ref().map(|a| a.hash),
+                addlayer: addlayer.as_ref().map(addlayer_identity),
             },
         }
     }
@@ -624,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_separates_static_by_addlayer_hash() {
+    fn cache_key_separates_static_by_addlayer_identity() {
         let mut base = task(0, None);
         base.request = RenderRequest::StaticImage {
             positioning: Positioning::Center {
@@ -662,12 +683,16 @@ mod tests {
                 source: None,
             }),
         };
-        // A second request with a different addlayer hash.
+        // A second addlayer whose JSON differs but whose `hash` field is
+        // identical: the render cache key must still separate them, because it
+        // keys on the JSON identity rather than the 64-bit hash. This is the
+        // hash-collision case that would otherwise return the wrong image.
         let mut with_other_addlayer = with_addlayer.clone();
         if let RenderRequest::StaticImage { addlayer, .. } = &mut with_other_addlayer.request
             && let Some(a) = addlayer
         {
-            a.hash = 456;
+            a.json = r#"{"id":"x","type":"line","source":"s"}"#.to_string();
+            // Same colliding hash value on purpose.
         }
 
         assert_ne!(
@@ -676,7 +701,8 @@ mod tests {
         );
         assert_ne!(
             RenderCacheKey::from_task(&with_addlayer),
-            RenderCacheKey::from_task(&with_other_addlayer)
+            RenderCacheKey::from_task(&with_other_addlayer),
+            "identical hash but different addlayer JSON must not share a cache entry"
         );
     }
 

@@ -115,6 +115,14 @@ bare entry) is the catch-all and receives the whole id:
 Without a `default`, an unregistered namespace returns `unknown_style` (404),
 which keeps the catalog scoped to providers you list.
 
+### Admission knobs
+
+`BIEI_QUEUE_CAPACITY_MULTIPLIER` controls the hard per-renderer-slot queue
+boundary over the fixed soft routing limit of one task per slot. It defaults to
+`2` and accepts `1` through `4`. Raising it absorbs short bursts while replicas
+scale out, but does not add render throughput; compare `queue_full` rejections
+with end-to-end tail latency before increasing it.
+
 ### Cache knobs
 
 `BIEI_SOURCE_CACHE_CAPACITY` controls the per-renderer warm source cache
@@ -145,95 +153,6 @@ are rejected. Keep this exception as narrow as possible: an allowlisted host
 bypasses private-address filtering, so broad service-domain wildcards can expose
 unrelated internal services when resource URLs are not fully trusted.
 
-## Simulator
+## Documentation
 
-Run one deterministic simulation and write both machine-readable and
-self-contained visual reports:
-
-```sh
-cargo run -p biei-sim -- run \
-  --report biei-sim-report.json \
-  --html biei-sim-report.html
-```
-
-Membership churn is replayed from an ordered JSON plan and sampled before and
-after every event. `at_request` counts measured requests after the configured
-warmup, so high-rate runs cannot hide churn inside the warmup window:
-
-```json
-{"events":[
-  {"at_request":500,"action":"add"},
-  {"at_request":1500,"action":"remove","node_id":"node-0"}
-]}
-```
-
-```sh
-cargo run -p biei-sim -- run \
-  --churn-plan biei-sim/examples/churn-plan.json \
-  --report churn-report.json
-cargo run -p biei-sim -- visualize churn-report.json --output churn-report.html
-```
-
-Events beyond the generated measured workload do not discard the run. They are
-preserved under `unapplied_events` in the JSON/HTML report and produce a CLI
-warning. A near-saturation churn run can be exercised with:
-
-```sh
-cargo run -p biei-sim -- run --nodes 4 --styles 20 --rate 3000 \
-  --duration-seconds 10 --warmup-seconds 2 \
-  --churn-plan biei-sim/examples/churn-plan.json \
-  --report churn-report.json --html churn-report.html
-```
-
-The churn report includes per-sample counter deltas and interval p50/p99/max
-latency, rather than requiring cumulative counters to be interpreted by eye.
-
-Running `cargo run -p biei-sim` without a subcommand retains the legacy sweep
-suite.
-
-Export a time-bounded, immutable production calibration snapshot from a
-Prometheus API before changing simulator costs or production permit defaults:
-
-```sh
-cargo run -p biei-sim -- calibration exercise \
-  --url 'http://localhost:8080/carto/gl/voyager-gl-style/0/0/0@2x.webp' \
-  --url 'http://localhost:8080/carto/gl/voyager-gl-style/static/139.767,35.681,11,0,0/640x360@2x.webp' \
-  --warmup-requests-per-url 2 --requests-per-url 100 --concurrency 4
-```
-
-The exercise prints the measured Unix-time window to pass to the exporter. It
-is deliberately bounded: calibration needs representative stage samples, not
-production-scale traffic. Its default 30-second settle period before and after
-measurement assumes a Prometheus scrape interval of at most 30 seconds; adjust
-`--scrape-settle-seconds` to match the deployment.
-
-```sh
-END=$(date +%s)
-START=$((END - 900))
-cargo run -p biei-sim -- calibration export \
-  --prometheus-url "$PROMETHEUS_URL" \
-  --start-unix-seconds "$START" --end-unix-seconds "$END" \
-  --match-label namespace=map-demo --match-label container=biei \
-  --deployment-revision "$DEPLOYMENT_REVISION" \
-  --architecture x86_64 --hardware-profile "$HARDWARE_PROFILE" \
-  --cpu-cores-per-node 2 --renderer-slots-per-node 3 \
-  --execution-permits-per-node 2 --native-render-permits-per-node 2 \
-  --output "calibration-${DEPLOYMENT_REVISION}-${START}-${END}.json"
-```
-
-`PROMETHEUS_URL` is the Prometheus server/API root, not biei's raw metrics
-endpoint. Google Managed Service for Prometheus roots are supported; pass an
-OAuth access token through `--bearer-token-file`, never through `--notes` or the
-URL. Existing output files are not overwritten. Importing this schema into a
-simulation is available through `biei-sim run --cost-profile <snapshot>`. The
-importer keeps workload-weighted global ranges for routing decisions, while
-renderer sleeps sample the recorded distributions by mode, scale, format, size,
-and warm/cold/swap state. When an exact shape is sparse, sampling falls back to
-the corresponding state aggregate and then to the simulator default. It applies
-the recorded core/slot/permit layout and writes structured coverage
-(`measured`, `derived`, or `default`), sample counts, and all approximation or
-fallback notes into the run report. The report also records how many exact
-shape and aggregate fallback samplers were built. Profiles may be partial:
-usable setup or render stages are applied independently. CPU/resource splitting remains an
-approximation, and the result is not sizing evidence until validated against
-production end-to-end distributions.
+- [Simulator documentation](biei-sim/README.md)

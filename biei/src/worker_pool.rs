@@ -15,16 +15,11 @@ use tokio::time::Instant;
 use crate::activity::ProfileActivityTracker;
 use crate::renderer::{BoxRenderer, PreparedProfile};
 use crate::types::{
-    InternalTask, NodeId, NodeKvs, ProcessError, RouteTier, TaskOutcome, WorkerId, WorkerProfile,
-    WorkerView, encode_worker_kvs,
+    InternalTask, NodeId, NodeKvs, ProcessError, RouteTier, TaskOutcome, TaskResult, WorkerId,
+    WorkerProfile, WorkerView, encode_worker_kvs,
 };
+use crate::util::lock_unpoisoned;
 use crate::worker::{WorkerCmd, worker_loop};
-
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum PickTier {
@@ -66,21 +61,66 @@ pub struct WorkerHandle {
     join: JoinHandle<()>,
 }
 
-/// RAII handle for a hard-limit reservation on a worker. Decrements
-/// `queue_depth` on drop so the reservation is always released — including
-/// error paths where `send` fails or the worker drops its response channel.
-struct QueueSlot<'a> {
-    counter: &'a AtomicUsize,
+/// Owns the accounting side effects of an accepted worker command.
+///
+/// This guard travels with `WorkerCmd`, rather than staying in the caller
+/// future. An HTTP disconnect may drop the caller after the command has been
+/// enqueued, but the native render is not cancellable and still consumes the
+/// worker. Keeping the reservation with the command makes queue depth, drain,
+/// and hard admission limits describe the work that actually remains.
+pub(crate) struct WorkerCompletion {
+    counter: Arc<AtomicUsize>,
+    state: Arc<Mutex<PoolState>>,
+    worker_idx: usize,
+    dispatch_generation: u64,
+    clear_loaded_on_drop: bool,
 }
 
-impl<'a> QueueSlot<'a> {
-    fn new(counter: &'a AtomicUsize) -> Self {
-        Self { counter }
+impl std::fmt::Debug for WorkerCompletion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkerCompletion")
+            .field("worker_idx", &self.worker_idx)
+            .finish_non_exhaustive()
     }
 }
 
-impl Drop for QueueSlot<'_> {
+impl WorkerCompletion {
+    fn new(
+        counter: Arc<AtomicUsize>,
+        state: Arc<Mutex<PoolState>>,
+        worker_idx: usize,
+        dispatch_generation: u64,
+    ) -> Self {
+        Self {
+            counter,
+            state,
+            worker_idx,
+            dispatch_generation,
+            // If a queued command is dropped before it produces an outcome,
+            // the eager dispatch-time warm-state prediction is not valid.
+            clear_loaded_on_drop: true,
+        }
+    }
+
+    pub(crate) fn finish(mut self, outcome: &TaskOutcome) {
+        if matches!(
+            outcome.result,
+            TaskResult::Failed { .. } | TaskResult::Rejected { .. }
+        ) {
+            lock_unpoisoned(&self.state)
+                .clear_loaded_if_latest(self.worker_idx, self.dispatch_generation);
+        }
+        self.clear_loaded_on_drop = false;
+    }
+}
+
+impl Drop for WorkerCompletion {
     fn drop(&mut self) {
+        if self.clear_loaded_on_drop {
+            lock_unpoisoned(&self.state)
+                .clear_loaded_if_latest(self.worker_idx, self.dispatch_generation);
+        }
         self.counter.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -90,6 +130,7 @@ impl Drop for QueueSlot<'_> {
 /// after its queue drains — not necessarily right now.
 pub struct PoolState {
     pub loaded: Vec<Option<WorkerProfile>>,
+    dispatch_generations: Vec<u64>,
     profile_counts: HashMap<WorkerProfile, usize>,
     addlayer_source_ids: Vec<HashSet<String>>,
     addlayer_source_lru: Vec<VecDeque<String>>,
@@ -99,15 +140,18 @@ impl PoolState {
     fn new(n: usize) -> Self {
         Self {
             loaded: vec![None; n],
+            dispatch_generations: vec![0; n],
             profile_counts: HashMap::new(),
             addlayer_source_ids: vec![HashSet::new(); n],
             addlayer_source_lru: vec![VecDeque::new(); n],
         }
     }
 
-    fn mark_loaded(&mut self, idx: usize, profile: WorkerProfile) {
+    fn mark_loaded(&mut self, idx: usize, profile: WorkerProfile) -> u64 {
+        self.dispatch_generations[idx] = self.dispatch_generations[idx].wrapping_add(1);
+        let generation = self.dispatch_generations[idx];
         if self.loaded[idx].as_ref() == Some(&profile) {
-            return;
+            return generation;
         }
 
         if let Some(previous) = self.loaded[idx].take() {
@@ -116,6 +160,7 @@ impl PoolState {
         self.clear_addlayer_sources(idx);
         *self.profile_counts.entry(profile.clone()).or_insert(0) += 1;
         self.loaded[idx] = Some(profile);
+        generation
     }
 
     fn mark_addlayer_source(&mut self, idx: usize, source_id: String) {
@@ -141,6 +186,12 @@ impl PoolState {
             self.decrement_profile_count(&previous);
         }
         self.clear_addlayer_sources(idx);
+    }
+
+    fn clear_loaded_if_latest(&mut self, idx: usize, dispatch_generation: u64) {
+        if self.dispatch_generations[idx] == dispatch_generation {
+            self.clear_loaded(idx);
+        }
     }
 
     fn decrement_profile_count(&mut self, profile: &WorkerProfile) {
@@ -391,15 +442,23 @@ impl WorkerPool {
             .and_then(|prepared| prepared.addlayer_source.as_ref())
             .map(|source| source.stable_source_id());
         self.activity.record(task_profile.clone(), Instant::now());
-        {
+        let dispatch_generation = {
             let mut s = lock_unpoisoned(&self.state);
-            s.mark_loaded(idx, task_profile);
+            let generation = s.mark_loaded(idx, task_profile);
             if let Some(source_id) = addlayer_source_id {
                 s.mark_addlayer_source(idx, source_id);
             }
-        }
-        // RAII guard so any exit path releases the hard-limit reservation.
-        let _slot = QueueSlot::new(&w.queue_depth);
+            generation
+        };
+        // Move completion accounting into the command. The caller future may
+        // be cancelled after `send`, while the worker must still execute the
+        // non-cancellable native render and remain visible to admission/drain.
+        let completion = WorkerCompletion::new(
+            w.queue_depth.clone(),
+            self.state.clone(),
+            idx,
+            dispatch_generation,
+        );
         let (tx, rx) = oneshot::channel();
         if let Err(err) =
             w.tx.send(WorkerCmd::Process {
@@ -408,30 +467,14 @@ impl WorkerPool {
                 route_tier,
                 admitted_at_overflow,
                 respond_to: tx,
+                completion,
             })
             .await
         {
             let WorkerCmd::Process { task, .. } = err.0;
             return Err(ProcessError::QueueFull(Box::new(task)));
         }
-        match rx.await {
-            Ok(outcome) => {
-                if matches!(
-                    outcome.result,
-                    crate::types::TaskResult::Failed { .. }
-                        | crate::types::TaskResult::Rejected { .. }
-                ) {
-                    let mut s = lock_unpoisoned(&self.state);
-                    s.clear_loaded(idx);
-                }
-                Ok(outcome)
-            }
-            Err(_) => {
-                let mut s = lock_unpoisoned(&self.state);
-                s.clear_loaded(idx);
-                Err(ProcessError::QueueDisconnected)
-            }
-        }
+        rx.await.map_err(|_| ProcessError::QueueDisconnected)
     }
 
     #[cfg(test)]
@@ -540,6 +583,15 @@ mod tests {
     }
 
     struct SourceSetupRenderer;
+
+    struct GatedFailingRenderer {
+        started: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+
+    struct RepairProbeRenderer {
+        repair_count: Arc<AtomicUsize>,
+    }
 
     #[async_trait::async_trait]
     impl Renderer for NoopRenderer {
@@ -690,6 +742,151 @@ mod tests {
                 source_setup_duration: Some(Duration::from_millis(3)),
             })
         }
+    }
+
+    #[async_trait::async_trait]
+    impl Renderer for GatedFailingRenderer {
+        async fn setup_profile(
+            &mut self,
+            task: &InternalTask,
+            _prepared: Option<PreparedProfile>,
+        ) -> Result<(), RendererError> {
+            self.started.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .expect("test release semaphore remains open")
+                .forget();
+            Err(RendererError::StyleLoadFailed {
+                style_id: task.style.id.clone(),
+                source: "gated test failure".to_string(),
+            })
+        }
+
+        async fn ensure_source(&mut self, _hash: SourceHash) -> Result<(), RendererError> {
+            Ok(())
+        }
+
+        async fn render(&mut self, task: &InternalTask) -> Result<RendererOutput, RendererError> {
+            Ok(RenderOutput {
+                bytes: bytes::Bytes::new(),
+                format: task.output_format,
+            }
+            .into())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Renderer for RepairProbeRenderer {
+        async fn setup_profile(
+            &mut self,
+            _task: &InternalTask,
+            _prepared: Option<PreparedProfile>,
+        ) -> Result<(), RendererError> {
+            Ok(())
+        }
+
+        async fn ensure_source(&mut self, _hash: SourceHash) -> Result<(), RendererError> {
+            Ok(())
+        }
+
+        async fn render(&mut self, task: &InternalTask) -> Result<RendererOutput, RendererError> {
+            Ok(RenderOutput {
+                bytes: bytes::Bytes::new(),
+                format: task.output_format,
+            }
+            .into())
+        }
+
+        fn repair_if_needed(&mut self) -> Result<bool, RendererError> {
+            self.repair_count.fetch_add(1, Ordering::AcqRel);
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_worker_runs_autonomous_renderer_repair() {
+        let repair_count = Arc::new(AtomicUsize::new(0));
+        let pool = WorkerPool::spawn(WorkerPoolSpawn {
+            node_id: NodeId::from_index(0),
+            renderers: vec![Box::new(RepairProbeRenderer {
+                repair_count: repair_count.clone(),
+            })],
+            activity: Arc::new(ProfileActivityTracker::new()),
+            bl_capacity: 1,
+            queue_capacity: 1,
+            render_permits: 1,
+            cpu_render_permits: 1,
+            source_cache_capacity: 1,
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while repair_count.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("idle worker must repair without an admitted task");
+        pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_keeps_command_accounted_until_worker_finishes() {
+        let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let pool = Arc::new(WorkerPool::spawn(WorkerPoolSpawn {
+            node_id: NodeId::from_index(0),
+            renderers: vec![Box::new(GatedFailingRenderer {
+                started: started.clone(),
+                release: release.clone(),
+            })],
+            activity: Arc::new(ProfileActivityTracker::new()),
+            bl_capacity: 1,
+            queue_capacity: 1,
+            render_permits: 1,
+            cpu_render_permits: 1,
+            source_cache_capacity: 1,
+        }));
+
+        let caller_pool = pool.clone();
+        let caller = tokio::spawn(async move {
+            caller_pool
+                .process(make_task(1, 1), None, RouteTier::Tier2HrwBl, Some(0))
+                .await
+        });
+        started
+            .acquire()
+            .await
+            .expect("worker start semaphore remains open")
+            .forget();
+        assert_eq!(pool.queue_at(0), 1);
+        assert!(lock_unpoisoned(&pool.state).loaded[0].is_some());
+
+        caller.abort();
+        let _ = caller.await;
+        assert_eq!(
+            pool.queue_at(0),
+            1,
+            "dropping the caller must not hide an executing native command"
+        );
+
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.queue_at(0) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker finishes after release");
+        assert!(
+            lock_unpoisoned(&pool.state).loaded[0].is_none(),
+            "worker-side failure must clear eager warm state without a caller"
+        );
+
+        Arc::try_unwrap(pool)
+            .unwrap_or_else(|_| panic!("test owns the last pool reference"))
+            .shutdown()
+            .await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -862,6 +1059,19 @@ mod tests {
         state.clear_loaded(0);
         assert_eq!(state.profile_counts.get(&lp(1)), None);
         assert_eq!(state.profile_counts.get(&lp(2)), Some(&2));
+    }
+
+    #[test]
+    fn older_failure_cannot_clear_a_later_dispatch_prediction() {
+        let mut state = PoolState::new(1);
+        let first = state.mark_loaded(0, lp(1));
+        let second = state.mark_loaded(0, lp(2));
+
+        state.clear_loaded_if_latest(0, first);
+        assert_eq!(state.loaded[0], Some(lp(2)));
+
+        state.clear_loaded_if_latest(0, second);
+        assert_eq!(state.loaded[0], None);
     }
 
     #[test]

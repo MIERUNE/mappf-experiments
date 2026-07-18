@@ -15,6 +15,15 @@ use crate::renderer::http_fetch::reqwest_error_label;
 // every subsequent resource lookup.
 const REVALIDATED_FALLBACK_TTL: Duration = Duration::from_secs(60);
 
+// RFC 9111 §4.2.2 heuristic freshness: a cacheable response with no explicit
+// expiry must not be fresh forever (that would serve a stale glyph/tile on
+// every render). Fresh for a fraction of its age since `Last-Modified`, clamped,
+// or a short default; after that it becomes a strictly-revalidated `Revalidate`.
+const HEURISTIC_FRESHNESS_DIVISOR: u32 = 10;
+const MIN_HEURISTIC_FRESHNESS: Duration = Duration::from_secs(60);
+const MAX_HEURISTIC_FRESHNESS: Duration = Duration::from_secs(3600);
+const DEFAULT_HEURISTIC_FRESHNESS: Duration = Duration::from_secs(300);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CachePolicy {
     Store,
@@ -239,6 +248,19 @@ fn with_cache_metadata(
                 }
                 expires => expires,
             })
+            // No explicit or inherited freshness: bound it heuristically rather
+            // than leaving `expires = None`, which `cache::lookup` would treat
+            // as fresh forever. Never for a response that requires validation
+            // (`must-revalidate`/`s-maxage`): fabricating a freshness window
+            // would defeat `cache::lookup`'s `must_revalidate && no-expiry`
+            // rule that forces revalidation on every lookup.
+            .or_else(|| {
+                if requires_validation {
+                    None
+                } else {
+                    heuristic_expires(headers, now)
+                }
+            })
     };
     if let Some(expires) = expires {
         response = response.with_expires(expires);
@@ -247,6 +269,19 @@ fn with_cache_metadata(
         response = response.with_must_revalidate(true);
     }
     response
+}
+
+/// Heuristic expiry for a response with no explicit freshness (see the
+/// `HEURISTIC_FRESHNESS_*` constants).
+fn heuristic_expires(headers: &reqwest::header::HeaderMap, now: SystemTime) -> Option<SystemTime> {
+    let ttl = header_date(headers, LAST_MODIFIED)
+        .and_then(|modified| now.duration_since(modified).ok())
+        .map(|age| {
+            (age / HEURISTIC_FRESHNESS_DIVISOR)
+                .clamp(MIN_HEURISTIC_FRESHNESS, MAX_HEURISTIC_FRESHNESS)
+        })
+        .unwrap_or(DEFAULT_HEURISTIC_FRESHNESS);
+    now.checked_add(ttl)
 }
 
 fn header_str(
@@ -327,4 +362,85 @@ pub(super) fn parse_retry_after(value: String) -> Option<SystemTime> {
 
 fn duration_until(deadline: SystemTime) -> Option<Duration> {
     deadline.duration_since(SystemTime::now()).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn unknown_freshness_gets_bounded_heuristic_expiry_not_forever() {
+        // No Cache-Control, no Expires, no Last-Modified, no prior freshness:
+        // the response must still gain a bounded expiry so `cache::lookup`
+        // eventually revalidates instead of serving it as a permanent Hit.
+        let response = with_cache_metadata(
+            Response::data(vec![1, 2, 3]),
+            &HeaderMap::new(),
+            PriorResponse::default(),
+        );
+        let now = SystemTime::now();
+        let expires = response
+            .expires
+            .expect("unknown-freshness response must not be treated as fresh forever");
+        assert!(expires > now, "heuristic expiry is in the future");
+        assert!(
+            expires <= now + DEFAULT_HEURISTIC_FRESHNESS + Duration::from_secs(5),
+            "with no Last-Modified the heuristic falls back to the short default"
+        );
+    }
+
+    #[test]
+    fn heuristic_freshness_scales_with_last_modified_and_clamps_to_max() {
+        // Modified ~100h ago → 10% = ~10h, clamped to MAX_HEURISTIC_FRESHNESS.
+        let modified = SystemTime::now() - Duration::from_secs(360_000);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            LAST_MODIFIED,
+            HeaderValue::from_str(&httpdate::fmt_http_date(modified)).expect("date header"),
+        );
+        let response =
+            with_cache_metadata(Response::data(vec![1]), &headers, PriorResponse::default());
+        let now = SystemTime::now();
+        let expires = response.expires.expect("bounded heuristic expiry");
+        assert!(expires >= now + MIN_HEURISTIC_FRESHNESS);
+        assert!(
+            expires <= now + MAX_HEURISTIC_FRESHNESS + Duration::from_secs(5),
+            "long-unmodified resources are still revalidated within the cap"
+        );
+    }
+
+    #[test]
+    fn explicit_max_age_is_not_overridden_by_heuristic() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CACHE_CONTROL,
+            HeaderValue::from_static("max-age=30"),
+        );
+        let response =
+            with_cache_metadata(Response::data(vec![1]), &headers, PriorResponse::default());
+        let now = SystemTime::now();
+        let expires = response.expires.expect("explicit max-age expiry");
+        // ~30s, well under the heuristic floor, proving the explicit directive wins.
+        assert!(expires <= now + Duration::from_secs(30) + Duration::from_secs(5));
+    }
+
+    #[test]
+    fn must_revalidate_without_expiry_is_not_given_heuristic_freshness() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CACHE_CONTROL,
+            HeaderValue::from_static("must-revalidate"),
+        );
+        let response =
+            with_cache_metadata(Response::data(vec![1]), &headers, PriorResponse::default());
+        assert!(response.must_revalidate);
+        // Leaving `expires = None` keeps `cache::lookup`'s
+        // `must_revalidate && no-expiry` rule forcing revalidation; a fabricated
+        // heuristic window would serve it stale instead.
+        assert_eq!(
+            response.expires, None,
+            "must-revalidate without explicit freshness must not receive heuristic freshness"
+        );
+    }
 }

@@ -30,7 +30,9 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
-      terminationGracePeriodSeconds: 25
+      # 10s preStop endpoint propagation + 12s HTTP shutdown grace still leaves
+      # time for membership publication and sequential native actor teardown.
+      terminationGracePeriodSeconds: 35
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
@@ -51,6 +53,7 @@ spec:
               containerPort: 9090
             - name: gossip
               containerPort: 7946
+              protocol: UDP
           env:
             - name: POD_IP
               valueFrom:
@@ -81,13 +84,10 @@ spec:
             # Only used by `addlayer` tileset references; unused by the basic demo
             - name: BIEI_TILESET_URL_TEMPLATE
               value: "https://tiles.example.invalid/{tileset_id}/tileset.json"
+            # Capacity-model invariant: BIEI_CORES must equal the *guaranteed*
+            # CPU request below (not the burst limit).
             - name: BIEI_CORES
               value: "2"
-            # Fallback native ambient-cache path. Normal operation uses biei's
-            # process-wide Rust resource cache; this path is read only when the
-            # Rust FileSources are disabled for diagnostics.
-            - name: BIEI_MAPLIBRE_CACHE_PATH
-              value: "/var/cache/biei/maplibre-ambient-cache.sqlite"
             - name: RUST_LOG
               value: "info"
           readinessProbe:
@@ -95,23 +95,30 @@ spec:
               path: /readyz
               port: http
             initialDelaySeconds: 3
-            periodSeconds: 5
+            periodSeconds: 2
+            failureThreshold: 1
           livenessProbe:
             httpGet:
               path: /livez
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
+            # Active FileSource retry sequences keep /livez healthy. Three
+            # failures therefore mean renderer capacity is unavailable without
+            # current provider-failure evidence and autonomous repair did not
+            # restore it during the probe window.
+            failureThreshold: 3
           lifecycle:
             preStop:
               exec:
                 command: ["/bin/sh", "-c", "sleep 10"]
           resources:
+            # cpu request == BIEI_CORES (2)
             requests:
-              cpu: "500m"
+              cpu: "2"
               memory: "512Mi"
             limits:
-              cpu: "2"
+              cpu: "4"
               memory: "2Gi"
           securityContext:
             allowPrivilegeEscalation: false

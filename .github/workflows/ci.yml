@@ -21,6 +21,23 @@ env:
   MLN_PRECOMPILE: "1"
 
 jobs:
+  security:
+    name: RustSec dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Audit Cargo.lock
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   rust:
     name: Rust workspace
     runs-on: ubuntu-24.04
@@ -67,10 +84,74 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --locked --features biei/gl-opengl
 
+      # The precompiled mbgl archive can build and link successfully while
+      # still being incompatible with the runner userspace at render time.
+      # Exercise the real native/EGL path with a local resource-free style.
+      - name: Smoke native MapLibre rendering
+        run: |
+          cargo run --locked -p biei --example maplibre_smoke \
+            --features biei/gl-opengl -- \
+            --style-url .github/fixtures/empty-style.json \
+            --scale 1x --output /tmp/biei-native-smoke.png
+          test -s /tmp/biei-native-smoke.png
+          cargo run --locked -p biei --example maplibre_smoke \
+            --features biei/gl-opengl -- \
+            --style-url .github/fixtures/empty-style.json \
+            --scale 1x --output /tmp/biei-native-smoke.webp
+          test -s /tmp/biei-native-smoke.webp
+
       - name: Lint workspace
         run: >-
           cargo clippy --workspace --all-targets --locked
           --features biei/gl-opengl -- -D warnings
+
+  container-smoke:
+    name: Production container native smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build production image
+        run: docker build -f demo-deploy/Dockerfile -t biei-ci:smoke .
+
+      - name: Render PNG and WebP inside the production image
+        run: |
+          set -euo pipefail
+          python3 -m http.server 18081 --bind 127.0.0.1 \
+            --directory .github/fixtures >/tmp/biei-fixture-server.log 2>&1 &
+          fixture_pid=$!
+          container_id="$(docker run -d --network host --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --tmpfs /var/cache/biei:rw,noexec,nosuid,size=64m \
+            -e BIEI_HTTP_BIND=127.0.0.1:18080 \
+            -e 'BIEI_STYLE_TEMPLATES=smoke=http://127.0.0.1:18081/{style_id}.json' \
+            -e BIEI_MLN_RESOURCE_PRIVATE_HOSTS=127.0.0.1 \
+            biei-ci:smoke)"
+          cleanup() {
+            docker logs "$container_id" || true
+            docker rm -f "$container_id" >/dev/null 2>&1 || true
+            kill "$fixture_pid" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          for _ in $(seq 1 30); do
+            if curl --fail --silent --max-time 1 http://127.0.0.1:18080/readyz >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl --fail --silent --show-error --max-time 30 \
+            'http://127.0.0.1:18080/smoke/empty-style/static/0,0,1/64x64.png' \
+            --output /tmp/biei-container-smoke.png
+          curl --fail --silent --show-error --max-time 30 \
+            'http://127.0.0.1:18080/smoke/empty-style/static/0,0,1/64x64.webp' \
+            --output /tmp/biei-container-smoke.webp
+          test "$(od -An -tx1 -N8 /tmp/biei-container-smoke.png | tr -d ' \n')" = 89504e470d0a1a0a
+          test "$(od -An -tx1 -N4 /tmp/biei-container-smoke.webp | tr -d ' \n')" = 52494646
+          test "$(dd if=/tmp/biei-container-smoke.webp bs=1 skip=8 count=4 status=none | od -An -tx1 | tr -d ' \n')" = 57454250
+          file /tmp/biei-container-smoke.png | grep -F '64 x 64'
 
   manifests:
     name: Deployment manifests
@@ -86,8 +167,11 @@ jobs:
         with:
           version: v1.32.0
 
+      - name: Install manifest assertion dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends jq ruby
+
       - name: Check shell syntax
         run: bash -n demo-deploy/check-hpa.sh demo-deploy/smoke.sh scripts/dev-cluster.sh
 
-      - name: Check portable HPA overlay
+      - name: Check deployment overlay invariants
         run: bash demo-deploy/check-hpa.sh

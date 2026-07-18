@@ -90,7 +90,13 @@ impl StubRenderer {
         first_render: bool,
     ) -> (std::time::Duration, std::time::Duration) {
         let mut rng = self.rng.lock().expect("renderer rng mutex poisoned");
-        let sampled_cpu = self.render_cpu_cost.sample(&mut *rng);
+        let sampled_cpu = task
+            .and_then(|task| {
+                self.calibration
+                    .as_ref()
+                    .and_then(|model| model.sample_render_cpu(task, &mut *rng))
+            })
+            .unwrap_or_else(|| self.render_cpu_cost.sample(&mut *rng));
         let empirical_total = task.and_then(|task| {
             self.calibration
                 .as_ref()

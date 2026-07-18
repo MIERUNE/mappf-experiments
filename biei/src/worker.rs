@@ -12,6 +12,9 @@ use crate::types::{
     RenderObservation, RenderRequest, RendererError, RouteTier, SourceHash, TaskOutcome,
     TaskResult, WorkerId, WorkerProfile,
 };
+use crate::worker_pool::WorkerCompletion;
+
+const RENDERER_REPAIR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Debug)]
 pub enum WorkerCmd {
@@ -21,6 +24,7 @@ pub enum WorkerCmd {
         route_tier: RouteTier,
         admitted_at_overflow: bool,
         respond_to: oneshot::Sender<TaskOutcome>,
+        completion: WorkerCompletion,
     },
 }
 
@@ -98,7 +102,22 @@ pub async fn worker_loop(
     let mut current_profile: Option<WorkerProfile> = None;
     let mut cache = SourceCache::new(source_cache_capacity);
 
-    while let Some(cmd) = rx.recv().await {
+    let mut repair_tick = tokio::time::interval(RENDERER_REPAIR_INTERVAL);
+    repair_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        let cmd = tokio::select! {
+            cmd = rx.recv() => match cmd {
+                Some(cmd) => cmd,
+                None => break,
+            },
+            _ = repair_tick.tick() => {
+                if let Err(error) = renderer.repair_if_needed() {
+                    tracing::debug!(worker_id = id, %error, "renderer actor is not repairable yet");
+                }
+                continue;
+            }
+        };
         match cmd {
             WorkerCmd::Process {
                 task,
@@ -106,6 +125,7 @@ pub async fn worker_loop(
                 route_tier,
                 admitted_at_overflow,
                 respond_to,
+                completion,
             } => {
                 let had_source = task.has_source();
                 let outcome = match run_stages(
@@ -166,6 +186,10 @@ pub async fn worker_loop(
                         failed_outcome(task, had_source, RendererError::ActorDead)
                     }
                 };
+                // Finalize shared warm-state and queue accounting even when
+                // the request future (and therefore the response receiver)
+                // was dropped after dispatch.
+                completion.finish(&outcome);
                 let _ = respond_to.send(outcome);
             }
         }

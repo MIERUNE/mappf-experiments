@@ -181,7 +181,10 @@ fn spawn_node_with_backends(
         internal_forward_concurrency_limit(renderer_slots, queue_limits.hard);
     let render_permits = cluster.resolved_render_permits_per_node();
     let cpu_render_permits = cluster.resolved_cpu_render_permits_per_node();
-    let renderer_supervisor = RendererActorSupervisor::new(renderer_slots);
+    let renderer_supervisor = RendererActorSupervisor::with_provider_health(
+        renderer_slots,
+        crate::renderer::file_source::provider_health(),
+    );
 
     let renderers: Vec<BoxRenderer> = (0..renderer_slots)
         .map(|worker_id| {
@@ -198,7 +201,8 @@ fn spawn_node_with_backends(
     let profile_preparer = Arc::new(MapLibreProfilePreparer::new(
         style_catalog.clone(),
         render_permits,
-    ));
+        options.mln_resource_private_hosts.clone(),
+    )?);
 
     let activity = Arc::new(ProfileActivityTracker::new());
 
@@ -227,6 +231,11 @@ fn spawn_node_with_backends(
         render_output_cache_capacity_bytes: cluster.render_output_cache_capacity_bytes,
         dispatcher_seed: 0,
     });
+    // Install the production health probe before the first publisher interval
+    // can advertise this node. HTTP entry points repeat this defensively for
+    // direct test construction; the node's OnceLock keeps one shared probe.
+    let supervisor = renderer_supervisor.clone();
+    node.set_render_admission_probe(Arc::new(move || supervisor.can_start_render()));
 
     Ok(Runtime {
         node,

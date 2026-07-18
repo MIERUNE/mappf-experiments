@@ -43,6 +43,10 @@ pub fn shutdown_channel() -> (watch::Sender<bool>, ShutdownSignal) {
 }
 
 impl ShutdownSignal {
+    pub(crate) fn is_triggered(&self) -> bool {
+        *self.rx.borrow()
+    }
+
     async fn wait(mut self) {
         if *self.rx.borrow() {
             return;
@@ -119,6 +123,7 @@ impl HttpMetrics {
             renderer_total: renderer.total_slots as i64,
             renderer_available: renderer.available_slots as i64,
             renderer_orphaned: renderer.orphaned_threads as i64,
+            renderer_health: renderer.health.as_str(),
             renderer_replacements_succeeded: renderer.replacements_succeeded,
             renderer_replacements_exhausted: renderer.replacements_exhausted,
             renderer_replacements_failed: renderer.replacements_failed,
@@ -345,12 +350,9 @@ fn healthz(method: &Method, state: &HttpServerState) -> Response {
     if method != Method::GET {
         return simple_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
-    // Liveness is stricter than readiness: fail only when full in-process
-    // recovery is impossible (some slot unavailable AND the orphan budget
-    // exhausted — wedged Still renders cannot be cancelled), so the
-    // orchestrator restores capacity per production-spec §8.2. Mere saturation
-    // (`!is_ready`) only drops readiness; restarting a self-healing node would
-    // discard warm state.
+    // Provider-correlated loss stays live because restart would discard its
+    // warm cache without fixing the provider. Internal unrecoverable loss fails
+    // liveness after the worker's autonomous repair path had a chance to run.
     if state
         .renderer_supervisor
         .as_ref()
@@ -614,8 +616,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn renderer_health_gates_readiness_before_liveness() {
-        let supervisor = crate::renderer::actor::RendererActorSupervisor::new(1);
+    async fn renderer_unavailability_gates_readiness_and_liveness() {
+        let supervisor = crate::renderer::actor::RendererActorSupervisor::new(2);
         let mut slot_available = true;
         supervisor.set_slot_available(&mut slot_available, false);
         let state = HttpServerState {
@@ -627,9 +629,10 @@ mod tests {
             renderer_supervisor: Some(supervisor.clone()),
         };
 
-        // Saturated but recoverable (orphan budget not exhausted): drop out of
-        // the LB via readiness, but do NOT ask the orchestrator to restart —
-        // a completing orphan or replacement can still heal in-process.
+        // `slot_available=false` is set only after replacement was refused or
+        // failed. Even with another healthy slot, readiness drains traffic
+        // immediately; the much slower liveness threshold may later restart
+        // the permanently reduced process.
         let ready = handle(
             State(state.clone()),
             Method::GET,
@@ -645,12 +648,48 @@ mod tests {
             Request::builder().body(Body::empty()).unwrap(),
         )
         .await;
-        assert_eq!(live.status(), StatusCode::OK, "/livez while recoverable");
+        assert_eq!(
+            live.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "/livez once a renderer slot cannot be replaced"
+        );
+    }
 
-        // Orphan budget exhausted on top: wedged Still renders cannot be
-        // cancelled and no replacement can spawn — only a process restart
-        // recovers, so liveness must fail too (production-spec §8.2).
-        supervisor.exhaust_orphan_budget_for_test();
+    #[tokio::test]
+    async fn active_provider_retry_keeps_degraded_cache_endpoint_ready_and_live() {
+        let provider = crate::renderer::file_source::ProviderHealthTracker::new();
+        let supervisor = crate::renderer::actor::RendererActorSupervisor::with_provider_health(
+            2,
+            provider.clone(),
+        );
+        let mut slot_available = true;
+        supervisor.set_slot_available(&mut slot_available, false);
+        let retry = provider.begin_retry();
+        let state = HttpServerState {
+            ingress: None,
+            drain: None,
+            membership: None,
+            internal_forward: None,
+            metrics: None,
+            renderer_supervisor: Some(supervisor.clone()),
+        };
+
+        for path in ["/readyz", "/livez"] {
+            let response = handle(
+                State(state.clone()),
+                Method::GET,
+                path.parse().unwrap(),
+                Request::builder().body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+        assert!(
+            supervisor.can_start_render(),
+            "readiness preserves cache reachability, and the remaining healthy slot still renders while externally degraded"
+        );
+
+        drop(retry);
         let live = handle(
             State(state),
             Method::GET,
@@ -658,11 +697,7 @@ mod tests {
             Request::builder().body(Body::empty()).unwrap(),
         )
         .await;
-        assert_eq!(
-            live.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "/livez once unrecoverable"
-        );
+        assert_eq!(live.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -763,6 +798,7 @@ mod tests {
         assert!(body.contains("biei_drain_state"));
         assert!(body.contains("biei_renderer_slots"));
         assert!(body.contains("biei_renderer_orphan_threads"));
+        assert!(body.contains("biei_renderer_health"));
         assert!(body.contains("biei_renderer_replacements_total"));
         assert!(body.contains("# TYPE biei_tasks_completed_total counter"));
         assert!(body.contains(r#"scope="ingress"} 0"#));

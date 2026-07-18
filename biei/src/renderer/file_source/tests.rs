@@ -31,6 +31,16 @@ fn body_permit_wait_and_inflight_metrics_are_registered() {
             .iter()
             .any(|name| name == "biei_mln_resource_bodies_inflight")
     );
+    assert!(
+        names
+            .iter()
+            .any(|name| name == "biei_mln_resource_retry_sequences_inflight")
+    );
+    assert!(
+        names
+            .iter()
+            .any(|name| name == "biei_mln_resource_slow_attempts_inflight")
+    );
     drop(guard);
 }
 
@@ -69,12 +79,82 @@ async fn network_attempt_budget_excludes_admission_wait() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn provider_evidence_and_duration_count_only_network_pending_time() {
+    let health = ProviderHealthTracker::new();
+    let mut observation = NetworkIoObservation::without_metrics(&health, true);
+    let mut budget = NetworkAttemptBudget::new();
+    observation
+        .run(
+            &mut budget,
+            tokio::time::sleep(SLOW_PROVIDER_ATTEMPT_THRESHOLD / 2),
+        )
+        .await
+        .expect("fast network operation");
+    assert!(!health.has_external_evidence());
+
+    // This represents a saturated response-body semaphore. It must affect the
+    // dedicated body-wait metric, not upstream duration or provider health.
+    tokio::time::sleep(SLOW_PROVIDER_ATTEMPT_THRESHOLD * 10).await;
+    assert!(!health.has_external_evidence());
+    assert_eq!(observation.elapsed(), SLOW_PROVIDER_ATTEMPT_THRESHOLD / 2);
+    observation
+        .run(
+            &mut budget,
+            tokio::time::sleep(SLOW_PROVIDER_ATTEMPT_THRESHOLD * 3 / 4),
+        )
+        .await
+        .expect("cumulatively slow network operation");
+    assert!(
+        !health.has_external_evidence(),
+        "provisional evidence must end when network polling ends"
+    );
+    tokio::time::sleep(SLOW_PROVIDER_ATTEMPT_THRESHOLD * 2).await;
+    assert!(
+        !health.has_external_evidence(),
+        "local work after a slow network operation must not inherit provider evidence"
+    );
+
+    let slow = tokio::spawn({
+        let health = health.clone();
+        async move {
+            let mut observation = NetworkIoObservation::without_metrics(&health, true);
+            let mut budget = NetworkAttemptBudget::new();
+            observation
+                .run(
+                    &mut budget,
+                    tokio::time::sleep(SLOW_PROVIDER_ATTEMPT_THRESHOLD * 10),
+                )
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(SLOW_PROVIDER_ATTEMPT_THRESHOLD - Duration::from_millis(1)).await;
+    assert!(!health.has_external_evidence());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert!(health.has_external_evidence());
+
+    slow.abort();
+    let _ = slow.await;
+    assert!(
+        !health.has_external_evidence(),
+        "cancelling the fetch must release provisional evidence"
+    );
+}
+
 #[test]
 fn request_metadata_uses_bounded_native_labels() {
     assert_eq!(priority_label(Priority::Regular), "regular");
     assert_eq!(priority_label(Priority::Low), "low");
     assert_eq!(usage_label(Usage::Online), "online");
     assert_eq!(usage_label(Usage::Offline), "offline");
+}
+
+#[test]
+fn background_refresh_retry_is_not_render_failure_evidence() {
+    assert!(tracks_provider_health(Priority::Regular));
+    assert!(!tracks_provider_health(Priority::Low));
 }
 
 #[test]
@@ -331,7 +411,14 @@ fn replacement_response_does_not_inherit_old_validators_or_freshness() {
     assert_eq!(response.data.as_deref(), Some(b"replacement".as_slice()));
     assert_eq!(response.etag, None);
     assert_eq!(response.modified, None);
-    assert_eq!(response.expires, None);
+    // The replacement carries no explicit freshness, so it gets bounded
+    // heuristic freshness rather than inheriting the prior entry's hour-long
+    // expiry (and rather than being cached forever).
+    let expires = response.expires.expect("bounded heuristic freshness");
+    assert!(
+        expires < old_expiry,
+        "replacement must not inherit the prior's longer freshness"
+    );
 }
 
 #[test]
@@ -429,7 +516,14 @@ fn extreme_cache_durations_do_not_panic_or_overflow() {
         HeaderValue::from_static("max-age=18446744073709551615"),
     );
     let response = map_response(200, &headers, b"data", ResourceKind::Tile);
-    assert_eq!(response.expires, None);
+    // An un-representable max-age cannot produce an absolute expiry; it must not
+    // panic or overflow, and now degrades to bounded heuristic freshness rather
+    // than being treated as fresh forever.
+    let now = SystemTime::now();
+    let expires = response
+        .expires
+        .expect("bounded heuristic expiry, no overflow");
+    assert!(expires > now && expires <= now + Duration::from_secs(3600));
 
     assert_eq!(parse_retry_after("18446744073709551615".to_string()), None);
 }

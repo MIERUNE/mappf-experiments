@@ -1,15 +1,10 @@
 # Distributed Map Renderer: Production Specification
 
 This document records the production-specific contracts and design decisions for
-biei. Read it together with `simulator-spec.md`. The simulator specification is
-the source of truth for routing, bounded loads, HRW, and worker-pool behavior;
-this document owns shared wire semantics and production concerns such as HTTP,
+biei, including routing, bounded loads, HRW, worker-pool behavior, HTTP,
 membership, MapLibre Native integration, resource loading, and operations.
-
-The current workspace contains two crates:
-
-- `biei`: the production library and server.
-- `biei-sim`: a downstream simulator that implements biei's public traits.
+Simulator commands, models, calibration workflows, experiments, and reports are
+documented only in [`../biei-sim/README.md`](../biei-sim/README.md).
 
 Tile rendering, static center/bounds/auto rendering, overlays, `addlayer`, HTTP
 forwarding, chitchat membership, Rust-backed Network and Database FileSources,
@@ -27,10 +22,10 @@ the document falls behind.
 
 ### Goals
 
-- Run the routing, bounded-load, and worker-pool algorithms validated by the
-  simulator with real MapLibre Native rendering and real network forwarding.
-- Keep dispatcher, worker pool, HRW, domain types, and trait contracts shared
-  between production and simulation.
+- Run the routing, bounded-load, and worker-pool algorithms with real MapLibre
+  Native rendering and real network forwarding.
+- Keep dispatcher, worker pool, HRW, domain types, and trait contracts in the
+  production crate.
 - Expose a static-image-style HTTP API and a rasterized tile API.
 - Support both a single-node server and an explicitly enabled distributed
   cluster.
@@ -49,13 +44,13 @@ the document falls behind.
 
 `Renderer`, `GossipBus`, and `Transport` are the replacement boundaries.
 `Dispatcher`, `WorkerPool`, `Node`, HRW, and shared types are production code in
-the `biei` crate and are consumed directly by `biei-sim`.
+the `biei` crate.
 
-| Boundary | Simulator | Production |
-|---|---|---|
-| renderer | sleep-based stub | MapLibre actor on a dedicated OS thread |
-| gossip | in-process chitchat harness | chitchat membership adapter |
-| transport | in-process channel with simulated latency | internal HTTP forwarding |
+| Boundary | Production implementation |
+|---|---|
+| renderer | MapLibre actor on a dedicated OS thread |
+| gossip | chitchat membership adapter |
+| transport | internal HTTP forwarding |
 
 The old `production`/`sim` feature split and the value-level `Mode` enum are not
 part of the design. Cluster mode is a runtime decision made with `--cluster`.
@@ -108,7 +103,6 @@ Primary checks:
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --tests
-cargo run -p biei-sim
 ```
 
 ## 3. Repository Layout
@@ -121,8 +115,7 @@ used only where a boundary has grown enough to benefit from them.
 biei/
 |-- Cargo.toml
 |-- spec/
-|   |-- production-spec.md
-|   `-- simulator-spec.md
+|   `-- production-spec.md
 |-- issues/
 |   `-- mln-rs-wishlist.md
 |-- biei/
@@ -137,8 +130,6 @@ biei/
 |       |-- style_catalog.rs
 |       |-- http/                   # public and internal HTTP boundaries
 |       `-- renderer/               # actor, overlays, and FileSources
-`-- biei-sim/
-    `-- src/                         # simulator-only adapters and workloads
 ```
 
 ## 4. Domain Contracts
@@ -161,10 +152,14 @@ is the node-to-node representation and must never carry a process-local clock.
 | budget | `arrived_at` and `deadline` | `remaining_budget_ms` |
 | forwarding | `forwarding_hops` | `forwarding_hops` |
 
-The sender encodes only the remaining budget; the receiver creates a new local
-deadline from its own clock. The sender subtracts the configured hop-latency
-estimate before serialization so forwarding does not recreate a full budget.
-This is an estimate, not a synchronized cross-process timestamp.
+The sender encodes only relative budgets; the receiver creates a new local
+deadline from its own clock. `WireTask.remaining_budget_ms` reserves the
+estimated outbound and return hops and bounds remote execution. The surrounding
+`ForwardRequest.origin_response_budget_ms` separately bounds the sender's full
+peer transaction — address resolution plus HTTP connect/response/body — against
+its original deadline; reusing the smaller remote budget here
+would make the origin abandon a response before the remote deadline. These are
+estimates, not synchronized cross-process timestamps.
 
 ### 4.2 Style identity and worker profiles
 
@@ -226,8 +221,7 @@ the object-safety and ownership design changes.
 ## 6. Entry Points
 
 `biei/src/main.rs` runs the production server through the library entry point.
-`biei-sim/src/main.rs` runs the simulator. Each crate has one normal Cargo
-binary; there is no conditional dual-entry main.
+There is no conditional dual-entry main.
 
 ## 7. HTTP Ingress
 
@@ -426,9 +420,54 @@ Native rendering cannot be cancelled. When a reply exceeds its deadline, biei
 queues `Retire` to the old actor, detaches it as a bounded orphan, and starts a
 replacement immediately. If the old render returns, it observes `Retire` and
 exits. Orphan count is bounded by renderer-slot count. If the orphan budget is
-exhausted and any slot becomes unavailable, liveness fails so the process is
-restarted instead of remaining permanently at reduced capacity. Ordinary
-saturation and recoverable orphaning do not fail liveness.
+exhausted for a worker, or spawning its replacement fails, that slot becomes
+unavailable. Every idle worker runs a one-second repair tick, so a finished
+retiring actor is joined and replaced without requiring another admitted task.
+Repeated repair attempts do not repeatedly increment replacement-exhaustion
+accounting.
+
+Renderer health has three states:
+
+- `full`: every configured slot is available;
+- `external_degraded`: capacity is missing while a regular-priority Rust
+  FileSource request shows external evidence — either an active transient-failure
+  retry, or an upstream attempt that has stayed in network I/O past a short
+  threshold (a render can time out and cost its slot before its first HTTP
+  attempt fails, so requiring retry evidence would briefly and wrongly look
+  internal; the threshold keeps fast, healthy traffic from counting);
+- `internal_unrecoverable`: capacity is missing without any such external
+  evidence.
+
+A retry guard covers attempts and backoff and is released on success, final
+failure, or cancellation; the slow-attempt guard is promoted only after
+admission plus the network threshold and hands off to the retry guard.
+Low-priority background refreshes do not count as render-failure evidence. The
+evidence signal is process-global and cannot be proven to be the cause of a
+specific lost slot (mbgl's `FileSource` carries no requester identity), but
+elapsed time is deliberately *not* used to reclassify the loss: restarting
+cannot repair a provider outage and would discard warm cache, so
+`external_degraded` is not time-bounded and remains ready and live. The
+slow-attempt threshold — evidence only after real network delay — is instead
+what keeps normal fast traffic from masking an internal renderer loss.
+Render admission is per-slot, not whole-pod: `can_start_render` is true whenever
+at least one slot is available, so a single lost slot never stops the remaining
+healthy slots (including renders that only touch already-cached resources).
+A genuine systemic outage still self-limits — cold renders wedge their slots
+until the per-worker orphan budget is exhausted and admission finally closes.
+The cache-hit path runs first; a public miss may be dispatched to a healthy peer
+and its result cached locally, while a forwarded-destination miss requires an
+available local slot and is shed retryably otherwise.
+Admission is checked again immediately before worker/native dispatch because
+renderer health can change while a forwarded body is buffered, the cluster
+view is loaded, or profile I/O runs. A local route that loses admission at this
+last boundary uses its remaining peer candidates when available. After remote
+candidates are exhausted — whether they rejected retryably or all failed at the
+transport — a healthy local renderer is used for overflow (gated on render
+admission first, so a degraded renderer does no wasted profile I/O).
+`internal_unrecoverable` fails readiness and liveness; autonomous repair gets
+the ordinary Kubernetes probe grace before restart. This is direct runtime
+evidence, not inference from scraped Prometheus rates. Ordinary saturation and
+successfully replaced orphaning remain `full`.
 
 A native segfault still kills the process. Version 1 relies on pod/process
 restart and cluster failover. Subprocess isolation is a possible future design,
@@ -479,6 +518,13 @@ Network behavior:
 - A 304 without new freshness metadata reuses `no-cache` semantics when
   required; otherwise it receives a short bounded freshness window to avoid a
   revalidation request on every lookup.
+- A cacheable 2xx with no explicit expiry (no `max-age`/`s-maxage`, no
+  `Expires`, no inherited freshness) receives RFC 9111 §4.2.2 heuristic
+  freshness — a fraction of the time since `Last-Modified`, clamped to a bounded
+  window, or a short default when there is no `Last-Modified`. It is never
+  treated as fresh forever, so a resource with no cache headers is revalidated
+  (strictly, before being served) instead of being reused on every render and
+  baked into the render-output cache indefinitely.
 - Short retry/backoff for transport errors, 429, and 5xx.
 - Bounded 404/410 negative cache. Its lifetime honors `s-maxage`, `max-age`,
   `Age`, `Date`, and `Expires`, capped at 15 seconds; `no-cache`, zero
@@ -580,8 +626,9 @@ Forwarding rules:
 - The current maximum is one forwarding hop.
 - Retry transport failures and retryable remote rejections such as queue full,
   no capacity, or drain too slow.
-- When the first HRW candidate is local, retain the remaining remote candidates
-  and try them if local admission races with stale queue state.
+- Warm-tracking and HRW routes retain a bounded remote fallback behind a local
+  primary and use it when local admission races with stale queue or renderer
+  health state.
 - Do not retry deadline exhaustion, invalid input, unknown style, or hop-limit
   errors.
 - Stop when the caller's original budget is exhausted.
@@ -595,7 +642,19 @@ POST /_internal/forward
 ```
 
 The JSON request contains `ForwardRequest { task: WireTask, route_tier,
-drain_worker }`. `X-Request-Id` is propagated and returned.
+drain_worker, origin_response_budget_ms }`. `X-Request-Id` is propagated and
+returned. The origin rejects a response unless its task id, request id, style id,
+and source-presence bit match the request; mismatched image bytes are never
+returned or inserted into the render cache. Peer HTTP uses a direct client and
+does not inherit environment proxy settings; internal payloads must remain
+inside the cluster trust boundary. Kubernetes readiness does not gate this
+direct gossip-address path, so `/_internal/forward` independently rejects
+an output-cache miss whenever local native admission is unavailable; exact
+hits and an already-running same-key single-flight may still complete. An
+unframed 408, 429, or
+5xx response is a retryable transport result and advances to the next bounded
+candidate; malformed success responses and non-retryable 4xx responses remain
+fatal protocol errors.
 
 The response content type is `application/x-biei-forward-response` and the body
 is framed as:
@@ -626,9 +685,14 @@ Production membership uses chitchat. It owns node identity, live/draining
 state, advertise address, worker KVs, readiness, and conversion to
 `ClusterView`.
 
-Published worker state includes profile, queue depth, and renderer shape. The
-HTTP advertise address is a single `host:port` value. Wildcard bind addresses
-must not be advertised in cluster mode.
+Published worker state includes profile, queue depth, and renderer shape. A
+node-level `renderer.accepting` key separately reports whether the process may
+start new native renders. Explicit `false` nodes remain live and addressable
+for exact output-cache hits and already selected/stale forwards, but every new
+routing tier excludes them. A missing key is treated as `true` for rolling
+compatibility with older nodes; an advertised malformed value fails closed.
+The HTTP advertise address is a single `host:port` value. Wildcard bind
+addresses must not be advertised in cluster mode.
 
 `Node` uses a short-lived `Arc<ClusterView>` snapshot cache with single-flight
 refresh and stale-while-refresh behavior. Peer advertise-address snapshots use
@@ -645,12 +709,23 @@ Cluster mode uses separate public and internal listeners:
 
 | Listener | Endpoint | Meaning |
 |---|---|---|
-| public | `/livez` | liveness; fails only when renderer capacity cannot recover in-process |
-| public | `/readyz` | readiness; false while draining, gossip-unready, or renderer-unavailable |
+| public | `/livez` | liveness; fails for renderer loss without active external-failure evidence |
+| public | `/readyz` | readiness; false while draining, internally unrecoverable, or gossip-unready during bootstrap only |
 | internal | `/_internal/healthz` | same liveness decision as `/livez` |
 | internal | `/_internal/readyz` | same readiness decision as `/readyz` |
 | internal | `/_internal/metrics` | Prometheus text exposition |
 | internal | `/_internal/forward` | peer forwarding inside the network trust boundary |
+
+`external_degraded` remains ready/live so the endpoint stays eligible for the
+cache-hit and healthy-peer-routing paths, while local native render admission
+requires an available slot (per-slot, not whole-pod `full`). The output-cache
+lookup must therefore precede that admission gate. An
+`internal_unrecoverable` renderer fails both probes. Health reachability and
+permission to create native work are deliberately separate predicates. Gossip
+also publishes the latter predicate so healthy entry nodes stop selecting a
+degraded peer after the bounded publish/view-cache convergence delay; a stale
+selection is still safe because the destination rechecks admission and returns
+a retryable capacity rejection on a cache miss.
 
 The public listener rejects `/_internal/*` and `/metrics`. In single-node mode,
 one combined listener serves the public probes and `/_internal/*`; forwarding
@@ -668,7 +743,13 @@ Startup:
 5. Become ready only after required cluster state is available.
 
 Cluster bootstrap with DNS seeds requires discovery of not-yet-ready peers;
-Kubernetes headless services should publish not-ready addresses.
+Kubernetes headless services should publish not-ready addresses. The peer
+requirement is bootstrap-only: a seeded node waits for a first peer before
+reporting gossip-ready, but once any peer has been seen (or a bootstrap grace
+elapses) it stays ready even if gossip later partitions or every peer
+disappears. Rendering and the warm cache need no quorum, so a healthy node must
+not remove itself from the Service on peer loss — that would turn a gossip
+partition or a single co-scheduled peer outage into a self-inflicted outage.
 
 Shutdown:
 
@@ -678,6 +759,10 @@ Shutdown:
    drain grace period.
    Slow internal body reads have their own timeout, and the HTTP server drops
    remaining active connections after a bounded shutdown grace.
+   The main server lifecycle also awaits the drain coordinator: a client can
+   disconnect and let hyper drop its handler while the separately spawned,
+   non-cancellable render still owns a drain permit, so listener completion
+   alone is not proof that local work finished.
 4. Let runtime ownership drop workers, membership, and actor resources as the
    server exits.
 5. Exit even if a bounded orphan native thread cannot be joined.
@@ -720,9 +805,13 @@ Metric families include:
 - deadline stage;
 - rendered-output cache outcomes and single-flight state;
 - resource FileSource requests, bytes, latency, admission/body-permit wait,
-  in-flight body work, and cache state;
+  in-flight body work, active retry sequences, promoted slow attempts, and
+  cache state. `upstream_attempt_duration` and provisional slow-attempt evidence
+  count only time while HTTP send/body-chunk futures are pending; lane admission,
+  body-permit wait, and retry backoff have separate accounting and cannot be
+  treated as provider latency;
 - queue depth, loaded workers, membership size, permit usage, drain state, and
-  actor health/replacement/orphan counts.
+  actor health state/replacement/orphan counts.
 
 Never use style id, URL, request id, or other attacker-controlled values as
 metric labels.
@@ -730,6 +819,7 @@ metric labels.
 The calibration metric families are:
 
 - `biei_render_duration_seconds{scope,render_mode,scale,format,size,state}`;
+- `biei_render_timeout_lower_bound_seconds{scope}`;
 - `biei_style_setup_duration_seconds{scope,render_mode,scale,state}`;
 - `biei_source_setup_duration_seconds{scope,render_mode,scale}`;
 - `biei_profile_prepare_duration_seconds{outcome}`.
@@ -741,35 +831,13 @@ dimensions are not labels.
 `scope=ingress` produces one sample per public request and is the calibration
 view used across a cluster. `scope=forwarded` observes execution on a receiving
 peer and must not be added to ingress samples for the same request.
+The timeout family is censored lower-bound evidence rather than a render-time
+distribution; consumers must not treat successful-render samples as an
+uncensored distribution when timeouts occurred.
 
-Production calibration uses a time-bounded Prometheus snapshot rather than a
-live dependency from the simulator. Cumulative histogram buckets are converted
-to per-bucket counts and stored with the collection window, query, deployment
-revision, architecture, and effective CPU/renderer configuration. End-to-end
-request latency is a validation target only: it already includes queueing and
-must not be reused as renderer service time, which would double-count queueing
-inside the simulator.
-
-M12a is implemented by `biei-sim calibration export`. It evaluates
-`increase(...[window])` at the explicit window end, aggregates across scrape
-targets by the bounded semantic labels above, forces `scope=ingress` for the
-render/setup families, and writes schema-v1 disjoint bucket counts. The profile
-also requires an operator-supplied deployment revision, architecture, hardware
-profile, and effective core/renderer/permit configuration. Authentication is
-accepted only from a bearer-token file and is not stored; an existing snapshot
-path is never overwritten.
-
-The M12b `--cost-profile` bridge applies the recorded core/slot/permit layout,
-derives representative global ranges for routing, and builds empirical runtime
-samplers keyed by bounded render shape and warm/cold/swap state. Sparse exact
-shapes fall back to the matching state aggregate and then the simulator
-default. Metric families are optional: each usable stage is applied
-independently and missing, sparse, or unsafe stages retain defaults with
-structured coverage and sample counts. The bounded `calibration exercise`
-command can generate representative warmup and measured windows without
-production-scale traffic. CPU/resource decomposition and production
-end-to-end validation remain pending, so neither export nor import alone
-justifies changing defaults.
+End-to-end request latency already includes queueing and must not be interpreted
+as renderer service time. Offline export and import procedures live in the
+documentation linked at the top of this specification.
 
 `RequestId` is propagated through `InternalTask`, `WireTask`, internal HTTP, and
 response headers. Tracing spans include it as a structured field, allowing
@@ -785,6 +853,7 @@ optional future export path.
 - explicit `--cluster` intent and gossip seeds;
 - style and tileset URL templates/catalog entries;
 - end-to-end SLA budget (five seconds by default);
+- bounded hard queue multiplier over the fixed one-task-per-slot soft limit;
 - core count, which conservatively derives one execution and one native-render
   residency permit per core until a calibrated deployment profile justifies
   oversubscription;
@@ -798,8 +867,8 @@ optional future export path.
 
 Hidden `--debug-renderer-slots`, `--debug-render-permits`,
 `--debug-cpu-render-permits`, and `--mln-regular-permits` overrides exist for
-experiments. Queue multipliers, drain grace, HTTP shutdown grace, retry policy,
-and the low-priority FileSource lane are code-owned constants. A hidden
+experiments. Drain grace, HTTP shutdown grace, retry policy, and the
+low-priority FileSource lane are code-owned constants. A hidden
 `--disable-mln-file-sources` escape hatch exists for comparison and recovery,
 not as a normal deployment mode.
 
@@ -813,10 +882,9 @@ Keep retry micro-policy and overlay layer layout in code unless operators have a
 demonstrated need to tune them. Uncalibrated execution/native-render permit
 defaults do not oversubscribe cores, and production uses a soft queue bound of
 one task per renderer slot instead of deriving BL from heuristic CPU-only
-costs. Hidden overrides exist for controlled calibration sweeps, not as sizing
-evidence.
-
-Simulator-only knobs belong in `biei-sim`, not the production CLI.
+costs. The hard queue multiplier is bounded to `1..=4`; it bridges short bursts
+but is not a substitute for render capacity. Hidden overrides exist for
+controlled measurements, not as sizing evidence.
 
 ## 14. Implementation Status
 
@@ -832,17 +900,17 @@ Simulator-only knobs belong in `biei-sim`, not the production CLI.
 | chitchat membership and HTTP forwarding | complete | wire-compatibility discipline during upgrades |
 | actor timeout replacement | complete | long-running overload soak tests |
 | Rust Network/Database FileSources | complete in-memory version | optional persistent cache only if measured useful |
-| observability | production histograms, M12a exporter, and shape-conditioned M12b importer complete | production validation, direct CPU/resource attribution, gossip-age metric, and optional OTel |
+| observability | production histograms complete | production validation, direct CPU/resource attribution, gossip-age metric, and optional OTel |
 | deployment demo | available | Helm/production policy only when needed |
 
-When a shared type or trait changes, update `biei-sim` in the same change and
-run workspace tests. Local implementation TODOs are appropriate for small,
-code-adjacent optimizations with a clear trigger. Architecture, security
-boundaries, and operational constraints belong in this document.
+When a shared type or trait changes, run workspace tests. Local implementation
+TODOs are appropriate for small, code-adjacent optimizations with a clear
+trigger. Architecture, security boundaries, and operational constraints belong
+in this document.
 
-## 15. Simulator-to-Production Transfer
+## 15. Production Sizing
 
-Carry these validated principles into production:
+Production follows these capacity-safety principles:
 
 - Bounded-load safety and queue overflow bands.
 - Proactive expansion near the bounded-load comfort threshold.
@@ -851,12 +919,11 @@ Carry these validated principles into production:
 - HRW affinity by stable profile identity.
 - One-hop forwarding.
 
-Production style reload, renderer rebuild, first-resource load, render, and
-encode timings must be measured and fed back into simulator costs. Simulator
-absolute latency values are not production sizing evidence until calibrated.
+Measure production style reload, renderer rebuild, first-resource load, render,
+encode, queue, and admission-wait timings before changing capacity defaults.
 The portable deployment example scales on standard CPU utilization only; an
-I/O-bound production deployment must add queue/admission-wait scaling because
-provider latency can grow queues while CPU remains low.
+I/O-bound deployment must add queue/admission-wait scaling because provider
+latency can grow queues while CPU remains low.
 
 ## 16. External Providers
 
@@ -869,8 +936,7 @@ Use public remote styles only for compatibility and resilience smoke tests.
 
 ## 17. Build and Packaging
 
-The workspace owns one lockfile. `biei` carries all production dependencies;
-`biei-sim` depends on `biei` and adds only simulation dependencies.
+The workspace owns one lockfile. `biei` carries all production dependencies.
 
 CI should run build, test, and clippy for the workspace. Production container
 builds must use the MapLibre Native-compatible Linux runtime and reproducible

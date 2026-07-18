@@ -51,6 +51,10 @@ impl HttpIngress {
         concurrency_limit: usize,
         renderer_supervisor: crate::renderer::actor::RendererActorSupervisor,
     ) -> Self {
+        // Teach the (shared) node when it may start a native render; it gates
+        // renders (not cache hits) inside its output-cache admission path. All
+        // node handles share one `NodeInner`, so this covers both paths.
+        node.set_render_admission_probe(renderer_supervisor.render_admission_probe());
         Self {
             node,
             catalog,
@@ -92,6 +96,9 @@ impl HttpIngress {
         &self,
         request_id: &RequestId,
     ) -> Result<(Option<OwnedSemaphorePermit>, Option<DrainPermit>), IngressResponse> {
+        // Degraded shedding is not decided here: that would drop cache hits too.
+        // The node gates it after the output-cache lookup; a miss with no usable
+        // renderer is relabeled to `renderer_degraded` in the handler below.
         let concurrency_permit = match &self.concurrency {
             Some(limit) => match limit.clone().try_acquire_owned() {
                 Ok(permit) => Some(permit),
@@ -150,7 +157,7 @@ impl HttpIngress {
         now: Instant,
     ) -> IngressResponse {
         let request_id = request_id.unwrap_or_default();
-        let _admission = match self.acquire_admission(&request_id) {
+        let admission = match self.acquire_admission(&request_id) {
             Ok(guards) => guards,
             Err(response) => return response,
         };
@@ -168,7 +175,39 @@ impl HttpIngress {
             Ok(task) => task,
             Err(err) => return response_from_ingress_error(err).with_request_id(&request_id),
         };
-        response_from_outcome(self.node.handle_incoming(task).await)
+        let node = self.node.clone();
+        match tokio::spawn(async move {
+            // Keep ingress/drain admission attached to the non-cancellable
+            // render, not to the client connection that may disappear first.
+            let _admission = admission;
+            node.handle_incoming(task).await
+        })
+        .await
+        {
+            Ok(outcome) => {
+                // Surface the node's degraded shed (a wire-safe `NoCapacity`)
+                // as the distinct `renderer_degraded` 503; a real queue-full on
+                // a renderer that can still render keeps `no_capacity`.
+                if !self.renderer_supervisor.can_start_render()
+                    && matches!(
+                        outcome.result,
+                        crate::types::TaskResult::Rejected {
+                            reason: crate::types::RejectionReason::NoCapacity
+                        }
+                    )
+                {
+                    IngressResponse::json(503, "renderer_degraded", "")
+                        .with_retry_after("2")
+                        .with_request_id(&request_id)
+                } else {
+                    response_from_outcome(outcome)
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "ingress render task terminated unexpectedly");
+                IngressResponse::json(500, "internal_error", "").with_request_id(&request_id)
+            }
+        }
     }
 }
 
@@ -346,5 +385,66 @@ mod tests {
                 .expect("json body")
                 .contains("service_draining")
         );
+    }
+
+    #[tokio::test]
+    async fn degraded_renderer_sheds_uncached_render_as_renderer_degraded() {
+        let options = crate::options::Options::try_parse_from([
+            "biei",
+            "--style-templates",
+            "https://styles.test/{style_id}/style.json",
+            "--cores",
+            "1",
+        ])
+        .expect("options parse");
+        let runtime = crate::runtime::Runtime::spawn_single_node(&options).expect("runtime");
+        let supervisor = runtime.renderer_supervisor();
+        let mut slot_available = true;
+        supervisor.set_slot_available(&mut slot_available, false);
+        let ingress = runtime.http_ingress(Duration::from_secs(2));
+
+        // A valid render path that misses the (empty) output cache: the node
+        // sheds the would-be render before starting native work, and the
+        // ingress relabels the wire-safe `NoCapacity` shed to the distinct
+        // `renderer_degraded` 503.
+        let response = ingress
+            .handle_path("/carto/0/0/0.png", Instant::now())
+            .await;
+        assert_eq!(response.status, 503);
+        assert!(
+            std::str::from_utf8(&response.body)
+                .expect("json body")
+                .contains("renderer_degraded"),
+            "uncached render on a degraded node is shed as renderer_degraded"
+        );
+    }
+
+    #[tokio::test]
+    async fn degraded_renderer_no_longer_sheds_before_path_processing() {
+        let options = crate::options::Options::try_parse_from([
+            "biei",
+            "--style-templates",
+            "https://styles.test/{style_id}/style.json",
+            "--cores",
+            "1",
+        ])
+        .expect("options parse");
+        let runtime = crate::runtime::Runtime::spawn_single_node(&options).expect("runtime");
+        let supervisor = runtime.renderer_supervisor();
+        let mut slot_available = true;
+        supervisor.set_slot_available(&mut slot_available, false);
+        let ingress = runtime.http_ingress(Duration::from_secs(2));
+
+        // The render-admission gate now runs after path parsing (so exact
+        // output-cache hits stay reachable). A malformed path therefore fails
+        // parsing with a 4xx rather than being shed with a blanket 503.
+        let response = ingress
+            .handle_path("/not/a/render/path", Instant::now())
+            .await;
+        assert_ne!(
+            response.status, 503,
+            "degraded shedding no longer precedes path processing"
+        );
+        assert!((400..500).contains(&response.status));
     }
 }

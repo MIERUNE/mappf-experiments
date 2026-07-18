@@ -15,6 +15,8 @@ use crate::types::NodeId;
 const DEFAULT_BIND: &str = "0.0.0.0:8080";
 const DEFAULT_GOSSIP_BIND: &str = "0.0.0.0:7946";
 const DEFAULT_SLA: &str = "5s";
+const DEFAULT_QUEUE_CAPACITY_MULTIPLIER: usize = 2;
+const MAX_QUEUE_CAPACITY_MULTIPLIER: usize = 4;
 const STANDBY_RATIO_NUMERATOR: usize = 5;
 const STANDBY_RATIO_DENOMINATOR: usize = 4;
 const DEFAULT_RENDER_OUTPUT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -56,6 +58,8 @@ pub struct Options {
     pub renderer_slots_per_node: usize,
     pub render_permits_per_node: usize,
     pub cpu_render_permits_per_node: usize,
+    /// Hard per-slot queue limit multiplier over the fixed soft limit.
+    pub queue_capacity_multiplier: usize,
     pub source_cache_capacity: usize,
     pub render_output_cache_capacity_bytes: u64,
     pub mln_resource_cache_capacity_bytes: u64,
@@ -118,6 +122,14 @@ struct Cli {
     debug_render_permits: Option<usize>,
     #[arg(long, hide = true)]
     debug_cpu_render_permits: Option<usize>,
+    /// Hard per-slot queue multiplier over the soft routing limit. Keep this
+    /// bounded: it absorbs short bursts but does not add render throughput.
+    #[arg(
+        long,
+        env = "BIEI_QUEUE_CAPACITY_MULTIPLIER",
+        default_value_t = DEFAULT_QUEUE_CAPACITY_MULTIPLIER
+    )]
+    queue_capacity_multiplier: usize,
     /// Per-renderer source warm-state cache capacity.
     #[arg(long, env = "BIEI_SOURCE_CACHE_CAPACITY", default_value_t = 1)]
     source_cache_capacity: usize,
@@ -179,6 +191,11 @@ impl Options {
         validate_tileset_url_template(&cli.tileset_url_template)?;
         let mln_resource_private_hosts =
             normalize_private_resource_hosts(cli.mln_resource_private_hosts)?;
+        if !(1..=MAX_QUEUE_CAPACITY_MULTIPLIER).contains(&cli.queue_capacity_multiplier) {
+            bail!(
+                "--queue-capacity-multiplier must be between 1 and {MAX_QUEUE_CAPACITY_MULTIPLIER}"
+            );
+        }
         let cores = cli.cores.unwrap_or_else(default_cores).max(1);
         let render_permits = cli
             .debug_render_permits
@@ -243,6 +260,7 @@ impl Options {
             renderer_slots_per_node: renderer_slots,
             render_permits_per_node: render_permits.min(renderer_slots),
             cpu_render_permits_per_node: cpu_render_permits.min(renderer_slots),
+            queue_capacity_multiplier: cli.queue_capacity_multiplier,
             source_cache_capacity: cli.source_cache_capacity,
             render_output_cache_capacity_bytes: cli.render_output_cache_bytes,
             mln_resource_cache_capacity_bytes: cli.mln_resource_cache_bytes,
@@ -278,7 +296,7 @@ impl Options {
             // soft queue at one task per slot. The previous Auto value used a
             // CPU-only render estimate and over-admitted I/O-bound renders.
             bl_capacity: BlCapacityPolicy::Fixed(1),
-            queue_capacity_multiplier: 2,
+            queue_capacity_multiplier: self.queue_capacity_multiplier,
             source_cache_capacity: self.source_cache_capacity,
             render_output_cache_capacity_bytes: self.render_output_cache_capacity_bytes,
         }
@@ -617,9 +635,41 @@ mod tests {
         assert_eq!(opts.render_permits_per_node, 2);
         assert_eq!(opts.cpu_render_permits_per_node, 2);
         assert_eq!(opts.renderer_slots_per_node, 3);
+        assert_eq!(opts.queue_capacity_multiplier, 2);
+        assert_eq!(opts.cluster_config().queue_capacity_multiplier, 2);
         // Floors dominate: body max(24, 4×3), regular max(64, 2×24).
         assert_eq!(opts.mln_body_permits, 24);
         assert_eq!(opts.mln_regular_permits, 64);
+    }
+
+    #[test]
+    fn queue_capacity_multiplier_is_bounded_and_forwarded_to_cluster_config() {
+        let opts = Options::try_parse_from([
+            "biei",
+            "--style-templates",
+            "http://style-api.test/styles/{style_id}/style.json",
+            "--queue-capacity-multiplier",
+            "3",
+        ])
+        .expect("bounded queue multiplier parses");
+
+        assert_eq!(opts.queue_capacity_multiplier, 3);
+        assert_eq!(opts.cluster_config().queue_capacity_multiplier, 3);
+
+        for invalid in ["0", "5"] {
+            let err = Options::try_parse_from([
+                "biei",
+                "--style-templates",
+                "http://style-api.test/styles/{style_id}/style.json",
+                "--queue-capacity-multiplier",
+                invalid,
+            ])
+            .expect_err("unbounded queue multiplier must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("--queue-capacity-multiplier must be between 1 and 4")
+            );
+        }
     }
 
     #[test]

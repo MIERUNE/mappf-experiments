@@ -1,4 +1,6 @@
-# Distributed Renderer Simulator Specification
+# biei-sim
+
+Distributed renderer simulator specification.
 
 ## 1. Overview
 
@@ -13,7 +15,8 @@ and types as a downstream crate.
 
 The production meaning of `StyleRevision`, wire types, HTTP forwarding,
 membership, MapLibre Native integration, and rendered output is defined in
-`production-spec.md`. Concrete Rust definitions are authoritative.
+[`../spec/production-spec.md`](../spec/production-spec.md). Concrete Rust
+definitions are authoritative.
 
 This is a current-state specification. Unqualified statements describe the
 current simulator; future work is confined to the milestone and future-
@@ -345,6 +348,18 @@ Reports include:
   time-weighted residency-permit capacity. Schema v3 names these fields
   `native_render_*`; they are not OS CPU utilization.
 
+Run one deterministic simulation and write both machine-readable and
+self-contained visual reports:
+
+```sh
+cargo run -p biei-sim -- run \
+  --report biei-sim-report.json \
+  --html biei-sim-report.html
+```
+
+Running `cargo run -p biei-sim` without a subcommand retains the legacy sweep
+suite.
+
 `biei-sim run --report <path>` writes a schema-versioned JSON report containing
 the complete effective simulation configuration and final result. When a churn
 plan is supplied, the report also contains observations before and after every
@@ -396,8 +411,14 @@ two-window form derives setup and warm/first-render wall distributions from the
 realistic traffic window, while the verified resource-warm reference supplies
 the representative CPU+encode service-wall proxy. The reference must contain
 non-empty upstream instrumentation, have at most 0.05 regular upstream attempts
-per warm render, and match the traffic window's deployment revision, hardware,
-architecture, core count, renderer slots, and permit layout. The single-window
+per warm render, record `capture_concurrency=1` so its wall time does not already
+contain scheduler contention, and match the traffic window's deployment
+revision, hardware, architecture, core count, renderer slots, and permit layout.
+Every sufficiently sampled traffic render shape must also have a matching warm
+reference shape. The importer samples CPU from the exact reference shape and
+reweights the routing-level global CPU range to the traffic mix; it rejects
+cross-shape subtraction instead of interpreting format/size encoding cost as
+resource I/O. The single-window
 form remains a provisional compatibility path that estimates CPU+encode from
 the fastest warm-render quantiles.
 
@@ -418,6 +439,19 @@ waits for a configurable scrape-settle interval before and after measurement,
 and prints the exact Unix start/end timestamps for `calibration export`. Any
 non-2xx response fails the exercise. It is not a general load generator and
 intentionally does not require production-scale traffic.
+
+```sh
+cargo run -p biei-sim -- calibration exercise \
+  --url 'http://localhost:8080/carto/gl/voyager-gl-style/0/0/0@2x.webp' \
+  --url 'http://localhost:8080/carto/gl/voyager-gl-style/static/139.767,35.681,11,0,0/640x360@2x.webp' \
+  --warmup-requests-per-url 2 --requests-per-url 100 --concurrency 4
+```
+
+The exercise prints the measured Unix-time window for the exporter. Its
+default 30-second settle period before and after measurement assumes a
+Prometheus scrape interval of at most 30 seconds; set
+`--scrape-settle-seconds` to the deployment's scrape interval when it is
+longer.
 
 Routing continues to use workload-weighted global `CostRange`s because the
 dispatcher needs one representative service-cost range. The stub renderer,
@@ -441,7 +475,7 @@ snapshot and never depends directly on a live Prometheus endpoint.
 Example (the URL is a Prometheus API root, not biei's raw metrics endpoint):
 
 ```sh
-biei-sim calibration export \
+cargo run -p biei-sim -- calibration export \
   --prometheus-url "$PROMETHEUS_URL" \
   --start-unix-seconds "$START" --end-unix-seconds "$END" \
   --match-label namespace=map-demo --match-label container=biei \
@@ -449,6 +483,7 @@ biei-sim calibration export \
   --architecture x86_64 --hardware-profile "$HARDWARE_PROFILE" \
   --cpu-cores-per-node 2 --renderer-slots-per-node 3 \
   --execution-permits-per-node 2 --native-render-permits-per-node 2 \
+  --capture-concurrency 4 \
   --output "$PROFILE"
 ```
 
@@ -508,6 +543,13 @@ requests selected before the event complete. Queue depth and per-node counters
 therefore remain observable during scale-down instead of disappearing at the
 event boundary.
 
+```sh
+cargo run -p biei-sim -- run \
+  --churn-plan biei-sim/examples/churn-plan.json \
+  --report churn-report.json
+cargo run -p biei-sim -- visualize churn-report.json --output churn-report.html
+```
+
 ## 11. Tokio Paused Time
 
 Tests and runs use Tokio paused time so delay-heavy scenarios finish quickly
@@ -564,15 +606,26 @@ Completed:
 - Resource-warm capture verification: warm render walls approximate CPU
   service only when the capture window was resource-cache-warm. The profile
   carries in-render upstream fetch activity over the same window; the import
-  fails when render-blocking fetches exceed one per two renders, and reports
-  the verified ratio otherwise. `state="warm"` alone means style-warm, not
-  resource-warm.
+  rejects that render stage when the upstream family is missing or empty,
+  fails it when render-blocking fetches exceed one per two renders, and reports
+  the verified ratio otherwise. Other independently measured stages remain
+  usable. `state="warm"` alone means style-warm, not resource-warm.
 - Two-window fusion (`--cpu-profile` + `--cost-profile`): a verified
   resource-warm reference window supplies a CPU+encode service-wall proxy and a
   realistic-traffic window supplies the walls that become resource waits.
-  Both windows must come from the same deployment revision, hardware, and node
-  shape. This remains an approximation without per-render fetch attribution or
-  renderer-thread CPU time, which the current production metrics do not expose.
+  The CPU reference must record capture concurrency one; concurrent reference
+  walls are rejected because replaying them under the simulator core semaphore
+  would count CPU contention twice. Both windows must come from the same
+  deployment revision, hardware, and node shape, and the CPU reference must
+  cover every sufficiently sampled traffic render shape. Per-request CPU replay
+  uses that exact reference shape; representative routing ranges are reweighted
+  to the traffic mix. This remains an approximation
+  without per-render fetch attribution or renderer-thread CPU time, which the
+  current production metrics do not expose.
+- Calibration import rejects windows containing render timeouts because their
+  successful-render histograms are right-censored. Export also rejects `pod` or
+  `instance` matchers: ingress accounting and forwarded FileSource work must be
+  summed across the same deployment-wide pod set.
 
 Pending calibration:
 
@@ -589,29 +642,30 @@ Pending calibration:
 ```text
 biei/
 |-- spec/
-|   |-- production-spec.md
-|   `-- simulator-spec.md
+|   `-- production-spec.md
 |-- issues/
 |   `-- mln-rs-wishlist.md
 |-- biei/src/                      # shared production core and traits
-`-- biei-sim/src/
-    |-- main.rs
-    |-- lib.rs
-    |-- calibration.rs
-    |-- calibrated_costs.rs
-    |-- config.rs
-    |-- churn.rs
-    |-- harness.rs
-    |-- workload.rs
-    |-- scenarios.rs
-    |-- sweep.rs
-    |-- metrics.rs
-    |-- report.rs
-    |-- visualization.rs
-    |-- visualization.html
-    |-- stub_renderer.rs
-    |-- channel_transport.rs
-    `-- chitchat_bus.rs
+`-- biei-sim/
+    |-- README.md                   # all simulator documentation
+    `-- src/
+        |-- main.rs
+        |-- lib.rs
+        |-- calibration.rs
+        |-- calibrated_costs.rs
+        |-- config.rs
+        |-- churn.rs
+        |-- harness.rs
+        |-- workload.rs
+        |-- scenarios.rs
+        |-- sweep.rs
+        |-- metrics.rs
+        |-- report.rs
+        |-- visualization.rs
+        |-- visualization.html
+        |-- stub_renderer.rs
+        |-- channel_transport.rs
+        `-- chitchat_bus.rs
 ```
 
 The workspace root owns the lockfile and shared dependency versions.

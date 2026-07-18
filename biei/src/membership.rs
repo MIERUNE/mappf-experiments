@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -21,6 +22,7 @@ use tokio::time::Instant;
 use crate::gossip::GossipBus;
 use crate::options::Options;
 use crate::types::{ClusterView, NodeId, NodeKvs, NodeStateView};
+use crate::util::lock_unpoisoned;
 
 const CLUSTER_ID: &str = "biei-production-v1";
 const KV_NODE_ID: &str = "node-id";
@@ -28,6 +30,10 @@ const KV_ADVERTISE_ADDR: &str = "advertise-addr";
 const KV_DRAINING: &str = "draining";
 const MARKED_FOR_DELETION_GRACE_PERIOD: Duration = Duration::from_secs(300);
 const PEER_ADDRESS_CACHE_TTL: Duration = Duration::from_millis(100);
+/// How long a seeded node waits to discover a peer before reporting
+/// gossip-ready anyway. Peer presence is a bootstrap check, not an ongoing
+/// quorum — rendering needs no peers.
+const GOSSIP_BOOTSTRAP_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct Membership {
@@ -38,6 +44,11 @@ struct MembershipInner {
     self_node_id: NodeId,
     handle: ChitchatHandle,
     requires_peer_for_readiness: bool,
+    // Bootstrap-only peer requirement: latched true once any peer has been
+    // seen, and treated as satisfied past `bootstrap_deadline` regardless, so
+    // an established node stays ready when gossip later partitions.
+    gossip_bootstrapped: AtomicBool,
+    bootstrap_deadline: Instant,
     peer_addresses: Mutex<PeerAddressCacheState>,
     peer_addresses_changed: Notify,
 }
@@ -63,11 +74,7 @@ impl Drop for PeerAddressRefreshGuard {
         if self.completed {
             return;
         }
-        let mut state = self
-            .inner
-            .peer_addresses
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = lock_unpoisoned(&self.inner.peer_addresses);
         state.refreshing = false;
         drop(state);
         self.inner.peer_addresses_changed.notify_waiters();
@@ -128,6 +135,8 @@ impl Membership {
         Ok(Self {
             inner: Arc::new(MembershipInner {
                 self_node_id: options.node_id.clone(),
+                gossip_bootstrapped: AtomicBool::new(false),
+                bootstrap_deadline: Instant::now() + GOSSIP_BOOTSTRAP_GRACE,
                 handle,
                 requires_peer_for_readiness: !options.gossip_seeds.is_empty(),
                 peer_addresses: Mutex::new(PeerAddressCacheState::default()),
@@ -156,11 +165,7 @@ impl Membership {
         loop {
             let notified = self.inner.peer_addresses_changed.notified();
             let lookup = {
-                let mut state = self
-                    .inner
-                    .peer_addresses
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut state = lock_unpoisoned(&self.inner.peer_addresses);
                 match state.snapshot.as_ref() {
                     Some(snapshot) if snapshot.expires_at > Instant::now() => {
                         Lookup::Return(snapshot.addresses.get(node_id).copied())
@@ -192,11 +197,7 @@ impl Membership {
                     };
                     let addresses = self.load_peer_addresses().await;
                     let address = addresses.get(node_id).copied();
-                    let mut state = self
-                        .inner
-                        .peer_addresses
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let mut state = lock_unpoisoned(&self.inner.peer_addresses);
                     state.snapshot = Some(CachedPeerAddresses {
                         expires_at: Instant::now() + PEER_ADDRESS_CACHE_TTL,
                         addresses,
@@ -232,13 +233,28 @@ impl Membership {
         if !self.inner.requires_peer_for_readiness {
             return true;
         }
-        self.inner
+        // Bootstrap-only: once a peer has been seen (latch) or the grace has
+        // elapsed, stay ready through later partitions. Only a node that never
+        // bootstrapped still waits.
+        if self.inner.gossip_bootstrapped.load(Ordering::Acquire)
+            || Instant::now() >= self.inner.bootstrap_deadline
+        {
+            return true;
+        }
+        let has_peer = self
+            .inner
             .handle
             .with_chitchat(|c| {
                 let live = live_node_ids(c);
                 has_ready_peer(&self.inner.self_node_id, c.node_states(), &live)
             })
-            .await
+            .await;
+        if has_peer {
+            self.inner
+                .gossip_bootstrapped
+                .store(true, Ordering::Release);
+        }
+        has_peer
     }
 }
 

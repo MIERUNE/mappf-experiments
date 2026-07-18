@@ -4,14 +4,14 @@
 use std::time::Duration;
 
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
-    proto::MetricFamily,
+    Encoder, HistogramVec, IntCounter, IntCounterVec, Registry, TextEncoder, proto::MetricFamily,
 };
 
 use crate::types::{
-    DeadlineStage, ImageFormat, RejectionReason, RenderMode, RenderObservation, RouteTier, Scale,
-    TaskOutcome, TaskResult,
+    DeadlineStage, FailureKind, ImageFormat, RejectionReason, RenderMode, RenderObservation,
+    RouteTier, Scale, TaskOutcome, TaskResult,
 };
+use crate::util::{counter_vec, gauge_vec, histogram_vec_buckets};
 
 type BoxedCollector = Box<dyn prometheus::core::Collector>;
 
@@ -46,6 +46,7 @@ pub struct RuntimeGauges {
     pub renderer_total: i64,
     pub renderer_available: i64,
     pub renderer_orphaned: i64,
+    pub renderer_health: &'static str,
     pub renderer_replacements_succeeded: u64,
     pub renderer_replacements_exhausted: u64,
     pub renderer_replacements_failed: u64,
@@ -103,6 +104,7 @@ pub struct NodeMetrics {
     /// Deprecated metric-name compatibility alias for native render residency.
     cpu_render_duration: HistogramVec,
     render_duration: HistogramVec,
+    render_timeout_lower_bound: HistogramVec,
     style_setup_duration: HistogramVec,
     source_setup_duration: HistogramVec,
     profile_prepare_duration: HistogramVec,
@@ -113,151 +115,119 @@ pub struct NodeMetrics {
     forwards: IntCounterVec,
     admission_overflow: IntCounterVec,
     deadline_exceeded: IntCounterVec,
+    // Would-be renders shed because the renderer cannot start native work
+    // (degraded). Recorded exactly at the shed decision — no health re-check —
+    // so it is a faithful count even though the rejection itself rides the wire
+    // as the generic `NoCapacity` reason.
+    render_admission_shed: IntCounter,
 }
 
 impl NodeMetrics {
     pub fn new() -> Self {
         let registry = Registry::new();
-        let completed = IntCounterVec::new(
-            prometheus::Opts::new(
-                "biei_tasks_completed_total",
-                "Completed tasks by ingress scope and route tier.",
-            ),
+        let completed = counter_vec(
+            "biei_tasks_completed_total",
+            "Completed tasks by ingress scope and route tier.",
             &["scope", "route_tier"],
-        )
-        .expect("valid completed counter");
-        let rejected = IntCounterVec::new(
-            prometheus::Opts::new(
-                "biei_tasks_rejected_total",
-                "Rejected tasks by ingress scope and reason.",
-            ),
+        );
+        let rejected = counter_vec(
+            "biei_tasks_rejected_total",
+            "Rejected tasks by ingress scope and reason.",
             &["scope", "reason"],
-        )
-        .expect("valid rejected counter");
-        let failed = IntCounterVec::new(
-            prometheus::Opts::new("biei_tasks_failed_total", "Failed tasks by ingress scope."),
+        );
+        let failed = counter_vec(
+            "biei_tasks_failed_total",
+            "Failed tasks by ingress scope.",
             &["scope"],
-        )
-        .expect("valid failed counter");
-        let request_duration = HistogramVec::new(
-            HistogramOpts::new(
-                "biei_request_duration_seconds",
-                "End-to-end task duration from node arrival to completion.",
-            )
-            .buckets(LATENCY_BUCKETS.to_vec()),
+        );
+        let request_duration = histogram_vec_buckets(
+            "biei_request_duration_seconds",
+            "End-to-end task duration from node arrival to completion.",
+            LATENCY_BUCKETS,
             &["scope", "route_tier"],
-        )
-        .expect("valid request duration histogram");
-        let native_render_duration = HistogramVec::new(
-            HistogramOpts::new(
-                "biei_native_render_duration_seconds",
-                "Native renderStill wall time, including in-render FileSource waits.",
-            )
-            .buckets(CPU_RENDER_BUCKETS.to_vec()),
+        );
+        let native_render_duration = histogram_vec_buckets(
+            "biei_native_render_duration_seconds",
+            "Native renderStill wall time, including in-render FileSource waits.",
+            CPU_RENDER_BUCKETS,
             &["scope"],
-        )
-        .expect("valid native render duration histogram");
-        let cpu_render_duration = HistogramVec::new(
-            HistogramOpts::new(
-                "biei_cpu_render_duration_seconds",
-                "Deprecated alias of biei_native_render_duration_seconds; includes FileSource waits and is not CPU service time.",
-            )
-            .buckets(CPU_RENDER_BUCKETS.to_vec()),
+        );
+        let cpu_render_duration = histogram_vec_buckets(
+            "biei_cpu_render_duration_seconds",
+            "Deprecated alias of biei_native_render_duration_seconds; includes FileSource waits and is not CPU service time.",
+            CPU_RENDER_BUCKETS,
             &["scope"],
-        )
-        .expect("valid cpu render duration histogram");
-        let render_duration = HistogramVec::new(
-            HistogramOpts::new(
-                "biei_render_duration_seconds",
-                "Native render and output encoding duration by bounded render shape and worker state.",
-            )
-            .buckets(CPU_RENDER_BUCKETS.to_vec()),
+        );
+        let render_duration = histogram_vec_buckets(
+            "biei_render_duration_seconds",
+            "Native render and output encoding duration by bounded render shape and worker state.",
+            CPU_RENDER_BUCKETS,
             &["scope", "render_mode", "scale", "format", "size", "state"],
-        )
-        .expect("valid detailed render duration histogram");
-        let style_setup_duration = HistogramVec::new(
-            HistogramOpts::new(
-                "biei_style_setup_duration_seconds",
-                "Worker profile/style setup duration for cold starts and style swaps.",
-            )
-            .buckets(LATENCY_BUCKETS.to_vec()),
+        );
+        let render_timeout_lower_bound = histogram_vec_buckets(
+            "biei_render_timeout_lower_bound_seconds",
+            "Elapsed request residency for render timeouts; censored lower-bound evidence, not a successful render distribution.",
+            LATENCY_BUCKETS,
+            &["scope"],
+        );
+        let style_setup_duration = histogram_vec_buckets(
+            "biei_style_setup_duration_seconds",
+            "Worker profile/style setup duration for cold starts and style swaps.",
+            LATENCY_BUCKETS,
             &["scope", "render_mode", "scale", "state"],
-        )
-        .expect("valid style setup duration histogram");
-        let source_setup_duration = HistogramVec::new(
-            HistogramOpts::new(
-                "biei_source_setup_duration_seconds",
-                "Worker source setup duration on modeled or addlayer source-cache misses.",
-            )
-            .buckets(LATENCY_BUCKETS.to_vec()),
+        );
+        let source_setup_duration = histogram_vec_buckets(
+            "biei_source_setup_duration_seconds",
+            "Worker source setup duration on modeled or addlayer source-cache misses.",
+            LATENCY_BUCKETS,
             &["scope", "render_mode", "scale"],
-        )
-        .expect("valid source setup duration histogram");
-        let profile_prepare_duration = HistogramVec::new(
-            HistogramOpts::new(
-                "biei_profile_prepare_duration_seconds",
-                "Pre-worker style and addlayer profile preparation duration.",
-            )
-            .buckets(LATENCY_BUCKETS.to_vec()),
+        );
+        let profile_prepare_duration = histogram_vec_buckets(
+            "biei_profile_prepare_duration_seconds",
+            "Pre-worker style and addlayer profile preparation duration.",
+            LATENCY_BUCKETS,
             &["outcome"],
-        )
-        .expect("valid profile preparation duration histogram");
-        let style_swaps = IntCounterVec::new(
-            prometheus::Opts::new(
-                "biei_style_swaps_total",
-                "Completed tasks that swapped style/profile.",
-            ),
+        );
+        let style_swaps = counter_vec(
+            "biei_style_swaps_total",
+            "Completed tasks that swapped style/profile.",
             &["scope"],
-        )
-        .expect("valid style swap counter");
-        let cold_starts = IntCounterVec::new(
-            prometheus::Opts::new(
-                "biei_cold_starts_total",
-                "Completed tasks that used a cold renderer slot.",
-            ),
+        );
+        let cold_starts = counter_vec(
+            "biei_cold_starts_total",
+            "Completed tasks that used a cold renderer slot.",
             &["scope"],
-        )
-        .expect("valid cold start counter");
-        let source_cache = IntCounterVec::new(
-            prometheus::Opts::new(
-                "biei_source_cache_total",
-                "Addlayer source cache hits and misses.",
-            ),
+        );
+        let source_cache = counter_vec(
+            "biei_source_cache_total",
+            "Addlayer source cache hits and misses.",
             &["outcome"],
-        )
-        .expect("valid source cache counter");
-        let render_output_cache = IntCounterVec::new(
-            prometheus::Opts::new(
-                "biei_render_output_cache_total",
-                "Rendered image cache lookups and insertions.",
-            ),
+        );
+        let render_output_cache = counter_vec(
+            "biei_render_output_cache_total",
+            "Rendered image cache lookups and insertions.",
             &["outcome"],
-        )
-        .expect("valid render output cache counter");
-        let forwards = IntCounterVec::new(
-            prometheus::Opts::new(
-                "biei_forwards_total",
-                "Internal forward attempts by outcome.",
-            ),
+        );
+        let forwards = counter_vec(
+            "biei_forwards_total",
+            "Internal forward attempts by outcome.",
             &["outcome"],
-        )
-        .expect("valid forwards counter");
-        let admission_overflow = IntCounterVec::new(
-            prometheus::Opts::new(
-                "biei_admission_overflow_total",
-                "Completed tasks admitted while the chosen worker was already at or above BL.",
-            ),
+        );
+        let admission_overflow = counter_vec(
+            "biei_admission_overflow_total",
+            "Completed tasks admitted while the chosen worker was already at or above BL.",
             &["scope"],
-        )
-        .expect("valid admission overflow counter");
-        let deadline_exceeded = IntCounterVec::new(
-            prometheus::Opts::new(
-                "biei_deadline_exceeded_total",
-                "Deadline rejections by worker stage.",
-            ),
+        );
+        let deadline_exceeded = counter_vec(
+            "biei_deadline_exceeded_total",
+            "Deadline rejections by worker stage.",
             &["stage"],
+        );
+        let render_admission_shed = IntCounter::new(
+            "biei_render_admission_shed_total",
+            "Would-be renders shed because the local renderer cannot start native work.",
         )
-        .expect("valid deadline stage counter");
+        .expect("valid render admission shed counter");
 
         register_collectors(
             &registry,
@@ -269,6 +239,7 @@ impl NodeMetrics {
                 Box::new(native_render_duration.clone()),
                 Box::new(cpu_render_duration.clone()),
                 Box::new(render_duration.clone()),
+                Box::new(render_timeout_lower_bound.clone()),
                 Box::new(style_setup_duration.clone()),
                 Box::new(source_setup_duration.clone()),
                 Box::new(profile_prepare_duration.clone()),
@@ -279,6 +250,7 @@ impl NodeMetrics {
                 Box::new(forwards.clone()),
                 Box::new(admission_overflow.clone()),
                 Box::new(deadline_exceeded.clone()),
+                Box::new(render_admission_shed.clone()),
             ],
         );
 
@@ -291,6 +263,7 @@ impl NodeMetrics {
             native_render_duration,
             cpu_render_duration,
             render_duration,
+            render_timeout_lower_bound,
             style_setup_duration,
             source_setup_duration,
             profile_prepare_duration,
@@ -301,9 +274,16 @@ impl NodeMetrics {
             forwards,
             admission_overflow,
             deadline_exceeded,
+            render_admission_shed,
         };
         metrics.init_zero_series();
         metrics
+    }
+
+    /// Count a would-be render shed because the renderer is degraded. Called at
+    /// the shed decision so the count never depends on a later health re-check.
+    pub fn record_render_admission_shed(&self) {
+        self.render_admission_shed.inc();
     }
 
     pub fn record_ingress(&self, outcome: &TaskOutcome) {
@@ -372,64 +352,51 @@ impl NodeMetrics {
     pub fn render_prometheus_with_runtime(&self, runtime: &RuntimeGauges) -> String {
         let node = runtime.node_id.as_str();
         let registry = Registry::new();
-        let queue_depth = IntGaugeVec::new(
-            Opts::new(
-                "biei_queue_depth",
-                "Current queued tasks per renderer worker.",
-            ),
+        let queue_depth = gauge_vec(
+            "biei_queue_depth",
+            "Current queued tasks per renderer worker.",
             &["node", "worker", "render_mode", "scale"],
-        )
-        .expect("valid queue gauge");
-        let worker_loaded = IntGaugeVec::new(
-            Opts::new(
-                "biei_worker_loaded",
-                "Whether a renderer worker has a loaded profile.",
-            ),
+        );
+        let worker_loaded = gauge_vec(
+            "biei_worker_loaded",
+            "Whether a renderer worker has a loaded profile.",
             &["node", "worker"],
-        )
-        .expect("valid worker-loaded gauge");
-        let membership_size = IntGaugeVec::new(
-            Opts::new("biei_membership_size", "Current membership size by state."),
+        );
+        let membership_size = gauge_vec(
+            "biei_membership_size",
+            "Current membership size by state.",
             &["node", "state"],
-        )
-        .expect("valid membership gauge");
-        let cpu_permits_inuse = IntGaugeVec::new(
-            Opts::new(
-                "biei_cpu_permits_inuse",
-                "Currently held CPU/GPU render-stage permits.",
-            ),
+        );
+        let cpu_permits_inuse = gauge_vec(
+            "biei_cpu_permits_inuse",
+            "Currently held CPU/GPU render-stage permits.",
             &["node"],
-        )
-        .expect("valid cpu permits gauge");
-        let drain_state = IntGaugeVec::new(
-            Opts::new("biei_drain_state", "Whether the node is draining."),
+        );
+        let drain_state = gauge_vec(
+            "biei_drain_state",
+            "Whether the node is draining.",
             &["node"],
-        )
-        .expect("valid drain-state gauge");
-        let renderer_slots = IntGaugeVec::new(
-            Opts::new(
-                "biei_renderer_slots",
-                "Configured and currently available renderer slots.",
-            ),
+        );
+        let renderer_slots = gauge_vec(
+            "biei_renderer_slots",
+            "Configured and currently available renderer slots.",
             &["node", "state"],
-        )
-        .expect("valid renderer-slots gauge");
-        let renderer_orphaned = IntGaugeVec::new(
-            Opts::new(
-                "biei_renderer_orphan_threads",
-                "Detached native renderer threads that have not returned.",
-            ),
+        );
+        let renderer_orphaned = gauge_vec(
+            "biei_renderer_orphan_threads",
+            "Detached native renderer threads that have not returned.",
             &["node"],
-        )
-        .expect("valid renderer-orphan gauge");
-        let renderer_replacements = IntCounterVec::new(
-            Opts::new(
-                "biei_renderer_replacements_total",
-                "Renderer actor replacement attempts by outcome.",
-            ),
+        );
+        let renderer_health = gauge_vec(
+            "biei_renderer_health",
+            "Current renderer health state (one-hot).",
+            &["node", "state"],
+        );
+        let renderer_replacements = counter_vec(
+            "biei_renderer_replacements_total",
+            "Renderer actor replacement attempts by outcome.",
             &["node", "outcome"],
-        )
-        .expect("valid renderer-replacements counter");
+        );
 
         register_collectors(
             &registry,
@@ -441,6 +408,7 @@ impl NodeMetrics {
                 Box::new(drain_state.clone()),
                 Box::new(renderer_slots.clone()),
                 Box::new(renderer_orphaned.clone()),
+                Box::new(renderer_health.clone()),
                 Box::new(renderer_replacements.clone()),
             ],
         );
@@ -471,6 +439,11 @@ impl NodeMetrics {
         renderer_orphaned
             .with_label_values(&[node])
             .set(runtime.renderer_orphaned);
+        for state in ["full", "external_degraded", "internal_unrecoverable"] {
+            renderer_health
+                .with_label_values(&[node, state])
+                .set(i64::from(state == runtime.renderer_health));
+        }
         for (outcome, value) in [
             ("success", runtime.renderer_replacements_succeeded),
             ("exhausted", runtime.renderer_replacements_exhausted),
@@ -564,8 +537,16 @@ impl NodeMetrics {
                         .inc();
                 }
             }
-            TaskResult::Failed { .. } => {
+            TaskResult::Failed { kind, .. } => {
                 self.failed.with_label_values(&[scope]).inc();
+                if *kind == FailureKind::RenderTimeout {
+                    self.render_timeout_lower_bound
+                        .with_label_values(&[scope])
+                        .observe(seconds(
+                            tokio::time::Instant::now()
+                                .saturating_duration_since(outcome.arrived_at),
+                        ));
+                }
             }
         }
     }
@@ -580,6 +561,7 @@ impl NodeMetrics {
                 .inc_by(0);
             self.native_render_duration.with_label_values(&[scope]);
             self.cpu_render_duration.with_label_values(&[scope]);
+            self.render_timeout_lower_bound.with_label_values(&[scope]);
             for tier in ROUTE_TIERS {
                 let tier = route_tier_label(tier);
                 self.completed.with_label_values(&[scope, tier]).inc_by(0);
@@ -661,7 +643,7 @@ pub const LATENCY_BUCKETS: &[f64] = &[
 
 const CPU_RENDER_BUCKETS: &[f64] = &[
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0,
-    3.0,
+    3.0, 5.0, 10.0,
 ];
 
 const DEADLINE_STAGES: [DeadlineStage; 5] = [
@@ -785,6 +767,27 @@ mod tests {
         assert!(rendered.contains(
             "biei_render_duration_seconds_count{format=\"webp\",render_mode=\"static\",scale=\"2x\",scope=\"forwarded\",size=\"le_1024px\",state=\"warm\"} 1"
         ));
+    }
+
+    #[test]
+    fn render_timeout_is_exported_as_censored_tail_evidence() {
+        let metrics = NodeMetrics::default();
+        metrics.record_ingress(&TaskOutcome {
+            task_id: 7,
+            request_id: RequestId::from_string("timeout-metrics-test"),
+            arrived_at: Instant::now() - Duration::from_secs(5),
+            had_source: false,
+            deadline_stage: None,
+            result: TaskResult::Failed {
+                kind: FailureKind::RenderTimeout,
+                error: "render timeout".to_owned(),
+            },
+        });
+
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains("biei_render_timeout_lower_bound_seconds_count{scope=\"ingress\"} 1")
+        );
     }
 
     #[test]

@@ -108,6 +108,13 @@ pub trait Renderer: Send + Sync {
     /// replacement so one wedged native call cannot permanently consume the
     /// renderer slot.
     fn retire_after_current(&mut self) {}
+
+    /// Attempt to restore an actor that could not be replaced at timeout time.
+    /// Called periodically even when no requests are admitted, so readiness
+    /// recovery never depends on a new task reaching the worker.
+    fn repair_if_needed(&mut self) -> Result<bool, RendererError> {
+        Ok(false)
+    }
 }
 
 pub type BoxRenderer = Box<dyn Renderer + Send>;

@@ -16,13 +16,15 @@
 //! gauge are released by RAII guards.
 
 mod cache;
+mod health;
 mod metrics;
-mod policy;
+pub(crate) mod policy;
 mod response;
 mod retry;
 mod singleflight;
 
 use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -35,6 +37,7 @@ use moka::sync::Cache;
 use reqwest::header::{IF_MODIFIED_SINCE, IF_NONE_MATCH, RANGE};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
+pub(crate) use health::ProviderHealthTracker;
 pub(crate) use metrics::gather_metrics;
 #[cfg(test)]
 use metrics::usage_label;
@@ -59,13 +62,13 @@ use retry::{
 };
 use singleflight::{
     FLIGHT_SHARDS, Flight, FlightKey, FlightLeader, FlightMap, FlightRequestSemantics,
-    lock_unpoisoned,
 };
 
 #[cfg(test)]
 use maplibre_native::file_source::Usage;
 
 use super::http_fetch::{redacted_url_str, reqwest_error_label};
+use crate::util::lock_unpoisoned;
 
 /// TCP connect timeout for upstream resource fetches.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -95,6 +98,116 @@ const NEGATIVE_CACHE_CAPACITY: u64 = 4_096;
 /// background refresh must not keep one Tokio task parked for an arbitrarily
 /// long upstream freshness lifetime.
 const MAX_REFRESH_DEFERRAL: Duration = Duration::from_secs(300);
+/// A normal cache miss is not provider-failure evidence. Promote only an
+/// attempt that has spent this long in actual network I/O (after admission),
+/// which still precedes the default render SLA and the per-attempt timeout.
+const SLOW_PROVIDER_ATTEMPT_THRESHOLD: Duration = Duration::from_secs(1);
+
+struct NetworkIoObservation<'a> {
+    provider_health: &'a ProviderHealthTracker,
+    metrics: Option<&'a mut UpstreamAttemptObservation>,
+    enabled: bool,
+    elapsed: Duration,
+}
+
+impl<'a> NetworkIoObservation<'a> {
+    fn new(
+        provider_health: &'a ProviderHealthTracker,
+        metrics: &'a mut UpstreamAttemptObservation,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            provider_health,
+            metrics: Some(metrics),
+            enabled,
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    #[cfg(test)]
+    fn without_metrics(provider_health: &'a ProviderHealthTracker, enabled: bool) -> Self {
+        Self {
+            provider_health,
+            metrics: None,
+            enabled,
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    async fn run<F>(
+        &mut self,
+        budget: &mut NetworkAttemptBudget,
+        future: F,
+    ) -> Result<F::Output, tokio::time::error::Elapsed>
+    where
+        F: Future,
+    {
+        let threshold_remaining = SLOW_PROVIDER_ATTEMPT_THRESHOLD.saturating_sub(self.elapsed);
+        let Self {
+            provider_health,
+            metrics,
+            enabled,
+            elapsed,
+        } = self;
+        // This guard spans only `NetworkAttemptBudget::run`. Its Drop also
+        // covers cancellation, while body-permit and retry waits occur outside.
+        let _timing = NetworkOperationTiming::new(elapsed, metrics.as_deref_mut());
+        let operation = budget.run(future);
+        tokio::pin!(operation);
+
+        if !*enabled {
+            return operation.await;
+        }
+        // Evidence belongs to this network future only. It must be dropped
+        // before response-body permit waits or CPU work between chunks.
+        let mut slow_evidence = None;
+        let output = if threshold_remaining.is_zero() {
+            slow_evidence = Some(provider_health.begin_slow_attempt());
+            operation.await
+        } else {
+            tokio::select! {
+                output = &mut operation => output,
+                () = tokio::time::sleep(threshold_remaining) => {
+                    slow_evidence = Some(provider_health.begin_slow_attempt());
+                    operation.await
+                }
+            }
+        };
+        drop(slow_evidence);
+        output
+    }
+
+    #[cfg(test)]
+    fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+}
+
+struct NetworkOperationTiming<'a> {
+    started: tokio::time::Instant,
+    elapsed: &'a mut Duration,
+    metrics: Option<&'a mut UpstreamAttemptObservation>,
+}
+
+impl<'a> NetworkOperationTiming<'a> {
+    fn new(elapsed: &'a mut Duration, metrics: Option<&'a mut UpstreamAttemptObservation>) -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            elapsed,
+            metrics,
+        }
+    }
+}
+
+impl Drop for NetworkOperationTiming<'_> {
+    fn drop(&mut self) {
+        let duration = self.started.elapsed();
+        *self.elapsed = self.elapsed.saturating_add(duration);
+        if let Some(metrics) = &mut self.metrics {
+            metrics.add_network_duration(duration);
+        }
+    }
+}
 
 fn max_resource_bytes(kind: ResourceKind) -> u64 {
     if kind == ResourceKind::Glyphs
@@ -169,6 +282,7 @@ struct BieiNetworkFileSource {
     negative_cache: Cache<ResourceRequestKey, NegativeCacheEntry>,
     resource_cache: cache::ResourceCache,
     inflight: Box<[FlightMap]>,
+    provider_health: ProviderHealthTracker,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,27 +349,11 @@ impl BieiNetworkFileSource {
         resource_cache: cache::ResourceCache,
         private_hosts: Vec<String>,
         io_permits: FileSourceIoPermits,
+        provider_health: ProviderHealthTracker,
     ) -> anyhow::Result<Self> {
         let io_permits = io_permits.clamped();
         let url_policy = ResourceUrlPolicy::new(private_hosts);
-        let redirect_policy = url_policy.clone();
-        let client = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .user_agent(concat!("biei/", env!("CARGO_PKG_VERSION")))
-            // Keep address filtering authoritative; an environment proxy could
-            // otherwise resolve blocked destinations outside this process.
-            .no_proxy()
-            .dns_resolver(FilteringResolver::new(url_policy.clone()))
-            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                if attempt.previous().len() >= 10 {
-                    attempt.error("too many resource redirects")
-                } else if redirect_policy.permits_url_without_dns(attempt.url()) {
-                    attempt.follow()
-                } else {
-                    attempt.error("resource redirect target is blocked")
-                }
-            }))
-            .build()?;
+        let client = build_filtered_http_client(url_policy.clone())?;
         Ok(Self {
             client,
             url_policy,
@@ -270,6 +368,7 @@ impl BieiNetworkFileSource {
             inflight: (0..FLIGHT_SHARDS)
                 .map(|_| Mutex::new(HashMap::new()))
                 .collect(),
+            provider_health,
         })
     }
 
@@ -354,6 +453,10 @@ impl BieiNetworkFileSource {
         let lane = priority_label(request.priority);
         let retry_started = tokio::time::Instant::now();
         let mut attempt_index = 0usize;
+        let mut retry_evidence = None;
+        // A first attempt is promoted to provisional external evidence only
+        // after it is actually on the network and remains slow. Admission
+        // wait and ordinary fast traffic are not provider-failure evidence.
         loop {
             let attempt = {
                 // Hold an admission permit only while network I/O can happen;
@@ -365,7 +468,11 @@ impl BieiNetworkFileSource {
                     .with_label_values(&[kind_label(request.kind), lane])
                     .observe(admission_started.elapsed().as_secs_f64());
                 let _inflight = InflightGuard::new(lane);
-                self.fetch_once(request).await
+                self.fetch_once(
+                    request,
+                    attempt_index == 0 && tracks_provider_health(request.priority),
+                )
+                .await
             };
             if let Some(ttl) = attempt.negative_cache_ttl
                 && uses_shared_cache(request.storage_policy)
@@ -386,6 +493,10 @@ impl BieiNetworkFileSource {
             let Some(retry) = attempt.retry else {
                 return self.finish_fetch(request, attempt);
             };
+
+            if tracks_provider_health(request.priority) {
+                retry_evidence.get_or_insert_with(|| self.provider_health.begin_retry());
+            }
 
             let delay = retry
                 .delay
@@ -424,17 +535,33 @@ impl BieiNetworkFileSource {
         response
     }
 
-    async fn fetch_once(&self, request: &ResourceRequest) -> FetchAttempt {
-        let mut observation = UpstreamAttemptObservation::new(request);
-        let attempt = self.fetch_once_inner(request).await;
-        observation.outcome = attempt
+    async fn fetch_once(
+        &self,
+        request: &ResourceRequest,
+        track_provider_health: bool,
+    ) -> FetchAttempt {
+        let mut metrics = UpstreamAttemptObservation::new(request);
+        let attempt = {
+            let mut network_io = NetworkIoObservation::new(
+                &self.provider_health,
+                &mut metrics,
+                track_provider_health,
+            );
+            self.fetch_once_inner(request, &mut network_io).await
+        };
+        let outcome = attempt
             .retry
             .as_ref()
             .map_or_else(|| outcome_label(&attempt.response), |retry| retry.reason);
+        metrics.outcome = outcome;
         attempt
     }
 
-    async fn fetch_once_inner(&self, request: &ResourceRequest) -> FetchAttempt {
+    async fn fetch_once_inner(
+        &self,
+        request: &ResourceRequest,
+        network_io: &mut NetworkIoObservation<'_>,
+    ) -> FetchAttempt {
         let mut network_budget = NetworkAttemptBudget::new();
         let resource_key = ResourceRequestKey::from_request(request);
         // MLN's background revalidation deliberately omits `prior_data` from
@@ -462,7 +589,7 @@ impl BieiNetworkFileSource {
             None => {}
         }
 
-        let mut response = match network_budget.run(builder.send()).await {
+        let mut response = match network_io.run(&mut network_budget, builder.send()).await {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
                 tracing::debug!(
@@ -550,7 +677,7 @@ impl BieiNetworkFileSource {
                 .min(max_resource_bytes) as usize,
         );
         loop {
-            match network_budget.run(response.chunk()).await {
+            match network_io.run(&mut network_budget, response.chunk()).await {
                 Ok(Ok(Some(chunk))) => {
                     let Some(new_len) = body.len().checked_add(chunk.len()) else {
                         return FetchAttempt::done(Response::error(
@@ -601,6 +728,41 @@ impl BieiNetworkFileSource {
             cache_policy_for_response(request.storage_policy, &headers),
         )
     }
+}
+
+pub(crate) fn provider_health() -> ProviderHealthTracker {
+    static HEALTH: OnceLock<ProviderHealthTracker> = OnceLock::new();
+    HEALTH.get_or_init(ProviderHealthTracker::new).clone()
+}
+
+fn build_filtered_http_client(url_policy: ResourceUrlPolicy) -> anyhow::Result<reqwest::Client> {
+    let redirect_policy = url_policy.clone();
+    Ok(reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .user_agent(concat!("biei/", env!("CARGO_PKG_VERSION")))
+        // Keep address filtering authoritative; an environment proxy could
+        // otherwise resolve blocked destinations outside this process.
+        .no_proxy()
+        .dns_resolver(FilteringResolver::new(url_policy))
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 10 {
+                attempt.error("too many resource redirects")
+            } else if redirect_policy.permits_url_without_dns(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.error("resource redirect target is blocked")
+            }
+        }))
+        .build()?)
+}
+
+/// Build the same address- and redirect-filtered client for the profile
+/// preparer's style/TileJSON fetches. Those requests happen before MapLibre's
+/// FileSource waterfall but must enforce the identical SSRF boundary.
+pub(crate) fn build_profile_http_client(
+    url_policy: ResourceUrlPolicy,
+) -> anyhow::Result<reqwest::Client> {
+    build_filtered_http_client(url_policy)
 }
 
 struct FetchAttempt {
@@ -791,6 +953,10 @@ fn uses_shared_cache(storage_policy: maplibre_native::file_source::StoragePolicy
     )
 }
 
+fn tracks_provider_health(priority: Priority) -> bool {
+    priority != Priority::Low
+}
+
 fn may_consult_shared_cache(
     storage_policy: maplibre_native::file_source::StoragePolicy,
     cache_loading_allowed: bool,
@@ -823,6 +989,7 @@ pub(crate) fn register_file_sources(
                 resource_cache.clone(),
                 private_hosts.clone(),
                 io_permits,
+                provider_health(),
             )
             .map_err(|error| error.to_string())?;
             register_tokio_file_source(FileSourceType::Network, source);

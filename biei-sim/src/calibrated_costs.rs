@@ -15,7 +15,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use rand::{Rng, RngExt};
 use serde::Serialize;
 
@@ -36,7 +36,7 @@ const MIN_OPTIONAL_SAMPLES: f64 = 10.0;
 
 /// Above this many render-blocking upstream fetch attempts per render, the
 /// capture window was clearly not resource-cache-warm and warm render walls
-/// cannot be read as CPU service demand: the import fails.
+/// cannot be read as CPU service demand: that stage falls back to base costs.
 const WARM_WINDOW_FETCHES_PER_RENDER_ERROR: f64 = 0.5;
 /// Above this ratio the derivation still proceeds but records a warning note.
 const WARM_WINDOW_FETCHES_PER_RENDER_WARN: f64 = 0.05;
@@ -82,6 +82,10 @@ impl CalibrationRenderState {
 pub struct EmpiricalCostModel {
     render_exact: BTreeMap<RenderSampleKey, MergedHistogram>,
     render_by_state: BTreeMap<CalibrationRenderState, MergedHistogram>,
+    /// Resource-warm CPU/service-wall references keyed by render shape. Kept
+    /// separate from traffic totals so per-shape encoding cost is never
+    /// mistaken for provider wait.
+    render_cpu_exact: BTreeMap<RenderShapeKey, MergedHistogram>,
     style_exact: BTreeMap<StyleSampleKey, MergedHistogram>,
     style_by_state: BTreeMap<CalibrationRenderState, MergedHistogram>,
     source_exact: BTreeMap<SourceSampleKey, MergedHistogram>,
@@ -92,6 +96,7 @@ pub struct EmpiricalCostModel {
 pub struct EmpiricalSamplingCoverage {
     pub render_exact_shapes: usize,
     pub render_state_fallbacks: usize,
+    pub render_cpu_exact_shapes: usize,
     pub style_exact_shapes: usize,
     pub style_state_fallbacks: usize,
     pub source_exact_shapes: usize,
@@ -105,6 +110,14 @@ struct RenderSampleKey {
     format: String,
     size: String,
     state: CalibrationRenderState,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RenderShapeKey {
+    render_mode: String,
+    scale: String,
+    format: String,
+    size: String,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -266,6 +279,7 @@ impl EmpiricalCostModel {
         EmpiricalSamplingCoverage {
             render_exact_shapes: self.render_exact.len(),
             render_state_fallbacks: self.render_by_state.len(),
+            render_cpu_exact_shapes: self.render_cpu_exact.len(),
             style_exact_shapes: self.style_exact.len(),
             style_state_fallbacks: self.style_by_state.len(),
             source_exact_shapes: self.source_exact.len(),
@@ -284,6 +298,38 @@ impl EmpiricalCostModel {
             .get(&key)
             .or_else(|| self.render_by_state.get(&state))
             .and_then(|histogram| histogram.sample(rng))
+    }
+
+    pub fn sample_render_cpu(&self, task: &InternalTask, rng: &mut impl Rng) -> Option<Duration> {
+        self.render_cpu_exact
+            .get(&render_shape_for_task(task))
+            .and_then(|histogram| histogram.sample(rng))
+    }
+
+    fn add_cpu_reference(&mut self, profile: &CalibrationProfile) {
+        let Some(render) = histogram(profile, "biei_render_duration_seconds") else {
+            return;
+        };
+        let shapes = render
+            .series
+            .iter()
+            .filter(|series| {
+                series
+                    .labels
+                    .get("state")
+                    .is_some_and(|state| state == "warm")
+            })
+            .filter_map(|series| render_shape_from_labels(&series.labels))
+            .collect::<BTreeSet<_>>();
+        for shape in shapes {
+            let merged = merge_series(render, |labels| {
+                labels.get("state").is_some_and(|state| state == "warm")
+                    && render_shape_from_labels(labels).as_ref() == Some(&shape)
+            });
+            if merged.count >= MIN_OPTIONAL_SAMPLES {
+                self.render_cpu_exact.insert(shape, merged);
+            }
+        }
     }
 
     pub fn sample_style_setup(
@@ -321,12 +367,22 @@ impl EmpiricalCostModel {
 }
 
 fn render_key_from_labels(labels: &BTreeMap<String, String>) -> Option<RenderSampleKey> {
+    let shape = render_shape_from_labels(labels)?;
     Some(RenderSampleKey {
+        render_mode: shape.render_mode,
+        scale: shape.scale,
+        format: shape.format,
+        size: shape.size,
+        state: render_state_from_labels(labels)?,
+    })
+}
+
+fn render_shape_from_labels(labels: &BTreeMap<String, String>) -> Option<RenderShapeKey> {
+    Some(RenderShapeKey {
         render_mode: labels.get("render_mode")?.clone(),
         scale: labels.get("scale")?.clone(),
         format: labels.get("format")?.clone(),
         size: labels.get("size")?.clone(),
-        state: render_state_from_labels(labels)?,
     })
 }
 
@@ -355,12 +411,22 @@ fn render_state_from_labels(labels: &BTreeMap<String, String>) -> Option<Calibra
 }
 
 fn render_key_for_task(task: &InternalTask, state: CalibrationRenderState) -> RenderSampleKey {
+    let shape = render_shape_for_task(task);
     RenderSampleKey {
+        render_mode: shape.render_mode,
+        scale: shape.scale,
+        format: shape.format,
+        size: shape.size,
+        state,
+    }
+}
+
+fn render_shape_for_task(task: &InternalTask) -> RenderShapeKey {
+    RenderShapeKey {
         render_mode: render_mode_label(task.request.render_mode()).to_owned(),
         scale: task.pixel_ratio.to_scale().as_gossip_value().to_owned(),
         format: image_format_label(task.output_format).to_owned(),
         size: render_size_label(task).to_owned(),
-        state,
     }
 }
 
@@ -413,6 +479,12 @@ pub fn derive_costs_with_cpu_reference(
     base: &CostConfig,
 ) -> Result<CalibratedCosts> {
     ensure_compatible_provenance(&cpu_reference.provenance, &traffic.provenance)?;
+    ensure!(
+        cpu_reference.provenance.capture_concurrency == Some(1),
+        "cpu reference must record capture_concurrency=1; a concurrent service-wall window may already include CPU scheduling contention that the simulator would apply again"
+    );
+    ensure_uncensored_render_tail(cpu_reference, "cpu reference")?;
+    ensure_uncensored_render_tail(traffic, "traffic")?;
 
     let mut notes = Vec::new();
 
@@ -421,14 +493,41 @@ pub fn derive_costs_with_cpu_reference(
     // ratio, it is not a usable service-wall reference.
     let reference_render = histogram(cpu_reference, "biei_render_duration_seconds")
         .context("cpu reference profile has no render duration histogram")?;
-    let reference_warm = merge_series(reference_render, |labels| {
+    let reference_warm_actual = merge_series(reference_render, |labels| {
         labels.get("state").is_some_and(|state| state == "warm")
     });
     ensure!(
-        reference_warm.count >= MIN_WARM_RENDER_SAMPLES,
+        reference_warm_actual.count >= MIN_WARM_RENDER_SAMPLES,
         "cpu reference has {} warm render samples; at least {MIN_WARM_RENDER_SAMPLES} are required",
-        reference_warm.count
+        reference_warm_actual.count
     );
+    let traffic_render = histogram(traffic, "biei_render_duration_seconds")
+        .context("traffic profile has no render duration histogram")?;
+    let reference_shapes =
+        render_shape_counts(reference_render, Some(CalibrationRenderState::Warm))?;
+    let traffic_shapes = render_shape_counts(traffic_render, None)?;
+    for (shape, samples) in traffic_shapes
+        .iter()
+        .filter(|(_, samples)| **samples >= MIN_OPTIONAL_SAMPLES)
+    {
+        ensure!(
+            reference_shapes.get(shape).copied().unwrap_or_default() >= MIN_OPTIONAL_SAMPLES,
+            "cpu reference does not cover traffic render shape {shape:?} with at least {MIN_OPTIONAL_SAMPLES:.0} warm samples ({samples:.0} traffic samples); cross-shape wall subtraction would misclassify CPU/encoding as provider I/O"
+        );
+    }
+    let traffic_warm_shapes =
+        render_shape_counts(traffic_render, Some(CalibrationRenderState::Warm))?;
+    for (shape, samples) in &traffic_warm_shapes {
+        ensure!(
+            reference_shapes.get(shape).copied().unwrap_or_default() > 0.0,
+            "cpu reference has no warm samples for traffic render shape {shape:?} ({samples:.0} warm traffic samples)"
+        );
+    }
+    let reference_warm = reweight_reference_for_traffic_mix(
+        reference_render,
+        &reference_shapes,
+        &traffic_warm_shapes,
+    )?;
     let reference_upstream = histogram(
         cpu_reference,
         "biei_mln_resource_upstream_attempt_duration_seconds",
@@ -448,7 +547,7 @@ pub fn derive_costs_with_cpu_reference(
             .get("priority")
             .is_some_and(|priority| priority == "regular")
     });
-    let reference_ratio = reference_fetches.count / reference_warm.count.max(1.0);
+    let reference_ratio = reference_fetches.count / reference_warm_actual.count.max(1.0);
     ensure!(
         reference_ratio <= WARM_WINDOW_FETCHES_PER_RENDER_WARN,
         "cpu reference window saw {reference_ratio:.3} render-blocking upstream fetches per \
@@ -467,18 +566,21 @@ pub fn derive_costs_with_cpu_reference(
     let render_cpu_cost = ordered_range(cpu_low, cpu_high);
     let cpu_mid = (cpu_low + cpu_high) / 2;
     notes.push(format!(
-        "render cpu approximated by a verified resource-warm service-wall reference \
-         ({reference_ratio:.3} fetches per render), q{:02}..q{:02} of warm render walls",
+        "render cpu approximated by a verified resource-warm, shape-conditioned service-wall \
+         reference ({reference_ratio:.3} fetches per render), reweighted to the traffic mix, \
+         q{:02}..q{:02} of warm render walls",
         (DIRECT_BAND.0 * 100.0) as u32,
         (DIRECT_BAND.1 * 100.0) as u32,
     ));
 
-    derive_with_cpu(
+    let mut derived = derive_with_cpu(
         traffic,
         base,
-        Some((render_cpu_cost, cpu_mid, reference_warm.count)),
+        Some((render_cpu_cost, cpu_mid, reference_warm_actual.count)),
         notes,
-    )
+    )?;
+    derived.sampling_model.add_cpu_reference(cpu_reference);
+    Ok(derived)
 }
 
 fn ensure_compatible_provenance(
@@ -522,8 +624,108 @@ fn ensure_compatible_provenance(
     Ok(())
 }
 
+fn render_shape_counts(
+    render: &CalibrationHistogram,
+    state: Option<CalibrationRenderState>,
+) -> Result<BTreeMap<RenderShapeKey, f64>> {
+    let mut counts = BTreeMap::new();
+    for series in &render.series {
+        if series.sample_count <= 0.0 {
+            continue;
+        }
+        let series_state = render_state_from_labels(&series.labels).with_context(|| {
+            format!(
+                "render histogram series is missing a supported state label: {:?}",
+                series.labels
+            )
+        })?;
+        if state.is_some_and(|expected| series_state != expected) {
+            continue;
+        }
+        let shape = render_shape_from_labels(&series.labels).with_context(|| {
+            format!(
+                "render histogram series lacks bounded render-shape labels: {:?}",
+                series.labels
+            )
+        })?;
+        *counts.entry(shape).or_default() += series.sample_count;
+    }
+    ensure!(
+        !counts.is_empty(),
+        "render histogram has no positive samples for the requested state"
+    );
+    Ok(counts)
+}
+
+fn reweight_reference_for_traffic_mix(
+    reference: &CalibrationHistogram,
+    reference_shapes: &BTreeMap<RenderShapeKey, f64>,
+    traffic_shapes: &BTreeMap<RenderShapeKey, f64>,
+) -> Result<MergedHistogram> {
+    let mut merged: BTreeMap<u64, (f64, f64)> = BTreeMap::new();
+    let mut count = 0.0;
+    for series in &reference.series {
+        if !series
+            .labels
+            .get("state")
+            .is_some_and(|state| state == "warm")
+        {
+            continue;
+        }
+        let Some(shape) = render_shape_from_labels(&series.labels) else {
+            continue;
+        };
+        let Some(traffic_count) = traffic_shapes.get(&shape) else {
+            continue;
+        };
+        let reference_count = reference_shapes.get(&shape).copied().unwrap_or_default();
+        ensure!(
+            reference_count > 0.0,
+            "cpu reference has no samples for traffic render shape {shape:?}"
+        );
+        let weight = traffic_count / reference_count;
+        count += series.sample_count * weight;
+        for bucket in &series.buckets {
+            let Some(bound) = bucket.upper_bound_seconds else {
+                continue;
+            };
+            let entry = merged.entry(bound.to_bits()).or_insert((bound, 0.0));
+            entry.1 += bucket.count * weight;
+        }
+    }
+    ensure!(
+        count > 0.0,
+        "cpu reference and traffic profile have no overlapping warm render shapes"
+    );
+    Ok(MergedHistogram {
+        count,
+        buckets: merged.into_values().collect(),
+    })
+}
+
 pub fn derive_costs(profile: &CalibrationProfile, base: &CostConfig) -> Result<CalibratedCosts> {
+    ensure_uncensored_render_tail(profile, "single-window")?;
     derive_with_cpu(profile, base, None, Vec::new())
+}
+
+fn ensure_uncensored_render_tail(profile: &CalibrationProfile, label: &str) -> Result<()> {
+    let censored = histogram(profile, "biei_render_timeout_lower_bound_seconds").context(
+        "calibration profile lacks render-timeout censoring evidence; recapture it with the current exporter",
+    )?;
+    ensure!(
+        !censored.series.is_empty(),
+        "{label} calibration profile has no render-timeout censoring series; zero timeouts cannot be distinguished from missing instrumentation, so recapture it with the current exporter",
+    );
+    let timeout_count = censored
+        .series
+        .iter()
+        .map(|series| series.sample_count)
+        .sum::<f64>();
+    ensure!(
+        timeout_count == 0.0,
+        "{label} calibration window contains {timeout_count:.0} timed-out renders; successful render histograms are right-censored, so choose a clean window or model the censored tail explicitly",
+    );
+    Ok(())
 }
 
 /// Shared derivation tail. Every stage is independent: missing or sparse
@@ -750,14 +952,33 @@ fn verify_resource_warm_window(
         "biei_mln_resource_upstream_attempt_duration_seconds",
     ) else {
         if matches!(role, WarmthWindowRole::CpuSource) {
-            notes.push(
-                "profile lacks upstream fetch activity; cannot verify the capture window was \
-                 resource-cache-warm — render cpu may include provider I/O"
-                    .to_owned(),
+            bail!(
+                "profile lacks upstream fetch instrumentation; the capture window cannot prove \
+                 it was resource-cache-warm — recapture it with the current exporter"
             );
         }
+        notes.push(
+            "traffic profile lacks upstream fetch instrumentation; wall-minus-reference-cpu \
+             remains usable, but resource activity cannot be reported"
+                .to_owned(),
+        );
         return Ok(());
     };
+    if upstream.series.is_empty() {
+        if matches!(role, WarmthWindowRole::CpuSource) {
+            bail!(
+                "profile has an empty upstream fetch histogram; zero observed fetches and \
+                 missing instrumentation cannot be distinguished — recapture it from a \
+                 deployment that exposes FileSource upstream series"
+            );
+        }
+        notes.push(
+            "traffic profile has an empty upstream fetch histogram; wall-minus-reference-cpu \
+             remains usable, but resource activity cannot be reported"
+                .to_owned(),
+        );
+        return Ok(());
+    }
     let render_blocking = merge_series(upstream, |labels| {
         labels
             .get("priority")
@@ -985,6 +1206,9 @@ mod tests {
             labels: BTreeMap::from([
                 ("state".to_owned(), state.to_owned()),
                 ("render_mode".to_owned(), render_mode.to_owned()),
+                ("scale".to_owned(), "1x".to_owned()),
+                ("format".to_owned(), "png".to_owned()),
+                ("size".to_owned(), "le_512px".to_owned()),
             ]),
             sample_count,
             buckets: buckets
@@ -997,7 +1221,31 @@ mod tests {
         }
     }
 
-    fn profile(histograms: Vec<CalibrationHistogram>) -> CalibrationProfile {
+    fn profile(mut histograms: Vec<CalibrationHistogram>) -> CalibrationProfile {
+        if !histograms
+            .iter()
+            .any(|histogram| histogram.metric == "biei_render_timeout_lower_bound_seconds")
+        {
+            histograms.push(CalibrationHistogram {
+                metric: "biei_render_timeout_lower_bound_seconds".to_owned(),
+                unit: "seconds".to_owned(),
+                query: "test".to_owned(),
+                series: vec![CalibrationSeries {
+                    labels: BTreeMap::new(),
+                    sample_count: 0.0,
+                    buckets: vec![
+                        CalibrationBucket {
+                            upper_bound_seconds: Some(10.0),
+                            count: 0.0,
+                        },
+                        CalibrationBucket {
+                            upper_bound_seconds: None,
+                            count: 0.0,
+                        },
+                    ],
+                }],
+            });
+        }
         CalibrationProfile {
             schema_version: CALIBRATION_PROFILE_SCHEMA_VERSION,
             kind: CALIBRATION_PROFILE_KIND.to_owned(),
@@ -1020,6 +1268,7 @@ mod tests {
                 renderer_slots_per_node: 3,
                 execution_permits_per_node: 2,
                 native_render_permits_per_node: 2,
+                capture_concurrency: Some(1),
                 notes: None,
             },
             histograms,
@@ -1215,6 +1464,53 @@ mod tests {
     }
 
     #[test]
+    fn calibration_rejects_right_censored_render_timeouts() {
+        let timeout_histogram = CalibrationHistogram {
+            metric: "biei_render_timeout_lower_bound_seconds".to_owned(),
+            unit: "seconds".to_owned(),
+            query: "test".to_owned(),
+            series: vec![CalibrationSeries {
+                labels: BTreeMap::new(),
+                sample_count: 1.0,
+                buckets: vec![
+                    CalibrationBucket {
+                        upper_bound_seconds: Some(5.0),
+                        count: 1.0,
+                    },
+                    CalibrationBucket {
+                        upper_bound_seconds: None,
+                        count: 0.0,
+                    },
+                ],
+            }],
+        };
+        let profile = profile(vec![render_histogram(), timeout_histogram]);
+
+        let error = match derive_costs(&profile, &base_costs()) {
+            Ok(_) => panic!("successful render samples are incomplete when a timeout was censored"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("right-censored"));
+    }
+
+    #[test]
+    fn calibration_rejects_empty_render_timeout_instrumentation() {
+        let timeout_histogram = CalibrationHistogram {
+            metric: "biei_render_timeout_lower_bound_seconds".to_owned(),
+            unit: "seconds".to_owned(),
+            query: "test".to_owned(),
+            series: Vec::new(),
+        };
+        let profile = profile(vec![render_histogram(), timeout_histogram]);
+
+        let error = match derive_costs(&profile, &base_costs()) {
+            Ok(_) => panic!("an empty family cannot prove that the timeout count was zero"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("missing instrumentation"));
+    }
+
+    #[test]
     fn quantiles_interpolate_and_clamp_the_unbounded_tail() {
         let merged = MergedHistogram {
             count: 100.0,
@@ -1371,7 +1667,10 @@ mod tests {
             metric: "biei_render_duration_seconds".to_owned(),
             unit: "seconds".to_owned(),
             query: "test".to_owned(),
-            series: vec![series("warm", "tile", &[(Some(0.05), 100.0), (None, 0.0)])],
+            series: vec![
+                series("warm", "tile", &[(Some(0.05), 80.0), (None, 0.0)]),
+                series("warm", "static", &[(Some(0.05), 20.0), (None, 0.0)]),
+            ],
         };
         let reference = profile(vec![reference_render, upstream_histogram(0.0)]);
         // Traffic: heavily I/O-contaminated (400 fetches / 114 renders) —
@@ -1399,8 +1698,9 @@ mod tests {
             derived
                 .notes
                 .iter()
-                .any(|note| note.contains("verified resource-warm service-wall reference"))
+                .any(|note| note.contains("verified resource-warm, shape-conditioned"))
         );
+        assert_eq!(derived.sampling_model.coverage().render_cpu_exact_shapes, 2);
         assert!(
             derived
                 .notes
@@ -1415,10 +1715,21 @@ mod tests {
             metric: "biei_render_duration_seconds".to_owned(),
             unit: "seconds".to_owned(),
             query: "test".to_owned(),
-            series: vec![series("warm", "tile", &[(Some(0.05), 100.0), (None, 0.0)])],
+            series: vec![
+                series("warm", "tile", &[(Some(0.05), 80.0), (None, 0.0)]),
+                series("warm", "static", &[(Some(0.05), 20.0), (None, 0.0)]),
+            ],
         };
         let traffic = profile(vec![render_histogram(), upstream_histogram(400.0)]);
         let base = base_costs();
+
+        let mut concurrent_reference = profile(vec![clean_render.clone(), upstream_histogram(0.0)]);
+        concurrent_reference.provenance.capture_concurrency = Some(4);
+        let Err(err) = derive_costs_with_cpu_reference(&traffic, &concurrent_reference, &base)
+        else {
+            panic!("a contended service-wall reference must not become CPU demand");
+        };
+        assert!(err.to_string().contains("capture_concurrency=1"));
 
         // Reference without upstream evidence cannot prove warmth.
         let unverified = profile(vec![clean_render.clone()]);
@@ -1478,6 +1789,54 @@ mod tests {
     }
 
     #[test]
+    fn fusion_rejects_cross_shape_cpu_subtraction() {
+        let reference_render = CalibrationHistogram {
+            metric: "biei_render_duration_seconds".to_owned(),
+            unit: "seconds".to_owned(),
+            query: "test".to_owned(),
+            series: vec![shaped_series(
+                &[
+                    ("render_mode", "tile"),
+                    ("scale", "1x"),
+                    ("format", "png"),
+                    ("size", "le_256px"),
+                    ("state", "warm"),
+                ],
+                0.02,
+                100.0,
+            )],
+        };
+        let traffic_render = CalibrationHistogram {
+            metric: "biei_render_duration_seconds".to_owned(),
+            unit: "seconds".to_owned(),
+            query: "test".to_owned(),
+            series: vec![shaped_series(
+                &[
+                    ("render_mode", "static"),
+                    ("scale", "2x"),
+                    ("format", "webp"),
+                    ("size", "le_2048px"),
+                    ("state", "warm"),
+                ],
+                0.5,
+                100.0,
+            )],
+        };
+        let reference = profile(vec![reference_render, upstream_histogram(0.0)]);
+        let traffic = profile(vec![traffic_render, upstream_histogram(100.0)]);
+
+        let Err(error) = derive_costs_with_cpu_reference(&traffic, &reference, &base_costs())
+        else {
+            panic!("a CPU profile for another render shape is not calibration evidence");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("does not cover traffic render shape")
+        );
+    }
+
+    #[test]
     fn contaminated_render_stage_falls_back_and_hot_window_is_verified() {
         // 114 renders (100 warm + 14 first) with 400 render-blocking fetches
         // during the window: warm walls contain provider I/O, not CPU demand.
@@ -1503,15 +1862,36 @@ mod tests {
                 .any(|note| note.contains("verified resource-cache-warm"))
         );
 
-        // No upstream histogram at all: derivation proceeds but the report
-        // must say warmth could not be verified.
+        // No upstream histogram at all: setup stages may still derive, but
+        // warm render walls cannot be promoted to CPU evidence.
         let unverifiable = profile(vec![render_histogram()]);
-        let derived = derive_costs(&unverifiable, &base_costs()).expect("derives with note");
+        let base = base_costs();
+        let derived = derive_costs(&unverifiable, &base).expect("partial derivation survives");
+        assert_eq!(derived.costs.render_cpu_cost.min, base.render_cpu_cost.min);
         assert!(
             derived
                 .notes
                 .iter()
-                .any(|note| note.contains("cannot verify the capture window"))
+                .any(|note| note.contains("lacks upstream fetch instrumentation"))
+        );
+
+        // An empty exported family is equally unverifiable: it may mean the
+        // current zero series was never initialized on the captured pods.
+        let empty = CalibrationHistogram {
+            metric: "biei_mln_resource_upstream_attempt_duration_seconds".to_owned(),
+            unit: "seconds".to_owned(),
+            query: "test".to_owned(),
+            series: Vec::new(),
+        };
+        let empty_evidence = profile(vec![render_histogram(), empty]);
+        let derived =
+            derive_costs(&empty_evidence, &base).expect("other partial stages remain usable");
+        assert_eq!(derived.costs.render_cpu_cost.min, base.render_cpu_cost.min);
+        assert!(
+            derived
+                .notes
+                .iter()
+                .any(|note| note.contains("empty upstream fetch histogram"))
         );
     }
 

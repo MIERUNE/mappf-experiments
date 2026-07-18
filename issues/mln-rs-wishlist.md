@@ -68,17 +68,16 @@ already a usable lookup when biei needs to validate a base-style source.
 | `style.remove_image(id) -> Result<bool, StyleError>` or `Option<ImageId>` | Distinguish "removed" from "not present" without relying on MapLibre Native warnings |
 
 biei registers request-local marker images with `style.add_image` and removes
-them after rendering. This works, but the current `remove_image` wrapper returns
-`()` while MapLibre Native logs a warning when the image id is not present:
-`Image '...' is not present in style, cannot remove`. That warning is harmless
-for rendering, but it becomes log noise in normal request cleanup and makes it
-harder to spot real native warnings.
+them after rendering. The current `remove_image` wrapper returns `()` while
+MapLibre Native logs a warning when the image id is not present:
+`Image '...' is not present in style, cannot remove`. biei now tracks successful
+registrations and avoids speculative pre-removal, so the normal path is quiet;
+introspection would still make partial-failure reconciliation and independent
+downstream implementations explicit.
 
-This is an improvement, not a blocker. biei can avoid most redundant removals on
-its side, and request-local images are still cleaned up after successful
-renders. A small image introspection/removal result API would make the lifecycle
-explicit and keep downstream cleanup code from depending on "unknown id is a
-warning" behavior.
+This is an improvement, not a blocker. A small image introspection/removal
+result API would make the lifecycle explicit without requiring downstream code
+to infer presence from its own bookkeeping.
 
 ## Notes
 
@@ -109,7 +108,6 @@ per-renderer cache-isolation requirement appears — or if per-render in-render
 I/O attribution ever needs to be exact in production: `ResourceRequest` carries
 no requester identity (mbgl's engine-global `FileSource` interface has none to
 forward), so the process-global source cannot know which render a fetch blocks.
-biei currently covers this with two workarounds: the calibration importer's
-statistical CPU/resource split over a verified resource-warm window, and exact
-attribution in single-renderer-slot benches where every regular-lane fetch
-belongs to the only in-flight render.
+biei currently estimates this statistically over verified resource-warm windows
+and obtains exact attribution only in single-renderer-slot benches where every
+regular-lane fetch belongs to the only in-flight render.

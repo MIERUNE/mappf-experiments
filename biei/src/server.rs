@@ -45,13 +45,16 @@ pub async fn run() -> anyhow::Result<()> {
         Runtime::spawn_single_node(&options)?
     };
     let ingress = runtime.http_ingress(options.sla);
-    let shutdown = install_shutdown_handler(runtime.clone());
-    if options.cluster {
-        let internal_forward = crate::http::internal::InternalForwardEndpoint::with_drain_and_limit(
-            runtime.node(),
-            runtime.drain_controller(),
-            runtime.internal_forward_concurrency_limit(),
-        );
+    let (shutdown, shutdown_task) = install_shutdown_handler(runtime.clone());
+    let shutdown_observer = shutdown.clone();
+    let serve_result = if options.cluster {
+        let internal_forward =
+            crate::http::internal::InternalForwardEndpoint::with_renderer_health_and_limit(
+                runtime.node(),
+                runtime.drain_controller(),
+                ingress.renderer_supervisor(),
+                runtime.internal_forward_concurrency_limit(),
+            );
         crate::http::adapter::serve_with_shutdown_and_membership_and_internal_forward(
             ingress,
             options.http_bind,
@@ -63,7 +66,9 @@ pub async fn run() -> anyhow::Result<()> {
         .await
     } else {
         crate::http::adapter::serve_with_shutdown(ingress, options.http_bind, Some(shutdown)).await
-    }
+    };
+    finish_shutdown(shutdown_observer, shutdown_task).await;
+    serve_result
 }
 
 fn init_tracing() {
@@ -76,9 +81,14 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
-fn install_shutdown_handler(runtime: Runtime) -> crate::http::adapter::ShutdownSignal {
+fn install_shutdown_handler(
+    runtime: Runtime,
+) -> (
+    crate::http::adapter::ShutdownSignal,
+    tokio::task::JoinHandle<()>,
+) {
     let (tx, signal) = crate::http::adapter::shutdown_channel();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         wait_for_shutdown_signal().await;
         tracing::info!(
             drain_grace_ms = DRAIN_GRACE.as_millis(),
@@ -98,7 +108,26 @@ fn install_shutdown_handler(runtime: Runtime) -> crate::http::adapter::ShutdownS
             tracing::warn!("drain grace elapsed with in-flight requests remaining");
         }
     });
-    signal
+    (signal, task)
+}
+
+/// Keep the runtime and its drain accounting alive after the HTTP listeners
+/// have stopped. A disconnected client can let hyper drop its handler while
+/// the separately spawned, non-cancellable render still owns a drain permit.
+async fn finish_shutdown(
+    signal: crate::http::adapter::ShutdownSignal,
+    mut task: tokio::task::JoinHandle<()>,
+) {
+    if signal.is_triggered() {
+        if let Err(error) = (&mut task).await {
+            tracing::error!(%error, "shutdown coordinator terminated unexpectedly");
+        }
+    } else {
+        // Listener failure before SIGTERM must surface immediately rather than
+        // waiting forever for a shutdown signal that may never arrive.
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 async fn wait_for_shutdown_signal() {
@@ -119,5 +148,35 @@ async fn wait_for_shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use super::finish_shutdown;
+
+    #[tokio::test(start_paused = true)]
+    async fn main_lifecycle_waits_for_drain_coordinator_after_http_stops() {
+        let (tx, signal) = crate::http::adapter::shutdown_channel();
+        tx.send(true).expect("trigger shutdown");
+        let completed = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn({
+            let completed = Arc::clone(&completed);
+            async move {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                completed.store(true, Ordering::Release);
+            }
+        });
+        let finish = tokio::spawn(finish_shutdown(signal, task));
+
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert!(!finish.is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        finish.await.expect("finish task");
+        assert!(completed.load(Ordering::Acquire));
     }
 }

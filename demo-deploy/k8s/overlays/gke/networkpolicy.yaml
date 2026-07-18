@@ -1,0 +1,38 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: biei-internal-boundary
+spec:
+  podSelector:
+    matchLabels:
+      app: biei
+  policyTypes:
+    - Ingress
+  ingress:
+    # Public HTTP and kubelet probes remain reachable through the normal
+    # Service/Gateway path. The application itself hides /_internal/* here.
+    - ports:
+        - port: 8080
+          protocol: TCP
+    # Peer forwarding and gossip are reachable only from biei peers in this
+    # namespace. Gossip is UDP (chitchat::UdpTransport), not TCP.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: biei
+      ports:
+        - port: 9090
+          protocol: TCP
+        - port: 7946
+          protocol: UDP
+    # Google Managed Service for Prometheus scrapes the internal metrics port.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: collector
+      ports:
+        - port: 9090
+          protocol: TCP

@@ -19,6 +19,7 @@ pub mod style_catalog;
 pub(crate) mod tileset_catalog;
 pub mod transport;
 pub mod types;
+pub(crate) mod util;
 pub mod wire;
 pub(crate) mod worker;
 pub(crate) mod worker_pool;

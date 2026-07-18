@@ -23,29 +23,28 @@ pub(super) fn register_pin_images(
     style: &mut maplibre_native::StyleRef<'_, maplibre_native::Static>,
     overlays: &[StaticOverlay],
 ) -> Result<(), maplibre_native::StyleError> {
-    let ids = pin_image_ids(overlays);
-    for id in &ids {
-        // Avoid stale duplicate IDs from a failed prior render. `remove_image`
-        // is a no-op for unknown IDs.
-        style.remove_image(id);
-    }
-    let mut registered = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut registered = Vec::new();
     for pin in overlays.iter().filter_map(|overlay| match overlay {
         StaticOverlay::Pin(pin) => Some(pin),
         _ => None,
     }) {
         let id = pin_image_id(pin);
         // Repeated same-color/label pins in one request share one style image.
-        if !registered.insert(id.clone()) {
+        if !seen.insert(id.clone()) {
             continue;
         }
         let image = render_pin_image(pin).map_err(maplibre_native::StyleError::Native)?;
-        if let Err(err) = style.add_image(id, &image, 2.0, false) {
-            for id in ids {
+        if let Err(err) = style.add_image(id.clone(), &image, 2.0, false) {
+            // Roll back only images this call actually installed. Removing
+            // candidate IDs that were never present makes MapLibre emit a
+            // warning on every normal pin render.
+            for id in registered {
                 style.remove_image(id);
             }
             return Err(err);
         }
+        registered.push(id);
     }
     Ok(())
 }

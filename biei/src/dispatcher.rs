@@ -14,7 +14,7 @@ use crate::config::{CostConfig, RoutingConfig, Tier1Strategy};
 use crate::hrw::hrw_weight;
 use crate::types::{
     ClusterView, Decision, ForwardCandidate, InternalTask, NodeId, NodeStateView, RejectionReason,
-    RouteTier, WorkerId, WorkerProfile, WorkerView,
+    RouteTier, WorkerProfile, WorkerView,
 };
 
 const DEFAULT_FORWARD_CANDIDATES: usize = 2;
@@ -177,7 +177,27 @@ impl Dispatcher {
 
         // ---- Tier 1: warm tracking (over propagated states only) ----
         if let Some(target_id) = self.select_warm_target(task, view, &profile) {
-            return self.materialize_route(task, target_id, RouteTier::Tier1WarmTracking, None);
+            // Keep one HRW fallback behind the warm target. This is normally a
+            // queue-race escape hatch; it is also what lets a node survive the
+            // short gossip window where the selected warm renderer has already
+            // stopped admission but still appears healthy in this snapshot.
+            let mut candidates = vec![ForwardCandidate {
+                node_id: target_id.clone(),
+                drain_worker: None,
+            }];
+            candidates.extend(
+                top_hrw_candidates(&view.members, &profile, DEFAULT_FORWARD_CANDIDATES, |id| {
+                    id != &target_id
+                        && view
+                            .states
+                            .get(id)
+                            .map(|node| node.has_capacity(self.bl_capacity))
+                            .unwrap_or(true)
+                })
+                .into_iter()
+                .take(DEFAULT_FORWARD_CANDIDATES.saturating_sub(1)),
+            );
+            return self.materialize_candidates(task, RouteTier::Tier1WarmTracking, candidates);
         }
 
         // ---- Tier 2: HRW over static members, optimistic when state missing ----
@@ -240,6 +260,9 @@ impl Dispatcher {
         let mut cluster_counts: HashMap<WorkerProfile, usize> = HashMap::new();
         let mut candidates: Vec<(NodeId, &WorkerView)> = Vec::new();
         for (nid, node) in &view.states {
+            if !node.accepts_new_renders {
+                continue;
+            }
             for worker in &node.workers {
                 if let Some(profile) = &worker.loaded_profile {
                     *cluster_counts.entry(profile.clone()).or_insert(0) += 1;
@@ -304,23 +327,6 @@ impl Dispatcher {
         (count <= 1, shape_mismatch, Reverse(count), last_seen)
     }
 
-    fn materialize_route(
-        &self,
-        task: &InternalTask,
-        target: NodeId,
-        tier: RouteTier,
-        worker_hint: Option<WorkerId>,
-    ) -> Decision {
-        self.materialize_candidates(
-            task,
-            tier,
-            vec![ForwardCandidate {
-                node_id: target,
-                drain_worker: worker_hint,
-            }],
-        )
-    }
-
     fn materialize_candidates(
         &self,
         task: &InternalTask,
@@ -383,6 +389,9 @@ fn warm_candidate<'a>(
     profile: &WorkerProfile,
     bl: usize,
 ) -> Option<WarmCandidate<'a>> {
+    if !node.accepts_new_renders {
+        return None;
+    }
     let mut warm_count = 0;
     let mut style_spare_bl = 0;
     let mut has_usable_capacity = false;
@@ -510,6 +519,7 @@ mod tests {
                 node_id.clone(),
                 NodeStateView {
                     id: node_id,
+                    accepts_new_renders: true,
                     workers,
                 },
             )]
@@ -578,6 +588,7 @@ mod tests {
         let target = profile(9);
         let node = NodeStateView {
             id: NodeId::from_index(0),
+            accepts_new_renders: true,
             workers: vec![
                 WorkerView {
                     id: 0,
@@ -600,6 +611,7 @@ mod tests {
         let target = profile(9);
         let node = NodeStateView {
             id: NodeId::from_index(0),
+            accepts_new_renders: true,
             workers: vec![
                 WorkerView {
                     id: 0,
@@ -853,6 +865,32 @@ mod tests {
     }
 
     #[test]
+    fn explicit_renderer_degradation_excludes_node_from_every_routing_tier() {
+        let activity = Arc::new(ProfileActivityTracker::new());
+        let now = Instant::now();
+        activity.record(profile(9), now);
+        let dispatcher = dispatcher_with_caps(activity, 2, 8);
+        let task = make_task(9, now);
+        let mut cluster = view(vec![WorkerView {
+            id: 0,
+            loaded_profile: Some(profile(9)),
+            queue_depth: 0,
+        }]);
+        cluster
+            .states
+            .get_mut(&NodeId::from_index(0))
+            .expect("node state")
+            .accepts_new_renders = false;
+
+        assert!(matches!(
+            dispatcher.decide(&task, &cluster),
+            Decision::Reject {
+                reason: RejectionReason::NoCapacity
+            }
+        ));
+    }
+
+    #[test]
     fn decide_forwards_top_two_candidates_when_remote_capacity_exists() {
         let activity = Arc::new(ProfileActivityTracker::new());
         let now = Instant::now();
@@ -869,6 +907,7 @@ mod tests {
                     NodeId::from_index(1),
                     NodeStateView {
                         id: NodeId::from_index(1),
+                        accepts_new_renders: true,
                         workers: vec![WorkerView {
                             id: 0,
                             loaded_profile: Some(profile(1)),
@@ -880,6 +919,7 @@ mod tests {
                     NodeId::from_index(2),
                     NodeStateView {
                         id: NodeId::from_index(2),
+                        accepts_new_renders: true,
                         workers: vec![WorkerView {
                             id: 0,
                             loaded_profile: Some(profile(2)),
@@ -891,6 +931,7 @@ mod tests {
                     NodeId::from_index(3),
                     NodeStateView {
                         id: NodeId::from_index(3),
+                        accepts_new_renders: true,
                         workers: vec![WorkerView {
                             id: 0,
                             loaded_profile: Some(profile(3)),
@@ -947,5 +988,61 @@ mod tests {
             panic!("expected local decision");
         };
         assert_eq!(fallback_candidates, vec![remote]);
+    }
+
+    #[test]
+    fn tier1_warm_local_route_keeps_remote_fallback_for_stale_health() {
+        let dispatcher = dispatcher(Arc::new(ProfileActivityTracker::new()));
+        let now = Instant::now();
+        let task = make_task(9, now);
+        let local_id = NodeId::from_index(0);
+        let remote_id = NodeId::from_index(1);
+        let cluster = ClusterView {
+            members: vec![local_id.clone(), remote_id.clone()],
+            states: HashMap::from([
+                (
+                    local_id.clone(),
+                    NodeStateView {
+                        id: local_id,
+                        accepts_new_renders: true,
+                        workers: vec![WorkerView {
+                            id: 0,
+                            loaded_profile: Some(profile(9)),
+                            queue_depth: 0,
+                        }],
+                    },
+                ),
+                (
+                    remote_id.clone(),
+                    NodeStateView {
+                        id: remote_id.clone(),
+                        accepts_new_renders: true,
+                        workers: vec![WorkerView {
+                            id: 0,
+                            loaded_profile: None,
+                            queue_depth: 0,
+                        }],
+                    },
+                ),
+            ]),
+            generated_at: now,
+        };
+
+        let Decision::Local {
+            route_tier,
+            fallback_candidates,
+            ..
+        } = dispatcher.decide(&task, &cluster)
+        else {
+            panic!("warm local worker should remain the primary route");
+        };
+        assert_eq!(route_tier, RouteTier::Tier1WarmTracking);
+        assert_eq!(
+            fallback_candidates,
+            vec![ForwardCandidate {
+                node_id: remote_id,
+                drain_worker: None,
+            }]
+        );
     }
 }

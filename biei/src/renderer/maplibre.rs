@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use moka::sync::Cache;
@@ -24,6 +24,7 @@ use crate::types::RenderOutput;
 use crate::types::{
     AddLayerSource, InternalTask, RenderRequest, RendererError, SourceHash, StyleId, StyleRevision,
 };
+use crate::util::lock_unpoisoned;
 
 pub struct MapLibreRenderer {
     actor: RendererActor,
@@ -36,6 +37,7 @@ pub struct MapLibreRenderer {
 pub struct MapLibreProfilePreparer {
     style_catalog: Arc<StyleCatalog>,
     http_client: reqwest::Client,
+    url_policy: crate::renderer::file_source::policy::ResourceUrlPolicy,
     fetch_permits: Arc<tokio::sync::Semaphore>,
     style_json_cache: Cache<StyleRevision, Arc<str>>,
     style_error_cache: Cache<StyleRevision, RendererError>,
@@ -74,12 +76,6 @@ impl<K: Eq + Hash> Drop for InFlightJsonLoad<'_, K> {
         lock_unpoisoned(self.inflight).remove(&self.key);
         self.tx.send_replace(JsonLoadSignal::Aborted);
     }
-}
-
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 const STYLE_JSON_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -148,14 +144,19 @@ impl MapLibreRenderer {
 
     fn replace_retiring_actor(&mut self) -> Result<(), RendererError> {
         if !self.actor.try_abandon() {
-            self.supervisor.record_replacement_exhausted();
+            let first_exhaustion = self.slot_available;
+            if first_exhaustion {
+                self.supervisor.record_replacement_exhausted();
+            }
             self.supervisor
                 .set_slot_available(&mut self.slot_available, false);
-            tracing::error!(
-                worker_id = self.config.worker_id,
-                orphaned_threads = self.supervisor.snapshot().orphaned_threads,
-                "renderer actor replacement budget exhausted"
-            );
+            if first_exhaustion {
+                tracing::error!(
+                    worker_id = self.config.worker_id,
+                    orphaned_threads = self.supervisor.snapshot().orphaned_threads,
+                    "renderer actor replacement budget exhausted"
+                );
+            }
             return Err(RendererError::ActorDead);
         }
 
@@ -205,10 +206,19 @@ impl MapLibreRenderer {
 }
 
 impl MapLibreProfilePreparer {
-    pub fn new(style_catalog: Arc<StyleCatalog>, max_concurrent_fetches: usize) -> Self {
-        Self {
+    pub fn new(
+        style_catalog: Arc<StyleCatalog>,
+        max_concurrent_fetches: usize,
+        private_hosts: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        let url_policy =
+            crate::renderer::file_source::policy::ResourceUrlPolicy::new(private_hosts);
+        Ok(Self {
             style_catalog,
-            http_client: reqwest::Client::new(),
+            http_client: crate::renderer::file_source::build_profile_http_client(
+                url_policy.clone(),
+            )?,
+            url_policy,
             fetch_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_fetches.max(1))),
             style_json_cache: style_json_cache(),
             style_error_cache: error_cache(),
@@ -216,7 +226,7 @@ impl MapLibreProfilePreparer {
             tileset_error_cache: error_cache(),
             inflight_style_loads: Mutex::new(HashMap::new()),
             inflight_tileset_loads: Mutex::new(HashMap::new()),
-        }
+        })
     }
 
     async fn resolve_style(
@@ -420,6 +430,7 @@ impl MapLibreProfilePreparer {
         Ok(Arc::from(
             fetch_style_json(
                 &self.http_client,
+                &self.url_policy,
                 &style.id,
                 &definition.style_url,
                 deadline,
@@ -439,7 +450,14 @@ impl MapLibreProfilePreparer {
             .map_err(|_| ProfileFetchError::transient(RendererError::Timeout))?
             .map_err(|_| ProfileFetchError::transient(RendererError::ActorDead))?;
         Ok(Arc::from(
-            fetch_tileset_json(&self.http_client, style_id, tileset_url, deadline).await?,
+            fetch_tileset_json(
+                &self.http_client,
+                &self.url_policy,
+                style_id,
+                tileset_url,
+                deadline,
+            )
+            .await?,
         ))
     }
 }
@@ -600,6 +618,10 @@ impl MapLibreProfilePreparer {
         Self {
             style_catalog,
             http_client: reqwest::Client::new(),
+            url_policy: crate::renderer::file_source::policy::ResourceUrlPolicy::new(vec![
+                "127.0.0.1".to_owned(),
+                "localhost".to_owned(),
+            ]),
             fetch_permits: Arc::new(tokio::sync::Semaphore::new(16)),
             style_json_cache: style_json_cache(),
             style_error_cache: error_cache(),
@@ -653,6 +675,18 @@ impl Renderer for MapLibreRenderer {
         // native call returns.
         let _ = self.replace_retiring_actor();
     }
+
+    fn repair_if_needed(&mut self) -> Result<bool, RendererError> {
+        if self.retiring {
+            self.replace_retiring_actor()?;
+            Ok(true)
+        } else if !self.actor.is_alive() {
+            self.replace_finished_actor()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
 }
 
 const MAX_STYLE_JSON_BYTES: usize = 2 * 1024 * 1024;
@@ -690,6 +724,7 @@ fn source_url_from_addlayer_source(
 
 async fn fetch_tileset_json(
     client: &reqwest::Client,
+    url_policy: &crate::renderer::file_source::policy::ResourceUrlPolicy,
     style_id: &StyleId,
     tileset_url: &str,
     deadline: Instant,
@@ -706,6 +741,14 @@ async fn fetch_tileset_json(
             RendererError::StyleLoadFailed {
                 style_id: style_id.clone(),
                 source: format!("unsupported tileset URL scheme: {}", url.scheme()),
+            },
+        ));
+    }
+    if !url_policy.permits_url_without_dns(&url) {
+        return Err(ProfileFetchError::permanent(
+            RendererError::StyleLoadFailed {
+                style_id: style_id.clone(),
+                source: format!("blocked tileset URL destination: {safe_input}"),
             },
         ));
     }
@@ -927,13 +970,14 @@ fn unprotect_tile_template_placeholders(url: &str) -> String {
 
 async fn fetch_style_json(
     client: &reqwest::Client,
+    url_policy: &crate::renderer::file_source::policy::ResourceUrlPolicy,
     style_id: &StyleId,
     style_url: &str,
     deadline: Instant,
 ) -> Result<String, ProfileFetchError> {
     let json = match url::Url::parse(style_url) {
         Ok(url) if url.scheme() == "http" || url.scheme() == "https" => {
-            fetch_http_style_json(client, style_id, url, deadline).await?
+            fetch_http_style_json(client, url_policy, style_id, url, deadline).await?
         }
         Ok(url) if url.scheme() == "file" => {
             let path = url.to_file_path().map_err(|_| {
@@ -969,11 +1013,20 @@ async fn fetch_style_json(
 
 async fn fetch_http_style_json(
     client: &reqwest::Client,
+    url_policy: &crate::renderer::file_source::policy::ResourceUrlPolicy,
     style_id: &crate::types::StyleId,
     style_url: url::Url,
     deadline: Instant,
 ) -> Result<String, ProfileFetchError> {
     let safe_url = redacted_url(&style_url);
+    if !url_policy.permits_url_without_dns(&style_url) {
+        return Err(ProfileFetchError::permanent(
+            RendererError::StyleLoadFailed {
+                style_id: style_id.clone(),
+                source: format!("blocked style URL destination: {safe_url}"),
+            },
+        ));
+    }
     let response = tokio::time::timeout_at(deadline, client.get(style_url.clone()).send())
         .await
         .map_err(|_| ProfileFetchError::transient(RendererError::Timeout))?
@@ -1186,6 +1239,13 @@ mod tests {
         }
     }
 
+    fn test_url_policy() -> crate::renderer::file_source::policy::ResourceUrlPolicy {
+        crate::renderer::file_source::policy::ResourceUrlPolicy::new(vec![
+            "127.0.0.1".to_owned(),
+            "localhost".to_owned(),
+        ])
+    }
+
     #[test]
     fn tile_template_resolution_preserves_only_tile_placeholders() {
         let base = url::Url::parse("https://tiles.example.test/a/b/tileset.json").unwrap();
@@ -1302,6 +1362,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn autonomous_repair_restores_slot_without_another_render_task() {
+        let supervisor = RendererActorSupervisor::new(1);
+        let config = RendererActorConfig {
+            worker_id: 10,
+            ambient_cache_path: None,
+        };
+        let actor = RendererActor::spawn_with_backend_supervised(
+            config.clone(),
+            supervisor.clone(),
+            FakeBackend,
+        )
+        .expect("actor spawns");
+        actor.retire_after_current();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while actor.is_alive() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("idle actor retires");
+
+        let mut slot_available = true;
+        supervisor.set_slot_available(&mut slot_available, false);
+        let mut renderer = MapLibreRenderer {
+            actor,
+            config,
+            supervisor: supervisor.clone(),
+            retiring: true,
+            slot_available,
+        };
+        assert_eq!(
+            supervisor.health(),
+            crate::renderer::actor::RendererHealth::InternalUnrecoverable
+        );
+
+        assert!(renderer.repair_if_needed().expect("repair succeeds"));
+        assert_eq!(
+            supervisor.health(),
+            crate::renderer::actor::RendererHealth::Full
+        );
+    }
+
+    #[tokio::test]
     async fn profile_preparer_caches_successful_style_json() {
         let (style_url, request_count, server) = spawn_counting_style_server(
             axum::http::StatusCode::OK,
@@ -1329,6 +1432,34 @@ mod tests {
         server.abort();
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         assert!(Arc::ptr_eq(&first.style_json, &second.style_json));
+    }
+
+    #[tokio::test]
+    async fn production_profile_preparer_blocks_unallowlisted_private_style_host() {
+        let (style_url, request_count, server) = spawn_counting_style_server(
+            axum::http::StatusCode::OK,
+            r#"{"version":8,"sources":{},"layers":[]}"#,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let rev = revision();
+        let catalog = Arc::new(StyleCatalog::new());
+        catalog.upsert_definition(rev.id.clone(), StyleDefinition::new(style_url, rev.version));
+        let preparer = MapLibreProfilePreparer::new(catalog, 1, Vec::new())
+            .expect("build filtered profile client");
+
+        let error = preparer
+            .prepare_profile(&internal_task(rev))
+            .await
+            .expect_err("loopback style host must require an exact allowlist entry");
+
+        server.abort();
+        assert!(matches!(error, RendererError::StyleLoadFailed { .. }));
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            0,
+            "blocked initial URL must not reach the private server"
+        );
     }
 
     #[tokio::test]
@@ -1541,8 +1672,10 @@ mod tests {
         )
         .await;
         let secret = "do-not-log-this-token";
+        let policy = test_url_policy();
         let error = fetch_tileset_json(
             &reqwest::Client::new(),
+            &policy,
             &revision().id,
             &format!("{tileset_url}?access_token={secret}"),
             Instant::now() + std::time::Duration::from_secs(1),
@@ -1616,8 +1749,10 @@ mod tests {
             axum::serve(listener, app).await.expect("test server runs");
         });
 
+        let policy = test_url_policy();
         let err = fetch_style_json(
             &reqwest::Client::new(),
+            &policy,
             &revision().id,
             &format!("http://{addr}/missing-style.json"),
             Instant::now() + std::time::Duration::from_secs(1),
@@ -1703,8 +1838,10 @@ mod tests {
     async fn fetch_style_json_rejects_invalid_json_file() {
         let path = write_test_style_json("invalid", "not-json");
 
+        let policy = test_url_policy();
         let err = fetch_style_json(
             &reqwest::Client::new(),
+            &policy,
             &revision().id,
             &path,
             Instant::now() + std::time::Duration::from_secs(1),

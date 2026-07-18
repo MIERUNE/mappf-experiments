@@ -39,7 +39,8 @@ async fn main() -> anyhow::Result<()> {
         ambient_cache_path: Some(std::env::temp_dir().join("biei-maplibre-smoke-cache.sqlite")),
     })
     .context("spawn maplibre renderer")?;
-    let preparer = MapLibreProfilePreparer::new(catalog, 1);
+    let preparer = MapLibreProfilePreparer::new(catalog, 1, Vec::new())
+        .context("build profile HTTP client")?;
     let spawn_elapsed = started.elapsed();
     let task = args.task(revision, output_format);
     let setup_started = StdInstant::now();

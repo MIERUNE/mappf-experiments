@@ -42,6 +42,12 @@ pub struct ForwardRequest {
     pub task: WireTask,
     pub route_tier: RouteTier,
     pub drain_worker: Option<WorkerId>,
+    /// Origin-local budget for receiving the complete HTTP response. This is
+    /// intentionally distinct from `task.remaining_budget_ms`, which is the
+    /// smaller remote execution budget after reserving transport latency.
+    /// Older senders omit it; receivers then fall back to the task budget.
+    #[serde(default)]
+    pub origin_response_budget_ms: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -92,7 +98,16 @@ impl InternalTask {
     }
 
     pub fn to_forward_wire(&self, now: Instant, hop_latency: Duration) -> WireTask {
-        let mut wire = self.to_wire_with_hop_latency(now, hop_latency);
+        // Reserve the round trip, not just the outbound hop. A native render
+        // cannot be cancelled, so a remote render that consumed its whole
+        // budget would finish just as the origin's deadline arrives — and its
+        // response still needs a return hop the origin will no longer wait
+        // for, wasting an uncancellable render. Subtracting both hops keeps a
+        // completed remote render's response arriving at/under the origin
+        // deadline when the hop estimate holds, and halves the overshoot when
+        // the actual hop exceeds it.
+        let round_trip = hop_latency.saturating_mul(2);
+        let mut wire = self.to_wire_with_hop_latency(now, round_trip);
         wire.forwarding_hops = self.forwarding_hops.saturating_add(1);
         wire
     }
@@ -554,9 +569,52 @@ mod tests {
             forwarding_hops: 1,
         };
 
+        // Forward reserves the round trip (2 x 125ms), not just the outbound
+        // hop, so a completed remote render's response can still return before
+        // the origin's deadline: 3000 - 250 = 2750.
         let wire = task.to_forward_wire(now, Duration::from_millis(125));
-        assert_eq!(wire.remaining_budget_ms, 2875);
+        assert_eq!(wire.remaining_budget_ms, 2750);
         assert_eq!(wire.forwarding_hops, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_render_does_not_outlive_origin_deadline_at_estimated_latency() {
+        // When the actual hop matches the estimate, a remote render must not
+        // run past the point where its response can still reach the origin
+        // before the origin's deadline — otherwise an uncancellable render
+        // keeps burning cluster capacity after the origin gave up.
+        let hop = Duration::from_millis(60);
+        let origin_send = Instant::now();
+        let origin_deadline = origin_send + Duration::from_secs(2);
+        let task = InternalTask {
+            id: 7,
+            request_id: RequestId::from_string("forward-overshoot"),
+            style: style(),
+            source: None,
+            request: RenderRequest::Tile {
+                z: 1,
+                x: 2,
+                y: 3,
+                tile_size: 256,
+            },
+            pixel_ratio: PixelRatio::from(Scale::X1),
+            output_format: ImageFormat::Png,
+            arrived_at: origin_send,
+            deadline: origin_deadline,
+            forwarding_hops: 0,
+        };
+
+        let wire = task.to_forward_wire(origin_send, hop);
+        // Remote receives one actual hop later and rebuilds its local deadline.
+        let remote_receipt = origin_send + hop;
+        let remote = wire.into_internal(remote_receipt);
+        // Worst case: the remote render finishes exactly at its deadline; its
+        // response then needs one more hop to return.
+        let response_back_at_origin = remote.deadline + hop;
+        assert!(
+            response_back_at_origin <= origin_deadline,
+            "remote render + return hop must not exceed the origin deadline when the hop estimate holds"
+        );
     }
 
     #[tokio::test(start_paused = true)]

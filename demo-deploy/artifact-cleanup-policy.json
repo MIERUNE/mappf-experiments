@@ -1,0 +1,11 @@
+[
+  {
+    "name": "delete-stale-biei-build-cache",
+    "action": { "type": "Delete" },
+    "condition": {
+      "tagState": "untagged",
+      "packageNamePrefixes": ["biei-buildcache"],
+      "olderThan": "1d"
+    }
+  }
+]

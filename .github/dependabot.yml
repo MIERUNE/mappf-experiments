@@ -1,0 +1,32 @@
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: docker
+    directory: "/demo-deploy/biei/runtime"
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      biei-production-bases:
+        patterns:
+          - "*"
+
+  - package-ecosystem: docker
+    directory: "/demo-deploy/ishikari/runtime"
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      ishikari-production-bases:
+        patterns:
+          - "*"

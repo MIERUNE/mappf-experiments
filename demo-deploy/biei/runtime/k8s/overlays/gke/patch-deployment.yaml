@@ -3,7 +3,8 @@ kind: Deployment
 metadata:
   name: biei
 spec:
-  replicas: 3
+  # No `replicas` here: the HPA owns the replica count and the kustomization
+  # removes `/spec/replicas` from the base, so setting it would be dead config.
   template:
     spec:
       nodeSelector:

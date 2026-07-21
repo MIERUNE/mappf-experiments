@@ -1,58 +1,19 @@
 //! Production node metrics: a Prometheus `Registry` of counters/histograms
 //! (`NodeMetrics`) plus the label helpers used to render them.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
-use prometheus::{
-    Encoder, HistogramVec, IntCounter, IntCounterVec, Registry, TextEncoder, proto::MetricFamily,
-};
+pub use mmpf_common::metrics::encode_metric_families;
+use mmpf_common::metrics::{counter_vec, histogram_vec_buckets, register_collectors};
+use prometheus::{HistogramVec, IntCounter, IntCounterVec, Registry, proto::MetricFamily};
 
 use crate::types::{
     DeadlineStage, FailureKind, ImageFormat, RejectionReason, RenderMode, RenderObservation,
     RouteTier, Scale, TaskOutcome, TaskResult,
 };
-use crate::util::{counter_vec, gauge_vec, histogram_vec_buckets};
 
-type BoxedCollector = Box<dyn prometheus::core::Collector>;
-
-/// Register a fixed metric family set consistently. Metric construction and
-/// registration are startup invariants; a duplicate or invalid descriptor is
-/// a programming error, not a recoverable runtime condition.
-fn register_collectors<const N: usize>(registry: &Registry, collectors: [BoxedCollector; N]) {
-    for collector in collectors {
-        registry.register(collector).expect("register biei metric");
-    }
-}
-
-/// One renderer worker's gauge sample. Primitives only, so the dynamic gauge
-/// schema can live here in `metrics` without depending on the worker/profile
-/// types — the caller (HTTP layer) extracts these from its worker snapshot.
-pub struct WorkerGaugeSample {
-    pub worker: String,
-    pub render_mode: &'static str,
-    pub scale: &'static str,
-    pub queue_depth: i64,
-    pub loaded: bool,
-}
-
-/// Runtime gauge inputs sampled at scrape time (not stored in the registry).
-pub struct RuntimeGauges {
-    pub node_id: String,
-    pub workers: Vec<WorkerGaugeSample>,
-    /// Live membership size, if this node tracks membership.
-    pub membership_live: Option<i64>,
-    pub cpu_permits_inuse: i64,
-    pub draining: bool,
-    pub renderer_total: i64,
-    pub renderer_available: i64,
-    pub renderer_orphaned: i64,
-    pub renderer_health: &'static str,
-    pub renderer_replacements_succeeded: u64,
-    pub renderer_replacements_exhausted: u64,
-    pub renderer_replacements_failed: u64,
-}
-
-pub const ROUTE_TIERS: [RouteTier; 5] = [
+const ROUTE_TIERS: [RouteTier; 5] = [
     RouteTier::RenderCacheHit,
     RouteTier::Tier1WarmTracking,
     RouteTier::Tier2HrwBl,
@@ -60,9 +21,10 @@ pub const ROUTE_TIERS: [RouteTier; 5] = [
     RouteTier::Tier4Overflow,
 ];
 
-pub const REJECTION_REASONS: [RejectionReason; 8] = [
+const REJECTION_REASONS: [RejectionReason; 9] = [
     RejectionReason::QueueFull,
     RejectionReason::NoCapacity,
+    RejectionReason::RendererDegraded,
     RejectionReason::DrainTooSlow,
     RejectionReason::UnknownStyle,
     RejectionReason::HopLimitExceeded,
@@ -85,6 +47,7 @@ pub fn rejection_reason_label(reason: RejectionReason) -> &'static str {
     match reason {
         RejectionReason::QueueFull => "queue_full",
         RejectionReason::NoCapacity => "no_capacity",
+        RejectionReason::RendererDegraded => "renderer_degraded",
         RejectionReason::DrainTooSlow => "drain_too_slow",
         RejectionReason::UnknownStyle => "unknown_style",
         RejectionReason::HopLimitExceeded => "hop_limit_exceeded",
@@ -99,10 +62,9 @@ pub struct NodeMetrics {
     completed: IntCounterVec,
     rejected: IntCounterVec,
     failed: IntCounterVec,
+    failed_by_kind: IntCounterVec,
     request_duration: HistogramVec,
     native_render_duration: HistogramVec,
-    /// Deprecated metric-name compatibility alias for native render residency.
-    cpu_render_duration: HistogramVec,
     render_duration: HistogramVec,
     render_timeout_lower_bound: HistogramVec,
     style_setup_duration: HistogramVec,
@@ -117,9 +79,13 @@ pub struct NodeMetrics {
     deadline_exceeded: IntCounterVec,
     // Would-be renders shed because the renderer cannot start native work
     // (degraded). Recorded exactly at the shed decision — no health re-check —
-    // so it is a faithful count even though the rejection itself rides the wire
-    // as the generic `NoCapacity` reason.
+    // so it is a faithful count of the typed `RendererDegraded` rejection.
     render_admission_shed: IntCounter,
+    // Optional process-global metrics folded into every scrape (e.g. the Rust
+    // FileSource families). Installed by the composition root so `biei-core`
+    // stays independent of any MapLibre-backed collector; left unset in
+    // embedders (e.g. the simulator) that have no such source.
+    extra_metrics: OnceLock<Box<dyn Fn() -> Vec<MetricFamily> + Send + Sync>>,
 }
 
 impl NodeMetrics {
@@ -140,6 +106,11 @@ impl NodeMetrics {
             "Failed tasks by ingress scope.",
             &["scope"],
         );
+        let failed_by_kind = counter_vec(
+            "biei_tasks_failed_by_kind_total",
+            "Failed tasks by ingress scope and bounded failure kind.",
+            &["scope", "kind"],
+        );
         let request_duration = histogram_vec_buckets(
             "biei_request_duration_seconds",
             "End-to-end task duration from node arrival to completion.",
@@ -149,19 +120,13 @@ impl NodeMetrics {
         let native_render_duration = histogram_vec_buckets(
             "biei_native_render_duration_seconds",
             "Native renderStill wall time, including in-render FileSource waits.",
-            CPU_RENDER_BUCKETS,
-            &["scope"],
-        );
-        let cpu_render_duration = histogram_vec_buckets(
-            "biei_cpu_render_duration_seconds",
-            "Deprecated alias of biei_native_render_duration_seconds; includes FileSource waits and is not CPU service time.",
-            CPU_RENDER_BUCKETS,
+            NATIVE_RENDER_BUCKETS,
             &["scope"],
         );
         let render_duration = histogram_vec_buckets(
             "biei_render_duration_seconds",
             "Native render and output encoding duration by bounded render shape and worker state.",
-            CPU_RENDER_BUCKETS,
+            NATIVE_RENDER_BUCKETS,
             &["scope", "render_mode", "scale", "format", "size", "state"],
         );
         let render_timeout_lower_bound = histogram_vec_buckets(
@@ -232,12 +197,12 @@ impl NodeMetrics {
         register_collectors(
             &registry,
             [
-                Box::new(completed.clone()) as BoxedCollector,
+                Box::new(completed.clone()) as Box<dyn prometheus::core::Collector>,
                 Box::new(rejected.clone()),
                 Box::new(failed.clone()),
+                Box::new(failed_by_kind.clone()),
                 Box::new(request_duration.clone()),
                 Box::new(native_render_duration.clone()),
-                Box::new(cpu_render_duration.clone()),
                 Box::new(render_duration.clone()),
                 Box::new(render_timeout_lower_bound.clone()),
                 Box::new(style_setup_duration.clone()),
@@ -252,6 +217,7 @@ impl NodeMetrics {
                 Box::new(deadline_exceeded.clone()),
                 Box::new(render_admission_shed.clone()),
             ],
+            "register biei metric",
         );
 
         let metrics = Self {
@@ -259,9 +225,9 @@ impl NodeMetrics {
             completed,
             rejected,
             failed,
+            failed_by_kind,
             request_duration,
             native_render_duration,
-            cpu_render_duration,
             render_duration,
             render_timeout_lower_bound,
             style_setup_duration,
@@ -275,6 +241,7 @@ impl NodeMetrics {
             admission_overflow,
             deadline_exceeded,
             render_admission_shed,
+            extra_metrics: OnceLock::new(),
         };
         metrics.init_zero_series();
         metrics
@@ -282,7 +249,7 @@ impl NodeMetrics {
 
     /// Count a would-be render shed because the renderer is degraded. Called at
     /// the shed decision so the count never depends on a later health re-check.
-    pub fn record_render_admission_shed(&self) {
+    pub(crate) fn record_render_admission_shed(&self) {
         self.render_admission_shed.inc();
     }
 
@@ -306,21 +273,21 @@ impl NodeMetrics {
         self.forwards.with_label_values(&["fatal"]).inc();
     }
 
-    pub fn record_render_output_cache_hit(&self) {
+    pub(crate) fn record_render_output_cache_hit(&self) {
         self.render_output_cache.with_label_values(&["hit"]).inc();
     }
 
-    pub fn record_render_output_cache_miss(&self) {
+    pub(crate) fn record_render_output_cache_miss(&self) {
         self.render_output_cache.with_label_values(&["miss"]).inc();
     }
 
-    pub fn record_render_output_cache_coalesced(&self) {
+    pub(crate) fn record_render_output_cache_coalesced(&self) {
         self.render_output_cache
             .with_label_values(&["coalesced"])
             .inc();
     }
 
-    pub fn record_render_output_cache_insert(&self) {
+    pub(crate) fn record_render_output_cache_insert(&self) {
         self.render_output_cache
             .with_label_values(&["insert"])
             .inc();
@@ -332,130 +299,27 @@ impl NodeMetrics {
             .observe(seconds(duration));
     }
 
+    /// Install a process-global metrics source folded into every scrape (e.g.
+    /// the Rust FileSource families). Idempotent: only the first source wins.
+    pub fn set_extra_metrics_source(
+        &self,
+        source: Box<dyn Fn() -> Vec<MetricFamily> + Send + Sync>,
+    ) {
+        let _ = self.extra_metrics.set(source);
+    }
+
     pub fn gather(&self) -> Vec<MetricFamily> {
-        // Node-scoped metrics plus the process-global Rust FileSource metrics
-        // (empty until the file source is registered).
+        // Node-scoped metrics plus any injected process-global families (e.g.
+        // the Rust FileSource metrics), empty until a source is installed.
         let mut families = self.registry.gather();
-        families.extend(crate::renderer::file_source::gather_metrics());
+        if let Some(source) = self.extra_metrics.get() {
+            families.extend(source());
+        }
         families
     }
 
     pub fn render_prometheus(&self) -> String {
         let families = self.gather();
-        encode_metric_families(&families)
-    }
-
-    /// Renders the stored counters/histograms plus the caller-sampled runtime
-    /// gauges (queue depth, loaded workers, membership, CPU permits, drain) into
-    /// the Prometheus text exposition format. The gauge schema lives here rather
-    /// than in the HTTP adapter.
-    pub fn render_prometheus_with_runtime(&self, runtime: &RuntimeGauges) -> String {
-        let node = runtime.node_id.as_str();
-        let registry = Registry::new();
-        let queue_depth = gauge_vec(
-            "biei_queue_depth",
-            "Current queued tasks per renderer worker.",
-            &["node", "worker", "render_mode", "scale"],
-        );
-        let worker_loaded = gauge_vec(
-            "biei_worker_loaded",
-            "Whether a renderer worker has a loaded profile.",
-            &["node", "worker"],
-        );
-        let membership_size = gauge_vec(
-            "biei_membership_size",
-            "Current membership size by state.",
-            &["node", "state"],
-        );
-        let cpu_permits_inuse = gauge_vec(
-            "biei_cpu_permits_inuse",
-            "Currently held CPU/GPU render-stage permits.",
-            &["node"],
-        );
-        let drain_state = gauge_vec(
-            "biei_drain_state",
-            "Whether the node is draining.",
-            &["node"],
-        );
-        let renderer_slots = gauge_vec(
-            "biei_renderer_slots",
-            "Configured and currently available renderer slots.",
-            &["node", "state"],
-        );
-        let renderer_orphaned = gauge_vec(
-            "biei_renderer_orphan_threads",
-            "Detached native renderer threads that have not returned.",
-            &["node"],
-        );
-        let renderer_health = gauge_vec(
-            "biei_renderer_health",
-            "Current renderer health state (one-hot).",
-            &["node", "state"],
-        );
-        let renderer_replacements = counter_vec(
-            "biei_renderer_replacements_total",
-            "Renderer actor replacement attempts by outcome.",
-            &["node", "outcome"],
-        );
-
-        register_collectors(
-            &registry,
-            [
-                Box::new(queue_depth.clone()) as BoxedCollector,
-                Box::new(worker_loaded.clone()),
-                Box::new(membership_size.clone()),
-                Box::new(cpu_permits_inuse.clone()),
-                Box::new(drain_state.clone()),
-                Box::new(renderer_slots.clone()),
-                Box::new(renderer_orphaned.clone()),
-                Box::new(renderer_health.clone()),
-                Box::new(renderer_replacements.clone()),
-            ],
-        );
-
-        for worker in &runtime.workers {
-            queue_depth
-                .with_label_values(&[node, &worker.worker, worker.render_mode, worker.scale])
-                .set(worker.queue_depth);
-            worker_loaded
-                .with_label_values(&[node, &worker.worker])
-                .set(i64::from(worker.loaded));
-        }
-        if let Some(live) = runtime.membership_live {
-            membership_size.with_label_values(&[node, "live"]).set(live);
-        }
-        cpu_permits_inuse
-            .with_label_values(&[node])
-            .set(runtime.cpu_permits_inuse);
-        drain_state
-            .with_label_values(&[node])
-            .set(i64::from(runtime.draining));
-        renderer_slots
-            .with_label_values(&[node, "total"])
-            .set(runtime.renderer_total);
-        renderer_slots
-            .with_label_values(&[node, "available"])
-            .set(runtime.renderer_available);
-        renderer_orphaned
-            .with_label_values(&[node])
-            .set(runtime.renderer_orphaned);
-        for state in ["full", "external_degraded", "internal_unrecoverable"] {
-            renderer_health
-                .with_label_values(&[node, state])
-                .set(i64::from(state == runtime.renderer_health));
-        }
-        for (outcome, value) in [
-            ("success", runtime.renderer_replacements_succeeded),
-            ("exhausted", runtime.renderer_replacements_exhausted),
-            ("spawn_failed", runtime.renderer_replacements_failed),
-        ] {
-            renderer_replacements
-                .with_label_values(&[node, outcome])
-                .inc_by(value);
-        }
-
-        let mut families = self.gather();
-        families.extend(registry.gather());
         encode_metric_families(&families)
     }
 
@@ -467,15 +331,15 @@ impl NodeMetrics {
                 self.request_duration
                     .with_label_values(&[scope, route_tier])
                     .observe(seconds(
-                        info.completed_at.duration_since(outcome.arrived_at),
+                        info.completed_at
+                            .saturating_duration_since(outcome.arrived_at),
                     ));
                 if info.route_tier != RouteTier::RenderCacheHit {
-                    let render_seconds =
-                        seconds(info.cpu_completed_at.duration_since(info.cpu_started_at));
+                    let render_seconds = seconds(
+                        info.native_render_completed_at
+                            .saturating_duration_since(info.native_render_started_at),
+                    );
                     self.native_render_duration
-                        .with_label_values(&[scope])
-                        .observe(render_seconds);
-                    self.cpu_render_duration
                         .with_label_values(&[scope])
                         .observe(render_seconds);
                     if let Some(observation) = &info.render_observation {
@@ -539,6 +403,9 @@ impl NodeMetrics {
             }
             TaskResult::Failed { kind, .. } => {
                 self.failed.with_label_values(&[scope]).inc();
+                self.failed_by_kind
+                    .with_label_values(&[scope, kind.as_label()])
+                    .inc();
                 if *kind == FailureKind::RenderTimeout {
                     self.render_timeout_lower_bound
                         .with_label_values(&[scope])
@@ -554,13 +421,17 @@ impl NodeMetrics {
     fn init_zero_series(&self) {
         for scope in ["ingress", "forwarded"] {
             self.failed.with_label_values(&[scope]).inc_by(0);
+            for kind in FailureKind::ALL {
+                self.failed_by_kind
+                    .with_label_values(&[scope, kind.as_label()])
+                    .inc_by(0);
+            }
             self.style_swaps.with_label_values(&[scope]).inc_by(0);
             self.cold_starts.with_label_values(&[scope]).inc_by(0);
             self.admission_overflow
                 .with_label_values(&[scope])
                 .inc_by(0);
             self.native_render_duration.with_label_values(&[scope]);
-            self.cpu_render_duration.with_label_values(&[scope]);
             self.render_timeout_lower_bound.with_label_values(&[scope]);
             for tier in ROUTE_TIERS {
                 let tier = route_tier_label(tier);
@@ -641,7 +512,7 @@ pub const LATENCY_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0,
 ];
 
-const CPU_RENDER_BUCKETS: &[f64] = &[
+const NATIVE_RENDER_BUCKETS: &[f64] = &[
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0,
     3.0, 5.0, 10.0,
 ];
@@ -650,7 +521,7 @@ const DEADLINE_STAGES: [DeadlineStage; 5] = [
     DeadlineStage::AcquireRenderPermit,
     DeadlineStage::StyleSwap,
     DeadlineStage::EnsureSource,
-    DeadlineStage::AcquireCpuPermit,
+    DeadlineStage::AcquireNativeRenderPermit,
     DeadlineStage::Render,
 ];
 
@@ -659,18 +530,9 @@ pub fn deadline_stage_label(stage: DeadlineStage) -> &'static str {
         DeadlineStage::AcquireRenderPermit => "acquire_render_permit",
         DeadlineStage::StyleSwap => "style_swap",
         DeadlineStage::EnsureSource => "ensure_source",
-        DeadlineStage::AcquireCpuPermit => "acquire_cpu_permit",
+        DeadlineStage::AcquireNativeRenderPermit => "acquire_native_render_permit",
         DeadlineStage::Render => "render",
     }
-}
-
-pub fn encode_metric_families(families: &[MetricFamily]) -> String {
-    let encoder = TextEncoder::new();
-    let mut buf = Vec::new();
-    if encoder.encode(families, &mut buf).is_err() {
-        return String::new();
-    }
-    String::from_utf8(buf).unwrap_or_default()
 }
 
 fn seconds(duration: Duration) -> f64 {
@@ -700,8 +562,8 @@ mod tests {
                     worker_id: Some(2),
                     route_tier,
                     started_at: now,
-                    cpu_started_at: now + Duration::from_millis(2),
-                    cpu_completed_at: now + Duration::from_millis(7),
+                    native_render_started_at: now + Duration::from_millis(2),
+                    native_render_completed_at: now + Duration::from_millis(7),
                     completed_at: now + Duration::from_millis(10),
                     style_swap: false,
                     cold_start: false,
@@ -749,7 +611,6 @@ mod tests {
                 .contains("biei_tasks_rejected_total{reason=\"queue_full\",scope=\"forwarded\"} 1")
         );
         assert!(rendered.contains("biei_request_duration_seconds_bucket"));
-        assert!(rendered.contains("biei_cpu_render_duration_seconds_bucket"));
         assert!(rendered.contains("biei_native_render_duration_seconds_bucket"));
     }
 
@@ -788,6 +649,15 @@ mod tests {
         assert!(
             rendered.contains("biei_render_timeout_lower_bound_seconds_count{scope=\"ingress\"} 1")
         );
+        // The bounded per-kind counter records the failure alongside the total.
+        assert!(rendered.contains(
+            "biei_tasks_failed_by_kind_total{kind=\"render_timeout\",scope=\"ingress\"} 1"
+        ));
+        // Other kinds stay present at zero (init) so dashboards see a stable set.
+        assert!(rendered.contains(
+            "biei_tasks_failed_by_kind_total{kind=\"style_unavailable\",scope=\"ingress\"} 0"
+        ));
+        assert!(rendered.contains("biei_tasks_failed_total{scope=\"ingress\"} 1"));
     }
 
     #[test]
@@ -813,7 +683,7 @@ mod tests {
             request_id: RequestId::from_string("deadline-test"),
             arrived_at: Instant::now(),
             had_source: false,
-            deadline_stage: Some(DeadlineStage::AcquireCpuPermit),
+            deadline_stage: Some(DeadlineStage::AcquireNativeRenderPermit),
             result: TaskResult::Rejected {
                 reason: RejectionReason::DeadlineExceeded,
             },
@@ -829,7 +699,10 @@ mod tests {
         assert!(rendered.contains("biei_cold_starts_total{scope=\"ingress\"} 1"));
         assert!(rendered.contains("biei_source_cache_total{outcome=\"miss\"} 1"));
         assert!(rendered.contains("biei_admission_overflow_total{scope=\"ingress\"} 1"));
-        assert!(rendered.contains("biei_deadline_exceeded_total{stage=\"acquire_cpu_permit\"} 1"));
+        assert!(
+            rendered
+                .contains("biei_deadline_exceeded_total{stage=\"acquire_native_render_permit\"} 1")
+        );
         assert!(rendered.contains("biei_forwards_total{outcome=\"success\"} 1"));
         assert!(rendered.contains("biei_forwards_total{outcome=\"retryable\"} 1"));
         assert!(rendered.contains("biei_forwards_total{outcome=\"fatal\"} 1"));
@@ -851,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn render_cache_hit_records_request_latency_but_not_cpu_render_latency() {
+    fn render_cache_hit_records_request_latency_but_not_native_render_latency() {
         let metrics = NodeMetrics::default();
         metrics.record_ingress(&completed_outcome(RouteTier::RenderCacheHit));
 
@@ -859,7 +732,6 @@ mod tests {
         assert!(rendered.contains(
             "biei_request_duration_seconds_count{route_tier=\"render_cache_hit\",scope=\"ingress\"} 1"
         ));
-        assert!(rendered.contains("biei_cpu_render_duration_seconds_count{scope=\"ingress\"} 0"));
         assert!(
             rendered.contains("biei_native_render_duration_seconds_count{scope=\"ingress\"} 0")
         );
@@ -874,6 +746,10 @@ mod tests {
         assert_eq!(
             rejection_reason_label(RejectionReason::DeadlineTooClose),
             "deadline_too_close"
+        );
+        assert_eq!(
+            rejection_reason_label(RejectionReason::RendererDegraded),
+            "renderer_degraded"
         );
     }
 }

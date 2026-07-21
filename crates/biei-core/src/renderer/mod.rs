@@ -1,18 +1,13 @@
 //! `Renderer` trait — profile setup / source / render worker hooks.
 
-pub mod actor;
-pub(crate) mod file_source;
-pub(crate) mod http_fetch;
-pub mod maplibre;
-pub(crate) mod overlay;
-
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::types::{
-    AddLayerSource, InternalTask, RenderOutput, RendererError, SourceHash, StyleRevision,
+    AddLayerSource, InternalTask, ProfilePreparationError, RenderOutput, RendererError, SourceHash,
+    StyleRevision,
 };
 
 #[derive(Clone, Debug)]
@@ -45,8 +40,8 @@ impl From<RenderOutput> for RendererOutput {
 
 #[derive(Clone, Debug)]
 pub enum StyleAvailabilityError {
-    NotFound(RendererError),
-    Unavailable(RendererError),
+    NotFound(ProfilePreparationError),
+    Unavailable(ProfilePreparationError),
 }
 
 #[async_trait]
@@ -55,7 +50,7 @@ pub trait ProfilePreparer: Send + Sync {
     async fn prepare_profile(
         &self,
         _task: &InternalTask,
-    ) -> Result<Option<PreparedProfile>, RendererError> {
+    ) -> Result<Option<PreparedProfile>, ProfilePreparationError> {
         Ok(None)
     }
 

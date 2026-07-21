@@ -11,7 +11,7 @@ use crate::config::{SimConfig, SourceProvider, StyleDist};
 use crate::metrics::Report;
 use biei_core::config::{BlCapacityPolicy, Tier1Strategy};
 
-pub const REPORT_SCHEMA_VERSION: u32 = 3;
+pub const REPORT_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Serialize)]
 pub struct RunReport {
@@ -50,7 +50,12 @@ pub struct ReportSnapshot {
     pub failed: usize,
     pub rejection_by_reason: BTreeMap<String, usize>,
     pub failure_by_error: BTreeMap<String, usize>,
-    pub sla_violations: usize,
+    pub completed_latency_sla_violations: usize,
+    pub completed_latency_sla_denominator: usize,
+    pub completed_latency_sla_violation_rate: Option<f64>,
+    pub request_successes: usize,
+    pub request_success_denominator: usize,
+    pub request_success_rate: Option<f64>,
     pub sla_ms: f64,
     pub throughput: f64,
     pub latency_p50_ms: f64,
@@ -97,7 +102,12 @@ impl From<&Report> for ReportSnapshot {
                 .iter()
                 .map(|(error, count)| (error.clone(), *count))
                 .collect(),
-            sla_violations: report.sla_violations,
+            completed_latency_sla_violations: report.completed_latency_sla_violations,
+            completed_latency_sla_denominator: report.completed_latency_sla_denominator,
+            completed_latency_sla_violation_rate: report.completed_latency_sla_violation_rate,
+            request_successes: report.request_successes,
+            request_success_denominator: report.request_success_denominator,
+            request_success_rate: report.request_success_rate,
             sla_ms: millis(report.sla),
             throughput: report.throughput,
             latency_p50_ms: millis(report.latency_p50),
@@ -151,7 +161,7 @@ fn config_snapshot(config: &SimConfig) -> Value {
     let biei_core::config::ClusterConfig {
         renderer_slots_per_node,
         render_permits_per_node,
-        cpu_render_permits_per_node,
+        native_render_permits_per_node,
         bl_capacity,
         queue_capacity_multiplier,
         source_cache_capacity,
@@ -193,8 +203,8 @@ fn config_snapshot(config: &SimConfig) -> Value {
             "renderer_slots_per_node": renderer_slots_per_node,
             "render_permits_per_node": render_permits_per_node,
             "effective_render_permits_per_node": cluster.resolved_render_permits_per_node(),
-            "native_render_permits_per_node": cpu_render_permits_per_node,
-            "effective_native_render_permits_per_node": cluster.resolved_cpu_render_permits_per_node(),
+            "native_render_permits_per_node": native_render_permits_per_node,
+            "effective_native_render_permits_per_node": cluster.resolved_native_render_permits_per_node(),
             "bl_capacity": match bl_capacity {
                 BlCapacityPolicy::Fixed(value) => json!({"kind": "fixed", "value": value}),
                 BlCapacityPolicy::Auto => json!({"kind": "auto"}),
@@ -319,9 +329,16 @@ mod tests {
             480.0
         );
         assert_eq!(value["result"]["total"], 0);
+        assert_eq!(value["result"]["completed_latency_sla_violations"], 0);
+        assert_eq!(value["result"]["completed_latency_sla_denominator"], 0);
+        assert!(value["result"]["completed_latency_sla_violation_rate"].is_null());
+        assert_eq!(value["result"]["request_successes"], 0);
+        assert_eq!(value["result"]["request_success_denominator"], 0);
+        assert!(value["result"]["request_success_rate"].is_null());
+        assert!(value["result"].get("sla_violations").is_none());
         assert_eq!(
             value["config"]["cluster"]["effective_native_render_permits_per_node"],
-            config.cluster.resolved_cpu_render_permits_per_node()
+            config.cluster.resolved_native_render_permits_per_node()
         );
         assert_eq!(
             value["result"]["latency_histogram"]

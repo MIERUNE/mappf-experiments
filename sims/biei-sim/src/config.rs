@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use anyhow::{Result, ensure};
 use biei_core::config::{
     BlCapacityPolicy, ClusterConfig, CostConfig, CostRange, GossipConfig, RoutingConfig,
     Tier1Strategy,
@@ -109,6 +110,175 @@ pub struct SimConfig {
     pub seed: u64,
 }
 
+impl SimConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(self.node_count > 0, "simulation needs at least one node");
+        ensure!(
+            self.cpu_cores_per_node > 0,
+            "cpu_cores_per_node must be greater than zero"
+        );
+        ensure!(
+            self.cluster.renderer_slots_per_node > 0,
+            "renderer_slots_per_node must be greater than zero"
+        );
+        ensure!(
+            self.cluster.queue_capacity_multiplier > 0,
+            "queue_capacity_multiplier must be greater than zero"
+        );
+        if let Some(permits) = self.cluster.render_permits_per_node {
+            ensure!(
+                permits > 0,
+                "render_permits_per_node must be greater than zero"
+            );
+        }
+        if let Some(permits) = self.cluster.native_render_permits_per_node {
+            ensure!(
+                permits > 0,
+                "native_render_permits_per_node must be greater than zero"
+            );
+        }
+        self.cluster
+            .validate_standby_ratio()
+            .map_err(anyhow::Error::msg)?;
+
+        ensure!(
+            self.workload.total_rate.is_finite() && self.workload.total_rate >= 0.0,
+            "workload total_rate must be finite and non-negative"
+        );
+        ensure!(
+            self.workload.new_style_rate.is_finite() && self.workload.new_style_rate >= 0.0,
+            "workload new_style_rate must be finite and non-negative"
+        );
+        ensure!(
+            self.workload.style_count > 0,
+            "workload style_count must be greater than zero"
+        );
+        ensure!(
+            self.workload.tile_style_count <= self.workload.style_count,
+            "workload tile_style_count must not exceed style_count"
+        );
+        ensure!(
+            self.workload.warmup <= self.workload.duration,
+            "workload warmup must not exceed duration"
+        );
+        validate_style_distribution(&self.workload.style_distribution, "workload style")?;
+
+        if let Some(burst) = &self.workload.burst_pattern {
+            ensure!(!burst.period.is_zero(), "burst period must be non-zero");
+            ensure!(
+                burst.duration <= burst.period,
+                "burst duration must not exceed its period"
+            );
+            ensure!(
+                burst.multiplier.is_finite() && burst.multiplier >= 0.0,
+                "burst multiplier must be finite and non-negative"
+            );
+        }
+        if let Some(pattern) = &self.workload.source_pattern {
+            ensure!(
+                pattern.probability.is_finite() && (0.0..=1.0).contains(&pattern.probability),
+                "source probability must be finite and in [0, 1]"
+            );
+            validate_source_provider(&pattern.provider, "source provider")?;
+        }
+
+        validate_cost_range("style_setup_cost", self.costs.style_setup_cost)?;
+        validate_cost_range("source_load_cost", self.costs.source_load_cost)?;
+        validate_cost_range("render_cpu_cost", self.costs.render_cpu_cost)?;
+        validate_cost_range("render_resource_cost", self.costs.render_resource_cost)?;
+        validate_cost_range(
+            "first_render_resource_cost",
+            self.costs.first_render_resource_cost,
+        )?;
+        ensure!(!self.costs.sla.is_zero(), "SLA must be non-zero");
+        ensure!(
+            !self.gossip.publish_interval.is_zero(),
+            "gossip publish_interval must be non-zero"
+        );
+        Ok(())
+    }
+}
+
+fn validate_style_distribution(distribution: &StyleDist, label: &str) -> Result<()> {
+    match distribution {
+        StyleDist::Uniform => Ok(()),
+        StyleDist::Zipf { alpha } => {
+            ensure!(
+                alpha.is_finite() && *alpha > 0.0,
+                "{label} Zipf alpha must be finite and greater than zero"
+            );
+            Ok(())
+        }
+        StyleDist::Custom(weights) => validate_weights(weights, label),
+    }
+}
+
+fn validate_source_provider(provider: &SourceProvider, label: &str) -> Result<()> {
+    match provider {
+        SourceProvider::Shared {
+            source_count,
+            distribution,
+        } => {
+            ensure!(
+                *source_count > 0,
+                "{label} shared source_count must be greater than zero"
+            );
+            validate_style_distribution(distribution, label)
+        }
+        SourceProvider::PeriodicRefresh {
+            source_count,
+            interval,
+            ..
+        } => {
+            ensure!(
+                *source_count > 0,
+                "{label} periodic source_count must be greater than zero"
+            );
+            ensure!(
+                !interval.is_zero(),
+                "{label} periodic interval must be non-zero"
+            );
+            Ok(())
+        }
+        SourceProvider::OneShot => Ok(()),
+        SourceProvider::Mixed(choices) => {
+            ensure!(
+                !choices.is_empty(),
+                "{label} mixed choices must not be empty"
+            );
+            let weights: Vec<_> = choices.iter().map(|(weight, _)| *weight).collect();
+            validate_weights(&weights, label)?;
+            for (index, (_, child)) in choices.iter().enumerate() {
+                validate_source_provider(child, &format!("{label} choice {index}"))?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_weights(weights: &[f64], label: &str) -> Result<()> {
+    ensure!(!weights.is_empty(), "{label} weights must not be empty");
+    ensure!(
+        weights
+            .iter()
+            .all(|weight| weight.is_finite() && *weight >= 0.0),
+        "{label} weights must be finite and non-negative"
+    );
+    ensure!(
+        weights.iter().any(|weight| *weight > 0.0),
+        "{label} weights must contain a positive value"
+    );
+    Ok(())
+}
+
+fn validate_cost_range(label: &str, range: CostRange) -> Result<()> {
+    ensure!(
+        range.min <= range.max,
+        "{label} minimum must not exceed maximum"
+    );
+    Ok(())
+}
+
 impl Default for SimConfig {
     fn default() -> Self {
         Self {
@@ -117,7 +287,7 @@ impl Default for SimConfig {
             cluster: ClusterConfig {
                 renderer_slots_per_node: 16,
                 render_permits_per_node: None,
-                cpu_render_permits_per_node: None,
+                native_render_permits_per_node: None,
                 bl_capacity: BlCapacityPolicy::Auto,
                 queue_capacity_multiplier: 4,
                 source_cache_capacity: 32,
@@ -170,5 +340,110 @@ impl Default for SimConfig {
             },
             seed: 0xDEAD_BEEF,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn configured(update: impl FnOnce(&mut SimConfig)) -> SimConfig {
+        let mut config = SimConfig::default();
+        update(&mut config);
+        config
+    }
+
+    #[test]
+    fn default_configuration_is_valid() {
+        SimConfig::default().validate().expect("default config");
+    }
+
+    #[test]
+    fn rejects_values_that_would_be_silently_normalized() {
+        let config = configured(|config| config.cpu_cores_per_node = 0);
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("cpu_cores_per_node")
+        );
+
+        let config = configured(|config| config.cluster.render_permits_per_node = Some(0));
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("render_permits_per_node")
+        );
+
+        let config = configured(|config| config.workload.style_count = 0);
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("style_count")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_stochastic_inputs_before_sampling() {
+        let config = configured(|config| config.workload.total_rate = f64::NAN);
+        assert!(config.validate().is_err());
+
+        let config = configured(|config| {
+            config.workload.style_distribution = StyleDist::Zipf { alpha: 0.0 };
+        });
+        assert!(config.validate().is_err());
+
+        let config = configured(|config| {
+            config.workload.style_distribution = StyleDist::Custom(vec![0.0, 0.0]);
+        });
+        assert!(config.validate().is_err());
+
+        let config = configured(|config| {
+            config.workload.source_pattern = Some(SourcePattern {
+                probability: 1.1,
+                provider: SourceProvider::OneShot,
+            });
+        });
+        assert!(config.validate().is_err());
+
+        let config = configured(|config| {
+            config.workload.source_pattern = Some(SourcePattern {
+                probability: 1.0,
+                provider: SourceProvider::Mixed(vec![(
+                    f64::NAN,
+                    Box::new(SourceProvider::OneShot),
+                )]),
+            });
+        });
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_incoherent_timing_and_cost_ranges() {
+        let config = configured(|config| {
+            config.workload.warmup = config.workload.duration + Duration::from_secs(1);
+        });
+        assert!(config.validate().is_err());
+
+        let config = configured(|config| {
+            config.workload.burst_pattern = Some(BurstPattern {
+                period: Duration::from_secs(1),
+                duration: Duration::from_secs(2),
+                multiplier: 2.0,
+                style_focus: None,
+            });
+        });
+        assert!(config.validate().is_err());
+
+        let config = configured(|config| {
+            config.costs.render_cpu_cost =
+                CostRange::new(Duration::from_millis(2), Duration::from_millis(1));
+        });
+        assert!(config.validate().is_err());
     }
 }

@@ -39,9 +39,14 @@
   <script>
     const report = __BIEI_REPORT_JSON__;
     const esc = value => String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    const rateSummary = (rate, numerator, denominator) => rate == null
+      ? `n/a (${numerator}/${denominator})`
+      : `${(rate * 100).toFixed(1)}% (${numerator}/${denominator})`;
     const r = report.result;
     const metrics = [
-      ['Requests', r.total], ['Completed', r.completed], ['Rejected', r.rejected],
+      ['Requests', r.total], ['Completed', r.completed], ['Rejected', r.rejected], ['Failed', r.failed],
+      ['Request success', rateSummary(r.request_success_rate, r.request_successes, r.request_success_denominator)],
+      ['Completed latency SLA violations', rateSummary(r.completed_latency_sla_violation_rate, r.completed_latency_sla_violations, r.completed_latency_sla_denominator)],
       ['p50', `${r.latency_p50_ms.toFixed(1)} ms`], ['p99', `${r.latency_p99_ms.toFixed(1)} ms`],
       ['Throughput', `${r.throughput.toFixed(1)} req/s`], ['Cold starts', r.cold_starts],
       ['Style swaps', r.style_swaps], ['Native residency utilization', `${r.native_render_utilization_pct.toFixed(1)}%`]
@@ -131,23 +136,23 @@
       c.textBaseline='alphabetic'; c.textAlign='left'; c.fillStyle='#c0392b'; c.fillText('queue depth (left)', left, 22); c.fillStyle='#21618c'; c.fillText('active nodes (right)', left+135, 22);
       c.fillStyle='#52616b'; c.textAlign='left'; c.fillText('0', left, h-15); c.textAlign='right'; c.fillText(`${maxX} requests`, w-right, h-15);
     }
-    const activity = samples.filter(s => s.reason !== 'initial' && s.interval);
-    if (!activity.length || !activity.some(s => (s.interval.cold_starts || 0) + (s.interval.style_swaps || 0) > 0)) {
+    const activity = samples.filter(s => s.reason !== 'initial' && s.completion_window);
+    if (!activity.length || !activity.some(s => (s.completion_window.cold_starts_observed || 0) + (s.completion_window.style_swaps_observed || 0) > 0)) {
       document.querySelector('#activity-chart').hidden = true;
       document.querySelector('#activity-empty').hidden = false;
     } else {
       const {context:c, width:w, height:h} = prepareCanvas('#activity-chart');
       const left=54, right=24, top=38, bottom=42, plotW=w-left-right, plotH=h-top-bottom;
-      const maxValue=Math.max(1,...activity.map(s => Math.max(s.interval.cold_starts||0,s.interval.style_swaps||0)));
+      const maxValue=Math.max(1,...activity.map(s => Math.max(s.completion_window.cold_starts_observed||0,s.completion_window.style_swaps_observed||0)));
       const step=plotW/activity.length, barWidth=Math.max(2,Math.min(18,step*0.34));
       c.font='12px ui-sans-serif, system-ui, sans-serif'; c.textBaseline='middle';
       for (let i=0;i<=4;i++) { const y=top+plotH*i/4; c.strokeStyle='#edf1f2'; c.beginPath(); c.moveTo(left,y); c.lineTo(w-right,y); c.stroke(); c.fillStyle='#7b8a91'; c.textAlign='right'; c.fillText(String(Math.round(maxValue*(1-i/4))),left-8,y); }
       c.strokeStyle='#aeb8bd'; c.beginPath(); c.moveTo(left,top); c.lineTo(left,h-bottom); c.lineTo(w-right,h-bottom); c.stroke();
-      activity.forEach((s,i) => { const center=left+(i+0.5)*step; const cold=plotH*(s.interval.cold_starts||0)/maxValue; const swaps=plotH*(s.interval.style_swaps||0)/maxValue; c.fillStyle='#d68910'; c.fillRect(center-barWidth,h-bottom-cold,barWidth,cold); c.fillStyle='#7d3c98'; c.fillRect(center,h-bottom-swaps,barWidth,swaps); });
+      activity.forEach((s,i) => { const center=left+(i+0.5)*step; const cold=plotH*(s.completion_window.cold_starts_observed||0)/maxValue; const swaps=plotH*(s.completion_window.style_swaps_observed||0)/maxValue; c.fillStyle='#d68910'; c.fillRect(center-barWidth,h-bottom-cold,barWidth,cold); c.fillStyle='#7d3c98'; c.fillRect(center,h-bottom-swaps,barWidth,swaps); });
       c.fillStyle='#d68910'; c.textAlign='left'; c.textBaseline='alphabetic'; c.fillText('cold starts',left,22); c.fillStyle='#7d3c98'; c.fillText('style swaps',left+92,22);
       c.fillStyle='#52616b'; c.fillText('0',left,h-15); c.textAlign='right'; c.fillText(`${Math.max(...activity.map(s=>s.at_request))} measured requests`,w-right,h-15);
     }
-    const intervalLatency = activity.filter(s => s.interval.latency_samples > 0);
+    const intervalLatency = activity.filter(s => s.completion_window.latency_samples > 0);
     if (!intervalLatency.length) {
       document.querySelector('#interval-latency-chart').hidden = true;
       document.querySelector('#interval-latency-empty').hidden = false;
@@ -155,13 +160,13 @@
       const {context:c, width:w, height:h} = prepareCanvas('#interval-latency-chart');
       const left=58, right=24, top=38, bottom=42, plotW=w-left-right, plotH=h-top-bottom;
       const maxX=Math.max(1,...intervalLatency.map(s=>s.at_request));
-      const maxLatency=Math.max(1,...intervalLatency.map(s=>s.interval.latency_p99_ms||0));
+      const maxLatency=Math.max(1,...intervalLatency.map(s=>s.completion_window.latency_p99_ms||0));
       const xOf=value=>left+plotW*value/maxX;
       const yOf=value=>top+plotH*(1-value/maxLatency);
       c.font='12px ui-sans-serif, system-ui, sans-serif'; c.textBaseline='middle';
       for (let i=0;i<=4;i++) { const y=top+plotH*i/4; c.strokeStyle='#edf1f2'; c.beginPath(); c.moveTo(left,y); c.lineTo(w-right,y); c.stroke(); c.fillStyle='#7b8a91'; c.textAlign='right'; c.fillText(`${(maxLatency*(1-i/4)).toFixed(0)}ms`,left-8,y); }
       c.strokeStyle='#aeb8bd'; c.beginPath(); c.moveTo(left,top); c.lineTo(left,h-bottom); c.lineTo(w-right,h-bottom); c.stroke();
-      const latencyLine=(key,color)=>{ c.strokeStyle=color; c.lineWidth=2.5; c.lineJoin='round'; c.beginPath(); intervalLatency.forEach((s,i)=>{ const x=xOf(s.at_request), y=yOf(s.interval[key]||0); i?c.lineTo(x,y):c.moveTo(x,y); }); c.stroke(); };
+      const latencyLine=(key,color)=>{ c.strokeStyle=color; c.lineWidth=2.5; c.lineJoin='round'; c.beginPath(); intervalLatency.forEach((s,i)=>{ const x=xOf(s.at_request), y=yOf(s.completion_window[key]||0); i?c.lineTo(x,y):c.moveTo(x,y); }); c.stroke(); };
       latencyLine('latency_p50_ms','#2471a3'); latencyLine('latency_p99_ms','#c0392b');
       c.fillStyle='#2471a3'; c.textAlign='left'; c.textBaseline='alphabetic'; c.fillText('interval p50',left,22); c.fillStyle='#c0392b'; c.fillText('interval p99',left+90,22);
       c.fillStyle='#52616b'; c.fillText('0',left,h-15); c.textAlign='right'; c.fillText(`${maxX} measured requests`,w-right,h-15);

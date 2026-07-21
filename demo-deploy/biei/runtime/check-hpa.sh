@@ -2,7 +2,7 @@
 # Regression checks for the portable CPU-only autoscaling example.
 set -euo pipefail
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+root="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 rendered="$(KUBECONFIG=/dev/null kubectl kustomize "$root/k8s/overlays/gke")"
 hpa="$(printf '%s\n' "$rendered" | awk '
   BEGIN { RS = "---" }

@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>{{style_path}} · biei preview</title>
+<link href="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.css" rel="stylesheet" />
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; }
+  #map { position: absolute; top: 0; bottom: 0; width: 100%; }
+  .biei-info {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    z-index: 1;
+    background: rgba(255, 255, 255, 0.85);
+    padding: 6px 10px;
+    border-radius: 4px;
+    font: 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    pointer-events: none;
+  }
+  .biei-stats {
+    position: absolute;
+    top: 44px;
+    left: 10px;
+    z-index: 1;
+    background: rgba(255, 255, 255, 0.9);
+    padding: 8px 12px;
+    border-radius: 4px;
+    font: 11px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    min-width: 180px;
+    pointer-events: none;
+  }
+  .biei-stats h2 {
+    font-size: 11px;
+    margin: 0 0 6px 0;
+    font-weight: 600;
+    color: #444;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .biei-stats dl {
+    margin: 0;
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 3px 10px;
+  }
+  .biei-stats dt {
+    color: #666;
+  }
+  .biei-stats dd {
+    margin: 0;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: #111;
+  }
+  .biei-stats .biei-stale {
+    color: #c00;
+  }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="biei-info">{{style_path}}</div>
+<aside class="biei-stats" id="biei-stats">
+  <h2>biei stats (this node)</h2>
+  <dl>
+    <dt>completed</dt><dd id="m-completed">—</dd>
+    <dt>+3s</dt><dd id="m-completed-delta">—</dd>
+    <dt>rejected</dt><dd id="m-rejected">—</dd>
+    <dt>+3s</dt><dd id="m-rejected-delta">—</dd>
+    <dt>recent cache hit</dt><dd id="m-cache-hit">—</dd>
+    <dt>recent avg render</dt><dd id="m-avg-render">—</dd>
+    <dt>rendering now</dt><dd id="m-permits">—</dd>
+    <dt>waiting</dt><dd id="m-waiting">—</dd>
+  </dl>
+</aside>
+<script src="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.js"></script>
+<script>
+  const stylePath = {{style_path_json}};
+  const tileUrl = location.origin + '/' + stylePath + '/{z}/{x}/{y}@2x.webp';
+  const map = new maplibregl.Map({
+    container: 'map',
+    style: {
+      version: 8,
+      sources: {
+        biei: {
+          type: 'raster',
+          tiles: [tileUrl],
+          tileSize: 512,
+          minzoom: 0,
+          maxzoom: 22,
+        },
+      },
+      layers: [
+        { id: 'biei', type: 'raster', source: 'biei' },
+      ],
+    },
+    center: [0, 0],
+    zoom: 1,
+    hash: true,
+  });
+  map.addControl(new maplibregl.NavigationControl(), 'top-right');
+  map.addControl(new maplibregl.ScaleControl(), 'bottom-left');
+
+  // ---- Stats panel: poll /_internal/metrics, show lifetime totals + 3s deltas ----
+  const REFRESH_INTERVAL_MS = 3000;
+  const statsEl = document.getElementById('biei-stats');
+  let pollTimer = null;
+  const elCompleted = document.getElementById('m-completed');
+  const elCompletedDelta = document.getElementById('m-completed-delta');
+  const elRejected = document.getElementById('m-rejected');
+  const elRejectedDelta = document.getElementById('m-rejected-delta');
+  const elCacheHit = document.getElementById('m-cache-hit');
+  const elAvgRender = document.getElementById('m-avg-render');
+  const elPermits = document.getElementById('m-permits');
+  const elWaiting = document.getElementById('m-waiting');
+  let prevSnapshot = null;
+
+  function parseLine(line) {
+    // "name{labels} value [timestamp]"  ※ labels と timestamp は省略可
+    const m = line.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+(\S+)/);
+    if (!m) return null;
+    const value = parseFloat(m[3]);
+    return Number.isFinite(value)
+      ? { name: m[1], labels: m[2] || '', value }
+      : null;
+  }
+
+  function hasLabel(labels, key, val) {
+    return labels.includes(key + '="' + val + '"');
+  }
+
+  function parseMetrics(text) {
+    const out = {
+      completed: 0,
+      rejected: 0,
+      cacheHit: 0,
+      cacheMiss: 0,
+      renderSum: 0,
+      renderCount: 0,
+      permits: 0,
+      queue: 0,
+    };
+    for (const line of text.split('\n')) {
+      if (!line || line.startsWith('#')) continue;
+      const m = parseLine(line);
+      if (!m) continue;
+      switch (m.name) {
+        case 'biei_tasks_completed_total':
+          out.completed += m.value;
+          break;
+        case 'biei_tasks_rejected_total':
+          out.rejected += m.value;
+          break;
+        case 'biei_render_output_cache_total':
+          if (hasLabel(m.labels, 'outcome', 'hit')) out.cacheHit += m.value;
+          else if (hasLabel(m.labels, 'outcome', 'miss')) out.cacheMiss += m.value;
+          break;
+        case 'biei_native_render_duration_seconds_sum':
+          out.renderSum += m.value;
+          break;
+        case 'biei_native_render_duration_seconds_count':
+          out.renderCount += m.value;
+          break;
+        case 'biei_native_render_permits_inuse':
+          out.permits = m.value;
+          break;
+        case 'biei_queue_depth':
+          out.queue += m.value;
+          break;
+      }
+    }
+    return out;
+  }
+
+  function format(value, unit) {
+    if (!Number.isFinite(value)) return '—';
+    return value.toLocaleString(undefined, { maximumFractionDigits: 1 }) + (unit || '');
+  }
+
+  function deltaOrReset(curr, prev) {
+    // counter reset(再起動 / overflow)で curr < prev になったケースは
+    // 「直近データなし」扱いで NaN を返す。次回 poll から再計算開始。
+    if (prev === undefined || curr < prev) return NaN;
+    return curr - prev;
+  }
+
+  function formatDelta(value) {
+    if (!Number.isFinite(value)) return '—';
+    if (value === 0) return '+0';
+    return '+' + value.toLocaleString();
+  }
+
+  async function refresh() {
+    try {
+      const resp = await fetch('/_internal/metrics', { cache: 'no-store' });
+      if (!resp.ok) {
+        if (resp.status === 404) {
+          // Metrics live only on the cluster-internal port and are not exposed
+          // through the public Gateway, so the public preview can't reach them.
+          // Hide the stats panel and stop polling a dead endpoint rather than
+          // showing a permanently-stale panel.
+          if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
+          statsEl.style.display = 'none';
+          return;
+        }
+        statsEl.classList.add('biei-stale');
+        return;
+      }
+      const text = await resp.text();
+      const m = parseMetrics(text);
+
+      // Lifetime cumulative values
+      elCompleted.textContent = format(m.completed, '');
+      elRejected.textContent = format(m.rejected, '');
+      // gauges。`queue_depth` は worker pool 内の admit〜完了の全タスク
+      // (mpsc 待ち + style/source I/O + render)、`native_render_permits_inuse` は
+      // そのうち render 中の subset。差分が「render を待っている処理数」
+      // (=mpsc / I/O 段階で render permit 取り待ち)。瞬間値が逆転
+      // (queue より permits が大きい)するエッジは clamp。
+      const waiting = Math.max(0, m.queue - m.permits);
+      elPermits.textContent = format(m.permits, '');
+      elWaiting.textContent = format(waiting, '');
+
+      // 3s deltas (counters) + windowed ratios (histogram / cache)
+      if (prevSnapshot) {
+        const dCompleted = deltaOrReset(m.completed, prevSnapshot.completed);
+        const dRejected = deltaOrReset(m.rejected, prevSnapshot.rejected);
+        const dCacheHit = deltaOrReset(m.cacheHit, prevSnapshot.cacheHit);
+        const dCacheMiss = deltaOrReset(m.cacheMiss, prevSnapshot.cacheMiss);
+        const dRenderSum = deltaOrReset(m.renderSum, prevSnapshot.renderSum);
+        const dRenderCount = deltaOrReset(m.renderCount, prevSnapshot.renderCount);
+
+        elCompletedDelta.textContent = formatDelta(dCompleted);
+        elRejectedDelta.textContent = formatDelta(dRejected);
+
+        const dTotalCache = Number.isFinite(dCacheHit) && Number.isFinite(dCacheMiss)
+          ? dCacheHit + dCacheMiss : NaN;
+        if (Number.isFinite(dTotalCache) && dTotalCache > 0) {
+          const recentHitRate = (dCacheHit / dTotalCache) * 100;
+          elCacheHit.textContent = recentHitRate.toFixed(1) + '% (' + dCacheHit + '/' + dTotalCache + ')';
+        } else if (Number.isFinite(dTotalCache)) {
+          elCacheHit.textContent = 'no traffic';
+        } else {
+          elCacheHit.textContent = '—';
+        }
+
+        if (Number.isFinite(dRenderCount) && dRenderCount > 0
+            && Number.isFinite(dRenderSum)) {
+          const recentAvgMs = (dRenderSum / dRenderCount) * 1000;
+          elAvgRender.textContent = recentAvgMs.toFixed(1) + ' ms';
+        } else if (Number.isFinite(dRenderCount)) {
+          elAvgRender.textContent = 'no traffic';
+        } else {
+          elAvgRender.textContent = '—';
+        }
+      } else {
+        // 初回 poll では差分計算できない
+        elCompletedDelta.textContent = '(collecting…)';
+        elRejectedDelta.textContent = '(collecting…)';
+        elCacheHit.textContent = '(collecting…)';
+        elAvgRender.textContent = '(collecting…)';
+      }
+      prevSnapshot = m;
+      statsEl.classList.remove('biei-stale');
+    } catch (_err) {
+      statsEl.classList.add('biei-stale');
+    }
+  }
+
+  pollTimer = setInterval(refresh, REFRESH_INTERVAL_MS);
+  refresh();
+</script>
+</body>
+</html>

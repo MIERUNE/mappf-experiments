@@ -17,7 +17,10 @@ use crate::worker_pool::WorkerCompletion;
 const RENDERER_REPAIR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Debug)]
-pub enum WorkerCmd {
+// `Process` is the hot path sent on every render; boxing it to shrink the rare
+// unit `Retire` variant would add an allocation per render for no real benefit.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum WorkerCmd {
     Process {
         task: InternalTask,
         prepared_profile: Option<PreparedProfile>,
@@ -26,6 +29,11 @@ pub enum WorkerCmd {
         respond_to: oneshot::Sender<TaskOutcome>,
         completion: WorkerCompletion,
     },
+    /// Graceful shutdown: drain any `Process` commands already queued ahead of
+    /// this one (native renders are non-preemptible and must complete), then
+    /// exit the loop. Unlike closing the channel, this works while other
+    /// `Sender` clones remain alive behind the shared `Node`.
+    Retire,
 }
 
 #[derive(Debug)]
@@ -45,8 +53,8 @@ enum StageFailure {
 struct StageSuccess {
     output: crate::types::RenderOutput,
     started_at: Instant,
-    cpu_started_at: Instant,
-    cpu_completed_at: Instant,
+    native_render_started_at: Instant,
+    native_render_completed_at: Instant,
     style_swap: bool,
     cold_start: bool,
     source_loaded: bool,
@@ -88,13 +96,13 @@ impl SourceCache {
     }
 }
 
-pub async fn worker_loop(
+pub(crate) async fn worker_loop(
     id: WorkerId,
     node_id: NodeId,
     mut rx: mpsc::Receiver<WorkerCmd>,
     mut renderer: BoxRenderer,
     render_permits: Arc<Semaphore>,
-    cpu_render_permits: Arc<Semaphore>,
+    native_render_permits: Arc<Semaphore>,
     source_cache_capacity: usize,
 ) {
     // The worker's view of warm state is style revision + render mode + scale.
@@ -120,7 +128,7 @@ pub async fn worker_loop(
         };
         match cmd {
             WorkerCmd::Process {
-                task,
+                mut task,
                 prepared_profile,
                 route_tier,
                 admitted_at_overflow,
@@ -133,42 +141,23 @@ pub async fn worker_loop(
                     &mut current_profile,
                     &mut cache,
                     render_permits.clone(),
-                    cpu_render_permits.clone(),
-                    &task,
+                    native_render_permits.clone(),
+                    &mut task,
                     prepared_profile,
                 )
                 .await
                 {
-                    Ok(success) => TaskOutcome {
-                        task_id: task.id,
-                        request_id: task.request_id.clone(),
-                        arrived_at: task.arrived_at,
+                    Ok(success) => completed_outcome(
+                        &task,
                         had_source,
-                        deadline_stage: None,
-                        result: TaskResult::Completed {
-                            info: CompletedInfo {
-                                node_id: node_id.clone(),
-                                worker_id: Some(id),
-                                route_tier,
-                                started_at: success.started_at,
-                                cpu_started_at: success.cpu_started_at,
-                                cpu_completed_at: success.cpu_completed_at,
-                                completed_at: Instant::now(),
-                                style_swap: success.style_swap,
-                                cold_start: success.cold_start,
-                                source_loaded: success.source_loaded,
-                                admitted_at_overflow,
-                                render_observation: Some(RenderObservation::from_task(
-                                    &task,
-                                    success.style_setup_duration,
-                                    success.source_setup_duration,
-                                )),
-                            },
-                            output: success.output,
-                        },
-                    },
+                        node_id.clone(),
+                        id,
+                        route_tier,
+                        admitted_at_overflow,
+                        success,
+                    ),
                     Err(StageFailure::DeadlineExceeded { at }) => {
-                        deadline_rejected_outcome(task, had_source, at)
+                        deadline_rejected_outcome(&task, had_source, at)
                     }
                     Err(StageFailure::RendererError { at, err }) => {
                         let _ = at;
@@ -179,11 +168,11 @@ pub async fn worker_loop(
                             current_profile = None;
                             cache.clear();
                         }
-                        failed_outcome(task, had_source, err)
+                        failed_outcome(&task, had_source, err)
                     }
                     Err(StageFailure::PermitClosed { at }) => {
                         let _ = at;
-                        failed_outcome(task, had_source, RendererError::ActorDead)
+                        failed_outcome(&task, had_source, RendererError::ActorDead)
                     }
                 };
                 // Finalize shared warm-state and queue accounting even when
@@ -192,6 +181,7 @@ pub async fn worker_loop(
                 completion.finish(&outcome);
                 let _ = respond_to.send(outcome);
             }
+            WorkerCmd::Retire => break,
         }
     }
 }
@@ -200,6 +190,9 @@ fn renderer_error_invalidates_warm_state(err: &RendererError) -> bool {
     matches!(
         err,
         RendererError::StyleLoadFailed { .. }
+            // A slot/setup failure makes the actor rebuild its loaded state, so
+            // the pool's warm tracking must be cleared to stay consistent.
+            | RendererError::SetupFailed { .. }
             | RendererError::StyleNotReady { .. }
             | RendererError::Timeout
             | RendererError::ActorDead
@@ -211,8 +204,8 @@ async fn run_stages(
     current_profile: &mut Option<WorkerProfile>,
     cache: &mut SourceCache,
     render_permits: Arc<Semaphore>,
-    cpu_render_permits: Arc<Semaphore>,
-    task: &InternalTask,
+    native_render_permits: Arc<Semaphore>,
+    task: &mut InternalTask,
     prepared_profile: Option<PreparedProfile>,
 ) -> Result<StageSuccess, StageFailure> {
     let task_profile = task.worker_profile();
@@ -263,37 +256,41 @@ async fn run_stages(
         }
     }
 
-    let cpu_permit =
-        acquire_permit(cpu_render_permits, task, DeadlineStage::AcquireCpuPermit).await?;
-    let cpu_started_at = Instant::now();
+    let native_render_permit = acquire_permit(
+        native_render_permits,
+        task,
+        DeadlineStage::AcquireNativeRenderPermit,
+    )
+    .await?;
+    let native_render_started_at = Instant::now();
 
     check_deadline_at(task, DeadlineStage::Render)?;
-    let render_task;
-    let task_for_render = if let Some(source) = prepared_addlayer_source {
-        render_task = task_with_prepared_addlayer_source(task, source);
-        &render_task
-    } else {
-        task
-    };
-    let rendered =
-        renderer
-            .render(task_for_render)
-            .await
-            .map_err(|err| StageFailure::RendererError {
-                at: DeadlineStage::Render,
-                err,
-            })?;
+    if let Some(source) = prepared_addlayer_source
+        && let RenderRequest::StaticImage {
+            addlayer: Some(addlayer),
+            ..
+        } = &mut task.request
+    {
+        addlayer.source = Some(source);
+    }
+    let rendered = renderer
+        .render(task)
+        .await
+        .map_err(|err| StageFailure::RendererError {
+            at: DeadlineStage::Render,
+            err,
+        })?;
     source_loaded |= rendered.source_setup_duration.is_some();
     source_setup_duration = match (source_setup_duration, rendered.source_setup_duration) {
         (Some(before_render), Some(during_render)) => Some(before_render + during_render),
         (duration @ Some(_), None) | (None, duration @ Some(_)) => duration,
         (None, None) => None,
     };
-    let cpu_completed_at = Instant::now();
-    drop(cpu_permit);
+    let native_render_completed_at = Instant::now();
+    drop(native_render_permit);
     drop(permit);
 
-    if cpu_completed_at > task.deadline {
+    if native_render_completed_at > task.deadline {
         return Err(StageFailure::RendererError {
             at: DeadlineStage::Render,
             err: RendererError::Timeout,
@@ -303,27 +300,14 @@ async fn run_stages(
     Ok(StageSuccess {
         output: rendered.output,
         started_at,
-        cpu_started_at,
-        cpu_completed_at,
+        native_render_started_at,
+        native_render_completed_at,
         style_swap,
         cold_start,
         source_loaded,
         style_setup_duration,
         source_setup_duration,
     })
-}
-
-fn task_with_prepared_addlayer_source(
-    task: &InternalTask,
-    source: crate::types::AddLayerSource,
-) -> InternalTask {
-    let mut task = task.clone();
-    if let RenderRequest::StaticImage { addlayer, .. } = &mut task.request
-        && let Some(addlayer) = addlayer
-    {
-        addlayer.source = Some(source);
-    }
-    task
 }
 
 async fn acquire_permit(
@@ -348,22 +332,69 @@ fn check_deadline_at(task: &InternalTask, at: DeadlineStage) -> Result<(), Stage
     }
 }
 
-fn failed_outcome(task: InternalTask, had_source: bool, error: RendererError) -> TaskOutcome {
+/// Build a `TaskOutcome` carrying the task's identity/timing header. All four
+/// outcome kinds share this envelope; only `result` (and, for deadlines, the
+/// `deadline_stage`) differs.
+fn outcome_for(task: &InternalTask, had_source: bool, result: TaskResult) -> TaskOutcome {
     TaskOutcome {
         task_id: task.id,
-        request_id: task.request_id,
+        request_id: task.request_id.clone(),
         arrived_at: task.arrived_at,
         had_source,
         deadline_stage: None,
-        result: TaskResult::Failed {
-            kind: crate::types::FailureKind::from_renderer_error(&error),
-            error: error.to_string(),
-        },
+        result,
     }
 }
 
+fn completed_outcome(
+    task: &InternalTask,
+    had_source: bool,
+    node_id: NodeId,
+    worker_id: WorkerId,
+    route_tier: RouteTier,
+    admitted_at_overflow: bool,
+    success: StageSuccess,
+) -> TaskOutcome {
+    outcome_for(
+        task,
+        had_source,
+        TaskResult::Completed {
+            info: CompletedInfo {
+                node_id,
+                worker_id: Some(worker_id),
+                route_tier,
+                started_at: success.started_at,
+                native_render_started_at: success.native_render_started_at,
+                native_render_completed_at: success.native_render_completed_at,
+                completed_at: Instant::now(),
+                style_swap: success.style_swap,
+                cold_start: success.cold_start,
+                source_loaded: success.source_loaded,
+                admitted_at_overflow,
+                render_observation: Some(RenderObservation::from_task(
+                    task,
+                    success.style_setup_duration,
+                    success.source_setup_duration,
+                )),
+            },
+            output: success.output,
+        },
+    )
+}
+
+fn failed_outcome(task: &InternalTask, had_source: bool, error: RendererError) -> TaskOutcome {
+    outcome_for(
+        task,
+        had_source,
+        TaskResult::Failed {
+            kind: crate::types::FailureKind::from_renderer_error(&error),
+            error: error.to_string(),
+        },
+    )
+}
+
 fn deadline_rejected_outcome(
-    task: InternalTask,
+    task: &InternalTask,
     had_source: bool,
     at: DeadlineStage,
 ) -> TaskOutcome {
@@ -372,13 +403,6 @@ fn deadline_rejected_outcome(
     outcome
 }
 
-fn rejected_outcome(task: InternalTask, had_source: bool, reason: RejectionReason) -> TaskOutcome {
-    TaskOutcome {
-        task_id: task.id,
-        request_id: task.request_id,
-        arrived_at: task.arrived_at,
-        had_source,
-        deadline_stage: None,
-        result: TaskResult::Rejected { reason },
-    }
+fn rejected_outcome(task: &InternalTask, had_source: bool, reason: RejectionReason) -> TaskOutcome {
+    outcome_for(task, had_source, TaskResult::Rejected { reason })
 }

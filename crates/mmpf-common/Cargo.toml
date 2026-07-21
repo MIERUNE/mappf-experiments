@@ -1,0 +1,16 @@
+[package]
+name = "mmpf-common"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Small service-independent primitives shared across MMPF crates"
+repository.workspace = true
+publish = false
+
+[dependencies]
+prometheus.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

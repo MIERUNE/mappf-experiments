@@ -1,7 +1,8 @@
 use std::{
     fs::File,
+    future::Future,
     io::{BufReader, BufWriter, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -15,6 +16,7 @@ use ishikari_sim::{
     run_modeled_churn_trace, run_sweep, run_timed_trace, viewport_batch_ranges, write_trace_entry,
     write_visualization,
 };
+use mmpf_common::path::same_file_target;
 use reqwest::Url;
 use serde::Serialize;
 
@@ -38,6 +40,14 @@ struct RunReport {
     trace: TraceSource,
     cluster: ClusterConfig,
     result: ishikari_sim::SimReport,
+}
+
+struct SimulationExecution {
+    modeled_result: Option<ishikari_sim::SimReport>,
+    catalog_tiles: Option<usize>,
+    timing: Option<TimedReport>,
+    churn: Option<ChurnReport>,
+    trace_source: TraceSource,
 }
 
 #[derive(Serialize)]
@@ -126,9 +136,10 @@ impl ReplayHttpArgs {
             (Some(_), false) => bail!("--gateway-url conflicts with --node-url"),
             (None, true) => bail!("provide --gateway-url or at least one --node-url"),
         };
-        if self.output == self.trace {
-            bail!("HTTP replay output must not overwrite the input trace");
-        }
+        reject_output_collisions(
+            &[(self.output.as_path(), "output")],
+            &[(self.trace.as_path(), "trace")],
+        )?;
         Ok((
             HttpReplayConfig {
                 trace_path: self.trace,
@@ -225,6 +236,10 @@ struct SimulationArgs {
     /// Process-wide object-storage range-fetch limit per simulated node.
     #[arg(long, default_value_t = 32)]
     backend_fetch_concurrency: usize,
+    /// Active plus queued object-storage range-fetch groups admitted per node.
+    /// Defaults to four times the active fetch concurrency.
+    #[arg(long)]
+    backend_fetch_max_inflight: Option<usize>,
     /// Fixed range-fetch delay, or the median when sigma is non-zero.
     #[arg(long, default_value_t = 0)]
     artificial_backend_delay_ms: u64,
@@ -282,6 +297,31 @@ impl SimulationArgs {
         Ok(())
     }
 
+    fn validate_artifact_paths(&self) -> Result<()> {
+        let mut outputs = Vec::new();
+        if let Some(output) = &self.output {
+            outputs.push((output.as_path(), "trace output"));
+        }
+        if let Some(report) = &self.report {
+            outputs.push((report.as_path(), "report"));
+        }
+
+        let mut inputs = Vec::new();
+        if let Some(input_trace) = &self.input_trace {
+            inputs.push((input_trace.as_path(), "input trace"));
+        } else {
+            inputs.push((self.census.as_path(), "census"));
+        }
+        if let Some(profile) = &self.backend_latency_profile {
+            inputs.push((profile.as_path(), "backend latency profile"));
+        }
+        if let Some(churn_plan) = &self.churn_plan {
+            inputs.push((churn_plan.as_path(), "churn plan"));
+        }
+
+        reject_output_collisions(&outputs, &inputs)
+    }
+
     fn uses_paused_time(&self) -> bool {
         self.simulate && self.cache_mode == CacheModeArg::Real
     }
@@ -313,6 +353,9 @@ impl SimulationArgs {
             max_fetch_chunks: self.max_fetch_chunks,
             chunk_fetch_merge_window_ms: self.chunk_fetch_merge_window_ms,
             backend_fetch_concurrency: self.backend_fetch_concurrency,
+            backend_fetch_max_inflight: self
+                .backend_fetch_max_inflight
+                .unwrap_or_else(|| self.backend_fetch_concurrency.max(1).saturating_mul(4)),
             backend_latency,
             peer_latency_ms: self.peer_latency_ms,
             gossip_interval_ms: self.gossip_interval_ms,
@@ -384,6 +427,48 @@ impl CacheModeArg {
     }
 }
 
+/// Rejects output/output and output/input aliases before any artifact is read
+/// or opened for writing. Identity resolution is shared with Biei; labels and
+/// errors remain CLI-owned.
+fn reject_output_collisions(outputs: &[(&Path, &str)], inputs: &[(&Path, &str)]) -> Result<()> {
+    for (index, (output, output_name)) in outputs.iter().enumerate() {
+        for (other, other_name) in outputs.iter().skip(index + 1) {
+            if same_file_target(output, other) {
+                bail!(
+                    "outputs `{output_name}` and `{other_name}` resolve to the same file ({}); \
+                     refusing to overwrite",
+                    output.display()
+                );
+            }
+        }
+        for (input, input_name) in inputs {
+            if same_file_target(output, input) {
+                bail!(
+                    "output `{output_name}` would overwrite input `{input_name}` ({}); \
+                     choose a distinct output path",
+                    output.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cleanup_on_error<T>(
+    result: Result<T>,
+    cleanup: impl Future<Output = Result<()>>,
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => match cleanup.await {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(error.context(format!(
+                "simulated cluster cleanup also failed: {cleanup_error:#}"
+            ))),
+        },
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -393,10 +478,18 @@ async fn main() -> Result<()> {
                 let output = args
                     .output
                     .unwrap_or_else(|| args.input.with_extension("html"));
+                reject_output_collisions(
+                    &[(output.as_path(), "output")],
+                    &[(args.input.as_path(), "input report")],
+                )?;
                 write_visualization(&args.input, &output)?;
                 eprintln!("wrote visualization to {}", output.display());
             }
             Command::Sweep(args) => {
+                reject_output_collisions(
+                    &[(args.output.as_path(), "output")],
+                    &[(args.spec.as_path(), "sweep spec")],
+                )?;
                 run_sweep(&args.spec, &args.output).await?;
                 eprintln!("wrote sweep results to {}", args.output.display());
             }
@@ -420,6 +513,7 @@ async fn main() -> Result<()> {
     }
     let args = cli.simulation;
     args.validate()?;
+    args.validate_artifact_paths()?;
     if args.uses_paused_time() {
         tokio::time::pause();
     }
@@ -429,6 +523,59 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let execution = run_simulation(&args, &cluster_config, &mut cluster).await;
+    let SimulationExecution {
+        modeled_result,
+        catalog_tiles,
+        timing,
+        churn,
+        trace_source,
+    } = if let Some(cluster) = cluster.as_ref() {
+        cleanup_on_error(execution, cluster.shutdown()).await?
+    } else {
+        execution?
+    };
+
+    let result = if let Some(result) = modeled_result {
+        Some(result)
+    } else if let Some(cluster) = cluster.take() {
+        Some(cluster.report().await?)
+    } else {
+        None
+    };
+    if let Some(result) = result {
+        let report = RunReport {
+            schema_version: REPORT_SCHEMA_VERSION,
+            execution_mode: args.execution_mode(),
+            cache_mode: args.cache_mode.label(),
+            catalog_tiles,
+            timing,
+            backend_latency_profile: args.backend_latency_profile,
+            churn_plan: args.churn_plan,
+            churn,
+            trace: trace_source,
+            cluster: cluster_config,
+            result,
+        };
+        if let Some(path) = args.report {
+            let file = File::create(&path)
+                .with_context(|| format!("create report file {}", path.display()))?;
+            let mut report_writer = BufWriter::new(file);
+            serde_json::to_writer_pretty(&mut report_writer, &report)
+                .context("serialize simulation report")?;
+            report_writer.flush().context("flush simulation report")?;
+        } else {
+            eprintln!("{}", serde_json::to_string_pretty(&report)?);
+        }
+    }
+    Ok(())
+}
+
+async fn run_simulation(
+    args: &SimulationArgs,
+    cluster_config: &ClusterConfig,
+    cluster: &mut Option<SimCluster>,
+) -> Result<SimulationExecution> {
     let mut modeled_result = None;
     let mut catalog_tiles = None;
     let mut timing = None;
@@ -460,7 +607,7 @@ async fn main() -> Result<()> {
             }
             CacheModeArg::Modeled => {
                 let (result, tile_count, churn_report) =
-                    run_modeled_simulation(&args, &cluster_config, &entries).await?;
+                    run_modeled_simulation(args, cluster_config, &entries).await?;
                 catalog_tiles = Some(tile_count);
                 modeled_result = Some(result);
                 churn = churn_report;
@@ -476,7 +623,7 @@ async fn main() -> Result<()> {
             requests: entries.len(),
         }
     } else {
-        let source = generate_trace(&args, cluster.as_mut()).await?;
+        let source = generate_trace(args, cluster.as_mut()).await?;
         if args.cache_mode == CacheModeArg::Modeled {
             let output = args
                 .output
@@ -486,7 +633,7 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("open generated trace file {}", output.display()))?;
             let entries = read_trace(BufReader::new(file))?;
             let (result, tile_count, churn_report) =
-                run_modeled_simulation(&args, &cluster_config, &entries).await?;
+                run_modeled_simulation(args, cluster_config, &entries).await?;
             catalog_tiles = Some(tile_count);
             modeled_result = Some(result);
             churn = churn_report;
@@ -495,33 +642,13 @@ async fn main() -> Result<()> {
         source
     };
 
-    let result = modeled_result.or_else(|| cluster.map(SimCluster::report));
-    if let Some(result) = result {
-        let report = RunReport {
-            schema_version: REPORT_SCHEMA_VERSION,
-            execution_mode: args.execution_mode(),
-            cache_mode: args.cache_mode.label(),
-            catalog_tiles,
-            timing,
-            backend_latency_profile: args.backend_latency_profile,
-            churn_plan: args.churn_plan,
-            churn,
-            trace: trace_source,
-            cluster: cluster_config,
-            result,
-        };
-        if let Some(path) = args.report {
-            let file = File::create(&path)
-                .with_context(|| format!("create report file {}", path.display()))?;
-            let mut report_writer = BufWriter::new(file);
-            serde_json::to_writer_pretty(&mut report_writer, &report)
-                .context("serialize simulation report")?;
-            report_writer.flush().context("flush simulation report")?;
-        } else {
-            eprintln!("{}", serde_json::to_string_pretty(&report)?);
-        }
-    }
-    Ok(())
+    Ok(SimulationExecution {
+        modeled_result,
+        catalog_tiles,
+        timing,
+        churn,
+        trace_source,
+    })
 }
 
 async fn run_modeled_simulation(
@@ -657,4 +784,110 @@ fn replay_modeled_trace(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use super::{Cli, cleanup_on_error, reject_output_collisions};
+    use anyhow::anyhow;
+    use clap::Parser;
+
+    #[tokio::test]
+    async fn execution_error_waits_for_cleanup_and_remains_primary() {
+        let cleaned_up = Arc::new(AtomicBool::new(false));
+        let cleanup_observation = Arc::clone(&cleaned_up);
+
+        let error = cleanup_on_error::<()>(Err(anyhow!("replay failed")), async move {
+            tokio::task::yield_now().await;
+            cleanup_observation.store(true, Ordering::Relaxed);
+            Ok(())
+        })
+        .await
+        .expect_err("execution must fail");
+
+        assert!(cleaned_up.load(Ordering::Relaxed));
+        assert_eq!(error.to_string(), "replay failed");
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_is_attached_to_the_execution_error() {
+        let error = cleanup_on_error::<()>(Err(anyhow!("timed replay failed")), async {
+            Err(anyhow!("membership shutdown failed"))
+        })
+        .await
+        .expect_err("execution and cleanup must fail");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("timed replay failed"));
+        assert!(message.contains("membership shutdown failed"));
+    }
+
+    #[tokio::test]
+    async fn successful_execution_defers_cleanup_to_report_construction() {
+        let result = cleanup_on_error(Ok(7), async {
+            panic!("successful execution must not run early cleanup");
+            #[allow(unreachable_code)]
+            Ok(())
+        })
+        .await
+        .expect("successful execution");
+
+        assert_eq!(result, 7);
+    }
+
+    #[test]
+    fn generated_trace_and_report_must_not_alias() {
+        let path = std::env::temp_dir().join("ishikari-sim-generated-report-collision.jsonl");
+        let cli = Cli::try_parse_from([
+            "ishikari-sim",
+            "--output",
+            path.to_str().expect("UTF-8 test path"),
+            "--simulate",
+            "--report",
+            path.to_str().expect("UTF-8 test path"),
+        ])
+        .expect("parse simulation arguments");
+
+        assert!(cli.simulation.validate_artifact_paths().is_err());
+    }
+
+    #[test]
+    fn report_must_not_alias_the_input_trace_through_dot() {
+        let directory = std::env::temp_dir();
+        let input = directory.join("ishikari-sim-input-report-collision.jsonl");
+        let report = directory
+            .join(".")
+            .join("ishikari-sim-input-report-collision.jsonl");
+        let cli = Cli::try_parse_from([
+            "ishikari-sim",
+            "--input-trace",
+            input.to_str().expect("UTF-8 test path"),
+            "--simulate",
+            "--report",
+            report.to_str().expect("UTF-8 test path"),
+        ])
+        .expect("parse simulation arguments");
+
+        assert!(cli.simulation.validate_artifact_paths().is_err());
+    }
+
+    #[test]
+    fn distinct_artifact_paths_are_accepted() {
+        let directory = std::env::temp_dir();
+        let output = directory.join("ishikari-sim-distinct-output.json");
+        let input = directory.join("ishikari-sim-distinct-input.json");
+
+        assert!(
+            reject_output_collisions(
+                &[(output.as_path(), "output")],
+                &[(input.as_path(), "input")],
+            )
+            .is_ok()
+        );
+    }
 }

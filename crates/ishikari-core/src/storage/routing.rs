@@ -4,7 +4,7 @@ use std::{cmp::Ordering, collections::BinaryHeap, hash::Hasher};
 
 use twox_hash::XxHash64;
 
-use crate::membership::Peer;
+use super::peer::Peer;
 
 /// HRW placement over cluster peers for a given tileset and tile-locality group.
 #[derive(Clone)]
@@ -71,7 +71,7 @@ impl HrwRouter {
     }
 
     /// Returns candidate peers for an arbitrary provider-resource key.
-    pub fn route_key(&self, peers: &[Peer], key: &str) -> Vec<ScoredPeer> {
+    pub(super) fn route_key(&self, peers: &[Peer], key: &str) -> Vec<ScoredPeer> {
         self.route_group(peers, key, 0)
     }
 
@@ -104,7 +104,7 @@ impl HrwRouter {
     }
 
     /// Returns candidate peers for tileset-wide metadata endpoints.
-    pub fn route_tileset(&self, peers: &[Peer], tileset_id: &str) -> Vec<ScoredPeer> {
+    pub(super) fn route_tileset(&self, peers: &[Peer], tileset_id: &str) -> Vec<ScoredPeer> {
         self.route_tile(peers, tileset_id, 0)
     }
 }
@@ -124,8 +124,7 @@ fn hrw_weight(tileset_id: &str, tile_group_id: u64, node_id: &str) -> u64 {
 mod tests {
     use std::net::SocketAddr;
 
-    use super::HrwRouter;
-    use crate::membership::Peer;
+    use super::{HrwRouter, Peer};
 
     fn peers() -> Vec<Peer> {
         ["node-a", "node-b", "node-c"]

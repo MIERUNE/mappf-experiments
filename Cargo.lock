@@ -309,9 +309,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.17.1"
+version = "1.17.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4342d8937fc7e5dd9b1c60292261c0670c882a2cd1719cfc11b1af41731e32ad"
+checksum = "00bdb5da18dac48ca2cc7cd4a98e533e8635a58e2361d13a1a4ee3888e0d72f1"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -319,9 +319,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.42.0"
+version = "0.43.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d9ceb1da931507a12f4fccea479dccd00da1943e1b4ae72d8e502d707361444"
+checksum = "43103168cc76fe62678a375e722fc9cb3a0146159ac5828bc4f0dfd755c2224c"
 dependencies = [
  "cc",
  "cmake",
@@ -392,41 +392,50 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 name = "biei"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "anyhow",
+ "async-trait",
+ "axum",
  "biei-core",
+ "bytes",
+ "clap",
+ "futures-util",
+ "humantime",
+ "image",
+ "maplibre_native",
+ "mmpf-cluster",
+ "mmpf-common",
+ "mmpf-http",
+ "mmpf-mln-filesource",
+ "moka",
+ "prometheus",
+ "reqwest 0.13.4",
+ "serde_json",
+ "tiny-skia",
  "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "webp",
 ]
 
 [[package]]
 name = "biei-core"
 version = "0.1.0"
 dependencies = [
- "ab_glyph",
- "anyhow",
  "async-trait",
- "axum",
  "bytes",
- "chitchat",
- "clap",
- "flate2",
- "futures-util",
- "httpdate",
- "humantime",
- "image",
- "maplibre_native",
+ "mmpf-common",
+ "mmpf-http",
  "moka",
  "prometheus",
  "rand 0.10.2",
  "rand_xoshiro",
- "reqwest 0.13.4",
  "serde",
  "serde_json",
- "tiny-skia",
  "tokio",
  "tracing",
- "tracing-subscriber",
- "url",
- "webp",
 ]
 
 [[package]]
@@ -437,8 +446,9 @@ dependencies = [
  "async-trait",
  "biei-core",
  "bytes",
- "chitchat",
  "clap",
+ "mmpf-cluster",
+ "mmpf-common",
  "rand 0.10.2",
  "rand_distr",
  "rand_xoshiro",
@@ -613,9 +623,9 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "cfg_aliases"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
+checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "chacha20"
@@ -1234,7 +1244,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
- "libz-ng-sys",
  "miniz_oxide",
 ]
 
@@ -2103,35 +2112,23 @@ name = "ishikari"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "ishikari-core",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "ishikari-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
  "axum",
  "brotli",
  "bytes",
- "chitchat",
  "clap",
- "fast_hilbert",
  "flate2",
  "httpdate",
- "internment",
+ "ishikari-core",
  "mlt-core",
+ "mmpf-cluster",
+ "mmpf-common",
+ "mmpf-http",
  "mmpf-terrain",
  "moka",
  "object_store",
- "prometheus",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "tokio",
  "tower",
  "tracing",
@@ -2142,16 +2139,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "ishikari-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "internment",
+ "mmpf-common",
+ "mmpf-pmtiles",
+ "moka",
+ "object_store",
+ "prometheus",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "twox-hash",
+ "url",
+]
+
+[[package]]
 name = "ishikari-sim"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "axum",
  "bytes",
- "chitchat",
  "clap",
  "ishikari-core",
+ "mmpf-cluster",
+ "mmpf-common",
+ "mmpf-pmtiles",
  "moka",
  "rand 0.10.2",
  "reqwest 0.13.4",
@@ -2296,16 +2315,6 @@ checksum = "54cd30df7c7165ce74a456e4ca9732c603e8dc5e60784558c1c6dc047f876733"
 dependencies = [
  "cc",
  "glob",
-]
-
-[[package]]
-name = "libz-ng-sys"
-version = "1.1.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "879917b256f6317769b9f374b435805a8697013098aacce5a38ac106cd6a9469"
-dependencies = [
- "cmake",
- "libc",
 ]
 
 [[package]]
@@ -2489,6 +2498,73 @@ dependencies = [
  "usize_cast",
  "wide",
  "zigzag",
+]
+
+[[package]]
+name = "mmpf-cluster"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chitchat",
+ "mmpf-common",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mmpf-common"
+version = "0.1.0"
+dependencies = [
+ "prometheus",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "mmpf-http"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "rand 0.10.2",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mmpf-mln-filesource"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "httpdate",
+ "maplibre_native",
+ "mmpf-common",
+ "mmpf-http",
+ "moka",
+ "prometheus",
+ "reqwest 0.13.4",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "mmpf-pmtiles"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "brotli",
+ "bytes",
+ "fast_hilbert",
+ "flate2",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zstd",
 ]
 
 [[package]]
@@ -2869,9 +2945,9 @@ dependencies = [
 
 [[package]]
 name = "portable-atomic"
-version = "1.13.1"
+version = "1.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
+checksum = "3d20d5497ef88037a52ff98267d066e7f11fcc5e99bbfbd58a42336193aacec3"
 
 [[package]]
 name = "potential_utf"
@@ -4169,14 +4245,13 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.52.3"
+version = "1.53.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+checksum = "d988bcd52dbe076d3d46903332f58c912b87a2c49b1428419a5845154762ffee"
 dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
@@ -4186,9 +4261,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-macros"
-version = "2.7.0"
+version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "385a6cb71ab9ab790c5fe8d67f1645e6c450a7ce006a33de03daa956cf70a496"
+checksum = "6328af13490e73a9b4694030fafd93f8c8c6a9dede33e821c3fc63eddf8042ba"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4664,9 +4739,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.8"
+version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d46a5a140e6f7afeccd8eae97eff335163939eac8b929834875168b29b3d267"
+checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
 dependencies = [
  "rustls-pki-types",
 ]

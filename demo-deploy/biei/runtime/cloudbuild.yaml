@@ -1,8 +1,7 @@
-#   gcloud builds submit --config demo-deploy/biei/runtime/cloudbuild.yaml \
-#     --substitutions=_IMAGE=asia-northeast1-docker.pkg.dev/mappf-experiment/biei/biei:dev .
+#   gcloud builds submit --config demo-deploy/biei/runtime/cloudbuild.yaml .
 
 substitutions:
-  _IMAGE: asia-northeast1-docker.pkg.dev/mappf-experiment/biei/biei:dev
+  _IMAGE_REPOSITORY: asia-northeast1-docker.pkg.dev/mappf-experiment/biei/biei
   # A separate package keeps large compiler-cache manifests out of the runtime
   # image history and lets Artifact Registry clean stale cache generations.
   _CACHE_IMAGE: asia-northeast1-docker.pkg.dev/mappf-experiment/biei/biei-buildcache:latest
@@ -22,8 +21,16 @@ steps:
         docker buildx create --driver docker-container --use --name biei-builder
         docker buildx build \
           --file demo-deploy/biei/runtime/Dockerfile \
-          --tag "${_IMAGE}" \
+          --tag "${_IMAGE_REPOSITORY}:dev" \
           --cache-from "type=registry,ref=${_CACHE_IMAGE}" \
           --cache-to "type=registry,ref=${_CACHE_IMAGE},mode=max,oci-mediatypes=true,image-manifest=true" \
+          --metadata-file /workspace/image-metadata.json \
           --push \
           .
+        digest="$$(sed -n 's/.*"containerimage\.digest"[[:space:]]*:[[:space:]]*"\(sha256:[0-9a-f]\{64\}\)".*/\1/p' /workspace/image-metadata.json)"
+        if [[ ! "$$digest" =~ ^sha256:[0-9a-f]{64}$$ ]]; then
+          echo "buildx did not report one valid image digest" >&2
+          exit 1
+        fi
+        printf 'mmpf-image-v1\nrepository=%s\ndigest=%s\n' \
+          "${_IMAGE_REPOSITORY}" "$$digest" > "$${BUILDER_OUTPUT}/output"

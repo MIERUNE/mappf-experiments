@@ -4,9 +4,11 @@
 # reachable. Exits non-zero if any hard check fails.
 #
 # Usage:
-#   bash demo-deploy/smoke.sh
-#   ISHIKARI_HOST=ishikari-demo.mierune.dev SCHEME=https bash demo-deploy/smoke.sh
-#   ISHIKARI_HOST=localhost:8080 SCHEME=http bash demo-deploy/smoke.sh   # port-forward
+#   bash demo-deploy/ishikari/runtime/smoke.sh
+#   ISHIKARI_HOST=ishikari-demo.mierune.dev SCHEME=https \
+#     bash demo-deploy/ishikari/runtime/smoke.sh
+#   ISHIKARI_HOST=localhost:8080 SCHEME=http \
+#     bash demo-deploy/ishikari/runtime/smoke.sh   # port-forward
 set -uo pipefail
 
 SCHEME="${SCHEME:-https}"

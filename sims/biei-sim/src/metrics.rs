@@ -5,13 +5,14 @@
 //! simulator collects an in-memory record per task. Production exposes
 //! Prometheus metrics via `biei_core::metrics::NodeMetrics` instead.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::time::Instant;
 
 use biei_core::types::{RejectionReason, RouteTier, TaskOutcome, TaskResult};
+use serde::Serialize;
 
 const LATENCY_HISTOGRAM_BOUNDS_MS: &[u64] = &[
     5, 10, 25, 50, 75, 100, 150, 200, 300, 500, 750, 1_000, 1_500, 2_000, 3_000, 5_000, 10_000,
@@ -19,6 +20,7 @@ const LATENCY_HISTOGRAM_BOUNDS_MS: &[u64] = &[
 
 #[derive(Debug, Clone)]
 struct TaskRecord {
+    submission_epoch: u64,
     arrived_at: Instant,
     completed_at: Option<Instant>,
     native_render_started_at: Option<Instant>,
@@ -49,7 +51,14 @@ pub struct MetricsCollector {
 struct MetricsState {
     records: Vec<TaskRecord>,
     observation: MetricsObservation,
+    submission_cohorts: BTreeMap<u64, SubmissionCohortState>,
     native_capacity_events: Vec<(Instant, usize)>,
+}
+
+#[derive(Default)]
+struct SubmissionCohortState {
+    submitted: u64,
+    outcomes: MetricsObservation,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -66,6 +75,44 @@ pub(crate) struct MetricsObservation {
     pub tier_counts: HashMap<RouteTier, usize>,
 }
 
+impl MetricsObservation {
+    fn record(&mut self, record: &TaskRecord) {
+        self.total += 1;
+        if let Some(tier) = record.route_tier {
+            self.completed += 1;
+            *self.tier_counts.entry(tier).or_default() += 1;
+            self.cold_starts += usize::from(record.cold_start);
+            self.style_swaps += usize::from(record.style_swap);
+            self.tasks_with_sources += usize::from(record.had_source);
+            self.source_loads += usize::from(record.source_loaded);
+            self.source_hits += usize::from(record.had_source && !record.source_loaded);
+        } else if record.rejection_reason.is_some() {
+            self.rejected += 1;
+        } else {
+            self.failed += 1;
+        }
+    }
+}
+
+/// Final outcomes grouped by the topology epoch in which requests were
+/// submitted. Unlike completion windows, a cohort never changes when a slow
+/// request crosses a sampling or churn boundary before terminating.
+#[derive(Clone, Debug, Serialize)]
+pub struct SubmissionCohortObservation {
+    pub submission_epoch: u64,
+    pub submitted: u64,
+    pub terminal_outcomes: usize,
+    pub outstanding: u64,
+    pub completed: usize,
+    pub rejected: usize,
+    pub failed: usize,
+    pub cold_starts: usize,
+    pub style_swaps: usize,
+    pub source_hits: usize,
+    pub source_loads: usize,
+    pub tier_counts: BTreeMap<String, usize>,
+}
+
 impl MetricsCollector {
     pub fn new() -> Self {
         Self::with_native_render_permits(0)
@@ -80,7 +127,16 @@ impl MetricsCollector {
         }
     }
 
-    pub fn record(&self, outcome: TaskOutcome) {
+    pub(crate) fn submit(&self, submission_epoch: u64) {
+        let mut state = self.state.lock().expect("metrics poisoned");
+        state
+            .submission_cohorts
+            .entry(submission_epoch)
+            .or_default()
+            .submitted += 1;
+    }
+
+    pub fn record(&self, outcome: TaskOutcome, submission_epoch: u64) {
         let TaskOutcome {
             arrived_at,
             had_source,
@@ -89,12 +145,11 @@ impl MetricsCollector {
         } = outcome;
         let record = match result {
             TaskResult::Completed { info: c, .. } => TaskRecord {
+                submission_epoch,
                 arrived_at,
                 completed_at: Some(c.completed_at),
-                // Production retains historical `cpu_*` field names, but the
-                // interval covers the whole native render call, including I/O.
-                native_render_started_at: Some(c.cpu_started_at),
-                native_render_completed_at: Some(c.cpu_completed_at),
+                native_render_started_at: Some(c.native_render_started_at),
+                native_render_completed_at: Some(c.native_render_completed_at),
                 route_tier: Some(c.route_tier),
                 style_swap: c.style_swap,
                 cold_start: c.cold_start,
@@ -105,6 +160,7 @@ impl MetricsCollector {
                 failure_error: None,
             },
             TaskResult::Rejected { reason } => TaskRecord {
+                submission_epoch,
                 arrived_at,
                 completed_at: None,
                 native_render_started_at: None,
@@ -119,6 +175,7 @@ impl MetricsCollector {
                 failure_error: None,
             },
             TaskResult::Failed { error, .. } => TaskRecord {
+                submission_epoch,
                 arrived_at,
                 completed_at: None,
                 native_render_started_at: None,
@@ -134,21 +191,13 @@ impl MetricsCollector {
             },
         };
         let mut state = self.state.lock().expect("metrics poisoned");
-        let observation = &mut state.observation;
-        observation.total += 1;
-        if let Some(tier) = record.route_tier {
-            observation.completed += 1;
-            *observation.tier_counts.entry(tier).or_default() += 1;
-            observation.cold_starts += usize::from(record.cold_start);
-            observation.style_swaps += usize::from(record.style_swap);
-            observation.tasks_with_sources += usize::from(record.had_source);
-            observation.source_loads += usize::from(record.source_loaded);
-            observation.source_hits += usize::from(record.had_source && !record.source_loaded);
-        } else if record.rejection_reason.is_some() {
-            observation.rejected += 1;
-        } else {
-            observation.failed += 1;
-        }
+        state.observation.record(&record);
+        let submission_epoch = record.submission_epoch;
+        let cohort = state
+            .submission_cohorts
+            .get_mut(&submission_epoch)
+            .expect("measured request cohort registered before task spawn");
+        cohort.outcomes.record(&record);
         state.records.push(record);
     }
 
@@ -172,6 +221,36 @@ impl MetricsCollector {
                 record
                     .completed_at
                     .map(|completed_at| completed_at.saturating_duration_since(record.arrived_at))
+            })
+            .collect()
+    }
+
+    pub(crate) fn submission_cohorts(&self) -> Vec<SubmissionCohortObservation> {
+        self.state
+            .lock()
+            .expect("metrics poisoned")
+            .submission_cohorts
+            .iter()
+            .map(|(submission_epoch, cohort)| {
+                let outcomes = &cohort.outcomes;
+                SubmissionCohortObservation {
+                    submission_epoch: *submission_epoch,
+                    submitted: cohort.submitted,
+                    terminal_outcomes: outcomes.total,
+                    outstanding: cohort.submitted.saturating_sub(outcomes.total as u64),
+                    completed: outcomes.completed,
+                    rejected: outcomes.rejected,
+                    failed: outcomes.failed,
+                    cold_starts: outcomes.cold_starts,
+                    style_swaps: outcomes.style_swaps,
+                    source_hits: outcomes.source_hits,
+                    source_loads: outcomes.source_loads,
+                    tier_counts: outcomes
+                        .tier_counts
+                        .iter()
+                        .map(|(tier, count)| (format!("{tier:?}"), *count))
+                        .collect(),
+                }
             })
             .collect()
     }
@@ -259,7 +338,16 @@ impl MetricsCollector {
             }
         }
 
-        let sla_violations = latencies.iter().filter(|&&d| d > sla).count();
+        let completed_latency_sla_violations = latencies.iter().filter(|&&d| d > sla).count();
+        let completed_latency_sla_denominator = completed_count;
+        let completed_latency_sla_violation_rate = ratio(
+            completed_latency_sla_violations,
+            completed_latency_sla_denominator,
+        );
+        let request_successes = completed_count;
+        let request_success_denominator = total;
+        let request_success_rate = ratio(request_successes, request_success_denominator);
+        debug_assert_eq!(total, completed_count + rejected.len() + failed.len());
         let native_render_busy = completed.iter().fold(Duration::ZERO, |acc, r| {
             match (r.native_render_started_at, r.native_render_completed_at) {
                 (Some(start), Some(end)) if end >= start => acc + end.duration_since(start),
@@ -294,7 +382,12 @@ impl MetricsCollector {
             failed: failed.len(),
             rejection_by_reason,
             failure_by_error,
-            sla_violations,
+            completed_latency_sla_violations,
+            completed_latency_sla_denominator,
+            completed_latency_sla_violation_rate,
+            request_successes,
+            request_success_denominator,
+            request_success_rate,
             sla,
             throughput,
             latency_p50: percentile(0.50),
@@ -318,6 +411,10 @@ impl MetricsCollector {
             native_render_utilization_pct,
         }
     }
+}
+
+fn ratio(numerator: usize, denominator: usize) -> Option<f64> {
+    (denominator > 0).then(|| numerator as f64 / denominator as f64)
 }
 
 fn build_latency_histogram(latencies: &[Duration]) -> Vec<LatencyHistogramBucket> {
@@ -370,19 +467,20 @@ fn average_capacity(
 }
 
 fn peak_inflight(records: &[&TaskRecord]) -> usize {
-    let mut events = Vec::new();
-    for r in records {
-        if let (Some(start), Some(end)) = (r.native_render_started_at, r.native_render_completed_at)
-            && end >= start
+    let mut deltas = BTreeMap::<Instant, i32>::new();
+    for record in records {
+        if let (Some(start), Some(end)) = (
+            record.native_render_started_at,
+            record.native_render_completed_at,
+        ) && end > start
         {
-            events.push((start, 0_u8, 1_i32));
-            events.push((end, 1_u8, -1_i32));
+            *deltas.entry(start).or_default() += 1;
+            *deltas.entry(end).or_default() -= 1;
         }
     }
-    events.sort_by_key(|(at, order, _)| (*at, *order));
     let mut current = 0_i32;
     let mut peak = 0_i32;
-    for (_, _, delta) in events {
+    for delta in deltas.into_values() {
         current += delta;
         peak = peak.max(current);
     }
@@ -403,7 +501,18 @@ pub struct Report {
     pub failed: usize,
     pub rejection_by_reason: HashMap<RejectionReason, usize>,
     pub failure_by_error: HashMap<String, usize>,
-    pub sla_violations: usize,
+    /// Completed requests whose observed latency exceeded `sla`.
+    pub completed_latency_sla_violations: usize,
+    /// Completed requests eligible for the latency SLA calculation.
+    pub completed_latency_sla_denominator: usize,
+    /// `completed_latency_sla_violations / completed_latency_sla_denominator`.
+    pub completed_latency_sla_violation_rate: Option<f64>,
+    /// Requests that completed successfully.
+    pub request_successes: usize,
+    /// All terminal requests: completed, rejected, or failed.
+    pub request_success_denominator: usize,
+    /// `request_successes / request_success_denominator`.
+    pub request_success_rate: Option<f64>,
     pub sla: Duration,
     pub throughput: f64,
     pub latency_p50: Duration,
@@ -442,131 +551,79 @@ pub struct LatencyHistogramBucket {
     pub count: usize,
 }
 
-impl Report {
-    pub fn to_human_readable(&self) -> String {
-        let pct = |n: usize| -> f64 {
-            if self.total > 0 {
-                n as f64 / self.total as f64 * 100.0
-            } else {
-                0.0
-            }
-        };
-        let pct_complete = |n: usize| -> f64 {
-            if self.completed > 0 {
-                n as f64 / self.completed as f64 * 100.0
-            } else {
-                0.0
-            }
-        };
-        let tier = |t: RouteTier| -> usize { self.tier_counts.get(&t).copied().unwrap_or(0) };
-        let reasons = if self.rejection_by_reason.is_empty() {
-            String::from("-")
-        } else {
-            let mut entries: Vec<_> = self.rejection_by_reason.iter().collect();
-            entries.sort_by_key(|(_, v)| std::cmp::Reverse(**v));
-            entries
-                .iter()
-                .map(|(r, n)| format!("{:?}={}", r, n))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let failures = if self.failure_by_error.is_empty() {
-            String::from("-")
-        } else {
-            let mut entries: Vec<_> = self.failure_by_error.iter().collect();
-            entries.sort_by_key(|(_, v)| std::cmp::Reverse(**v));
-            entries
-                .iter()
-                .map(|(error, n)| format!("{error}={n}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        format!(
-            "=== Simulation Report ===\n\
-             Total submitted:   {}\n\
-             Completed:         {} ({:.2}%)\n\
-             Rejected:          {} ({:.2}%)  reasons: {}\n\
-             Failed:            {} ({:.2}%)  errors: {}\n\
-             SLA ({:?}):         {} violations ({:.2}% of completed)\n\
-             Elapsed (sim):     {:?}\n\
-             Throughput:        {:.2} req/s\n\
-             Native render util:   {:.1}% avg={:.2} peak={} permits={} busy={:?}\n\
-             Latency p50:       {:?}\n\
-             Latency p90:       {:?}\n\
-             Latency p95:       {:?}\n\
-             Latency p99:       {:?}\n\
-             Latency max:       {:?}\n\
-             Tier 1 (warm):     {} ({:.2}%)\n\
-             Tier 2 (hrw/bl):   {} ({:.2}%)\n\
-             Tier 3 (drain):    {} ({:.2}%)\n\
-             Tier 4 (overflow): {} ({:.2}%)\n\
-             Cold starts:       {} ({:.2}%)\n\
-             Style swaps:       {} ({:.2}%)\n\
-             Overflow admits:   {} ({:.2}% of completed) — queued past soft limit\n\
-             Sources (tasks/loads/hits): {} / {} / {} ({})\n\
-             Tasks w/ sources:  {} ({:.2}%)\n",
-            self.total,
-            self.completed,
-            pct(self.completed),
-            self.rejected,
-            pct(self.rejected),
-            reasons,
-            self.failed,
-            pct(self.failed),
-            failures,
-            self.sla,
-            self.sla_violations,
-            pct_complete(self.sla_violations),
-            self.elapsed,
-            self.throughput,
-            self.native_render_utilization_pct,
-            self.native_render_avg_inflight,
-            self.native_render_peak_inflight,
-            self.native_render_permits_total,
-            self.native_render_busy,
-            self.latency_p50,
-            self.latency_p90,
-            self.latency_p95,
-            self.latency_p99,
-            self.latency_max,
-            tier(RouteTier::Tier1WarmTracking),
-            pct(tier(RouteTier::Tier1WarmTracking)),
-            tier(RouteTier::Tier2HrwBl),
-            pct(tier(RouteTier::Tier2HrwBl)),
-            tier(RouteTier::Tier3DrainSwap),
-            pct(tier(RouteTier::Tier3DrainSwap)),
-            tier(RouteTier::Tier4Overflow),
-            pct(tier(RouteTier::Tier4Overflow)),
-            self.cold_starts,
-            pct_complete(self.cold_starts),
-            self.style_swaps,
-            pct_complete(self.style_swaps),
-            self.overflow_admissions,
-            pct_complete(self.overflow_admissions),
-            self.tasks_with_sources,
-            self.source_loads,
-            self.source_hits,
-            if self.tasks_with_sources > 0 {
-                format!(
-                    "{:.2}% hit rate",
-                    self.source_hits as f64 / self.tasks_with_sources as f64 * 100.0
-                )
-            } else {
-                String::from("n/a")
-            },
-            self.tasks_with_sources,
-            pct_complete(self.tasks_with_sources),
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Mutex, time::Duration};
 
+    use biei_core::types::{RejectionReason, RequestId, RouteTier, TaskOutcome, TaskResult};
     use tokio::time::Instant;
 
-    use super::{LATENCY_HISTOGRAM_BOUNDS_MS, average_capacity, build_latency_histogram};
+    use super::{
+        LATENCY_HISTOGRAM_BOUNDS_MS, MetricsCollector, MetricsState, TaskRecord, average_capacity,
+        build_latency_histogram, peak_inflight,
+    };
+
+    fn terminal_record(
+        arrived_at: Instant,
+        completed_after: Option<Duration>,
+        rejection_reason: Option<RejectionReason>,
+        failure_error: Option<&str>,
+    ) -> TaskRecord {
+        let completed_at = completed_after.map(|duration| arrived_at + duration);
+        TaskRecord {
+            submission_epoch: 0,
+            arrived_at,
+            completed_at,
+            native_render_started_at: completed_at,
+            native_render_completed_at: completed_at,
+            route_tier: completed_at.map(|_| RouteTier::Tier2HrwBl),
+            style_swap: false,
+            cold_start: false,
+            had_source: false,
+            source_loaded: false,
+            admitted_at_overflow: false,
+            rejection_reason,
+            failure_error: failure_error.map(str::to_owned),
+        }
+    }
+
+    fn report_for(records: Vec<TaskRecord>, sla: Duration) -> super::Report {
+        MetricsCollector {
+            state: Mutex::new(MetricsState {
+                records,
+                ..MetricsState::default()
+            }),
+        }
+        .report(sla)
+    }
+
+    fn rejected_outcome(task_id: u64) -> TaskOutcome {
+        TaskOutcome {
+            task_id,
+            request_id: RequestId::from_string(format!("cohort-{task_id}")),
+            arrived_at: Instant::now(),
+            had_source: false,
+            deadline_stage: None,
+            result: TaskResult::Rejected {
+                reason: RejectionReason::QueueFull,
+            },
+        }
+    }
+
+    #[test]
+    fn adjacent_half_open_renders_do_not_overlap_at_the_boundary() {
+        let start = Instant::now();
+        let boundary = start + Duration::from_millis(10);
+        let end = boundary + Duration::from_millis(10);
+        let mut first = terminal_record(start, Some(Duration::from_millis(10)), None, None);
+        first.native_render_started_at = Some(start);
+        first.native_render_completed_at = Some(boundary);
+        let mut second = terminal_record(boundary, Some(Duration::from_millis(10)), None, None);
+        second.native_render_started_at = Some(boundary);
+        second.native_render_completed_at = Some(end);
+
+        assert_eq!(peak_inflight(&[&first, &second]), 1);
+    }
 
     #[test]
     fn averages_capacity_across_churn_events() {
@@ -575,6 +632,94 @@ mod tests {
         let events = vec![(start, 2), (start + Duration::from_secs(5), 4)];
 
         assert_eq!(average_capacity(&events, Some(start), Some(end)), 3.0);
+    }
+
+    #[test]
+    fn late_terminal_outcome_stays_in_its_submission_cohort() {
+        let metrics = MetricsCollector::new();
+        metrics.submit(0);
+        metrics.submit(1);
+
+        // The newer request terminates first. At this boundary the old epoch
+        // still has one outstanding request.
+        metrics.record(rejected_outcome(1), 1);
+        let at_boundary = metrics.submission_cohorts();
+        assert_eq!(at_boundary[0].submission_epoch, 0);
+        assert_eq!(at_boundary[0].outstanding, 1);
+        assert_eq!(at_boundary[1].submission_epoch, 1);
+        assert_eq!(at_boundary[1].terminal_outcomes, 1);
+
+        // Completing later must update epoch 0, not whichever epoch happens
+        // to be current when record() runs.
+        metrics.record(rejected_outcome(0), 0);
+        let final_cohorts = metrics.submission_cohorts();
+        assert_eq!(final_cohorts[0].terminal_outcomes, 1);
+        assert_eq!(final_cohorts[0].rejected, 1);
+        assert_eq!(final_cohorts[0].outstanding, 0);
+        assert_eq!(final_cohorts[1].terminal_outcomes, 1);
+    }
+
+    #[test]
+    fn sla_and_request_success_rates_expose_their_cohorts() {
+        let now = Instant::now();
+        let report = report_for(
+            vec![
+                terminal_record(now, Some(Duration::from_millis(50)), None, None),
+                terminal_record(now, Some(Duration::from_millis(200)), None, None),
+                terminal_record(now, None, Some(RejectionReason::QueueFull), None),
+                terminal_record(now, None, None, Some("renderer failed")),
+            ],
+            Duration::from_millis(100),
+        );
+
+        assert_eq!(report.total, 4);
+        assert_eq!(report.completed, 2);
+        assert_eq!(report.rejected, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(
+            report.total,
+            report.completed + report.rejected + report.failed
+        );
+        assert_eq!(report.completed_latency_sla_violations, 1);
+        assert_eq!(report.completed_latency_sla_denominator, 2);
+        assert_eq!(report.completed_latency_sla_violation_rate, Some(0.5));
+        assert_eq!(report.request_successes, 2);
+        assert_eq!(report.request_success_denominator, 4);
+        assert_eq!(report.request_success_rate, Some(0.5));
+    }
+
+    #[test]
+    fn rejection_heavy_run_cannot_look_perfectly_successful() {
+        let now = Instant::now();
+        let mut records = vec![terminal_record(
+            now,
+            Some(Duration::from_millis(50)),
+            None,
+            None,
+        )];
+        records.extend(
+            (0..8).map(|_| terminal_record(now, None, Some(RejectionReason::NoCapacity), None)),
+        );
+        records.push(terminal_record(now, None, None, Some("renderer failed")));
+
+        let report = report_for(records, Duration::from_millis(100));
+
+        assert_eq!(report.completed_latency_sla_violations, 0);
+        assert_eq!(report.completed_latency_sla_denominator, 1);
+        assert_eq!(report.completed_latency_sla_violation_rate, Some(0.0));
+        assert_eq!(report.request_successes, 1);
+        assert_eq!(report.request_success_denominator, 10);
+        assert_eq!(report.request_success_rate, Some(0.1));
+    }
+
+    #[test]
+    fn empty_rate_denominators_produce_undefined_rates() {
+        let report = report_for(Vec::new(), Duration::from_millis(100));
+
+        assert_eq!(report.completed_latency_sla_denominator, 0);
+        assert_eq!(report.completed_latency_sla_violation_rate, None);
+        assert_eq!(report.request_success_denominator, 0);
+        assert_eq!(report.request_success_rate, None);
     }
 
     #[test]

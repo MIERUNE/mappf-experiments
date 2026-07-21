@@ -5,8 +5,9 @@ mod coordinator;
 mod fetcher;
 mod store;
 
-pub use fetcher::{BackendLatencyModel, ChunkFetchError};
-pub use store::ChunkedStore;
+pub use fetcher::BackendLatencyModel;
+pub(super) use fetcher::ChunkFetchError;
+pub(super) use store::ChunkedStore;
 pub(crate) use store::{ChunkReadSource, ChunkedStoreConfig};
 
 #[cfg(feature = "simulator-support")]

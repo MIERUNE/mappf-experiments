@@ -1,14 +1,24 @@
 [package]
 name = "mmpf-terrain"
 version = "0.1.0"
-edition = "2024"
-license = "Apache-2.0 OR MIT"
-description = "MIERUNE Map Platform DEM decoding and derived contour and hillshade generation"
-repository = "https://github.com/MIERUNE/biei"
+edition.workspace = true
+license.workspace = true
+description = "MMPF DEM decoding and derived contour and hillshade generation"
+repository.workspace = true
+publish = false
+
+[features]
+# Adds the raster hillshade encoders (lossless/lossy WebP + JPEG). Off by
+# default so the published crate stays vector-only and pulls no image *encoder*
+# (the `webp` crate → `libwebp-sys` C build, and image's jpeg codec); Terrarium
+# DEM *decoding* still needs image's `webp` feature, which stays unconditional.
+# Experimental: these raster products exist for the raster-vs-vector size/
+# quality comparison and may change or be removed — do not depend on them.
+raster-encode = ["dep:webp", "image/jpeg"]
 
 [dependencies]
 anyhow.workspace = true
 fast-mvt.workspace = true
-image = { version = "0.25", default-features = false, features = ["webp", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["webp"] }
 tracing.workspace = true
-webp.workspace = true
+webp = { workspace = true, optional = true }

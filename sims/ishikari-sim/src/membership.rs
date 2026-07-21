@@ -1,61 +1,85 @@
-//! In-memory chitchat transport used by the real-cache simulator.
+//! Per-node simulated Ishikari membership adapter.
 
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use anyhow::Result;
-use async_trait::async_trait;
-use chitchat::{
-    ChitchatMessage,
-    transport::{ChannelTransport, Socket as ChitchatSocket, Transport as ChitchatTransport},
+use ishikari_core::{
+    cluster_metadata::{
+        CLUSTER_ID, DEAD_NODE_GRACE_PERIOD, HTTP_ADVERTISE_ADDR_KEY,
+        MARKED_FOR_DELETION_GRACE_PERIOD, project_peers,
+    },
+    storage::{Peer, PeerDirectory, PeerFuture, PeerSnapshotCache},
 };
+use mmpf_cluster::{Cluster, Config as ClusterNodeConfig, SimulatedNodeContext};
 
-/// Runs production chitchat over an in-process network with virtual hop delay.
+pub(crate) struct MembershipConfig {
+    pub(crate) http_advertise_addr: SocketAddr,
+    pub(crate) gossip_interval: Duration,
+}
+
+/// One simulated node's local membership perspective and routing cache.
 #[derive(Clone)]
-pub(crate) struct SimGossipTransport {
-    inner: ChannelTransport,
-    hop_latency: Duration,
+pub(crate) struct Membership {
+    handle: Cluster,
+    peers_cache: PeerSnapshotCache,
 }
 
-impl SimGossipTransport {
-    pub(crate) fn new(hop_latency: Duration) -> Self {
+impl Membership {
+    pub(crate) fn new(handle: Cluster, peers_cache_ttl: Duration) -> Self {
         Self {
-            inner: ChannelTransport::default(),
-            hop_latency,
+            handle,
+            peers_cache: PeerSnapshotCache::new(peers_cache_ttl),
         }
     }
 
-    pub(crate) fn statistics(&self) -> (u64, u64) {
-        let statistics = self.inner.statistics();
-        (statistics.num_messages_total, statistics.num_bytes_total)
+    /// Returns routable live peers from a cache lasting exactly one gossip tick.
+    pub(crate) async fn peers(&self) -> Arc<[Peer]> {
+        self.peers_cache
+            .get_or_load(|| self.read_live_peers())
+            .await
     }
-}
 
-#[async_trait]
-impl ChitchatTransport for SimGossipTransport {
-    async fn open(&self, listen_addr: SocketAddr) -> Result<Box<dyn ChitchatSocket>> {
-        let inner = self.inner.open(listen_addr).await?;
-        Ok(Box::new(SimGossipSocket {
-            inner,
-            hop_latency: self.hop_latency,
-        }))
-    }
-}
-
-struct SimGossipSocket {
-    inner: Box<dyn ChitchatSocket>,
-    hop_latency: Duration,
-}
-
-#[async_trait]
-impl ChitchatSocket for SimGossipSocket {
-    async fn send(&mut self, to: SocketAddr, message: ChitchatMessage) -> Result<()> {
-        if !self.hop_latency.is_zero() {
-            tokio::time::sleep(self.hop_latency).await;
+    /// Observes this node's local view without populating or extending its routing cache.
+    pub(crate) async fn peers_for_observation(&self) -> Arc<[Peer]> {
+        if let Some(peers) = self.peers_cache.get() {
+            return peers;
         }
-        self.inner.send(to, message).await
+        self.read_live_peers().await
     }
 
-    async fn recv(&mut self) -> Result<(SocketAddr, ChitchatMessage)> {
-        self.inner.recv().await
+    async fn read_live_peers(&self) -> Arc<[Peer]> {
+        self.handle
+            .inspect(|state| {
+                project_peers(
+                    state
+                        .live_nodes()
+                        .map(|node| (node.id(), node.get(HTTP_ADVERTISE_ADDR_KEY))),
+                )
+            })
+            .await
     }
+}
+
+impl PeerDirectory for Membership {
+    fn peers(&self) -> PeerFuture<'_> {
+        Box::pin(Membership::peers(self))
+    }
+}
+
+pub(crate) fn cluster_config(
+    config: &MembershipConfig,
+    context: SimulatedNodeContext,
+) -> ClusterNodeConfig {
+    ClusterNodeConfig::new(
+        CLUSTER_ID,
+        context.node_id,
+        context.gossip_endpoint,
+        context.seed_nodes,
+        config.gossip_interval,
+        MARKED_FOR_DELETION_GRACE_PERIOD,
+    )
+    .with_dead_node_grace_period(DEAD_NODE_GRACE_PERIOD)
+    .with_initial_key_values(vec![(
+        HTTP_ADVERTISE_ADDR_KEY.to_string(),
+        config.http_advertise_addr.to_string(),
+    )])
 }

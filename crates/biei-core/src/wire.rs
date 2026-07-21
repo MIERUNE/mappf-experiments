@@ -21,9 +21,9 @@ use crate::types::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WireTask {
     pub id: TaskId,
-    #[serde(default)]
     pub request_id: RequestId,
     pub style: StyleRevision,
+    #[serde(deserialize_with = "crate::types::deserialize_required_option")]
     pub source: Option<WireSourceRef>,
     pub request: RenderRequest,
     pub scale: Scale,
@@ -41,12 +41,11 @@ pub struct WireTask {
 pub struct ForwardRequest {
     pub task: WireTask,
     pub route_tier: RouteTier,
+    #[serde(deserialize_with = "crate::types::deserialize_required_option")]
     pub drain_worker: Option<WorkerId>,
     /// Origin-local budget for receiving the complete HTTP response. This is
     /// intentionally distinct from `task.remaining_budget_ms`, which is the
     /// smaller remote execution budget after reserving transport latency.
-    /// Older senders omit it; receivers then fall back to the task budget.
-    #[serde(default)]
     pub origin_response_budget_ms: u32,
 }
 
@@ -75,11 +74,12 @@ impl From<WireSourceRef> for SourceRef {
 }
 
 impl InternalTask {
-    pub fn to_wire(&self, now: Instant) -> WireTask {
+    #[cfg(test)]
+    pub(crate) fn to_wire(&self, now: Instant) -> WireTask {
         self.to_wire_with_hop_latency(now, Duration::ZERO)
     }
 
-    pub fn to_wire_with_hop_latency(&self, now: Instant, hop_latency: Duration) -> WireTask {
+    fn to_wire_with_hop_latency(&self, now: Instant, hop_latency: Duration) -> WireTask {
         let budget = self
             .deadline
             .saturating_duration_since(now)
@@ -143,12 +143,10 @@ pub struct ForwardResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutcomeHeader {
     pub task_id: TaskId,
-    #[serde(default)]
     pub request_id: RequestId,
     pub style_id: StyleId,
-    #[serde(default)]
     pub had_source: bool,
-    #[serde(default)]
+    #[serde(deserialize_with = "crate::types::deserialize_required_option")]
     pub image_format: Option<ImageFormat>,
     #[serde(flatten)]
     pub result: OutcomeResult,
@@ -159,33 +157,30 @@ pub struct OutcomeHeader {
 pub enum OutcomeResult {
     Completed {
         node_id: crate::types::NodeId,
-        #[serde(default)]
+        #[serde(deserialize_with = "crate::types::deserialize_required_option")]
         worker_id: Option<WorkerId>,
         route_tier: RouteTier,
         /// Peer-local elapsed times measured from the peer's reconstructed
         /// arrival. The origin preserves their differences but anchors the
         /// timeline at its actual response receipt time.
         render_started_ms: u64,
-        cpu_started_ms: u64,
-        cpu_completed_ms: u64,
+        native_render_started_ms: u64,
+        native_render_completed_ms: u64,
         completed_ms: u64,
         style_swap: bool,
         cold_start: bool,
         source_loaded: bool,
         admitted_at_overflow: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(deserialize_with = "crate::types::deserialize_required_option")]
         render_observation: Option<WireRenderObservation>,
     },
     Rejected {
         reason: RejectionReason,
-        #[serde(default)]
+        #[serde(deserialize_with = "crate::types::deserialize_required_option")]
         deadline_stage: Option<DeadlineStage>,
     },
     Failed {
         error: String,
-        /// `#[serde(default)]` so frames from peers that predate this field
-        /// still decode during a rolling deploy (missing kind → `Other`).
-        #[serde(default)]
         kind: FailureKind,
     },
 }
@@ -197,9 +192,9 @@ pub struct WireRenderObservation {
     pub output_format: ImageFormat,
     pub width: u16,
     pub height: u16,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::types::deserialize_required_option")]
     pub style_setup_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::types::deserialize_required_option")]
     pub source_setup_ms: Option<u64>,
 }
 
@@ -235,6 +230,7 @@ impl From<WireRenderObservation> for RenderObservation {
 pub enum WireError {
     Encode(serde_json::Error),
     Decode(serde_json::Error),
+    InvalidCompletedTimeline,
     Truncated,
     TooLarge,
 }
@@ -244,6 +240,9 @@ impl fmt::Display for WireError {
         match self {
             Self::Encode(err) => write!(f, "encode forward response metadata: {err}"),
             Self::Decode(err) => write!(f, "decode forward response metadata: {err}"),
+            Self::InvalidCompletedTimeline => {
+                f.write_str("forward response contains an invalid completed timeline")
+            }
             Self::Truncated => f.write_str("truncated forward response body"),
             Self::TooLarge => f.write_str("forward response metadata exceeds u32 length"),
         }
@@ -252,10 +251,8 @@ impl fmt::Display for WireError {
 
 impl Error for WireError {}
 
-pub fn encode_response_body(
-    header: &OutcomeHeader,
-    image_bytes: &[u8],
-) -> Result<Vec<u8>, WireError> {
+#[cfg(test)]
+fn encode_response_body(header: &OutcomeHeader, image_bytes: &[u8]) -> Result<Vec<u8>, WireError> {
     let json = serde_json::to_vec(header).map_err(WireError::Encode)?;
     let json_len: u32 = json.len().try_into().map_err(|_| WireError::TooLarge)?;
     let mut out = Vec::with_capacity(4 + json.len() + image_bytes.len());
@@ -277,27 +274,7 @@ pub fn encode_response_header(header: &OutcomeHeader) -> Result<bytes::Bytes, Wi
     Ok(out.into())
 }
 
-pub fn decode_response_body(body: &[u8]) -> Result<(OutcomeHeader, &[u8]), WireError> {
-    if body.len() < 4 {
-        return Err(WireError::Truncated);
-    }
-    let json_len = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
-    let payload_start = 4usize;
-    let payload_end = payload_start
-        .checked_add(json_len)
-        .ok_or(WireError::Truncated)?;
-    if body.len() < payload_end {
-        return Err(WireError::Truncated);
-    }
-    let header =
-        serde_json::from_slice(&body[payload_start..payload_end]).map_err(WireError::Decode)?;
-    Ok((header, &body[payload_end..]))
-}
-
-/// Decode an owned HTTP body while retaining the image as a zero-copy slice.
-pub fn decode_response_bytes(
-    body: bytes::Bytes,
-) -> Result<(OutcomeHeader, bytes::Bytes), WireError> {
+fn decode_response_prefix(body: &[u8]) -> Result<(OutcomeHeader, usize), WireError> {
     if body.len() < 4 {
         return Err(WireError::Truncated);
     }
@@ -306,7 +283,35 @@ pub fn decode_response_bytes(
     if body.len() < payload_end {
         return Err(WireError::Truncated);
     }
-    let header = serde_json::from_slice(&body[4..payload_end]).map_err(WireError::Decode)?;
+    let header: OutcomeHeader =
+        serde_json::from_slice(&body[4..payload_end]).map_err(WireError::Decode)?;
+    if let OutcomeResult::Completed {
+        render_started_ms,
+        native_render_started_ms,
+        native_render_completed_ms,
+        completed_ms,
+        ..
+    } = &header.result
+        && !(render_started_ms <= native_render_started_ms
+            && native_render_started_ms <= native_render_completed_ms
+            && native_render_completed_ms <= completed_ms)
+    {
+        return Err(WireError::InvalidCompletedTimeline);
+    }
+    Ok((header, payload_end))
+}
+
+#[cfg(test)]
+fn decode_response_body(body: &[u8]) -> Result<(OutcomeHeader, &[u8]), WireError> {
+    let (header, payload_end) = decode_response_prefix(body)?;
+    Ok((header, &body[payload_end..]))
+}
+
+/// Decode an owned HTTP body while retaining the image as a zero-copy slice.
+pub fn decode_response_bytes(
+    body: bytes::Bytes,
+) -> Result<(OutcomeHeader, bytes::Bytes), WireError> {
+    let (header, payload_end) = decode_response_prefix(&body)?;
     Ok((header, body.slice(payload_end..)))
 }
 
@@ -360,8 +365,14 @@ impl OutcomeHeader {
                     worker_id: info.worker_id,
                     route_tier: info.route_tier,
                     render_started_ms: millis_since(info.started_at, arrived_at),
-                    cpu_started_ms: millis_since(info.cpu_started_at, arrived_at),
-                    cpu_completed_ms: millis_since(info.cpu_completed_at, arrived_at),
+                    native_render_started_ms: millis_since(
+                        info.native_render_started_at,
+                        arrived_at,
+                    ),
+                    native_render_completed_ms: millis_since(
+                        info.native_render_completed_at,
+                        arrived_at,
+                    ),
                     completed_ms: millis_since(info.completed_at, arrived_at),
                     style_swap: info.style_swap,
                     cold_start: info.cold_start,
@@ -410,8 +421,8 @@ impl OutcomeHeader {
                 worker_id,
                 route_tier,
                 render_started_ms,
-                cpu_started_ms,
-                cpu_completed_ms,
+                native_render_started_ms,
+                native_render_completed_ms,
                 completed_ms,
                 style_swap,
                 cold_start,
@@ -430,8 +441,8 @@ impl OutcomeHeader {
                     peer_arrived_at + Duration::from_millis(offset_ms).min(peer_duration)
                 };
                 let started_at = peer_offset(render_started_ms);
-                let cpu_started_at = peer_offset(cpu_started_ms);
-                let cpu_completed_at = peer_offset(cpu_completed_ms);
+                let native_render_started_at = peer_offset(native_render_started_ms);
+                let native_render_completed_at = peer_offset(native_render_completed_ms);
                 if let Some(output) = output {
                     TaskResult::Completed {
                         info: CompletedInfo {
@@ -439,8 +450,8 @@ impl OutcomeHeader {
                             worker_id,
                             route_tier,
                             started_at,
-                            cpu_started_at,
-                            cpu_completed_at,
+                            native_render_started_at,
+                            native_render_completed_at,
                             completed_at,
                             style_swap,
                             cold_start,
@@ -503,7 +514,7 @@ fn duration_millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{PixelRatio, RenderRequest};
+    use crate::types::{AddLayer, Padding, PixelRatio, Positioning, RenderRequest};
 
     fn style() -> StyleRevision {
         StyleRevision {
@@ -546,6 +557,50 @@ mod tests {
         assert_eq!(rebuilt.style, style());
         assert_eq!(rebuilt.pixel_ratio.to_scale(), Scale::X2);
         assert_eq!(rebuilt.output_format, ImageFormat::Webp);
+    }
+
+    #[test]
+    fn nested_wire_values_require_explicit_current_fields() {
+        let request = RenderRequest::StaticImage {
+            positioning: Positioning::Center {
+                lon: 0.0,
+                lat: 0.0,
+                zoom: 1.0,
+                bearing: 0.0,
+                pitch: 0.0,
+            },
+            width: 256,
+            height: 256,
+            overlays: Vec::new(),
+            before_layer: None,
+            padding: Padding::default(),
+            addlayer: None,
+        };
+        let encoded = serde_json::to_value(request).expect("request JSON");
+        for missing in ["before_layer", "padding", "addlayer"] {
+            let mut incomplete = encoded.clone();
+            incomplete
+                .get_mut("StaticImage")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("static request object")
+                .remove(missing);
+            assert!(
+                serde_json::from_value::<RenderRequest>(incomplete).is_err(),
+                "missing {missing} must be rejected"
+            );
+        }
+
+        let mut addlayer = serde_json::to_value(AddLayer {
+            json: "{}".to_owned(),
+            hash: 0,
+            source: None,
+        })
+        .expect("addlayer JSON");
+        addlayer
+            .as_object_mut()
+            .expect("addlayer object")
+            .remove("source");
+        assert!(serde_json::from_value::<AddLayer>(addlayer).is_err());
     }
 
     #[test]
@@ -632,8 +687,8 @@ mod tests {
                     worker_id: Some(3),
                     route_tier: RouteTier::Tier2HrwBl,
                     render_started_ms: 25,
-                    cpu_started_ms: 40,
-                    cpu_completed_ms: 70,
+                    native_render_started_ms: 40,
+                    native_render_completed_ms: 70,
                     completed_ms: 100,
                     style_swap: false,
                     cold_start: false,
@@ -658,8 +713,14 @@ mod tests {
         // time. Anchor the peer offsets at receipt while preserving its stage
         // durations.
         assert_eq!(info.started_at, now + Duration::from_millis(75));
-        assert_eq!(info.cpu_started_at, now + Duration::from_millis(90));
-        assert_eq!(info.cpu_completed_at, now + Duration::from_millis(120));
+        assert_eq!(
+            info.native_render_started_at,
+            now + Duration::from_millis(90)
+        );
+        assert_eq!(
+            info.native_render_completed_at,
+            now + Duration::from_millis(120)
+        );
         assert_eq!(info.completed_at, now + Duration::from_millis(150));
         assert_eq!(output.format, ImageFormat::Png);
     }
@@ -679,8 +740,8 @@ mod tests {
                     worker_id: Some(3),
                     route_tier: RouteTier::Tier2HrwBl,
                     started_at: now,
-                    cpu_started_at: now + Duration::from_millis(2),
-                    cpu_completed_at: now + Duration::from_millis(8),
+                    native_render_started_at: now + Duration::from_millis(2),
+                    native_render_completed_at: now + Duration::from_millis(8),
                     completed_at: now + Duration::from_millis(10),
                     style_swap: false,
                     cold_start: false,
@@ -746,8 +807,8 @@ mod tests {
                 worker_id: Some(3),
                 route_tier: RouteTier::Tier1WarmTracking,
                 render_started_ms: 1,
-                cpu_started_ms: 2,
-                cpu_completed_ms: 8,
+                native_render_started_ms: 2,
+                native_render_completed_ms: 8,
                 completed_ms: 11,
                 style_swap: false,
                 cold_start: false,
@@ -777,13 +838,17 @@ mod tests {
             had_source: true,
             image_format: None,
             result: OutcomeResult::Rejected {
-                reason: RejectionReason::QueueFull,
+                reason: RejectionReason::RendererDegraded,
                 deadline_stage: None,
             },
         };
         let json = serde_json::to_string(&rejected).expect("rejected header JSON");
+        assert!(json.contains(r#""reason":"RendererDegraded""#));
         let decoded: OutcomeHeader = serde_json::from_str(&json).expect("rejected decodes");
-        assert_eq!(decoded.rejected_reason(), Some(RejectionReason::QueueFull));
+        assert_eq!(
+            decoded.rejected_reason(),
+            Some(RejectionReason::RendererDegraded)
+        );
         assert!(decoded.had_source);
 
         let failed = OutcomeHeader {
@@ -806,12 +871,14 @@ mod tests {
     fn outcome_header_ignores_unknown_fields() {
         let json = r#"{
             "task_id": 1,
+            "request_id": "unknown-field-test",
             "style_id": "style-1",
             "had_source": false,
             "image_format": null,
             "future_field": "ignored",
             "rejected": {
                 "reason": "QueueFull",
+                "deadline_stage": null,
                 "future_nested_field": 42
             }
         }"#;
@@ -821,11 +888,27 @@ mod tests {
     }
 
     #[test]
-    fn failed_without_kind_decodes_as_other_for_rolling_deploy() {
-        // A peer that predates `FailureKind` sends `failed` without `kind`;
-        // the frame must still decode (kind defaults to `Other`).
+    fn unknown_rejection_reason_is_rejected() {
         let json = r#"{
             "task_id": 1,
+            "request_id": "unknown-rejection-test",
+            "style_id": "style-1",
+            "had_source": false,
+            "image_format": null,
+            "rejected": {
+                "reason": "FutureRejection",
+                "deadline_stage": null
+            }
+        }"#;
+
+        assert!(serde_json::from_str::<OutcomeHeader>(json).is_err());
+    }
+
+    #[test]
+    fn failed_without_kind_is_rejected() {
+        let json = r#"{
+            "task_id": 1,
+            "request_id": "missing-kind-test",
             "style_id": "style-1",
             "had_source": false,
             "image_format": null,
@@ -834,14 +917,7 @@ mod tests {
             }
         }"#;
 
-        let decoded: OutcomeHeader = serde_json::from_str(json).expect("pre-kind frame decodes");
-        assert!(matches!(
-            decoded.result,
-            OutcomeResult::Failed {
-                kind: FailureKind::Other,
-                ..
-            }
-        ));
+        assert!(serde_json::from_str::<OutcomeHeader>(json).is_err());
     }
 
     #[test]
@@ -857,8 +933,8 @@ mod tests {
                 worker_id: Some(3),
                 route_tier: RouteTier::Tier1WarmTracking,
                 render_started_ms: 1,
-                cpu_started_ms: 2,
-                cpu_completed_ms: 8,
+                native_render_started_ms: 2,
+                native_render_completed_ms: 8,
                 completed_ms: 11,
                 style_swap: false,
                 cold_start: false,
@@ -934,17 +1010,60 @@ mod tests {
     }
 
     #[test]
+    fn response_body_frame_rejects_reversed_completed_timing() {
+        let header = OutcomeHeader {
+            task_id: 4,
+            request_id: RequestId::from_string("reversed-timing-test"),
+            style_id: style().id,
+            had_source: false,
+            image_format: Some(ImageFormat::Png),
+            result: OutcomeResult::Completed {
+                node_id: crate::types::NodeId::from_index(2),
+                worker_id: Some(3),
+                route_tier: RouteTier::Tier2HrwBl,
+                render_started_ms: 1,
+                native_render_started_ms: 10,
+                native_render_completed_ms: 2,
+                completed_ms: 12,
+                style_swap: false,
+                cold_start: false,
+                source_loaded: false,
+                admitted_at_overflow: false,
+                render_observation: None,
+            },
+        };
+        let body = encode_response_body(&header, &[1]).expect("encode body");
+
+        assert!(matches!(
+            decode_response_body(&body),
+            Err(WireError::InvalidCompletedTimeline)
+        ));
+        assert!(matches!(
+            decode_response_bytes(body.into()),
+            Err(WireError::InvalidCompletedTimeline)
+        ));
+    }
+
+    #[test]
     fn response_body_frame_reports_malformed_bodies() {
+        for body in [&[0, 0, 0][..], &[0, 0, 0, 10, b'{']] {
+            assert!(matches!(
+                decode_response_body(body),
+                Err(WireError::Truncated)
+            ));
+            assert!(matches!(
+                decode_response_bytes(bytes::Bytes::copy_from_slice(body)),
+                Err(WireError::Truncated)
+            ));
+        }
+
+        let invalid_json = [0, 0, 0, 1, b'{'];
         assert!(matches!(
-            decode_response_body(&[0, 0, 0]),
-            Err(WireError::Truncated)
+            decode_response_body(&invalid_json),
+            Err(WireError::Decode(_))
         ));
         assert!(matches!(
-            decode_response_body(&[0, 0, 0, 10, b'{']),
-            Err(WireError::Truncated)
-        ));
-        assert!(matches!(
-            decode_response_body(&[0, 0, 0, 1, b'{']),
+            decode_response_bytes(bytes::Bytes::copy_from_slice(&invalid_json)),
             Err(WireError::Decode(_))
         ));
     }

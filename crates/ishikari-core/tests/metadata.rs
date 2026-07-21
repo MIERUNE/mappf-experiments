@@ -1,4 +1,4 @@
-use ishikari_core::pmtiles::Metadata;
+use mmpf_pmtiles::Metadata;
 
 fn places_metadata_fixture() -> &'static [u8] {
     include_bytes!("fixtures/metadata/places.pmtiles.json")

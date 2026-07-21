@@ -8,18 +8,16 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::{Semaphore, mpsc, oneshot};
-#[cfg(test)]
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::activity::ProfileActivityTracker;
 use crate::renderer::{BoxRenderer, PreparedProfile};
 use crate::types::{
     InternalTask, NodeId, NodeKvs, ProcessError, RouteTier, TaskOutcome, TaskResult, WorkerId,
     WorkerProfile, WorkerView, encode_worker_kvs,
 };
-use crate::util::lock_unpoisoned;
 use crate::worker::{WorkerCmd, worker_loop};
+use mmpf_common::sync::lock_unpoisoned;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum PickTier {
@@ -51,14 +49,17 @@ struct PickContext<'a> {
     bl_capacity: usize,
     queue_capacity: usize,
     profile_counts: &'a HashMap<WorkerProfile, usize>,
-    activity: &'a ProfileActivityTracker,
+    last_used: &'a [Option<Instant>],
 }
 
-pub struct WorkerHandle {
+pub(crate) struct WorkerHandle {
     pub tx: mpsc::Sender<WorkerCmd>,
     pub queue_depth: Arc<AtomicUsize>,
-    #[cfg(test)]
-    join: JoinHandle<()>,
+    /// Retained so a graceful shutdown can await the worker task. `None` after it
+    /// has been joined (or its join timed out and the handle was detached).
+    /// Interior-mutable so `WorkerPool::shutdown(&self, ..)` works through the
+    /// shared `Arc<NodeInner>` without owning the pool.
+    join: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Owns the accounting side effects of an accepted worker command.
@@ -128,10 +129,11 @@ impl Drop for WorkerCompletion {
 /// Pool-side view of "which profile each worker is now (logically) committed
 /// to". Updated eagerly at dispatch time, so it reflects the worker's state
 /// after its queue drains — not necessarily right now.
-pub struct PoolState {
+pub(crate) struct PoolState {
     pub loaded: Vec<Option<WorkerProfile>>,
     dispatch_generations: Vec<u64>,
     profile_counts: HashMap<WorkerProfile, usize>,
+    last_used: Vec<Option<Instant>>,
     addlayer_source_ids: Vec<HashSet<String>>,
     addlayer_source_lru: Vec<VecDeque<String>>,
 }
@@ -142,6 +144,7 @@ impl PoolState {
             loaded: vec![None; n],
             dispatch_generations: vec![0; n],
             profile_counts: HashMap::new(),
+            last_used: vec![None; n],
             addlayer_source_ids: vec![HashSet::new(); n],
             addlayer_source_lru: vec![VecDeque::new(); n],
         }
@@ -150,6 +153,7 @@ impl PoolState {
     fn mark_loaded(&mut self, idx: usize, profile: WorkerProfile) -> u64 {
         self.dispatch_generations[idx] = self.dispatch_generations[idx].wrapping_add(1);
         let generation = self.dispatch_generations[idx];
+        self.last_used[idx] = Some(Instant::now());
         if self.loaded[idx].as_ref() == Some(&profile) {
             return generation;
         }
@@ -185,6 +189,7 @@ impl PoolState {
         if let Some(previous) = self.loaded[idx].take() {
             self.decrement_profile_count(&previous);
         }
+        self.last_used[idx] = None;
         self.clear_addlayer_sources(idx);
     }
 
@@ -216,7 +221,7 @@ impl PoolState {
 /// (the publisher diffs against the last sent snapshot and gossips changed
 /// keys).
 #[derive(Clone)]
-pub struct PoolSnapshotter {
+pub(crate) struct PoolSnapshotter {
     pub queue_depths: Vec<Arc<AtomicUsize>>,
     pub state: Arc<Mutex<PoolState>>,
 }
@@ -224,7 +229,7 @@ pub struct PoolSnapshotter {
 impl PoolSnapshotter {
     /// Encode current per-slot (loaded_profile, queue) into a flat KV map
     /// suitable for a batched `GossipBus::set_many` call.
-    pub fn snapshot_kvs(&self) -> NodeKvs {
+    pub(crate) fn snapshot_kvs(&self) -> NodeKvs {
         let s = lock_unpoisoned(&self.state);
         let mut out = NodeKvs::new();
         for (i, qd) in self.queue_depths.iter().enumerate() {
@@ -235,7 +240,7 @@ impl PoolSnapshotter {
         out
     }
 
-    pub fn snapshot_workers(&self) -> Vec<WorkerView> {
+    pub(crate) fn snapshot_workers(&self) -> Vec<WorkerView> {
         let s = lock_unpoisoned(&self.state);
         self.queue_depths
             .iter()
@@ -249,10 +254,9 @@ impl PoolSnapshotter {
     }
 }
 
-pub struct WorkerPool {
+pub(crate) struct WorkerPool {
     pub workers: Vec<WorkerHandle>,
     pub state: Arc<Mutex<PoolState>>,
-    pub activity: Arc<ProfileActivityTracker>,
     /// SLA-oriented soft queue limit per renderer slot (BL).
     pub bl_capacity: usize,
     /// Hard admission/backpressure limit per renderer slot.
@@ -264,38 +268,36 @@ pub struct WorkerPool {
     /// Node-wide CPU/GPU-heavy render-stage permits. Defaults to
     /// `render_permits` at config resolution time, but may be lower to model
     /// I/O overlap with a fixed render bottleneck.
-    pub cpu_render_permits: usize,
-    cpu_permit_sem: Arc<Semaphore>,
+    pub native_render_permits: usize,
+    native_render_permit_sem: Arc<Semaphore>,
 }
 
-pub struct WorkerPoolSpawn {
+pub(crate) struct WorkerPoolSpawn {
     pub node_id: NodeId,
     pub renderers: Vec<BoxRenderer>,
-    pub activity: Arc<ProfileActivityTracker>,
     pub bl_capacity: usize,
     pub queue_capacity: usize,
     pub render_permits: usize,
-    pub cpu_render_permits: usize,
+    pub native_render_permits: usize,
     pub source_cache_capacity: usize,
 }
 
 impl WorkerPool {
-    pub fn spawn(spec: WorkerPoolSpawn) -> Self {
+    pub(crate) fn spawn(spec: WorkerPoolSpawn) -> Self {
         let WorkerPoolSpawn {
             node_id,
             renderers,
-            activity,
             bl_capacity,
             queue_capacity,
             render_permits,
-            cpu_render_permits,
+            native_render_permits,
             source_cache_capacity,
         } = spec;
         let n = renderers.len();
         let render_permits = render_permits.max(1).min(n.max(1));
-        let cpu_render_permits = cpu_render_permits.max(1).min(render_permits);
+        let native_render_permits = native_render_permits.max(1).min(render_permits);
         let permit_sem = Arc::new(Semaphore::new(render_permits));
-        let cpu_permit_sem = Arc::new(Semaphore::new(cpu_render_permits));
+        let native_render_permit_sem = Arc::new(Semaphore::new(native_render_permits));
         let mut workers = Vec::with_capacity(n);
         for (i, renderer) in renderers.into_iter().enumerate() {
             let (tx, rx) = mpsc::channel(1024);
@@ -303,7 +305,7 @@ impl WorkerPool {
             let id = i as WorkerId;
             let worker_node_id = node_id.clone();
             let worker_permits = permit_sem.clone();
-            let worker_cpu_permits = cpu_permit_sem.clone();
+            let worker_native_render_permits = native_render_permit_sem.clone();
             let join = tokio::spawn(async move {
                 worker_loop(
                     id,
@@ -311,34 +313,26 @@ impl WorkerPool {
                     rx,
                     renderer,
                     worker_permits,
-                    worker_cpu_permits,
+                    worker_native_render_permits,
                     source_cache_capacity,
                 )
                 .await;
             });
-            #[cfg(test)]
-            let worker = WorkerHandle {
+            workers.push(WorkerHandle {
                 tx,
                 queue_depth,
-                join,
-            };
-            #[cfg(not(test))]
-            let worker = {
-                drop(join);
-                WorkerHandle { tx, queue_depth }
-            };
-            workers.push(worker);
+                join: Mutex::new(Some(join)),
+            });
         }
         Self {
             workers,
             state: Arc::new(Mutex::new(PoolState::new(n))),
-            activity,
             bl_capacity,
             queue_capacity: queue_capacity.max(bl_capacity),
             render_permits,
             render_permit_sem: permit_sem,
-            cpu_render_permits,
-            cpu_permit_sem,
+            native_render_permits,
+            native_render_permit_sem,
         }
     }
 
@@ -346,17 +340,17 @@ impl WorkerPool {
     /// any stage: setup, source load, or render). Used by the simulator to
     /// tell when a draining node has finished all of its *local* work,
     /// independent of tasks it forwarded to peers.
-    pub fn render_permits_inuse(&self) -> usize {
+    pub(crate) fn render_permits_inuse(&self) -> usize {
         self.render_permits
             .saturating_sub(self.render_permit_sem.available_permits())
     }
 
-    pub fn cpu_permits_inuse(&self) -> usize {
-        self.cpu_render_permits
-            .saturating_sub(self.cpu_permit_sem.available_permits())
+    pub(crate) fn native_render_permits_inuse(&self) -> usize {
+        self.native_render_permits
+            .saturating_sub(self.native_render_permit_sem.available_permits())
     }
 
-    pub fn snapshotter(&self) -> PoolSnapshotter {
+    pub(crate) fn snapshotter(&self) -> PoolSnapshotter {
         PoolSnapshotter {
             queue_depths: self.workers.iter().map(|w| w.queue_depth.clone()).collect(),
             state: self.state.clone(),
@@ -379,69 +373,107 @@ impl WorkerPool {
     ///   4. Allocation-aware swap (idle worker only).
     ///   5. Transient overload: warm-for-profile up to admission cap.
     ///   6. Fallback: saturated warm-for-profile → reject path.
-    fn pick_local(&self, task: &InternalTask, prepared_profile: Option<&PreparedProfile>) -> usize {
+    fn best_available_worker(
+        &self,
+        task: &InternalTask,
+        addlayer_source_id: Option<&str>,
+    ) -> Option<usize> {
         let s = lock_unpoisoned(&self.state);
         let task_profile = task.worker_profile();
-        let addlayer_source_id = prepared_profile
-            .and_then(|prepared| prepared.addlayer_source.as_ref())
-            .map(|source| source.stable_source_id());
         let ctx = PickContext {
             loaded: &s.loaded,
             addlayer_source_ids: &s.addlayer_source_ids,
-            incoming_addlayer_source_id: addlayer_source_id.as_deref(),
+            incoming_addlayer_source_id: addlayer_source_id,
             incoming_profile: &task_profile,
             bl_capacity: self.bl_capacity,
             queue_capacity: self.queue_capacity,
             profile_counts: &s.profile_counts,
-            activity: &self.activity,
+            last_used: &s.last_used,
         };
 
         (0..self.workers.len())
-            .min_by_key(|i| pick_score(&ctx, *i, self.queue_at(*i)))
-            .expect("worker pool is empty")
+            .filter_map(|idx| {
+                let queue_depth = self.queue_at(idx);
+                (queue_depth < self.queue_capacity)
+                    .then(|| (idx, pick_score(&ctx, idx, queue_depth)))
+            })
+            .min_by_key(|(_, score)| *score)
+            .map(|(idx, _)| idx)
+    }
+
+    /// Atomically reserve one queue slot at `idx` without breaching the hard
+    /// queue limit. Returns the pre-admission depth, or `None` if the worker is
+    /// already at the hard limit.
+    fn try_reserve(&self, idx: usize) -> Option<usize> {
+        let w = &self.workers[idx];
+        let mut current = w.queue_depth.load(Ordering::Acquire);
+        loop {
+            if current >= self.queue_capacity {
+                return None;
+            }
+            match w.queue_depth.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(current),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Reserve the best worker that currently has capacity. The common path is
+    /// one allocation-free linear scan. If another task fills that worker before
+    /// the CAS, rescan current state rather than sorting every worker up front.
+    fn reserve_best_available(
+        &self,
+        task: &InternalTask,
+        addlayer_source_id: Option<&str>,
+    ) -> Option<(usize, usize)> {
+        loop {
+            let idx = self.best_available_worker(task, addlayer_source_id)?;
+            if let Some(depth) = self.try_reserve(idx) {
+                return Some((idx, depth));
+            }
+        }
     }
 
     /// Process a task at one of the local workers. Returns `QueueFull(task)`
     /// if the pool cannot accept without breaching the hard queue limit.
     /// Tier 3 bypasses the BL soft limit but still respects the hard limit.
-    pub async fn process(
+    pub(crate) async fn process(
         &self,
         task: InternalTask,
         prepared_profile: Option<PreparedProfile>,
         route_tier: RouteTier,
         worker_hint: Option<WorkerId>,
     ) -> Result<TaskOutcome, ProcessError> {
-        let idx = match worker_hint {
-            Some(wid) if (wid as usize) < self.workers.len() => wid as usize,
-            _ => self.pick_local(&task, prepared_profile.as_ref()),
-        };
-        let w = &self.workers[idx];
-        // Atomic check-and-reserve so concurrent `process` calls cannot
-        // both see the same spare slot and overshoot the hard queue limit.
-        let pre_admit_depth = {
-            let mut current = w.queue_depth.load(Ordering::Acquire);
-            loop {
-                if current >= self.queue_capacity {
-                    return Err(ProcessError::QueueFull(Box::new(task)));
-                }
-                match w.queue_depth.compare_exchange_weak(
-                    current,
-                    current + 1,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break current,
-                    Err(actual) => current = actual,
-                }
-            }
-        };
-        let admitted_at_overflow = pre_admit_depth >= self.bl_capacity;
-        let task_profile = task.worker_profile();
         let addlayer_source_id = prepared_profile
             .as_ref()
             .and_then(|prepared| prepared.addlayer_source.as_ref())
             .map(|source| source.stable_source_id());
-        self.activity.record(task_profile.clone(), Instant::now());
+        // Reserve a worker before committing any predicted profile/source
+        // state. A hint intentionally targets one worker (e.g. an eviction
+        // target), so it is honored exactly with no fallback. Otherwise select
+        // the best worker with current capacity and rescan only after a lost
+        // check-and-reserve race.
+        let (idx, pre_admit_depth) = match worker_hint {
+            Some(wid) if (wid as usize) < self.workers.len() => {
+                let idx = wid as usize;
+                match self.try_reserve(idx) {
+                    Some(depth) => (idx, depth),
+                    None => return Err(ProcessError::QueueFull(Box::new(task))),
+                }
+            }
+            _ => match self.reserve_best_available(&task, addlayer_source_id.as_deref()) {
+                Some(reserved) => reserved,
+                None => return Err(ProcessError::QueueFull(Box::new(task))),
+            },
+        };
+        let w = &self.workers[idx];
+        let admitted_at_overflow = pre_admit_depth >= self.bl_capacity;
+        let task_profile = task.worker_profile();
         let dispatch_generation = {
             let mut s = lock_unpoisoned(&self.state);
             let generation = s.mark_loaded(idx, task_profile);
@@ -471,25 +503,57 @@ impl WorkerPool {
             })
             .await
         {
-            let WorkerCmd::Process { task, .. } = err.0;
-            return Err(ProcessError::QueueFull(Box::new(task)));
+            // We only ever send `Process` here; recover its task on send failure.
+            if let WorkerCmd::Process { task, .. } = err.0 {
+                return Err(ProcessError::QueueFull(Box::new(task)));
+            }
+            unreachable!("worker send failure returns the Process command we sent");
         }
         rx.await.map_err(|_| ProcessError::QueueDisconnected)
     }
 
-    #[cfg(test)]
-    async fn shutdown(self) {
-        let joins: Vec<_> = self
-            .workers
-            .into_iter()
-            .map(|w| {
-                drop(w.tx);
-                w.join
-            })
-            .collect();
-        for j in joins {
-            let _ = j.await;
+    /// Gracefully stop every worker within `deadline` and report the outcome.
+    ///
+    /// Each worker is asked to `Retire` — it drains the `Process` commands
+    /// already queued ahead of that message (native renders are non-preemptible
+    /// and must finish) and then exits. A worker whose task does not finish
+    /// within `deadline` is detached (its native render keeps running) and
+    /// counted as `timed_out`, so the caller can distinguish a clean shutdown
+    /// from a forced one rather than silently treating both as graceful.
+    pub(crate) async fn shutdown(&self, deadline: Instant) -> WorkerShutdown {
+        for worker in &self.workers {
+            if tokio::time::timeout_at(deadline, worker.tx.send(WorkerCmd::Retire))
+                .await
+                .is_err()
+            {
+                break;
+            }
         }
+        let mut outcome = WorkerShutdown::default();
+        for worker in &self.workers {
+            let Some(handle) = lock_unpoisoned(&worker.join).take() else {
+                continue;
+            };
+            match tokio::time::timeout_at(deadline, handle).await {
+                Ok(_) => outcome.joined += 1,
+                Err(_) => outcome.timed_out += 1,
+            }
+        }
+        outcome
+    }
+}
+
+/// Result of [`WorkerPool::shutdown`]: how many worker tasks joined cleanly
+/// versus were still running at the deadline and had to be detached.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerShutdown {
+    pub joined: usize,
+    pub timed_out: usize,
+}
+
+impl WorkerShutdown {
+    pub fn is_complete(self) -> bool {
+        self.timed_out == 0
     }
 }
 
@@ -528,7 +592,7 @@ fn pick_score(ctx: &PickContext<'_>, idx: usize, queue_depth: usize) -> PickScor
                 profile.render_mode != ctx.incoming_profile.render_mode
                     || profile.scale != ctx.incoming_profile.scale,
                 Reverse(count),
-                ctx.activity.last_seen(profile),
+                ctx.last_used[idx],
             )
         } else {
             (false, false, Reverse(usize::MAX), None)
@@ -734,6 +798,21 @@ mod tests {
         }
 
         async fn render(&mut self, task: &InternalTask) -> Result<RendererOutput, RendererError> {
+            let has_resolved_source = matches!(
+                &task.request,
+                RenderRequest::StaticImage {
+                    addlayer: Some(AddLayer {
+                        source: Some(AddLayerSource { json, .. }),
+                        ..
+                    }),
+                    ..
+                } if json.contains("https://tiles.test/")
+            );
+            if !has_resolved_source {
+                return Err(RendererError::RenderFailed(
+                    "prepared addlayer source was not applied".to_string(),
+                ));
+            }
             Ok(RendererOutput {
                 output: RenderOutput {
                     bytes: bytes::Bytes::new(),
@@ -812,11 +891,10 @@ mod tests {
             renderers: vec![Box::new(RepairProbeRenderer {
                 repair_count: repair_count.clone(),
             })],
-            activity: Arc::new(ProfileActivityTracker::new()),
             bl_capacity: 1,
             queue_capacity: 1,
             render_permits: 1,
-            cpu_render_permits: 1,
+            native_render_permits: 1,
             source_cache_capacity: 1,
         });
 
@@ -827,7 +905,7 @@ mod tests {
         })
         .await
         .expect("idle worker must repair without an admitted task");
-        pool.shutdown().await;
+        pool.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 
     #[tokio::test]
@@ -840,11 +918,10 @@ mod tests {
                 started: started.clone(),
                 release: release.clone(),
             })],
-            activity: Arc::new(ProfileActivityTracker::new()),
             bl_capacity: 1,
             queue_capacity: 1,
             render_permits: 1,
-            cpu_render_permits: 1,
+            native_render_permits: 1,
             source_cache_capacity: 1,
         }));
 
@@ -883,10 +960,7 @@ mod tests {
             "worker-side failure must clear eager warm state without a caller"
         );
 
-        Arc::try_unwrap(pool)
-            .unwrap_or_else(|_| panic!("test owns the last pool reference"))
-            .shutdown()
-            .await;
+        pool.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -894,11 +968,10 @@ mod tests {
         let pool = WorkerPool::spawn(WorkerPoolSpawn {
             node_id: NodeId::from_index(0),
             renderers: vec![Box::new(NoopRenderer)],
-            activity: Arc::new(ProfileActivityTracker::new()),
             bl_capacity: 1,
             queue_capacity: 1,
             render_permits: 1,
-            cpu_render_permits: 1,
+            native_render_permits: 1,
             source_cache_capacity: 1,
         });
 
@@ -917,7 +990,39 @@ mod tests {
         assert!(observation.style_setup_duration.is_some());
         assert_eq!(observation.source_setup_duration, None);
 
-        pool.shutdown().await;
+        pool.shutdown(Instant::now() + Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn reservation_falls_through_a_full_worker_to_an_idle_one() {
+        let pool = WorkerPool::spawn(WorkerPoolSpawn {
+            node_id: NodeId::from_index(0),
+            renderers: vec![Box::new(NoopRenderer), Box::new(NoopRenderer)],
+            bl_capacity: 1,
+            queue_capacity: 1,
+            render_permits: 1,
+            native_render_permits: 1,
+            source_cache_capacity: 1,
+        });
+
+        // Fill worker 0 to the hard queue limit.
+        assert_eq!(pool.try_reserve(0), Some(0));
+        assert_eq!(pool.try_reserve(0), None, "worker 0 is at the hard limit");
+
+        // With the best candidate full, reservation must fall through to the
+        // idle worker 1 instead of rejecting (the pre-fix behavior).
+        let task = make_task(1, 1);
+        let (idx, depth) = pool
+            .reserve_best_available(&task, None)
+            .expect("an idle worker must still admit the task");
+        assert_eq!(idx, 1);
+        assert_eq!(depth, 0);
+        assert_eq!(pool.queue_at(1), 1);
+
+        // Only when every candidate is full does reservation give up.
+        assert_eq!(pool.reserve_best_available(&task, None), None);
+
+        pool.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -925,11 +1030,10 @@ mod tests {
         let pool = WorkerPool::spawn(WorkerPoolSpawn {
             node_id: NodeId::from_index(0),
             renderers: vec![Box::new(SourceSetupRenderer)],
-            activity: Arc::new(ProfileActivityTracker::new()),
             bl_capacity: 1,
             queue_capacity: 1,
             render_permits: 1,
-            cpu_render_permits: 1,
+            native_render_permits: 1,
             source_cache_capacity: 1,
         });
         let mut task = make_task(1, 1);
@@ -952,14 +1056,22 @@ mod tests {
                 hash: 1,
                 source: Some(AddLayerSource {
                     tileset_id: "tiles".to_string(),
-                    json: r#"{"type":"vector","tiles":["https://tiles.test/{z}/{x}/{y}.pbf"]}"#
-                        .to_string(),
+                    json: r#"{"type":"vector","url":"tiles"}"#.to_string(),
                 }),
+            }),
+        };
+        let prepared = PreparedProfile {
+            revision: task.style.clone(),
+            style_json: Arc::from("{}"),
+            addlayer_source: Some(AddLayerSource {
+                tileset_id: "tiles".to_string(),
+                json: r#"{"type":"vector","tiles":["https://tiles.test/{z}/{x}/{y}.pbf"]}"#
+                    .to_string(),
             }),
         };
 
         let outcome = pool
-            .process(task, None, RouteTier::Tier2HrwBl, Some(0))
+            .process(task, Some(prepared), RouteTier::Tier2HrwBl, Some(0))
             .await
             .expect("task processes");
         assert!(outcome.had_source);
@@ -974,7 +1086,7 @@ mod tests {
             Some(Duration::from_millis(3))
         );
 
-        pool.shutdown().await;
+        pool.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 
     fn rev(id: u32) -> StyleRevision {
@@ -1021,7 +1133,7 @@ mod tests {
         loaded: &[Option<WorkerProfile>],
         queue_depths: &[usize],
         incoming_profile: &WorkerProfile,
-        activity: &ProfileActivityTracker,
+        last_used: &[Option<Instant>],
     ) -> Option<usize> {
         let counts = profile_counts(loaded);
         let addlayer_source_ids = vec![HashSet::new(); loaded.len()];
@@ -1033,7 +1145,7 @@ mod tests {
             bl_capacity: 1,
             queue_capacity: 1,
             profile_counts: &counts,
-            activity,
+            last_used,
         };
         (0..loaded.len())
             .filter_map(|idx| {
@@ -1076,31 +1188,29 @@ mod tests {
 
     #[test]
     fn local_swap_prefers_over_allocated_style_then_oldest_seen() {
-        let activity = Arc::new(ProfileActivityTracker::new());
         let now = Instant::now();
-        activity.record(lp(1), now);
-        activity.record(lp(2), now - Duration::from_secs(20));
-        activity.record(lp(3), now - Duration::from_secs(40));
 
         let picked = alloc_swap_candidate(
-            &[Some(lp(1)), Some(lp(2)), Some(lp(1)), Some(lp(3))],
+            &[Some(lp(1)), Some(lp(1)), Some(lp(2)), Some(lp(2))],
             &[0, 0, 0, 0],
             &lp(9),
-            &activity,
+            &[
+                Some(now),
+                Some(now - Duration::from_secs(40)),
+                Some(now - Duration::from_secs(20)),
+                Some(now - Duration::from_secs(10)),
+            ],
         )
         .unwrap();
 
-        assert!(matches!(picked, 0 | 2));
+        assert_eq!(picked, 1);
     }
 
     #[test]
     fn local_swap_prefers_same_renderer_shape_within_over_allocated_profiles() {
-        let activity = Arc::new(ProfileActivityTracker::new());
         let now = Instant::now();
         let different_shape = lp_with(1, RenderMode::Static, Scale::X1);
         let same_shape = lp(2);
-        activity.record(different_shape.clone(), now - Duration::from_secs(20));
-        activity.record(same_shape.clone(), now);
 
         let picked = alloc_swap_candidate(
             &[
@@ -1111,21 +1221,24 @@ mod tests {
             ],
             &[0, 0, 0, 0],
             &lp(9),
-            &activity,
+            &[
+                Some(now - Duration::from_secs(20)),
+                Some(now),
+                Some(now - Duration::from_secs(30)),
+                Some(now - Duration::from_secs(10)),
+            ],
         );
 
-        assert_eq!(picked, Some(1));
+        assert_eq!(picked, Some(3));
     }
 
     #[test]
     fn local_swap_skips_full_workers_and_incoming_profile() {
-        let activity = ProfileActivityTracker::new();
-
         let picked = alloc_swap_candidate(
             &[Some(lp(9)), Some(lp(1)), Some(lp(1)), Some(lp(2))],
             &[0, 1, 0, 0],
             &lp(9),
-            &activity,
+            &[None; 4],
         );
 
         assert_eq!(picked, Some(2));
@@ -1133,13 +1246,11 @@ mod tests {
 
     #[test]
     fn local_swap_can_steal_idle_singleton_when_no_over_allocated_style_exists() {
-        let activity = ProfileActivityTracker::new();
-
         let picked = alloc_swap_candidate(
             &[Some(lp(9)), Some(lp(1)), Some(lp(2))],
             &[1, 0, 1],
             &lp(9),
-            &activity,
+            &[None; 3],
         );
 
         assert_eq!(picked, Some(1));
@@ -1147,13 +1258,11 @@ mod tests {
 
     #[test]
     fn local_swap_does_not_steal_busy_singleton_for_another_style() {
-        let activity = ProfileActivityTracker::new();
-
         let picked = alloc_swap_candidate(
             &[Some(lp(9)), Some(lp(1)), Some(lp(2))],
             &[1, 1, 1],
             &lp(9),
-            &activity,
+            &[None; 3],
         );
 
         assert_eq!(picked, None);
@@ -1161,13 +1270,11 @@ mod tests {
 
     #[test]
     fn local_swap_does_not_steal_busy_over_allocated_style() {
-        let activity = ProfileActivityTracker::new();
-
         let picked = alloc_swap_candidate(
             &[Some(lp(9)), Some(lp(1)), Some(lp(1))],
             &[0, 1, 1],
             &lp(9),
-            &activity,
+            &[None; 3],
         );
 
         assert_eq!(picked, None);
@@ -1175,7 +1282,6 @@ mod tests {
 
     #[test]
     fn local_pick_prefers_cached_addlayer_source_within_same_tier() {
-        let activity = ProfileActivityTracker::new();
         let loaded = vec![Some(lp(1)), Some(lp(1))];
         let queue_depths = [0, 0];
         let mut addlayer_source_ids = vec![HashSet::new(), HashSet::new()];
@@ -1189,7 +1295,7 @@ mod tests {
             bl_capacity: 2,
             queue_capacity: 2,
             profile_counts: &profile_counts,
-            activity: &activity,
+            last_used: &[None; 2],
         };
 
         let picked = (0..loaded.len())
@@ -1219,11 +1325,10 @@ mod tests {
         let pool = WorkerPool::spawn(WorkerPoolSpawn {
             node_id: NodeId::from_index(0),
             renderers: vec![Box::new(NoopRenderer)],
-            activity: Arc::new(ProfileActivityTracker::new()),
             bl_capacity: 1,
             queue_capacity: 1,
             render_permits: 1,
-            cpu_render_permits: 1,
+            native_render_permits: 1,
             source_cache_capacity: 1,
         });
         pool.workers[0].queue_depth.store(1, Ordering::Release);
@@ -1235,7 +1340,7 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        pool.shutdown().await;
+        pool.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 
     #[tokio::test]
@@ -1243,11 +1348,10 @@ mod tests {
         let pool = WorkerPool::spawn(WorkerPoolSpawn {
             node_id: NodeId::from_index(0),
             renderers: vec![Box::new(FailingRenderer)],
-            activity: Arc::new(ProfileActivityTracker::new()),
             bl_capacity: 1,
             queue_capacity: 1,
             render_permits: 1,
-            cpu_render_permits: 1,
+            native_render_permits: 1,
             source_cache_capacity: 1,
         });
 
@@ -1265,7 +1369,7 @@ mod tests {
             let state = lock_unpoisoned(&pool.state);
             assert_eq!(state.loaded[0], None);
         }
-        pool.shutdown().await;
+        pool.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 
     #[tokio::test]
@@ -1276,11 +1380,10 @@ mod tests {
             renderers: vec![Box::new(RenderFailingRenderer {
                 setup_count: setup_count.clone(),
             })],
-            activity: Arc::new(ProfileActivityTracker::new()),
             bl_capacity: 1,
             queue_capacity: 1,
             render_permits: 1,
-            cpu_render_permits: 1,
+            native_render_permits: 1,
             source_cache_capacity: 1,
         });
 
@@ -1296,7 +1399,7 @@ mod tests {
         }
 
         assert_eq!(setup_count.load(Ordering::Acquire), 1);
-        pool.shutdown().await;
+        pool.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 
     #[tokio::test]
@@ -1304,11 +1407,10 @@ mod tests {
         let pool = WorkerPool::spawn(WorkerPoolSpawn {
             node_id: NodeId::from_index(0),
             renderers: vec![Box::new(NoopRenderer)],
-            activity: Arc::new(ProfileActivityTracker::new()),
             bl_capacity: 1,
             queue_capacity: 1,
             render_permits: 1,
-            cpu_render_permits: 1,
+            native_render_permits: 1,
             source_cache_capacity: 1,
         });
 
@@ -1329,7 +1431,7 @@ mod tests {
             let state = lock_unpoisoned(&pool.state);
             assert_eq!(state.loaded[0], None);
         }
-        pool.shutdown().await;
+        pool.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -1341,11 +1443,10 @@ mod tests {
                 delay: Duration::from_millis(5),
                 retire_count: retire_count.clone(),
             })],
-            activity: Arc::new(ProfileActivityTracker::new()),
             bl_capacity: 1,
             queue_capacity: 1,
             render_permits: 1,
-            cpu_render_permits: 1,
+            native_render_permits: 1,
             source_cache_capacity: 1,
         });
 
@@ -1361,7 +1462,7 @@ mod tests {
         };
         assert_eq!(error, RendererError::Timeout.to_string());
         assert_eq!(retire_count.load(Ordering::Acquire), 1);
-        pool.shutdown().await;
+        pool.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -1380,11 +1481,10 @@ mod tests {
         let pool = WorkerPool::spawn(WorkerPoolSpawn {
             node_id: NodeId::from_index(0),
             renderers,
-            activity: Arc::new(ProfileActivityTracker::new()),
             bl_capacity: 1,
             queue_capacity: 1,
             render_permits: 1,
-            cpu_render_permits: 1,
+            native_render_permits: 1,
             source_cache_capacity: 1,
         });
 
@@ -1398,11 +1498,11 @@ mod tests {
         assert!(a.is_ok());
         assert!(b.is_ok());
         assert_eq!(max_seen.load(Ordering::Acquire), 1);
-        pool.shutdown().await;
+        pool.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cpu_render_permits_limit_render_stage_when_execution_can_overlap() {
+    async fn native_render_permits_limit_render_stage_when_execution_can_overlap() {
         let inflight = Arc::new(AtomicUsize::new(0));
         let max_seen = Arc::new(AtomicUsize::new(0));
         let renderers: Vec<BoxRenderer> = (0..2)
@@ -1417,11 +1517,10 @@ mod tests {
         let pool = WorkerPool::spawn(WorkerPoolSpawn {
             node_id: NodeId::from_index(0),
             renderers,
-            activity: Arc::new(ProfileActivityTracker::new()),
             bl_capacity: 1,
             queue_capacity: 1,
             render_permits: 2,
-            cpu_render_permits: 1,
+            native_render_permits: 1,
             source_cache_capacity: 1,
         });
 
@@ -1435,7 +1534,7 @@ mod tests {
         assert!(a.is_ok());
         assert!(b.is_ok());
         assert_eq!(max_seen.load(Ordering::Acquire), 1);
-        assert_eq!(pool.cpu_render_permits, 1);
-        pool.shutdown().await;
+        assert_eq!(pool.native_render_permits, 1);
+        pool.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 }

@@ -40,27 +40,14 @@ Ishikari's GKE overlay first. Public namespaces such as `/carto/*`, `/mierune/*`
 and `/ishikari/*` are style-id prefixes under Ishikari's backing store.
 
 ```sh
-gcloud builds submit --config demo-deploy/biei/runtime/cloudbuild.yaml .
+BUILD_ID="$(gcloud builds submit \
+  --config demo-deploy/biei/runtime/cloudbuild.yaml \
+  --format='value(id)' \
+  .)"
 
-DIGEST="$(gcloud artifacts docker images describe \
-  asia-northeast1-docker.pkg.dev/mappf-experiment/biei/biei:dev \
-  --format='value(image_summary.digest)')"
-
-# Keep the GKE overlay pinned to the exact image that was just built. This
-# avoids ambiguous rollouts when the mutable :dev tag is reused.
-export DIGEST
-python3 - <<'PY'
-import os
-from pathlib import Path
-path = Path("demo-deploy/biei/runtime/k8s/overlays/gke/kustomization.yaml")
-text = path.read_text()
-lines = []
-for line in text.splitlines():
-    if line.strip().startswith("digest: sha256:"):
-        line = f"    digest: {os.environ['DIGEST']}"
-    lines.append(line)
-path.write_text("\\n".join(lines) + "\\n")
-PY
+# Read the digest recorded by this Cloud Build, pin it in only Biei's overlay,
+# and verify the rendered Deployment before applying it.
+demo-deploy/promote_image.py biei "$BUILD_ID"
 
 kubectl apply -k demo-deploy/biei/runtime/k8s/overlays/gke
 kubectl -n map-demo rollout status deploy/biei
@@ -76,9 +63,10 @@ it. Install the narrowly scoped cleanup policy once so superseded, untagged
 cache manifests do not grow indefinitely:
 
 BuildKit pushes the runtime image directly to Artifact Registry to avoid a
-local `--load` followed by Cloud Build's second push. Consequently the final
-Cloud Build summary shows `IMAGES: -`; the `${_IMAGE}` tag in Artifact Registry
-is the build output and the build log records its digest.
+local `--load` followed by Cloud Build's second push. Buildx writes the pushed
+digest into that build's Cloud Build result. Promotion reads the recorded
+result rather than the mutable `:dev` convenience tag, so a later registry
+change cannot alter the selected artifact.
 
 ```sh
 gcloud artifacts repositories set-cleanup-policies biei \
@@ -150,9 +138,14 @@ no peer authentication of its own.
 ## Checks
 
 ```sh
+# Build the production image, start two isolated Biei containers, and verify
+# gossip convergence plus a real peer-forwarded PNG/WebP render.
+docker build -f demo-deploy/biei/runtime/Dockerfile -t biei:dev .
+bash demo-deploy/biei/runtime/cluster-smoke.sh
+
 # Render the GKE overlay offline and verify CPU HPA, UDP gossip, and the
 # internal NetworkPolicy invariants.
-bash demo-deploy/check-hpa.sh
+bash demo-deploy/biei/runtime/check-hpa.sh
 
 kubectl -n map-demo port-forward deploy/biei 8080:8080
 
@@ -186,7 +179,9 @@ curl -s localhost:9090/_internal/metrics
 - The demo uses a Deployment, not a StatefulSet; chitchat handles dynamic
   membership.
 - The headless gossip Service uses `publishNotReadyAddresses: true` so pods can
-  discover each other during cold start.
+  discover each other during cold start. Each pod listens on wildcard UDP via
+  `BIEI_GOSSIP_BIND` and advertises `$(POD_IP):7946` via
+  `BIEI_GOSSIP_ADVERTISE_ADDR`.
 - Rendering combines CPU work with in-render provider I/O. Tune `BIEI_CORES`
   and CPU limits together, but do not infer queue health from CPU alone.
 - The GKE overlay keeps `minReplicas: 2` for cost and sets

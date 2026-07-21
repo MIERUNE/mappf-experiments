@@ -8,14 +8,19 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use mmpf_common::rng::{splitmix64, uniform_unit};
 use serde::Serialize;
 use tokio::{task::JoinSet, time::Instant};
 
 use crate::{
     TraceEntry,
-    cluster::{PreparedRequest, ServedRequest, SimCluster, execute_request, source_name},
+    cluster::{PreparedRequest, ServedRequest, SimCluster, execute_request},
+    report::SourceCategory,
     viewport_batch_ranges,
 };
+
+const MAX_FAILURE_SAMPLES: usize = 10;
+const MAX_FAILURE_SAMPLE_CHARS: usize = 512;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TimedConfig {
@@ -38,6 +43,7 @@ impl Default for TimedConfig {
     }
 }
 
+/// Exact latency observations from requests that completed successfully.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct LatencySummary {
     pub requests: usize,
@@ -51,9 +57,16 @@ pub struct LatencySummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct TimedReport {
     pub config: TimedConfig,
+    /// Total attempts. This always reconciles with `completed + failed + timed_out`.
     pub requests: usize,
     pub completed: usize,
+    pub failed: usize,
+    /// Bounded diagnostic examples for failed attempts.
+    pub failure_samples: Vec<String>,
     pub timed_out: usize,
+    /// Right-censoring bound for each timed-out request. Timeout observations are
+    /// excluded from the exact `latency` distributions below.
+    pub timeout_lower_bound_ms: f64,
     pub elapsed_ms: f64,
     pub throughput_rps: f64,
     pub latency: LatencySummary,
@@ -73,6 +86,7 @@ struct RequestRecord {
 
 enum RequestResult {
     Completed(ServedRequest),
+    Failed(anyhow::Error),
     TimedOut,
 }
 
@@ -140,24 +154,39 @@ pub async fn run_timed_trace(
         records.extend(user.records);
     }
 
+    let requests = records.len();
+    ensure!(
+        requests == entries.len(),
+        "timed runner produced {requests} records for {} input requests",
+        entries.len()
+    );
     let mut completed = 0;
+    let mut failed = 0;
+    let mut failure_samples = Vec::new();
     let mut timed_out = 0;
     let mut latencies = Vec::with_capacity(records.len());
-    let mut by_source: BTreeMap<String, Vec<Duration>> = BTreeMap::new();
+    let mut by_source: BTreeMap<SourceCategory, Vec<Duration>> = BTreeMap::new();
     for record in records {
-        latencies.push(record.latency);
         match record.result {
             RequestResult::Completed(served) => {
                 completed += 1;
+                latencies.push(record.latency);
                 by_source
-                    .entry(source_name(served.source).to_string())
+                    .entry(SourceCategory::from_tile_source(served.source))
                     .or_default()
                     .push(record.latency);
                 cluster.record(served);
             }
+            RequestResult::Failed(error) => {
+                failed += 1;
+                if failure_samples.len() < MAX_FAILURE_SAMPLES {
+                    failure_samples.push(bounded_failure_sample(&error));
+                }
+            }
             RequestResult::TimedOut => timed_out += 1,
         }
     }
+    debug_assert_eq!(requests, completed + failed + timed_out);
 
     let elapsed = completed_at.saturating_duration_since(started_at);
     let throughput_rps = if elapsed.is_zero() {
@@ -167,14 +196,18 @@ pub async fn run_timed_trace(
     };
     let latency_by_source = by_source
         .into_iter()
-        .map(|(source, values)| (source, summarize(values)))
+        .map(|(source, values)| (source.report_label().to_owned(), summarize(values)))
         .collect();
+    let timeout_lower_bound_ms = config.request_timeout_ms as f64;
 
     Ok(TimedReport {
         config,
-        requests: entries.len(),
+        requests,
         completed,
+        failed,
+        failure_samples,
         timed_out,
+        timeout_lower_bound_ms,
         elapsed_ms: duration_ms(elapsed),
         throughput_rps,
         latency: summarize(latencies),
@@ -241,7 +274,8 @@ async fn run_user(
                 .await;
                 tracker.leave(node);
                 let result = match result {
-                    Ok(served) => RequestResult::Completed(served?),
+                    Ok(Ok(served)) => RequestResult::Completed(served),
+                    Ok(Err(error)) => RequestResult::Failed(error),
                     Err(_) => RequestResult::TimedOut,
                 };
                 Ok::<_, anyhow::Error>(RequestRecord {
@@ -270,15 +304,11 @@ fn think_time(config: &TimedConfig, user: usize, iteration: u64) -> Duration {
     Duration::from_secs_f64((millis.max(0.0)) / 1_000.0)
 }
 
-fn uniform_unit(value: u64) -> f64 {
-    (value >> 11) as f64 * (1.0 / ((1_u64 << 53) as f64))
-}
-
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
+fn bounded_failure_sample(error: &anyhow::Error) -> String {
+    format!("{error:#}")
+        .chars()
+        .take(MAX_FAILURE_SAMPLE_CHARS)
+        .collect()
 }
 
 fn summarize(mut latencies: Vec<Duration>) -> LatencySummary {
@@ -372,8 +402,17 @@ mod tests {
 
         assert_eq!(report.requests, 2);
         assert_eq!(report.completed, 0);
+        assert_eq!(report.failed, 0);
+        assert!(report.failure_samples.is_empty());
         assert_eq!(report.timed_out, 2);
-        assert_eq!(report.latency.p50_ms, 5.0);
+        assert_eq!(
+            report.requests,
+            report.completed + report.failed + report.timed_out
+        );
+        assert_eq!(report.timeout_lower_bound_ms, 5.0);
+        assert_eq!(report.latency.requests, 0);
+        assert_eq!(report.latency.p50_ms, 0.0);
+        assert_eq!(report.latency_by_source.len(), 0);
         assert_eq!(report.node_peak_inflight, [2]);
     }
 }

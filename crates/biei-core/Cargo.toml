@@ -1,47 +1,24 @@
 [package]
 name = "biei-core"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
 
 [dependencies]
-anyhow.workspace = true
-ab_glyph.workspace = true
 async-trait.workspace = true
-axum.workspace = true
 bytes.workspace = true
-chitchat.workspace = true
-clap.workspace = true
-# image crate が transitively 引いてくる flate2 の backend を zlib-ng に揃えるため、
-# biei-core から直接参照する。Ishikari は representation-preserving path で
-# rust_backend を使うため、この依存の feature は共有 workspace 依存にしない。
-flate2 = { version = "1", default-features = false, features = ["zlib-ng"] }
-futures-util.workspace = true
-humantime.workspace = true
-httpdate.workspace = true
-image = "0.25"
-maplibre_native.workspace = true
+mmpf-common.workspace = true
+mmpf-http.workspace = true
 moka.workspace = true
 prometheus.workspace = true
 rand.workspace = true
 rand_xoshiro.workspace = true
-reqwest = { workspace = true, features = ["rustls", "http2", "gzip", "deflate", "stream"] }
 serde.workspace = true
 serde_json.workspace = true
-tiny-skia.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing.workspace = true
-tracing-subscriber.workspace = true
-url.workspace = true
-webp.workspace = true
 
-[features]
-# Opt-in OpenGL backend for Linux / headless containers. Kept out of the default
-# set so macOS dev builds keep using Metal. The container build enables it with
-# `cargo build --features gl-opengl`; on Linux maplibre-native's `opengl` backend
-# defaults to an EGL surfaceless context, so it renders headless with no X server
-# (no Xvfb). Do NOT also enable `glx` — that needs X11 and is rejected when
-# building against the precompiled amalgam (MLN_PRECOMPILE).
-gl-opengl = ["maplibre_native/opengl"]
-
-[[example]]
-name = "maplibre_smoke"
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

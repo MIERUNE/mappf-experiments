@@ -11,8 +11,49 @@ This is a demo, not a production deployment.
 |---|---|
 | `Dockerfile` | Release Ishikari image. |
 | `k8s/base/` | Deployment, ClusterIP HTTP Service, and headless gossip Service. |
-| `k8s/platform/` | Shared `map-demo` namespace and Gateway. Apply once per cluster. |
+| `../../platform/` | Shared `map-demo` namespace and Gateway. Apply once per cluster. |
 | `k8s/overlays/gke/` | GKE overlay with provider config, Artifact Registry image, and HTTPRoute. |
+
+## Memory budget
+
+The checked-in pod has a 2 GiB memory limit and assigns at most 1 GiB of
+configured Moka material-cache weight:
+
+| Cache | Weight ceiling |
+|---|---:|
+| Tile payloads | 256 MiB |
+| PMTiles chunks | 256 MiB |
+| Tileset metadata | 64 MiB |
+| PMTiles archive bootstraps | 64 MiB |
+| PMTiles leaf directories | 64 MiB |
+| Provider resources | 64 MiB |
+| Transcoded MLT tiles | 64 MiB |
+| Derived terrain tiles | 128 MiB |
+| Decoded DEM tiles | 64 MiB |
+| **Total** | **1 GiB** |
+
+Ishikari validates Mapterhorn's documented 512px source-tile contract before
+image decode, so a cached decoded DEM contributes about 1 MiB of f32 material
+rather than the reusable decoder's wider generic safety ceiling.
+
+`ISKR_CACHE_WEIGHT_BUDGET_BYTES` is a startup validation ceiling, not an RSS
+limit. Moka/hash-map/key overhead, small entry-count caches, in-flight response
+bodies, decompression and terrain-generation working memory, HTTP/object-store
+clients, Tokio and gossip tasks, and allocator fragmentation consume the other
+headroom. Raising the cache-weight budget therefore requires a corresponding
+container-memory review and a warm-cache load test at configured concurrency.
+The checked-in deployment sets the budget and the two largest cache shares
+explicitly so an application-default change cannot silently consume pod
+headroom.
+
+Backend range reads have a separate 128 MiB active-body reserve. Startup rejects
+configurations where
+`ISKR_CHUNK_SIZE_BYTES × ISKR_MAX_FETCH_CHUNKS × ISKR_BACKEND_FETCH_CONCURRENCY`
+overflows or exceeds `ISKR_BACKEND_ACTIVE_BODY_BUDGET_BYTES`; the checked-in
+`1 MiB × 4 × 32` settings exactly fit that reserve. This bounds response bodies
+while the object-store fetch permits are held. It does not account for bodies
+retained afterward by chunk coordination/caching, peer responses, or decoding
+work, which still require separate admission bounds and load-test validation.
 
 ## GKE
 
@@ -23,7 +64,14 @@ unless you move the demo to an Arm-supported region.
 Build and push the demo image:
 
 ```sh
-gcloud builds submit --config demo-deploy/ishikari/runtime/cloudbuild.yaml .
+BUILD_ID="$(gcloud builds submit \
+  --config demo-deploy/ishikari/runtime/cloudbuild.yaml \
+  --format='value(id)' \
+  .)"
+
+# Read the digest recorded by this Cloud Build, pin it in only Ishikari's
+# overlay, and verify the rendered Deployment before applying it.
+demo-deploy/promote_image.py ishikari "$BUILD_ID"
 ```
 
 The first build populates a BuildKit `mode=max` cache in the separate
@@ -42,9 +90,10 @@ gcloud artifacts repositories set-cleanup-policies ishikari \
 ```
 
 BuildKit pushes the runtime image directly to Artifact Registry, avoiding a
-local image load followed by Cloud Build's second push. The final Cloud Build
-summary therefore shows `IMAGES: -`; the `${_IMAGE}` tag is the output and the
-build log records its digest.
+local image load followed by Cloud Build's second push. Buildx writes the
+pushed digest into that build's Cloud Build result. Promotion reads the
+recorded result rather than the mutable `:dev` convenience tag, so a later
+registry change cannot alter the selected artifact.
 
 Create or bind the GCS reader identity once:
 
@@ -109,7 +158,7 @@ Point `ishikari-demo.mierune.dev` at the reserved `mappf-demo-ingress` address.
 Then apply the shared Gateway and Ishikari:
 
 ```sh
-kubectl apply -k demo-deploy/ishikari/runtime/k8s/platform
+kubectl apply -k demo-deploy/platform
 kubectl apply -k demo-deploy/ishikari/runtime/k8s/overlays/gke
 kubectl -n map-demo rollout status deploy/ishikari
 ```
@@ -128,21 +177,27 @@ For another data source, patch those env vars in
 
 The Gateway routes a catch-all `/` to Ishikari's public listener (`:8080`),
 which serves the provider prefixes (`/tilesets/*`, `/styles/*`, `/fonts/*`) plus
-top-level `/livez` `/readyz`. `/_internal/*`, `/metrics` and peer-to-peer
-forwarding live on a separate cluster-internal port (`:9090`) that the Service
+top-level `/livez` `/readyz`. In the Kubernetes deployment, readiness waits for
+one gossip peer during startup, fails open after 30 seconds, and remains open
+through later partitions. `/_internal/*`, including `/_internal/metrics`, and
+peer-to-peer forwarding live on a separate cluster-internal port (`:9090`) that the Service
 does not expose and the Gateway does not route, so nothing internal is reachable
 publicly. The shared Gateway listens on HTTPS only.
 
-**Trust boundary:** the internal port is not network-isolated. With no
-NetworkPolicy, any pod anywhere in the cluster (not just the `map-demo`
-namespace) that can route to a pod IP can reach `:9090/_internal/*` and gossip
-`:7946`. The demo cluster is assumed to host only trusted workloads. Add a
-NetworkPolicy restricting `:9090`/`:7946` ingress to peer pods if you need
-in-cluster isolation.
+**Trust boundary:** the GKE overlay installs `ishikari-internal-boundary`.
+Public and kubelet probe traffic remains reachable on TCP `:8080`; peer
+forwarding on TCP `:9090` and gossip on UDP `:7946` are limited to Ishikari pods
+in `map-demo`; Google Managed Service for Prometheus collectors may scrape
+`:9090`. All other ingress to Ishikari pods is denied. The base manifests do not
+install this GKE-specific policy, so other overlays must provide an equivalent
+NetworkPolicy or service-mesh boundary.
 
 ## Checks
 
 ```sh
+# Render the GKE overlay offline and verify the allowed/denied ingress matrix.
+bash demo-deploy/ishikari/runtime/check-network-policy.sh
+
 # In-cluster checks.
 kubectl -n map-demo port-forward svc/ishikari 8080:8080
 curl 'http://localhost:8080/tilesets/<tileset_id>'

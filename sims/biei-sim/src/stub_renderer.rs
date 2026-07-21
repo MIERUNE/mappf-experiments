@@ -1,6 +1,6 @@
 //! `StubRenderer` — sleep-based fake renderer driven by `CostRange` samples.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use rand::SeedableRng;
@@ -26,7 +26,7 @@ pub struct StubRenderer {
     next_render_state: CalibrationRenderState,
     current_render_mode: Option<RenderMode>,
     current_scale: Option<Scale>,
-    rng: Mutex<Xoshiro256PlusPlus>,
+    rng: Xoshiro256PlusPlus,
 }
 
 impl StubRenderer {
@@ -52,7 +52,7 @@ impl StubRenderer {
             next_render_state: CalibrationRenderState::Cold,
             current_render_mode: None,
             current_scale: None,
-            rng: Mutex::new(Xoshiro256PlusPlus::seed_from_u64(seed)),
+            rng: Xoshiro256PlusPlus::seed_from_u64(seed),
         }
     }
 
@@ -62,46 +62,47 @@ impl StubRenderer {
     }
 
     fn sample_style_setup(
-        &self,
+        &mut self,
         task: &InternalTask,
         state: CalibrationRenderState,
     ) -> std::time::Duration {
-        let mut rng = self.rng.lock().expect("renderer rng mutex poisoned");
-        self.calibration
-            .as_ref()
-            .and_then(|model| model.sample_style_setup(task, state, &mut *rng))
-            .unwrap_or_else(|| self.style_setup_cost.sample(&mut *rng))
+        if let Some(model) = &self.calibration
+            && let Some(sample) = model.sample_style_setup(task, state, &mut self.rng)
+        {
+            return sample;
+        }
+        self.style_setup_cost.sample(&mut self.rng)
     }
 
-    fn sample_source_setup(&self) -> std::time::Duration {
-        let mut rng = self.rng.lock().expect("renderer rng mutex poisoned");
-        self.calibration
-            .as_ref()
-            .and_then(|model| {
-                model.sample_source_setup(self.current_render_mode?, self.current_scale?, &mut *rng)
-            })
-            .unwrap_or_else(|| self.source_load_cost.sample(&mut *rng))
+    fn sample_source_setup(&mut self) -> std::time::Duration {
+        if let (Some(model), Some(render_mode), Some(scale)) = (
+            &self.calibration,
+            self.current_render_mode,
+            self.current_scale,
+        ) && let Some(sample) = model.sample_source_setup(render_mode, scale, &mut self.rng)
+        {
+            return sample;
+        }
+        self.source_load_cost.sample(&mut self.rng)
     }
 
     fn sample_render_costs(
-        &self,
+        &mut self,
         task: Option<&InternalTask>,
         state: CalibrationRenderState,
         first_render: bool,
     ) -> (std::time::Duration, std::time::Duration) {
-        let mut rng = self.rng.lock().expect("renderer rng mutex poisoned");
-        let sampled_cpu = task
-            .and_then(|task| {
-                self.calibration
-                    .as_ref()
-                    .and_then(|model| model.sample_render_cpu(task, &mut *rng))
-            })
-            .unwrap_or_else(|| self.render_cpu_cost.sample(&mut *rng));
-        let empirical_total = task.and_then(|task| {
-            self.calibration
-                .as_ref()
-                .and_then(|model| model.sample_render(task, state, &mut *rng))
-        });
+        let sampled_cpu = if let (Some(task), Some(model)) = (task, &self.calibration) {
+            model.sample_render_cpu(task, &mut self.rng)
+        } else {
+            None
+        }
+        .unwrap_or_else(|| self.render_cpu_cost.sample(&mut self.rng));
+        let empirical_total = if let (Some(task), Some(model)) = (task, &self.calibration) {
+            model.sample_render(task, state, &mut self.rng)
+        } else {
+            None
+        };
         if let Some(total) = empirical_total {
             let cpu = sampled_cpu.min(total);
             return (total.saturating_sub(cpu), cpu);
@@ -111,7 +112,7 @@ impl StubRenderer {
         } else {
             self.render_resource_cost
         };
-        (resource_range.sample(&mut *rng), sampled_cpu)
+        (resource_range.sample(&mut self.rng), sampled_cpu)
     }
 
     async fn spend_render_phases(
@@ -119,17 +120,21 @@ impl StubRenderer {
         resource_wait: std::time::Duration,
         cpu_cost: std::time::Duration,
     ) {
-        tokio::time::sleep(resource_wait).await;
+        if !resource_wait.is_zero() {
+            tokio::time::sleep(resource_wait).await;
+        }
 
-        // The worker's historical `cpu_render_permit` bounds whole native
-        // render residency, including the wait above. This separate semaphore
-        // represents actual cores, which the resource wait must not consume.
+        // The native-render permit bounds whole render residency, including
+        // the wait above. This separate semaphore represents actual cores,
+        // which the resource wait must not consume.
         let _cpu_core = self
             .cpu_cores
             .acquire()
             .await
             .expect("simulated CPU core semaphore is never closed");
-        tokio::time::sleep(cpu_cost).await;
+        if !cpu_cost.is_zero() {
+            tokio::time::sleep(cpu_cost).await;
+        }
     }
 
     #[cfg(test)]
@@ -158,7 +163,9 @@ impl Renderer for StubRenderer {
             CalibrationRenderState::Cold
         };
         let d = self.sample_style_setup(task, state);
-        tokio::time::sleep(d).await;
+        if !d.is_zero() {
+            tokio::time::sleep(d).await;
+        }
         self.has_profile = true;
         self.first_render_after_setup = true;
         self.next_render_state = state;
@@ -169,7 +176,9 @@ impl Renderer for StubRenderer {
 
     async fn ensure_source(&mut self, _hash: SourceHash) -> Result<(), RendererError> {
         let d = self.sample_source_setup();
-        tokio::time::sleep(d).await;
+        if !d.is_zero() {
+            tokio::time::sleep(d).await;
+        }
         Ok(())
     }
 
@@ -236,6 +245,27 @@ mod tests {
         let started = Instant::now();
         renderer.spend_render_cost().await;
         assert_eq!(started.elapsed(), Duration::from_millis(30));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_cost_render_still_acquires_the_modeled_cpu_core() {
+        let cpu_cores = Arc::new(Semaphore::new(0));
+        let mut renderer = renderer(
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+            cpu_cores.clone(),
+            1,
+        );
+
+        let render = tokio::spawn(async move {
+            renderer.spend_render_cost().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!render.is_finished());
+
+        cpu_cores.add_permits(1);
+        render.await.expect("zero-cost render task");
     }
 
     #[tokio::test(start_paused = true)]

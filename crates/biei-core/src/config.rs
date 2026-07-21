@@ -64,11 +64,10 @@ pub struct ClusterConfig {
     /// all renderer slots may run at once. Values above `renderer_slots_per_node` are
     /// capped because extra permits cannot be used without slots.
     pub render_permits_per_node: Option<usize>,
-    /// Optional native `renderStill` residency limit per node. The historical
-    /// name is retained for compatibility, but the permit includes FileSource
-    /// waits and is not a pure CPU/GPU service limit. `None` means the same
-    /// value as `render_permits_per_node`.
-    pub cpu_render_permits_per_node: Option<usize>,
+    /// Optional native `renderStill` residency limit per node. The permit
+    /// includes FileSource waits and is not a pure CPU/GPU service limit.
+    /// `None` means the same value as `render_permits_per_node`.
+    pub native_render_permits_per_node: Option<usize>,
     /// Policy for the per-slot soft queue limit. This is the BL used by
     /// routing to prefer targets likely to stay within SLA.
     pub bl_capacity: BlCapacityPolicy,
@@ -120,7 +119,7 @@ impl CostConfig {
     }
 
     /// Wall-clock native-render residency for the first render after setup.
-    pub fn first_render_cost(&self) -> CostRange {
+    pub(crate) fn first_render_cost(&self) -> CostRange {
         self.render_cpu_cost
             .saturating_add(self.first_render_resource_cost)
     }
@@ -138,9 +137,25 @@ pub struct RoutingConfig {
     pub drain_max_queue: usize,
 }
 
+/// Core-owned node policy after resolving cluster-level capacity settings.
+///
+/// Production and simulation provide different runtime adapters, but both use
+/// this exact queue, permit, cache, routing, and deadline policy.
+#[derive(Clone, Debug)]
+pub struct ResolvedNodeConfig {
+    pub routing: RoutingConfig,
+    pub costs: CostConfig,
+    pub gossip: GossipConfig,
+    pub queue_limits: QueueLimits,
+    pub render_permits: usize,
+    pub native_render_permits: usize,
+    pub source_cache_capacity: usize,
+    pub render_output_cache_capacity_bytes: u64,
+}
+
 /// SLA-oriented soft queue limit per renderer slot: `min(S/P, L/P - 1)`.
 /// This is the BL from the routing algorithm.
-pub fn compute_bl_capacity(s: Duration, p: Duration, l: Duration) -> usize {
+fn compute_bl_capacity(s: Duration, p: Duration, l: Duration) -> usize {
     let p_us = p.as_micros().max(1) as u64;
     let by_latency = (s.as_micros() as u64) / p_us;
     let by_sla = ((l.as_micros() as u64) / p_us).saturating_sub(1);
@@ -157,8 +172,8 @@ impl ClusterConfig {
             .min(self.renderer_slots_per_node.max(1))
     }
 
-    pub fn resolved_cpu_render_permits_per_node(&self) -> usize {
-        self.cpu_render_permits_per_node
+    pub fn resolved_native_render_permits_per_node(&self) -> usize {
+        self.native_render_permits_per_node
             .unwrap_or_else(|| self.resolved_render_permits_per_node())
             .max(1)
             .min(self.resolved_render_permits_per_node())
@@ -198,6 +213,26 @@ impl ClusterConfig {
             .max(soft);
         QueueLimits { soft, hard }
     }
+
+    pub fn resolve_node_config(
+        &self,
+        routing: RoutingConfig,
+        costs: CostConfig,
+        gossip: GossipConfig,
+    ) -> Result<ResolvedNodeConfig, String> {
+        self.validate_standby_ratio()?;
+        let queue_limits = self.resolved_queue_limits(&costs);
+        Ok(ResolvedNodeConfig {
+            routing,
+            costs,
+            gossip,
+            queue_limits,
+            render_permits: self.resolved_render_permits_per_node(),
+            native_render_permits: self.resolved_native_render_permits_per_node(),
+            source_cache_capacity: self.source_cache_capacity,
+            render_output_cache_capacity_bytes: self.render_output_cache_capacity_bytes,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -211,7 +246,7 @@ mod tests {
         let cluster = ClusterConfig {
             renderer_slots_per_node: 1,
             render_permits_per_node: None,
-            cpu_render_permits_per_node: None,
+            native_render_permits_per_node: None,
             bl_capacity: BlCapacityPolicy::Fixed(7),
             queue_capacity_multiplier: 3,
             source_cache_capacity: 1,
@@ -238,7 +273,7 @@ mod tests {
         let cluster = ClusterConfig {
             renderer_slots_per_node: 1,
             render_permits_per_node: None,
-            cpu_render_permits_per_node: None,
+            native_render_permits_per_node: None,
             bl_capacity: BlCapacityPolicy::Auto,
             queue_capacity_multiplier: 2,
             source_cache_capacity: 1,
@@ -264,11 +299,52 @@ mod tests {
     }
 
     #[test]
+    fn resolved_node_config_keeps_capacity_policy_together() {
+        let cluster = ClusterConfig {
+            renderer_slots_per_node: 4,
+            render_permits_per_node: Some(3),
+            native_render_permits_per_node: Some(2),
+            bl_capacity: BlCapacityPolicy::Fixed(5),
+            queue_capacity_multiplier: 2,
+            source_cache_capacity: 17,
+            render_output_cache_capacity_bytes: 23,
+        };
+        let costs = CostConfig {
+            style_setup_cost: CostRange::fixed(Duration::from_millis(100)),
+            source_load_cost: CostRange::fixed(Duration::ZERO),
+            render_cpu_cost: CostRange::fixed(Duration::from_millis(10)),
+            render_resource_cost: CostRange::fixed(Duration::ZERO),
+            first_render_resource_cost: CostRange::fixed(Duration::ZERO),
+            hop_latency: Duration::from_millis(3),
+            sla: Duration::from_secs(1),
+        };
+        let resolved = cluster
+            .resolve_node_config(
+                RoutingConfig {
+                    tier1_strategy: Tier1Strategy::PowerOfTwo,
+                    tier3_enabled: true,
+                    drain_max_queue: 5,
+                },
+                costs,
+                GossipConfig {
+                    publish_interval: Duration::from_millis(50),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(resolved.queue_limits, QueueLimits { soft: 5, hard: 10 });
+        assert_eq!(resolved.render_permits, 3);
+        assert_eq!(resolved.native_render_permits, 2);
+        assert_eq!(resolved.source_cache_capacity, 17);
+        assert_eq!(resolved.render_output_cache_capacity_bytes, 23);
+    }
+
+    #[test]
     fn render_permits_default_to_worker_slots_and_cap_at_slots() {
         let mut cluster = ClusterConfig {
             renderer_slots_per_node: 10,
             render_permits_per_node: None,
-            cpu_render_permits_per_node: None,
+            native_render_permits_per_node: None,
             bl_capacity: BlCapacityPolicy::Fixed(1),
             queue_capacity_multiplier: 1,
             source_cache_capacity: 1,
@@ -276,25 +352,25 @@ mod tests {
         };
 
         assert_eq!(cluster.resolved_render_permits_per_node(), 10);
-        assert_eq!(cluster.resolved_cpu_render_permits_per_node(), 10);
+        assert_eq!(cluster.resolved_native_render_permits_per_node(), 10);
         assert_eq!(cluster.standby_ratio(), 1.0);
         assert!(cluster.validate_standby_ratio().is_ok());
 
         cluster.render_permits_per_node = Some(6);
         assert_eq!(cluster.resolved_render_permits_per_node(), 6);
-        assert_eq!(cluster.resolved_cpu_render_permits_per_node(), 6);
+        assert_eq!(cluster.resolved_native_render_permits_per_node(), 6);
 
-        cluster.cpu_render_permits_per_node = Some(4);
-        assert_eq!(cluster.resolved_cpu_render_permits_per_node(), 4);
+        cluster.native_render_permits_per_node = Some(4);
+        assert_eq!(cluster.resolved_native_render_permits_per_node(), 4);
 
-        cluster.cpu_render_permits_per_node = Some(12);
-        assert_eq!(cluster.resolved_cpu_render_permits_per_node(), 6);
+        cluster.native_render_permits_per_node = Some(12);
+        assert_eq!(cluster.resolved_native_render_permits_per_node(), 6);
 
         assert!(cluster.validate_standby_ratio().is_err());
 
         cluster.render_permits_per_node = Some(12);
         assert_eq!(cluster.resolved_render_permits_per_node(), 10);
-        assert_eq!(cluster.resolved_cpu_render_permits_per_node(), 10);
+        assert_eq!(cluster.resolved_native_render_permits_per_node(), 10);
         assert!(cluster.validate_standby_ratio().is_ok());
     }
 }

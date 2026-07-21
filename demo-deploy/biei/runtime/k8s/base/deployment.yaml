@@ -71,6 +71,8 @@ spec:
               value: "0.0.0.0:8080"
             - name: BIEI_GOSSIP_BIND
               value: "0.0.0.0:7946"
+            - name: BIEI_GOSSIP_ADVERTISE_ADDR
+              value: "$(POD_IP):7946"
             - name: BIEI_INTERNAL_PORT
               value: "9090"
             # Peers forward /_internal/* to the internal port, never the public
@@ -79,6 +81,11 @@ spec:
               value: "$(POD_IP):9090"
             - name: BIEI_GOSSIP_SEEDS
               value: "biei-gossip:7946"
+            # Hold readiness until this pod observes another live gossip member.
+            # This is explicit rather than inferred from seeds; it fails open
+            # after 30s and never re-closes during a later partition.
+            - name: BIEI_REQUIRE_GOSSIP_BOOTSTRAP
+              value: "true"
             - name: BIEI_STYLE_TEMPLATES
               value: "carto=https://basemaps.cartocdn.com/gl/{style_id}/style.json;mierune=https://maps.mierune.co.jp/styles/{style_id}/style.json"
             # Only used by `addlayer` tileset references; unused by the basic demo

@@ -1,15 +1,21 @@
 [workspace]
 members = [
-    "crates/biei-core",
-    "crates/ishikari-core",
-    "crates/mmpf-terrain",
-    "servers/biei",
-    "servers/ishikari",
-    "sims/biei-sim",
-    "sims/ishikari-sim",
+    "crates/*",
+    "servers/*",
+    "sims/*",
 ]
-default-members = ["servers/biei", "servers/ishikari"]
+# No `default-members`: tests live across `crates/*`, `servers/*`, and `sims/*`
+# (the server binaries own the HTTP/serving stack and the bulk of the suites),
+# so bare `cargo test`/`clippy` must cover the whole workspace — a subset default
+# would silently skip crates. CI stays fast via per-crate `-p` jobs. Note only
+# `servers/biei` pulls MapLibre Native (needs `MLN_PRECOMPILE`); `biei-core` and
+# `biei-sim` build without it.
 resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/MIERUNE/mappf-experiment"
 
 [workspace.dependencies]
 ab_glyph = "0.2"
@@ -29,7 +35,7 @@ internment = { version = "0.8", default-features = false, features = ["arc"] }
 maplibre_native = { version = "0.8.7", default-features = false, features = ["json", "geojson", "log", "tokio"] }
 mlt-core = { version = "0.12", default-features = false }
 moka = { version = "0.12", features = ["sync", "future"] }
-object_store = { version = "0.14", features = ["aws", "gcp", "http"] }
+object_store = { version = "0.14" }
 prometheus = "0.14"
 rand = "0.10.2"
 rand_distr = "0.6"
@@ -39,7 +45,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tiny-skia = "0.12"
-tokio = { version = "1", features = ["full", "test-util"] }
+tokio = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 twox-hash = "2"
@@ -49,6 +55,11 @@ zstd = "0.13"
 
 biei-core = { path = "crates/biei-core" }
 ishikari-core = { path = "crates/ishikari-core" }
+mmpf-cluster = { path = "crates/mmpf-cluster" }
+mmpf-common = { path = "crates/mmpf-common" }
+mmpf-http = { path = "crates/mmpf-http" }
+mmpf-mln-filesource = { path = "crates/mmpf-mln-filesource" }
+mmpf-pmtiles = { path = "crates/mmpf-pmtiles" }
 mmpf-terrain = { path = "crates/mmpf-terrain" }
 
 [profile.dev.package."*"]

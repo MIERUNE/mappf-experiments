@@ -34,22 +34,6 @@ impl StyleDefinition {
     }
 }
 
-#[derive(Clone, Debug)]
-struct StyleUrlTemplate {
-    template: String,
-}
-
-impl StyleUrlTemplate {
-    /// Substitute `{style_id}` with `subst` (the namespace-local id for a
-    /// matched namespace template, or the whole style id for the default).
-    fn definition_for(&self, subst: &str) -> StyleDefinition {
-        StyleDefinition::new(
-            self.template.replace("{style_id}", subst),
-            INITIAL_STYLE_VERSION,
-        )
-    }
-}
-
 const INITIAL_STYLE_VERSION: u64 = 1;
 
 #[derive(Debug, Default)]
@@ -57,25 +41,25 @@ struct StyleCatalogInner {
     by_id: HashMap<StyleId, StyleDefinition>,
     /// `namespace -> template`, keyed on the first path segment of a style id.
     /// A match strips the namespace, substituting only the remaining segments.
-    namespace_templates: HashMap<String, StyleUrlTemplate>,
+    namespace_templates: HashMap<String, String>,
     /// Catch-all used when no namespace template matches; substitutes the whole
     /// style id (so `default` behaves like the historic single template).
-    default_template: Option<StyleUrlTemplate>,
+    default_template: Option<String>,
 }
 
 impl StyleCatalogInner {
     /// Pick the template for `id` and the value to substitute for `{style_id}`:
     /// a namespace match strips its prefix (provider-local id), otherwise the
     /// default template receives the whole id.
-    fn template_for(&self, id: &StyleId) -> Option<(&StyleUrlTemplate, String)> {
+    fn template_for<'a>(&'a self, id: &'a StyleId) -> Option<(&'a str, &'a str)> {
         if let Some((namespace, rest)) = id.as_str().split_once('/')
             && let Some(template) = self.namespace_templates.get(namespace)
         {
-            return Some((template, rest.to_string()));
+            return Some((template, rest));
         }
         self.default_template
-            .as_ref()
-            .map(|template| (template, id.as_str().to_string()))
+            .as_deref()
+            .map(|template| (template, id.as_str()))
     }
 }
 
@@ -89,13 +73,11 @@ impl StyleCatalog {
         Self::default()
     }
 
-    /// Add or update the renderable style definition. Returns the registered
-    /// version.
-    pub fn upsert_definition(&self, style_id: StyleId, definition: StyleDefinition) -> u64 {
-        let mut inner = write_unpoisoned(&self.inner);
-        let version = definition.version;
-        inner.by_id.insert(style_id, definition);
-        version
+    /// Add or update the renderable style definition.
+    pub fn upsert_definition(&self, style_id: StyleId, definition: StyleDefinition) {
+        write_unpoisoned(&self.inner)
+            .by_id
+            .insert(style_id, definition);
     }
 
     /// Configure the default lazy `StyleId -> style.json URL` template. Unknown
@@ -103,10 +85,7 @@ impl StyleCatalog {
     /// `{style_id}` (with the whole id) in this template. Explicit
     /// `upsert_definition` entries still take precedence.
     pub fn set_url_template(&self, template: impl Into<String>) {
-        let mut inner = write_unpoisoned(&self.inner);
-        inner.default_template = Some(StyleUrlTemplate {
-            template: template.into(),
-        });
+        write_unpoisoned(&self.inner).default_template = Some(template.into());
     }
 
     /// Register a per-namespace template. A style id whose first path segment is
@@ -117,13 +96,9 @@ impl StyleCatalog {
         namespace: impl Into<String>,
         template: impl Into<String>,
     ) {
-        let mut inner = write_unpoisoned(&self.inner);
-        inner.namespace_templates.insert(
-            namespace.into(),
-            StyleUrlTemplate {
-                template: template.into(),
-            },
-        );
+        write_unpoisoned(&self.inner)
+            .namespace_templates
+            .insert(namespace.into(), template.into());
     }
 
     pub fn resolve_latest(&self, style_id: &StyleId) -> Option<u64> {
@@ -151,20 +126,12 @@ impl StyleCatalog {
             return Some(definition);
         }
         if revision.version == INITIAL_STYLE_VERSION {
-            inner
-                .template_for(&revision.id)
-                .map(|(template, subst)| template.definition_for(&subst))
+            inner.template_for(&revision.id).map(|(template, subst)| {
+                StyleDefinition::new(template.replace("{style_id}", subst), INITIAL_STYLE_VERSION)
+            })
         } else {
             None
         }
-    }
-
-    pub fn len(&self) -> usize {
-        read_unpoisoned(&self.inner).by_id.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 
@@ -181,9 +148,7 @@ mod tests {
             3,
         );
 
-        let version = catalog.upsert_definition(style_id.clone(), definition.clone());
-
-        assert_eq!(version, 3);
+        catalog.upsert_definition(style_id.clone(), definition.clone());
         assert_eq!(catalog.resolve_latest(&style_id), Some(3));
         assert_eq!(
             catalog.definition_for_revision(&StyleRevision {
@@ -213,23 +178,6 @@ mod tests {
     }
 
     #[test]
-    fn len_tracks_registered_styles() {
-        let catalog = StyleCatalog::new();
-        assert!(catalog.is_empty());
-
-        catalog.upsert_definition(
-            StyleId("voyager-gl-style".to_string()),
-            StyleDefinition::new(
-                "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
-                1,
-            ),
-        );
-
-        assert_eq!(catalog.len(), 1);
-        assert!(!catalog.is_empty());
-    }
-
-    #[test]
     fn url_template_lazily_resolves_unknown_styles() {
         let catalog = StyleCatalog::new();
         catalog.set_url_template("http://style-provider.local/styles/{style_id}/style.json");
@@ -254,9 +202,8 @@ mod tests {
                 1,
             ))
         );
-        assert_eq!(
-            catalog.len(),
-            0,
+        assert!(
+            read_unpoisoned(&catalog.inner).by_id.is_empty(),
             "template resolution must not persist attacker-controlled style ids"
         );
     }

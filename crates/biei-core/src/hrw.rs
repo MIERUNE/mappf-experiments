@@ -1,22 +1,22 @@
 //! HRW (rendezvous hashing) weight for `(worker_profile, node)` — Tier 2 ordering.
 
+use mmpf_common::rng::splitmix64_finalize;
+
 use crate::types::{NodeId, RenderMode, Scale, WorkerProfile};
 
 /// Highest Random Weight (Rendezvous Hashing) score for `(profile, node)`.
 /// Hashes stable style_id + render mode + scale so Static/Tile and @1x/@2x
 /// get independent worker placement. `StyleRevision.version` is deliberately
 /// **not** part of the input — version bumps must not move routing.
-pub fn hrw_weight(profile: &WorkerProfile, node: &NodeId) -> u64 {
-    // FNV-1a over the key bytes then mixed with the node id via splitmix64.
+pub(crate) fn hrw_weight(profile: &WorkerProfile, node: &NodeId) -> u64 {
+    // FNV-1a over the key bytes then mixed with the node id via the SplitMix64 finalizer.
     // Deterministic, no dependencies, fine for sim/production HRW use
     // (production may want XxHash64 later; the I/F stays the same).
     let profile_hash = fnv1a_profile(profile);
     let node_hash = fnv1a(node.as_bytes());
     let mut h = profile_hash.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     h ^= node_hash.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    h ^ (h >> 31)
+    splitmix64_finalize(h)
 }
 
 fn fnv1a_profile(profile: &WorkerProfile) -> u64 {

@@ -1,0 +1,53 @@
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+comment:
+  layout: "reach,diff,components,tree"
+  behavior: default
+  require_changes: true
+
+# Per-service status checks and comment breakdown, derived from the carryforward
+# flags below. Components are display/status only; the flags remain the upload +
+# carryforward mechanism the path-filtered workflows depend on.
+component_management:
+  individual_components:
+    - component_id: biei
+      flag_regexes:
+        - biei
+    - component_id: ishikari
+      flag_regexes:
+        - ishikari
+    - component_id: shared
+      flag_regexes:
+        - shared
+
+# The service workflows are path-filtered and do not both run on every commit.
+# Carry the untouched side forward instead of reporting it as uncovered.
+flags:
+  biei:
+    paths:
+      - crates/biei-core/
+      - crates/mmpf-mln-filesource/
+      - servers/biei/
+      - sims/biei-sim/
+    carryforward: true
+  ishikari:
+    paths:
+      - crates/ishikari-core/
+      - crates/mmpf-pmtiles/
+      - crates/mmpf-terrain/
+      - servers/ishikari/
+      - sims/ishikari-sim/
+    carryforward: true
+  shared:
+    paths:
+      - crates/mmpf-cluster/
+      - crates/mmpf-common/
+      - crates/mmpf-http/
+    carryforward: true

@@ -1,56 +1,9 @@
-use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
-
-use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
+use anyhow::{Result, ensure};
+pub use mmpf_cluster::simulation::{ChurnEvent, ChurnPlan};
+use serde::Serialize;
 
 use crate::harness::WorkloadCluster;
-use crate::metrics::MetricsCollector;
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ChurnPlan {
-    pub events: Vec<ChurnEvent>,
-}
-
-impl ChurnPlan {
-    pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let file =
-            File::open(path).with_context(|| format!("open churn plan {}", path.display()))?;
-        let plan: Self = serde_json::from_reader(BufReader::new(file))
-            .with_context(|| format!("parse churn plan {}", path.display()))?;
-        plan.validate()?;
-        Ok(plan)
-    }
-
-    pub fn validate(&self) -> Result<()> {
-        let mut previous = 0;
-        for (index, event) in self.events.iter().enumerate() {
-            ensure!(
-                index == 0 || event.at_request() >= previous,
-                "churn events must be ordered by at_request"
-            );
-            previous = event.at_request();
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
-pub enum ChurnEvent {
-    Add { at_request: u64 },
-    Remove { at_request: u64, node_id: String },
-}
-
-impl ChurnEvent {
-    pub(crate) fn at_request(&self) -> u64 {
-        match self {
-            Self::Add { at_request } | Self::Remove { at_request, .. } => *at_request,
-        }
-    }
-}
+use crate::metrics::{MetricsCollector, SubmissionCohortObservation};
 
 #[derive(Debug, Serialize)]
 pub struct ChurnReport {
@@ -60,6 +13,7 @@ pub struct ChurnReport {
     pub submitted_measured: u64,
     pub events: Vec<AppliedChurnEvent>,
     pub unapplied_events: Vec<ChurnEvent>,
+    pub submission_cohorts: Vec<SubmissionCohortObservation>,
     pub samples: Vec<ChurnSample>,
 }
 
@@ -75,17 +29,20 @@ pub struct AppliedChurnEvent {
 #[derive(Debug, Serialize)]
 pub struct ChurnSample {
     pub at_request: u64,
+    /// Topology epoch assigned to a request submitted after this boundary.
+    pub submission_epoch: u64,
     pub reason: &'static str,
     #[serde(flatten)]
     pub observation: ClusterObservation,
-    pub interval: IntervalObservation,
+    pub completion_window: CompletionWindowObservation,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ClusterObservation {
     pub submitted_total: u64,
     pub submitted_measured: u64,
-    pub measured_outcomes: usize,
+    pub terminal_outcomes_measured: usize,
+    pub outstanding_measured: u64,
     pub completed: usize,
     pub rejected: usize,
     pub failed: usize,
@@ -104,25 +61,32 @@ pub struct ClusterObservation {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct IntervalObservation {
-    pub submitted_measured: u64,
-    pub completed: usize,
-    pub rejected: usize,
-    pub failed: usize,
-    pub cold_starts: usize,
-    pub style_swaps: usize,
-    pub source_hits: usize,
-    pub source_loads: usize,
+pub struct CompletionWindowObservation {
+    /// Requests whose submission was observed between the two boundaries.
+    pub submissions_started: u64,
+    /// Terminal outcomes observed between the two boundaries. These may
+    /// belong to an earlier submission epoch.
+    pub terminal_outcomes_observed: usize,
+    pub completed_observed: usize,
+    pub rejected_observed: usize,
+    pub failed_observed: usize,
+    pub cold_starts_observed: usize,
+    pub style_swaps_observed: usize,
+    pub source_hits_observed: usize,
+    pub source_loads_observed: usize,
     pub tier_counts: std::collections::BTreeMap<String, usize>,
-    pub forward_attempts: u64,
-    pub forward_successes: u64,
+    /// Physical forwarding attempts started during this observation window.
+    pub forward_attempts_started: u64,
+    /// Physical forwarding attempts that completed successfully during this
+    /// window. The corresponding attempt may have started in an earlier one.
+    pub forward_successes_observed: u64,
     pub latency_samples: usize,
     pub latency_p50_ms: Option<f64>,
     pub latency_p99_ms: Option<f64>,
     pub latency_max_ms: Option<f64>,
 }
 
-impl IntervalObservation {
+impl CompletionWindowObservation {
     fn between(
         current: &ClusterObservation,
         previous: &ClusterObservation,
@@ -144,22 +108,28 @@ impl IntervalObservation {
             let index = ((completed_latencies.len() - 1) as f64 * quantile).round() as usize;
             Some(completed_latencies[index].as_secs_f64() * 1_000.0)
         };
+        let completed_observed = current.completed.saturating_sub(previous.completed);
+        let rejected_observed = current.rejected.saturating_sub(previous.rejected);
+        let failed_observed = current.failed.saturating_sub(previous.failed);
         Self {
-            submitted_measured: current
+            submissions_started: current
                 .submitted_measured
                 .saturating_sub(previous.submitted_measured),
-            completed: current.completed.saturating_sub(previous.completed),
-            rejected: current.rejected.saturating_sub(previous.rejected),
-            failed: current.failed.saturating_sub(previous.failed),
-            cold_starts: current.cold_starts.saturating_sub(previous.cold_starts),
-            style_swaps: current.style_swaps.saturating_sub(previous.style_swaps),
-            source_hits: current.source_hits.saturating_sub(previous.source_hits),
-            source_loads: current.source_loads.saturating_sub(previous.source_loads),
+            terminal_outcomes_observed: completed_observed
+                .saturating_add(rejected_observed)
+                .saturating_add(failed_observed),
+            completed_observed,
+            rejected_observed,
+            failed_observed,
+            cold_starts_observed: current.cold_starts.saturating_sub(previous.cold_starts),
+            style_swaps_observed: current.style_swaps.saturating_sub(previous.style_swaps),
+            source_hits_observed: current.source_hits.saturating_sub(previous.source_hits),
+            source_loads_observed: current.source_loads.saturating_sub(previous.source_loads),
             tier_counts,
-            forward_attempts: current
+            forward_attempts_started: current
                 .forward_attempts
                 .saturating_sub(previous.forward_attempts),
-            forward_successes: current
+            forward_successes_observed: current
                 .forward_successes
                 .saturating_sub(previous.forward_successes),
             latency_samples: completed_latencies.len(),
@@ -194,6 +164,7 @@ pub(crate) struct ChurnTracker {
     next_event: usize,
     next_sample: u64,
     measurement_started: bool,
+    submission_epoch: u64,
     previous_observation: ClusterObservation,
     report: ChurnReport,
 }
@@ -211,15 +182,17 @@ impl ChurnTracker {
         );
         let initial_sample = ChurnSample {
             at_request: 0,
+            submission_epoch: 0,
             reason: "initial",
             observation: initial.clone(),
-            interval: IntervalObservation::default(),
+            completion_window: CompletionWindowObservation::default(),
         };
         Ok(Self {
             plan,
             next_event: 0,
             next_sample: sample_every_requests,
             measurement_started: false,
+            submission_epoch: 0,
             previous_observation: initial,
             report: ChurnReport {
                 request_clock: "measured_after_warmup",
@@ -228,6 +201,7 @@ impl ChurnTracker {
                 submitted_measured: 0,
                 events: Vec::new(),
                 unapplied_events: Vec::new(),
+                submission_cohorts: Vec::new(),
                 samples: vec![initial_sample],
             },
         })
@@ -238,8 +212,8 @@ impl ChurnTracker {
         cluster: &mut WorkloadCluster,
         metrics: &MetricsCollector,
         at_request: u64,
-    ) -> Result<()> {
-        if cluster.reap_drained_nodes() > 0 {
+    ) -> Result<u64> {
+        if cluster.reap_drained_nodes().await? > 0 {
             metrics.set_native_render_permits_total(cluster.native_render_permits_total());
         }
         if !self.measurement_started {
@@ -269,6 +243,7 @@ impl ChurnTracker {
                 }
             };
             metrics.set_native_render_permits_total(cluster.native_render_permits_total());
+            self.submission_epoch = self.submission_epoch.saturating_add(1);
             let observation = cluster.observation(metrics);
             self.report.events.push(AppliedChurnEvent {
                 requested_at_request: event.at_request(),
@@ -291,17 +266,18 @@ impl ChurnTracker {
                 self.next_sample += self.report.sample_every_requests;
             }
         }
-        Ok(())
+        Ok(self.submission_epoch)
     }
 
-    pub(crate) fn after_workload(
+    pub(crate) async fn after_workload(
         &mut self,
         cluster: &mut WorkloadCluster,
         metrics: &MetricsCollector,
-    ) {
-        if cluster.reap_drained_nodes() > 0 {
+    ) -> Result<()> {
+        if cluster.reap_drained_nodes().await? > 0 {
             metrics.set_native_render_permits_total(cluster.native_render_permits_total());
         }
+        Ok(())
     }
 
     pub(crate) fn finish(
@@ -317,6 +293,7 @@ impl ChurnTracker {
             .unapplied_events
             .extend_from_slice(&self.plan.events[self.next_event..]);
         self.sample(cluster.observation(metrics), metrics, at_request, "final");
+        self.report.submission_cohorts = metrics.submission_cohorts();
         self.report
     }
 
@@ -328,10 +305,10 @@ impl ChurnTracker {
         reason: &'static str,
     ) {
         let completed_latencies = metrics.completed_latencies_between(
-            self.previous_observation.measured_outcomes,
-            observation.measured_outcomes,
+            self.previous_observation.terminal_outcomes_measured,
+            observation.terminal_outcomes_measured,
         );
-        let interval = IntervalObservation::between(
+        let completion_window = CompletionWindowObservation::between(
             &observation,
             &self.previous_observation,
             completed_latencies,
@@ -339,9 +316,10 @@ impl ChurnTracker {
         self.previous_observation = observation.clone();
         self.report.samples.push(ChurnSample {
             at_request,
+            submission_epoch: self.submission_epoch,
             reason,
             observation,
-            interval,
+            completion_window,
         });
     }
 }
@@ -350,42 +328,21 @@ impl ChurnTracker {
 mod tests {
     use std::time::Duration;
 
-    use super::{ChurnEvent, ChurnPlan, ClusterObservation, IntervalObservation};
+    use super::{ClusterObservation, CompletionWindowObservation};
 
     #[test]
-    fn parses_flat_churn_events() {
-        let plan: ChurnPlan = serde_json::from_str(
-            r#"{"events":[{"at_request":10,"action":"add"},{"at_request":20,"action":"remove","node_id":"node-0"}]}"#,
-        )
-        .expect("churn plan");
-        assert!(matches!(plan.events[0], ChurnEvent::Add { at_request: 10 }));
-        plan.validate().expect("valid plan");
-    }
-
-    #[test]
-    fn rejects_out_of_order_events() {
-        let plan = ChurnPlan {
-            events: vec![
-                ChurnEvent::Add { at_request: 20 },
-                ChurnEvent::Add { at_request: 10 },
-            ],
-        };
-        assert!(plan.validate().is_err());
-    }
-
-    #[test]
-    fn interval_observation_summarizes_only_new_completed_latencies() {
+    fn completion_window_summarizes_only_new_terminal_outcomes_and_latencies() {
         let previous = ClusterObservation {
-            measured_outcomes: 10,
+            terminal_outcomes_measured: 10,
             completed: 8,
             ..ClusterObservation::default()
         };
         let current = ClusterObservation {
-            measured_outcomes: 13,
+            terminal_outcomes_measured: 13,
             completed: 11,
             ..ClusterObservation::default()
         };
-        let interval = IntervalObservation::between(
+        let window = CompletionWindowObservation::between(
             &current,
             &previous,
             vec![
@@ -395,10 +352,30 @@ mod tests {
             ],
         );
 
-        assert_eq!(interval.completed, 3);
-        assert_eq!(interval.latency_samples, 3);
-        assert_eq!(interval.latency_p50_ms, Some(20.0));
-        assert_eq!(interval.latency_p99_ms, Some(100.0));
-        assert_eq!(interval.latency_max_ms, Some(100.0));
+        assert_eq!(window.terminal_outcomes_observed, 3);
+        assert_eq!(window.completed_observed, 3);
+        assert_eq!(window.latency_samples, 3);
+        assert_eq!(window.latency_p50_ms, Some(20.0));
+        assert_eq!(window.latency_p99_ms, Some(100.0));
+        assert_eq!(window.latency_max_ms, Some(100.0));
+    }
+
+    #[test]
+    fn completion_window_names_allow_cross_boundary_forward_success() {
+        let previous = ClusterObservation {
+            forward_attempts: 10,
+            forward_successes: 5,
+            ..ClusterObservation::default()
+        };
+        let current = ClusterObservation {
+            forward_attempts: 10,
+            forward_successes: 6,
+            ..ClusterObservation::default()
+        };
+
+        let window = CompletionWindowObservation::between(&current, &previous, Vec::new());
+
+        assert_eq!(window.forward_attempts_started, 0);
+        assert_eq!(window.forward_successes_observed, 1);
     }
 }

@@ -10,6 +10,7 @@ BASE_GOSSIP_PORT="${BASE_GOSSIP_PORT:-7946}"
 HTTP_HOST="${HTTP_HOST:-127.0.0.1}"
 GOSSIP_HOST="${GOSSIP_HOST:-127.0.0.1}"
 ADVERTISE_HOST="${ADVERTISE_HOST:-127.0.0.1}"
+GOSSIP_ADVERTISE_HOST="${GOSSIP_ADVERTISE_HOST:-$ADVERTISE_HOST}"
 if [[ -z "${STYLE_URL_TEMPLATE:-}" ]]; then
   STYLE_URL_TEMPLATE='carto=https://basemaps.cartocdn.com/{style_id}/style.json'
 fi
@@ -35,7 +36,8 @@ Environment:
   BASE_GOSSIP_PORT      first UDP gossip port (default: 7946)
   HTTP_HOST             bind host for HTTP listeners (default: 127.0.0.1)
   GOSSIP_HOST           bind host for gossip listeners (default: 127.0.0.1)
-  ADVERTISE_HOST        HTTP host published to peers (default: 127.0.0.1)
+  ADVERTISE_HOST        internal HTTP host published to peers (default: 127.0.0.1)
+  GOSSIP_ADVERTISE_HOST gossip host published to peers (default: ADVERTISE_HOST)
   STYLE_URL_TEMPLATE    style.json URL template
   TILESET_URL_TEMPLATE  tileset.json URL template
   LOG_FILE              combined log path (default: target/dev-cluster/biei-cluster.log)
@@ -107,16 +109,19 @@ for ((i = 0; i < NUM_NODES; i++)); do
   # the public port (which no longer serves /_internal/*).
   internal_advertise_addr="${ADVERTISE_HOST}:${internal_port}"
   gossip_bind="${GOSSIP_HOST}:${gossip_port}"
+  gossip_advertise_addr="${GOSSIP_ADVERTISE_HOST}:${gossip_port}"
   cache_path="${CACHE_DIR}/${node_id}.sqlite"
 
   args=(
     "$ROOT_DIR/target/debug/biei"
     --cluster
+    --require-gossip-bootstrap
     --node-id "$node_id"
     --http-bind "$bind_addr"
     --internal-port "$internal_port"
     --internal-advertise-addr "$internal_advertise_addr"
     --gossip-bind "$gossip_bind"
+    --gossip-advertise-addr "$gossip_advertise_addr"
     --style-templates "$STYLE_URL_TEMPLATE"
     --tileset-url-template "$TILESET_URL_TEMPLATE"
     --maplibre-cache-path "$cache_path"
@@ -127,12 +132,12 @@ for ((i = 0; i < NUM_NODES; i++)); do
     args+=(--gossip-seeds "$(IFS=,; echo "${seed_addrs[*]}")")
   fi
 
-  echo "starting ${node_id}: http=http://${bind_addr} internal=http://${HTTP_HOST}:${internal_port} internal_advertise=${internal_advertise_addr} gossip=${gossip_bind} log=${LOG_FILE}"
+  echo "starting ${node_id}: http=http://${bind_addr} internal=http://${HTTP_HOST}:${internal_port} internal_advertise=${internal_advertise_addr} gossip_bind=${gossip_bind} gossip_advertise=${gossip_advertise_addr} log=${LOG_FILE}"
   RUST_LOG="$RUST_LOG" "${args[@]}" 2>&1 \
     | sed -u "s/^/[${node_id}] /" \
     | tee -a "$LOG_FILE" &
   pids+=("$!")
-  seed_addrs+=("$gossip_bind")
+  seed_addrs+=("$gossip_advertise_addr")
 done
 
 cat <<EOF

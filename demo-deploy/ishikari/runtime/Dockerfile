@@ -10,7 +10,7 @@
 # the target cluster supports Arm nodes. The checked-in GKE demo currently uses
 # linux/amd64 because its asia-northeast1 Autopilot cluster cannot provision Arm
 # workloads.
-FROM rust:1.96-slim-trixie AS chef
+FROM rust:1.96-slim-trixie@sha256:31ee7fc65186be7e0e0ccb3f2ca305f14e4739e7642a1ae65753aa5d7b874523 AS chef
 WORKDIR /app
 
 RUN apt-get update \
@@ -40,12 +40,21 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 COPY Cargo.toml Cargo.lock ./
 COPY crates/biei-core/Cargo.toml crates/biei-core/Cargo.toml
 COPY crates/ishikari-core/Cargo.toml crates/ishikari-core/Cargo.toml
+COPY crates/mmpf-cluster/Cargo.toml crates/mmpf-cluster/Cargo.toml
+COPY crates/mmpf-common/Cargo.toml crates/mmpf-common/Cargo.toml
+COPY crates/mmpf-http/Cargo.toml crates/mmpf-http/Cargo.toml
+COPY crates/mmpf-mln-filesource/Cargo.toml crates/mmpf-mln-filesource/Cargo.toml
+COPY crates/mmpf-pmtiles/Cargo.toml crates/mmpf-pmtiles/Cargo.toml
 COPY crates/mmpf-terrain/Cargo.toml crates/mmpf-terrain/Cargo.toml
 COPY servers/biei/Cargo.toml servers/biei/Cargo.toml
 COPY servers/ishikari/Cargo.toml servers/ishikari/Cargo.toml
 COPY sims/biei-sim/Cargo.toml sims/biei-sim/Cargo.toml
 COPY sims/ishikari-sim/Cargo.toml sims/ishikari-sim/Cargo.toml
 COPY crates/ishikari-core/src crates/ishikari-core/src
+COPY crates/mmpf-cluster/src crates/mmpf-cluster/src
+COPY crates/mmpf-common/src crates/mmpf-common/src
+COPY crates/mmpf-http/src crates/mmpf-http/src
+COPY crates/mmpf-pmtiles/src crates/mmpf-pmtiles/src
 COPY crates/mmpf-terrain/src crates/mmpf-terrain/src
 COPY servers/ishikari/src servers/ishikari/src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -53,7 +62,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked -p ishikari \
     && cp target/release/ishikari /ishikari
 
-FROM gcr.io/distroless/cc-debian13:nonroot
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /ishikari /ishikari
 # Public HTTP ingress + cluster-internal listener (/_internal/*, metrics, peer

@@ -7,10 +7,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use ishikari_core::{
-    pmtiles::{TileCoord, TileId},
-    storage::TilesetId,
-};
+use ishikari_core::storage::TilesetId;
+use mmpf_pmtiles::{TileCoord, TileId};
 use reqwest::{Client, StatusCode, Url, header};
 use serde::Serialize;
 use tokio::task::JoinSet;
@@ -166,26 +164,44 @@ struct ComparableMetrics {
     chunk_fetch_wait: BTreeMap<String, u64>,
 }
 
+/// Reads a per-label counter delta for each value into a map keyed by that value.
+fn counter_delta_map(
+    before: &MetricSnapshot,
+    after: &MetricSnapshot,
+    metric: &str,
+    label: &str,
+    values: &[&str],
+) -> Result<BTreeMap<String, u64>> {
+    values
+        .iter()
+        .copied()
+        .map(|value| {
+            Ok((
+                value.to_string(),
+                counter_delta(before, after, metric, &[(label, value)])?,
+            ))
+        })
+        .collect()
+}
+
 impl ComparableMetrics {
     fn from_delta(before: &MetricSnapshot, after: &MetricSnapshot) -> Result<Self> {
-        let mut result = Self::default();
-        for source in [
-            "self_cache",
-            "self_backend",
-            "peer_cache",
-            "peer_backend",
-            "miss",
-        ] {
-            result.by_source.insert(
-                source.to_string(),
-                counter_delta(
-                    before,
-                    after,
-                    "ishikari_tiles_served_total",
-                    &[("source", source)],
-                )?,
-            );
-        }
+        let mut result = Self {
+            by_source: counter_delta_map(
+                before,
+                after,
+                "ishikari_tiles_served_total",
+                "source",
+                &[
+                    "self_cache",
+                    "self_backend",
+                    "peer_cache",
+                    "peer_backend",
+                    "miss",
+                ],
+            )?,
+            ..Default::default()
+        };
         result.requests = result.by_source.values().sum();
         result.not_found = result.by_source.get("miss").copied().unwrap_or_default();
         result.found = result.requests.saturating_sub(result.not_found);
@@ -222,28 +238,20 @@ impl ComparableMetrics {
             "ishikari_backend_fetch_chunks_sum",
             &[("outcome", "success")],
         )?;
-        for outcome in ["hit", "miss", "post_fetch_hit"] {
-            result.chunk_cache.insert(
-                outcome.to_string(),
-                counter_delta(
-                    before,
-                    after,
-                    "ishikari_chunk_cache_total",
-                    &[("outcome", outcome)],
-                )?,
-            );
-        }
-        for outcome in ["queued", "joined_pending", "joined_inflight"] {
-            result.chunk_fetch_wait.insert(
-                outcome.to_string(),
-                counter_delta(
-                    before,
-                    after,
-                    "ishikari_chunk_fetch_wait_total",
-                    &[("outcome", outcome)],
-                )?,
-            );
-        }
+        result.chunk_cache = counter_delta_map(
+            before,
+            after,
+            "ishikari_chunk_cache_total",
+            "outcome",
+            &["hit", "miss", "post_fetch_hit"],
+        )?;
+        result.chunk_fetch_wait = counter_delta_map(
+            before,
+            after,
+            "ishikari_chunk_fetch_wait_total",
+            "outcome",
+            &["queued", "joined_pending", "joined_inflight"],
+        )?;
         result.finalize_rates();
         Ok(result)
     }
@@ -582,7 +590,7 @@ fn request_error_category(error: &reqwest::Error) -> &'static str {
 }
 
 fn summarize_http_outcomes(
-    outcomes: Vec<HttpRequestOutcome>,
+    mut outcomes: Vec<HttpRequestOutcome>,
     elapsed: Duration,
 ) -> HttpReplayResult {
     let mut result = HttpReplayResult {
@@ -601,6 +609,10 @@ fn summarize_http_outcomes(
         latency_ms: HttpLatencySummary::default(),
         failure_samples: Vec::new(),
     };
+    // JoinSet yields viewport requests in completion order. Aggregate results do
+    // not depend on that order, but the bounded diagnostic sample must be
+    // reproducible for the same trace.
+    outcomes.sort_unstable_by_key(|outcome| outcome.plan.trace_index);
     let mut latencies = Vec::with_capacity(outcomes.len());
     for outcome in outcomes {
         latencies.push(outcome.latency);
@@ -960,7 +972,7 @@ fn target_report(target: &HttpReplayTarget) -> HttpTargetReport {
 fn fingerprint_trace(path: &Path, requests: usize) -> Result<TraceFingerprint> {
     let mut file =
         File::open(path).with_context(|| format!("open {} for hashing", path.display()))?;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     let mut hash = FNV_OFFSET_BASIS;
     let mut bytes = 0_u64;
     loop {
@@ -1009,6 +1021,52 @@ mod tests {
             y: 0,
             entry_node,
         }
+    }
+
+    fn failed_outcome(trace_index: usize) -> HttpRequestOutcome {
+        HttpRequestOutcome {
+            plan: PlannedHttpRequest {
+                trace_index,
+                entry: entry(trace_index, None),
+                url: Url::parse(&format!(
+                    "https://gateway.example/tilesets/japan/0/{trace_index}/0"
+                ))
+                .unwrap(),
+            },
+            latency: Duration::from_millis(trace_index as u64 + 1),
+            status: Some(StatusCode::INTERNAL_SERVER_ERROR),
+            body_bytes: 0,
+            error_category: None,
+            error_detail: None,
+        }
+    }
+
+    #[test]
+    fn failure_samples_are_deterministic_and_bounded_by_trace_order() {
+        let forward = summarize_http_outcomes(
+            (0..25).map(failed_outcome).collect(),
+            Duration::from_secs(1),
+        );
+        let reverse = summarize_http_outcomes(
+            (0..25).rev().map(failed_outcome).collect(),
+            Duration::from_secs(1),
+        );
+
+        let sampled_indices = |result: &HttpReplayResult| {
+            result
+                .failure_samples
+                .iter()
+                .map(|sample| sample.trace_index)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sampled_indices(&forward), (0..20).collect::<Vec<_>>());
+        assert_eq!(sampled_indices(&reverse), sampled_indices(&forward));
+        assert_eq!(forward.unexpected_statuses, 25);
+        assert_eq!(reverse.unexpected_statuses, forward.unexpected_statuses);
+        assert_eq!(reverse.status_counts, forward.status_counts);
+        assert_eq!(reverse.latency_ms.count, forward.latency_ms.count);
+        assert_eq!(reverse.latency_ms.mean, forward.latency_ms.mean);
+        assert_eq!(reverse.latency_ms.p99, forward.latency_ms.p99);
     }
 
     #[test]
@@ -1116,7 +1174,9 @@ ishikari_peer_fetch_total{outcome="success",resource="tile"} 5
             "ishikari-http-replay-{}-{suffix}.jsonl",
             std::process::id()
         ));
-        let trace = [entry(0, Some(99)), entry(1, None)]
+        let mut second_entry = entry(0, None);
+        second_entry.step = 1;
+        let trace = [entry(0, Some(99)), second_entry]
             .into_iter()
             .map(|entry| serde_json::to_string(&entry).unwrap())
             .collect::<Vec<_>>()

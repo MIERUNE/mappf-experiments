@@ -30,7 +30,7 @@ pub(crate) enum PmtilesReadSource {
 
 /// Distributed storage implementation used by the PMTiles reader.
 #[derive(Clone)]
-pub struct DistributedPmtilesStorage {
+pub(super) struct DistributedPmtilesStorage {
     chunked_store: ChunkedStore,
     peer_backend: PeerBackend,
 }
@@ -44,11 +44,11 @@ impl DistributedPmtilesStorage {
         }
     }
 
-    pub fn chunk_cache_weighted_size(&self) -> u64 {
+    pub(super) fn chunk_cache_weighted_size(&self) -> u64 {
         self.chunked_store.chunk_cache_weighted_size()
     }
 
-    pub fn received_bytes(&self) -> u64 {
+    pub(super) fn received_bytes(&self) -> u64 {
         self.chunked_store.received_bytes()
     }
 
@@ -99,7 +99,9 @@ impl PmtilesStorage for DistributedPmtilesStorage {
                 .await
                 .map_err(|error| match error {
                     ChunkFetchError::NotFound => StorageError::NotFound,
+                    ChunkFetchError::Overloaded(message) => StorageError::Overloaded(message),
                     ChunkFetchError::Timeout(message) => StorageError::Timeout(message),
+                    ChunkFetchError::Backend(message) => StorageError::Backend(message),
                     ChunkFetchError::Message(message) => StorageError::Message(message),
                 })?;
 

@@ -1,6 +1,7 @@
 # Autoscale the tile provider on CPU. Ishikari's serving cost is dominated by
-# chunk fetch/decompress + HTTP serving (CPU tracks QPS well); memory is a
-# bounded cache, so it is not a scaling signal. Peer routing (HRW) redistributes
+# chunk fetch/decompress + HTTP serving (CPU tracks QPS well); retained material
+# cache weight is bounded, while transient memory is protected by admission and
+# the pod limit rather than used as a scaling signal. Peer routing (HRW) redistributes
 # tile ownership automatically as replicas join and leave.
 #
 # The GKE overlay drops the Deployment's fixed `spec.replicas` (see

@@ -1,6 +1,53 @@
 use std::time::Duration;
 
-use ishikari_core::metrics::NodeMetrics;
+use ishikari_core::metrics::{NodeMetrics, NodeMetricsSnapshot};
+
+fn node_metrics_snapshot(value: u64) -> NodeMetricsSnapshot {
+    NodeMetricsSnapshot {
+        peer_forward_successes: value,
+        peer_forward_not_found: value,
+        peer_forward_retryable: value,
+        peer_forward_fatal: value,
+        peer_forward_backoff_skips: value,
+        peer_tile_fetches: value,
+        peer_bootstrap_fetches: value,
+        peer_leaf_fetches: value,
+        peer_provider_fetches: value,
+        peer_tile_duplicate_inflight: value,
+        peer_bootstrap_duplicate_inflight: value,
+        peer_leaf_duplicate_inflight: value,
+        peer_provider_duplicate_inflight: value,
+        internal_tile_requests: value,
+        internal_bootstrap_requests: value,
+        internal_leaf_requests: value,
+        internal_provider_requests: value,
+        backend_fetches: value,
+        backend_fetch_successes: value,
+        backend_fetch_not_found: value,
+        backend_fetch_errors: value,
+        backend_fetch_timeouts: value,
+        backend_fetched_chunks: value,
+        chunk_cache_hits: value,
+        chunk_cache_misses: value,
+        chunk_cache_post_fetch_hits: value,
+        chunk_fetch_queued: value,
+        chunk_fetch_joined_pending: value,
+        chunk_fetch_joined_inflight: value,
+        chunk_dispatch_immediate: value,
+        chunk_dispatch_window: value,
+        chunk_dispatch_pending_chunks: value,
+        chunk_waiters_released: value,
+    }
+}
+
+#[test]
+fn merges_every_node_metric_counter() {
+    let mut total = node_metrics_snapshot(1);
+
+    total.merge(&node_metrics_snapshot(2));
+
+    assert_eq!(total, node_metrics_snapshot(3));
+}
 
 #[test]
 fn exposes_http_request_duration_by_bounded_route_and_status_class() {
@@ -8,12 +55,12 @@ fn exposes_http_request_duration_by_bounded_route_and_status_class() {
 
     metrics.record_http(
         "/tilesets/{tileset_id}/{z}/{x}/{y}",
-        200,
+        "200",
         Duration::from_millis(125),
     );
     metrics.record_http(
         "/tilesets/{tileset_id}/{z}/{x}/{y}",
-        404,
+        "404",
         Duration::from_millis(25),
     );
 
@@ -36,7 +83,7 @@ fn exposes_http_request_duration_by_bounded_route_and_status_class() {
 fn records_metrics_scrape_count_without_self_observing_duration() {
     let metrics = NodeMetrics::new();
 
-    metrics.record_http_request("/_internal/metrics", 200);
+    metrics.record_http_request("/_internal/metrics", "200");
 
     let encoded = metrics.encode();
     assert!(encoded.contains(
@@ -221,16 +268,19 @@ fn exposes_provider_resource_cache_activity() {
 }
 
 #[test]
-fn syncs_backend_fetch_bytes_as_monotonic_counter() {
+fn records_actual_backend_bytes_once_at_fetch_completion() {
     let metrics = NodeMetrics::new();
 
-    metrics.sync_backend_fetch_bytes(10);
-    metrics.sync_backend_fetch_bytes(25);
-    metrics.sync_backend_fetch_bytes(20);
+    metrics.record_backend_fetch("success", Duration::from_millis(10), 1, 10);
+    metrics.record_backend_fetch("timeout", Duration::from_millis(20), 2, 0);
+    metrics.record_backend_fetch("error", Duration::from_millis(25), 2, 4);
+    metrics.record_backend_fetch("success", Duration::from_millis(30), 3, 15);
 
-    let encoded = metrics.encode();
+    let first_scrape = metrics.encode();
+    let second_scrape = metrics.encode();
 
-    assert!(encoded.contains("ishikari_backend_fetch_bytes_total 25"));
+    assert!(first_scrape.contains("ishikari_backend_fetch_bytes_total 29"));
+    assert!(second_scrape.contains("ishikari_backend_fetch_bytes_total 29"));
 }
 
 #[test]
@@ -239,6 +289,7 @@ fn exposes_backend_fetch_histograms_and_chunk_config() {
 
     metrics.set_chunk_config(1_048_576, 8);
     metrics.set_backend_fetch_concurrency_limit(32);
+    metrics.set_backend_fetch_max_inflight(128);
     metrics.adjust_backend_fetch_concurrency("waiting", 1);
     metrics.adjust_backend_fetch_concurrency("waiting", -1);
     metrics.adjust_backend_fetch_concurrency("active", 1);
@@ -247,10 +298,12 @@ fn exposes_backend_fetch_histograms_and_chunk_config() {
     metrics.record_backend_fetch("success", Duration::from_millis(250), 4, 4_194_304);
     metrics.record_chunk_fetch_dispatch("window", Duration::from_millis(10), 6);
     metrics.record_chunk_fetch_group_waiters("success", 12);
+    metrics.record_chunk_fetch_group_waiters("shed", 3);
     metrics.record_chunk_cache("hit");
     metrics.record_chunk_cache("miss");
     metrics.record_chunk_fetch_wait("queued");
     metrics.record_chunk_fetch_wait("joined_inflight");
+    metrics.record_cancelled_chunk_fetch_waiters(2);
 
     let encoded = metrics.encode();
 
@@ -258,6 +311,7 @@ fn exposes_backend_fetch_histograms_and_chunk_config() {
     assert!(encoded.contains("ishikari_max_fetch_chunks 8"));
     assert!(encoded.contains("ishikari_backend_fetch_concurrency{state=\"active\"} 1"));
     assert!(encoded.contains("ishikari_backend_fetch_concurrency{state=\"limit\"} 32"));
+    assert!(encoded.contains("ishikari_backend_fetch_concurrency{state=\"max_inflight\"} 128"));
     assert!(encoded.contains("ishikari_backend_fetch_concurrency{state=\"waiting\"} 0"));
     assert!(encoded.contains("ishikari_backend_fetch_queue_duration_seconds_count 1"));
     assert!(encoded.contains("ishikari_backend_fetch_queue_duration_seconds_sum 0.125"));
@@ -265,6 +319,7 @@ fn exposes_backend_fetch_histograms_and_chunk_config() {
     assert!(
         encoded.contains("ishikari_backend_fetch_duration_seconds_count{outcome=\"success\"} 1")
     );
+    assert!(encoded.contains("ishikari_backend_fetch_bytes_total 4194304"));
     assert!(
         encoded.contains("ishikari_backend_fetch_duration_seconds_sum{outcome=\"success\"} 0.25")
     );
@@ -275,10 +330,12 @@ fn exposes_backend_fetch_histograms_and_chunk_config() {
     assert!(encoded.contains("ishikari_chunk_fetch_queue_delay_seconds_count{flush=\"window\"} 1"));
     assert!(encoded.contains("ishikari_chunk_fetch_pending_chunks_sum{flush=\"window\"} 6"));
     assert!(encoded.contains("ishikari_chunk_fetch_group_waiters_sum{outcome=\"success\"} 12"));
+    assert!(encoded.contains("ishikari_chunk_fetch_group_waiters_sum{outcome=\"shed\"} 3"));
     assert!(encoded.contains("ishikari_chunk_cache_total{outcome=\"hit\"} 1"));
     assert!(encoded.contains("ishikari_chunk_cache_total{outcome=\"miss\"} 1"));
     assert!(encoded.contains("ishikari_chunk_fetch_wait_total{outcome=\"queued\"} 1"));
     assert!(encoded.contains("ishikari_chunk_fetch_wait_total{outcome=\"joined_inflight\"} 1"));
+    assert!(encoded.contains("ishikari_chunk_fetch_wait_total{outcome=\"cancelled\"} 2"));
 
     let snapshot = metrics.snapshot();
     assert_eq!(snapshot.backend_fetches, 1);
@@ -290,7 +347,7 @@ fn exposes_backend_fetch_histograms_and_chunk_config() {
     assert_eq!(snapshot.chunk_fetch_joined_inflight, 1);
     assert_eq!(snapshot.chunk_dispatch_window, 1);
     assert_eq!(snapshot.chunk_dispatch_pending_chunks, 6);
-    assert_eq!(snapshot.chunk_waiters_released, 12);
+    assert_eq!(snapshot.chunk_waiters_released, 15);
 
     let histograms = metrics.histogram_snapshot();
     assert_eq!(histograms.backend_fetch_duration_seconds.count, 1);
@@ -301,5 +358,5 @@ fn exposes_backend_fetch_histograms_and_chunk_config() {
     assert_eq!(histograms.backend_fetch_chunks.sum, 4.0);
     assert_eq!(histograms.queue_delay_window_seconds.count, 1);
     assert_eq!(histograms.pending_chunks_window.sum, 6.0);
-    assert_eq!(histograms.group_waiters.sum, 12.0);
+    assert_eq!(histograms.group_waiters.sum, 15.0);
 }

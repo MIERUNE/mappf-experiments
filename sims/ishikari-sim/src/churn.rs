@@ -1,72 +1,22 @@
-use std::{fs::File, io::BufReader, path::Path};
-
-use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
+use anyhow::{Result, ensure};
+pub use mmpf_cluster::simulation::{ChurnEvent, ChurnPlan};
+use mmpf_common::rng::splitmix64_finalize;
+use serde::Serialize;
 
 use crate::{
     EntryAffinity, ModeledCluster, SimCluster, TraceEntry, report::ClusterObservation,
     viewport_batch_ranges,
 };
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ChurnPlan {
-    pub events: Vec<ChurnEvent>,
-}
-
-impl ChurnPlan {
-    /// Creates an event-free plan for steady-state replay with dynamic ingress assignment.
-    pub fn empty() -> Self {
-        Self { events: Vec::new() }
+fn validate_trace_length(plan: &ChurnPlan, requests: usize) -> Result<()> {
+    if let Some(event) = plan.events.last() {
+        ensure!(
+            event.at_request() <= requests as u64,
+            "churn event at request {} is beyond trace length {requests}",
+            event.at_request()
+        );
     }
-
-    pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let file =
-            File::open(path).with_context(|| format!("open churn plan {}", path.display()))?;
-        let plan: Self = serde_json::from_reader(BufReader::new(file))
-            .with_context(|| format!("parse churn plan {}", path.display()))?;
-        plan.validate()?;
-        Ok(plan)
-    }
-
-    fn validate(&self) -> Result<()> {
-        let mut previous = 0;
-        for (index, event) in self.events.iter().enumerate() {
-            let at_request = event.at_request();
-            ensure!(
-                index == 0 || at_request >= previous,
-                "churn events must be ordered by at_request"
-            );
-            previous = at_request;
-        }
-        Ok(())
-    }
-
-    fn validate_trace_length(&self, requests: usize) -> Result<()> {
-        if let Some(event) = self.events.last() {
-            ensure!(
-                event.at_request() <= requests as u64,
-                "churn event at request {} is beyond trace length {requests}",
-                event.at_request()
-            );
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
-pub enum ChurnEvent {
-    Add { at_request: u64 },
-    Remove { at_request: u64, node_id: String },
-}
-
-impl ChurnEvent {
-    fn at_request(&self) -> u64 {
-        match self {
-            Self::Add { at_request } | Self::Remove { at_request, .. } => *at_request,
-        }
-    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -130,7 +80,7 @@ pub async fn run_churn_trace(
     config: ChurnConfig,
 ) -> Result<ChurnReport> {
     config.validate()?;
-    plan.validate_trace_length(entries.len())?;
+    validate_trace_length(plan, entries.len())?;
     let mut state = ChurnState::new(config, cluster.observation().await);
     apply_real_events(cluster, plan, &mut state, 0).await?;
 
@@ -168,7 +118,7 @@ pub fn run_modeled_churn_trace(
     config: ChurnConfig,
 ) -> Result<ChurnReport> {
     config.validate()?;
-    plan.validate_trace_length(entries.len())?;
+    validate_trace_length(plan, entries.len())?;
     let mut state = ChurnState::new(config, cluster.observation());
     apply_modeled_events(cluster, plan, &mut state, 0)?;
 
@@ -360,46 +310,13 @@ fn assign_entry(entry: &TraceEntry, node_count: usize, config: ChurnConfig) -> u
         key ^= (entry.ordinal as u64).rotate_left(17);
         key ^= (u64::from(entry.z) << 58) ^ (u64::from(entry.x) << 29) ^ u64::from(entry.y);
     }
-    (mix64(key) % node_count as u64) as usize
-}
-
-fn mix64(mut value: u64) -> u64 {
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
+    (splitmix64_finalize(key) % node_count as u64) as usize
 }
 
 #[cfg(test)]
 mod tests {
     use super::{ChurnConfig, ChurnEvent, ChurnPlan, run_churn_trace};
     use crate::{ClusterConfig, SimCluster};
-
-    #[test]
-    fn parses_flat_churn_events() {
-        let plan: ChurnPlan = serde_json::from_str(
-            r#"{"events":[{"at_request":10,"action":"add"},{"at_request":20,"action":"remove","node_id":"node-0"}]}"#,
-        )
-        .expect("churn plan");
-
-        assert!(matches!(plan.events[0], ChurnEvent::Add { at_request: 10 }));
-        assert!(matches!(
-            &plan.events[1],
-            ChurnEvent::Remove { node_id, .. } if node_id == "node-0"
-        ));
-        plan.validate().expect("valid plan");
-    }
-
-    #[test]
-    fn rejects_out_of_order_events() {
-        let plan = ChurnPlan {
-            events: vec![
-                ChurnEvent::Add { at_request: 20 },
-                ChurnEvent::Add { at_request: 10 },
-            ],
-        };
-
-        assert!(plan.validate().is_err());
-    }
 
     #[tokio::test(start_paused = true)]
     async fn applies_zero_request_events_and_reports_active_membership() {

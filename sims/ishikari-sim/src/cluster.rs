@@ -1,6 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    net::SocketAddr,
+    collections::{BTreeSet, HashMap},
     sync::{
         Arc, RwLock, Weak,
         atomic::{AtomicU64, Ordering},
@@ -11,141 +10,33 @@ use tokio::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 use ishikari_core::{
-    membership::{Membership, MembershipConfig, Peer},
     metrics::{NodeHistogramSnapshot, NodeMetrics, NodeMetricsSnapshot},
-    pmtiles::{TileCoord, TileId},
     storage::{
-        FetchFuture, HrwRouter, InternalTransport, ObjectStoreRegistry, PeerBackend, PeerDirectory,
-        PeerFetchError, PeerFuture, PeerTileCachePolicy, ResourceResolver,
-        ResourceResolverStorageConfig, TileSource, TilesetId, internal_resource_kind,
+        FetchFuture, HrwRouter, InternalTransport, ObjectStoreRegistry, Peer, PeerBackend,
+        PeerFetchError, PeerTileCachePolicy, ResolverTuning, ResourceResolver,
+        ResourceResolverStorageConfig, TileSource, TilesetId, internal_peer_request_timeout,
+        internal_resource_kind,
     },
 };
-use serde::{Deserialize, Serialize};
+use mmpf_cluster::SimulatedNetwork;
+use mmpf_pmtiles::{TileCoord, TileId};
 
 use crate::{
-    BackendLatencyConfig, TraceEntry,
-    membership::SimGossipTransport,
-    report::{
-        ClusterObservation, NodeReport, SchedulerReport, SimReport, add_histograms, add_metrics,
-    },
+    TraceEntry,
+    config::ClusterConfig,
+    membership::{Membership, MembershipConfig, cluster_config},
+    report::{ClusterObservation, NodeReport, SchedulerReport, SimReport, SourceCounts},
+    topology::simulated_peer,
 };
-
-const SIM_NODE_BASE_PORT: u16 = 10_000;
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
-pub struct ClusterConfig {
-    pub node_count: usize,
-    pub tileset_sources: String,
-    pub candidate_count: usize,
-    pub tile_group_size: u64,
-    pub chunk_size_bytes: u64,
-    pub max_fetch_chunks: u64,
-    pub chunk_fetch_merge_window_ms: u64,
-    pub backend_fetch_concurrency: usize,
-    #[serde(flatten, default)]
-    pub backend_latency: BackendLatencyConfig,
-    pub peer_latency_ms: u64,
-    pub gossip_interval_ms: u64,
-    pub gossip_hop_latency_ms: u64,
-    pub tile_cache_max_bytes: u64,
-    pub chunk_cache_max_bytes: u64,
-    pub cache_peer_tiles: bool,
-}
-
-impl Default for ClusterConfig {
-    fn default() -> Self {
-        Self {
-            node_count: 3,
-            tileset_sources: "data".to_string(),
-            candidate_count: 3,
-            tile_group_size: 512,
-            chunk_size_bytes: 1024 * 1024,
-            max_fetch_chunks: 4,
-            chunk_fetch_merge_window_ms: 10,
-            backend_fetch_concurrency: 32,
-            backend_latency: BackendLatencyConfig::default(),
-            peer_latency_ms: 0,
-            gossip_interval_ms: 200,
-            gossip_hop_latency_ms: 1,
-            tile_cache_max_bytes: 512 * 1024 * 1024,
-            chunk_cache_max_bytes: 512 * 1024 * 1024,
-            cache_peer_tiles: true,
-        }
-    }
-}
-
-impl ClusterConfig {
-    pub(crate) fn validate(&self) -> Result<()> {
-        ensure!(self.node_count > 0, "node_count must be greater than zero");
-        ensure!(
-            self.node_count <= usize::from(u16::MAX - SIM_NODE_BASE_PORT) + 1,
-            "node_count exceeds the simulator address range"
-        );
-        ensure!(
-            self.candidate_count > 0,
-            "candidate_count must be greater than zero"
-        );
-        ensure!(
-            self.tile_group_size > 0,
-            "tile_group_size must be greater than zero"
-        );
-        ensure!(
-            self.chunk_size_bytes > 0,
-            "chunk_size_bytes must be greater than zero"
-        );
-        ensure!(
-            self.max_fetch_chunks > 0,
-            "max_fetch_chunks must be greater than zero"
-        );
-        ensure!(
-            self.backend_fetch_concurrency > 0,
-            "backend_fetch_concurrency must be greater than zero"
-        );
-        ensure!(
-            self.gossip_interval_ms > 0,
-            "gossip_interval_ms must be greater than zero"
-        );
-        self.backend_latency.model_for_node(0)?;
-        Ok(())
-    }
-}
-
-pub(crate) fn simulated_peers(node_count: usize) -> Vec<Peer> {
-    (0..node_count)
-        .map(|index| Peer {
-            id: format!("node-{index}"),
-            addr: SocketAddr::from((
-                [127, 0, 0, 1],
-                SIM_NODE_BASE_PORT + u16::try_from(index).expect("validated node index"),
-            )),
-        })
-        .collect()
-}
-
-pub(crate) fn simulated_peer(index: usize) -> Result<Peer> {
-    ensure!(
-        index <= usize::from(u16::MAX - SIM_NODE_BASE_PORT),
-        "node index exceeds the simulator address range"
-    );
-    Ok(Peer {
-        id: format!("node-{index}"),
-        addr: SocketAddr::from((
-            [127, 0, 0, 1],
-            SIM_NODE_BASE_PORT + u16::try_from(index).expect("validated node index"),
-        )),
-    })
-}
 
 struct SimNode {
     id: String,
-    gossip_addr: SocketAddr,
     membership: Membership,
     resolver: Arc<ResourceResolver>,
     metrics: NodeMetrics,
     requests: u64,
     served_bytes: u64,
-    by_source: BTreeMap<String, u64>,
+    by_source: SourceCounts,
 }
 
 pub(crate) struct PreparedRequest {
@@ -160,17 +51,6 @@ pub(crate) struct ServedRequest {
     pub(crate) node_index: usize,
     pub(crate) source: TileSource,
     bytes: Option<u64>,
-}
-
-#[derive(Clone)]
-struct ChitchatPeerDirectory {
-    membership: Membership,
-}
-
-impl PeerDirectory for ChitchatPeerDirectory {
-    fn peers(&self) -> PeerFuture<'_> {
-        Box::pin(self.membership.peers())
-    }
 }
 
 #[derive(Default)]
@@ -225,30 +105,42 @@ impl InternalTransport for SimInternalTransport {
     fn fetch<'a>(&'a self, peer: &'a Peer, path: &'a str) -> FetchFuture<'a> {
         Box::pin(async move {
             self.counters.requests.fetch_add(1, Ordering::Relaxed);
-            if !self.latency.is_zero() {
-                tokio::time::sleep(self.latency).await;
-            }
-            let (resolver, metrics) = self.registry.get(&peer.id).ok_or_else(|| {
+            let fetch = async {
+                if !self.latency.is_zero() {
+                    tokio::time::sleep(self.latency).await;
+                }
+                let (resolver, metrics) = self.registry.get(&peer.id).ok_or_else(|| {
+                    self.counters
+                        .unavailable_requests
+                        .fetch_add(1, Ordering::Relaxed);
+                    PeerFetchError::Retryable(format!("simulator peer {} is unavailable", peer.id))
+                })?;
+                let result = resolver.fetch_internal_for_simulator(path).await;
+                if let Some(resource) = internal_resource_kind(path) {
+                    let outcome = match &result {
+                        Ok(_) => "success",
+                        Err(PeerFetchError::NotFound) => "not_found",
+                        Err(PeerFetchError::ProviderNotFound) => "provider_not_found",
+                        Err(PeerFetchError::ProviderGone) => "provider_gone",
+                        Err(PeerFetchError::Retryable(_)) => "retryable",
+                        Err(PeerFetchError::Fatal(_)) => "error",
+                    };
+                    metrics.record_internal_resource_request(resource, outcome);
+                }
+                let response = result?;
                 self.counters
-                    .unavailable_requests
-                    .fetch_add(1, Ordering::Relaxed);
-                PeerFetchError::Retryable(format!("simulator peer {} is unavailable", peer.id))
-            })?;
-            let result = resolver.fetch_internal_for_simulator(path).await;
-            if let Some(resource) = internal_resource_kind(path) {
-                let outcome = match &result {
-                    Ok(_) => "success",
-                    Err(PeerFetchError::NotFound) => "not_found",
-                    Err(PeerFetchError::Retryable(_)) => "retryable",
-                    Err(PeerFetchError::Fatal(_)) => "error",
-                };
-                metrics.record_internal_resource_request(resource, outcome);
-            }
-            let response = result?;
-            self.counters
-                .bytes
-                .fetch_add(response.bytes.len() as u64, Ordering::Relaxed);
-            Ok(response)
+                    .bytes
+                    .fetch_add(response.bytes.len() as u64, Ordering::Relaxed);
+                Ok(response)
+            };
+            tokio::time::timeout(internal_peer_request_timeout(path), fetch)
+                .await
+                .map_err(|_| {
+                    self.counters
+                        .unavailable_requests
+                        .fetch_add(1, Ordering::Relaxed);
+                    PeerFetchError::Retryable("simulator peer request timed out".to_string())
+                })?
         })
     }
 }
@@ -256,20 +148,22 @@ impl InternalTransport for SimInternalTransport {
 /// In-process Ishikari cluster using production routing, PMTiles, and caches.
 pub struct SimCluster {
     config: ClusterConfig,
+    resolver_tuning: ResolverTuning,
     nodes: Vec<SimNode>,
     retired_nodes: Vec<NodeReport>,
-    gossip_transport: SimGossipTransport,
+    gossip_network: SimulatedNetwork,
     registry: Arc<NodeRegistry>,
     transport: Arc<dyn InternalTransport>,
     transport_counters: Arc<TransportCounters>,
     next_node_index: usize,
     simulation_started_at: Instant,
     report: SimReport,
+    by_source: SourceCounts,
 }
 
 impl SimCluster {
     pub async fn new(config: ClusterConfig) -> Result<Self> {
-        config.validate()?;
+        let resolver_tuning = config.validate()?;
         let registry = Arc::new(NodeRegistry::default());
         let transport_counters = Arc::new(TransportCounters::default());
         let transport: Arc<dyn InternalTransport> = Arc::new(SimInternalTransport {
@@ -281,9 +175,10 @@ impl SimCluster {
         let initial_node_count = config.node_count;
         let mut cluster = Self {
             config: config.clone(),
+            resolver_tuning,
             nodes: Vec::with_capacity(initial_node_count),
             retired_nodes: Vec::new(),
-            gossip_transport: SimGossipTransport::new(Duration::from_millis(
+            gossip_network: SimulatedNetwork::new(Duration::from_millis(
                 config.gossip_hop_latency_ms,
             )),
             registry,
@@ -292,11 +187,23 @@ impl SimCluster {
             next_node_index: 0,
             simulation_started_at: Instant::now(),
             report: SimReport::default(),
+            by_source: SourceCounts::default(),
         };
-        for _ in 0..initial_node_count {
-            cluster.add_node().await?;
+        let initialization = async {
+            for _ in 0..initial_node_count {
+                cluster.add_node().await?;
+            }
+            cluster.wait_for_membership_convergence().await
         }
-        cluster.wait_for_membership_convergence().await?;
+        .await;
+        if let Err(error) = initialization {
+            return match cluster.shutdown().await {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(error.context(format!(
+                    "partially initialized membership cleanup also failed: {cleanup_error:#}"
+                ))),
+            };
+        }
         cluster.simulation_started_at = Instant::now();
         Ok(cluster)
     }
@@ -312,36 +219,35 @@ impl SimCluster {
     pub async fn add_node(&mut self) -> Result<String> {
         let node_index = self.next_node_index;
         let peer = simulated_peer(node_index)?;
-        let seed_nodes = self
-            .nodes
-            .iter()
-            .map(|node| node.gossip_addr.to_string())
-            .collect();
-        let membership = Membership::spawn_for_simulator(
-            MembershipConfig {
-                node_id: peer.id.clone(),
-                listen_addr: peer.addr,
-                advertise_addr: peer.addr,
-                http_advertise_addr: peer.addr,
-                http_port: peer.addr.port(),
-                seed_nodes,
-                gossip_interval: Duration::from_millis(self.config.gossip_interval_ms),
-            },
-            node_index as u64 + 1,
-            &self.gossip_transport,
-        )
-        .await?;
-        let directory: Arc<dyn PeerDirectory> = Arc::new(ChitchatPeerDirectory {
-            membership: membership.clone(),
-        });
-        let node = build_node(
+        let membership_config = MembershipConfig {
+            http_advertise_addr: peer.addr,
+            gossip_interval: Duration::from_millis(self.config.gossip_interval_ms),
+        };
+        let spawned = self
+            .gossip_network
+            .spawn(peer.id.clone(), |context| {
+                cluster_config(&membership_config, context)
+            })
+            .await?;
+        let membership = Membership::new(spawned.cluster(), membership_config.gossip_interval);
+        let node = match build_node(
             &self.config,
+            self.resolver_tuning,
             node_index,
             peer.clone(),
             membership,
-            directory,
             self.transport.clone(),
-        )?;
+        ) {
+            Ok(node) => node,
+            Err(error) => {
+                return match self.gossip_network.remove(&peer.id).await {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(error.context(format!(
+                        "simulated membership cleanup also failed: {cleanup_error}"
+                    ))),
+                };
+            }
+        };
         self.registry
             .register(peer.id.clone(), &node.resolver, node.metrics.clone());
         self.nodes.push(node);
@@ -358,7 +264,10 @@ impl SimCluster {
             .with_context(|| format!("active node {id} does not exist"))?;
         self.registry.remove(id);
         let node = self.nodes.remove(index);
-        node.membership.shutdown()?;
+        self.gossip_network
+            .remove(id)
+            .await
+            .context("failed to stop removed simulated membership node")?;
         self.retired_nodes.push(real_node_report(&node, false));
         Ok(())
     }
@@ -395,13 +304,13 @@ impl SimCluster {
     }
 
     #[cfg(test)]
-    async fn membership_peer_ids(&self) -> BTreeMap<String, Vec<String>> {
-        let mut views = BTreeMap::new();
+    async fn membership_peer_ids(&self) -> std::collections::BTreeMap<String, Vec<String>> {
+        let mut views = std::collections::BTreeMap::new();
         for node in &self.nodes {
             views.insert(
                 node.id.clone(),
                 node.membership
-                    .peers_for_simulator_observation()
+                    .peers_for_observation()
                     .await
                     .iter()
                     .map(|peer| peer.id.clone())
@@ -501,10 +410,10 @@ impl SimCluster {
     pub async fn observation(&self) -> ClusterObservation {
         let mut metrics = NodeMetricsSnapshot::default();
         for node in &self.retired_nodes {
-            add_metrics(&mut metrics, node.metrics);
+            metrics.merge(&node.metrics);
         }
         for node in &self.nodes {
-            add_metrics(&mut metrics, node.metrics.snapshot());
+            metrics.merge(&node.metrics.snapshot());
         }
         let expected = self.active_node_ids().into_iter().collect::<BTreeSet<_>>();
         let mut membership_converged_nodes = 0;
@@ -515,7 +424,7 @@ impl SimCluster {
         for node in &self.nodes {
             let actual = node
                 .membership
-                .peers_for_simulator_observation()
+                .peers_for_observation()
                 .await
                 .iter()
                 .map(|peer| peer.id.clone())
@@ -530,7 +439,7 @@ impl SimCluster {
             membership_min_peer_count = membership_min_peer_count.min(actual.len());
             membership_max_peer_count = membership_max_peer_count.max(actual.len());
         }
-        let (gossip_messages, gossip_bytes) = self.gossip_transport.statistics();
+        let gossip = self.gossip_network.statistics();
         ClusterObservation {
             requests: self.report.requests,
             active_nodes: self.nodes.len(),
@@ -540,8 +449,8 @@ impl SimCluster {
                     .as_millis()
                     .min(u128::from(u64::MAX)) as u64,
             ),
-            gossip_messages,
-            gossip_bytes,
+            gossip_messages: gossip.messages_total,
+            gossip_bytes: gossip.bytes_total,
             membership_converged_nodes,
             membership_stale_nodes: self.nodes.len() - membership_converged_nodes,
             membership_missing_peer_refs,
@@ -553,7 +462,7 @@ impl SimCluster {
             },
             membership_max_peer_count,
             cache_hits: self.report.l1_cache_hits,
-            by_source: self.report.by_source.clone(),
+            by_source: self.by_source.to_report_map(),
             node_requests: self
                 .nodes
                 .iter()
@@ -567,49 +476,51 @@ impl SimCluster {
             peer_retryable_failures: metrics.peer_forward_retryable,
             peer_backoff_skips: metrics.peer_forward_backoff_skips,
             backend_fetches: metrics.backend_fetches,
-            backend_bytes: self
-                .retired_nodes
-                .iter()
-                .map(|node| node.backend_bytes)
-                .sum::<u64>()
-                + self
-                    .nodes
-                    .iter()
-                    .map(|node| node.resolver.received_bytes())
-                    .sum::<u64>(),
+            backend_bytes: self.backend_bytes_total(),
             served_bytes: self.report.served_bytes,
-            tile_cache_bytes: self
-                .nodes
-                .iter()
-                .map(|node| node.resolver.tile_cache_weighted_size())
-                .sum(),
-            chunk_cache_bytes: self
-                .nodes
-                .iter()
-                .map(|node| node.resolver.chunk_cache_weighted_size())
-                .sum(),
+            tile_cache_bytes: self.tile_cache_bytes_total(),
+            chunk_cache_bytes: self.chunk_cache_bytes_total(),
         }
+    }
+
+    /// Total backend bytes fetched across live and retired nodes.
+    fn backend_bytes_total(&self) -> u64 {
+        self.retired_nodes
+            .iter()
+            .map(|node| node.backend_bytes)
+            .sum::<u64>()
+            + self
+                .nodes
+                .iter()
+                .map(|node| node.resolver.received_bytes())
+                .sum::<u64>()
+    }
+
+    /// Weighted tile-cache footprint across live nodes.
+    fn tile_cache_bytes_total(&self) -> u64 {
+        self.nodes
+            .iter()
+            .map(|node| node.resolver.tile_cache_weighted_size())
+            .sum()
+    }
+
+    /// Weighted chunk-cache footprint across live nodes.
+    fn chunk_cache_bytes_total(&self) -> u64 {
+        self.nodes
+            .iter()
+            .map(|node| node.resolver.chunk_cache_weighted_size())
+            .sum()
     }
 
     pub(crate) fn record(&mut self, served: ServedRequest) {
         let node = &mut self.nodes[served.node_index];
         self.report.requests += 1;
         node.requests += 1;
-        if matches!(
-            served.source,
-            TileSource::SelfTileCache | TileSource::NegativeCache
-        ) {
+        if served.source.is_l1_hit() {
             self.report.l1_cache_hits += 1;
         }
-        *node
-            .by_source
-            .entry(source_name(served.source).to_string())
-            .or_default() += 1;
-        *self
-            .report
-            .by_source
-            .entry(source_name(served.source).to_string())
-            .or_default() += 1;
+        node.by_source.increment(served.source);
+        self.by_source.increment(served.source);
         if let Some(bytes) = served.bytes {
             node.served_bytes += bytes;
             self.report.found += 1;
@@ -619,38 +530,30 @@ impl SimCluster {
         }
     }
 
-    pub fn report(mut self) -> SimReport {
-        for node in &self.nodes {
-            let _ = node.membership.shutdown();
-        }
+    /// Stops every simulated membership task without consuming accumulated
+    /// report state. Calling this more than once is safe.
+    pub async fn shutdown(&self) -> Result<()> {
+        self.gossip_network
+            .shutdown_all()
+            .await
+            .context("failed to stop simulated membership nodes")
+    }
+
+    pub async fn report(mut self) -> Result<SimReport> {
+        self.shutdown().await?;
         self.report.peer_requests = self.transport_counters.requests.load(Ordering::Relaxed);
         self.report.peer_bytes = self.transport_counters.bytes.load(Ordering::Relaxed);
         self.report.peer_unavailable_requests = self
             .transport_counters
             .unavailable_requests
             .load(Ordering::Relaxed);
-        (self.report.gossip_messages, self.report.gossip_bytes) =
-            self.gossip_transport.statistics();
-        self.report.backend_bytes = self
-            .retired_nodes
-            .iter()
-            .map(|node| node.backend_bytes)
-            .sum::<u64>()
-            + self
-                .nodes
-                .iter()
-                .map(|node| node.resolver.received_bytes())
-                .sum::<u64>();
-        self.report.tile_cache_bytes = self
-            .nodes
-            .iter()
-            .map(|node| node.resolver.tile_cache_weighted_size())
-            .sum();
-        self.report.chunk_cache_bytes = self
-            .nodes
-            .iter()
-            .map(|node| node.resolver.chunk_cache_weighted_size())
-            .sum();
+        let gossip = self.gossip_network.statistics();
+        self.report.gossip_messages = gossip.messages_total;
+        self.report.gossip_bytes = gossip.bytes_total;
+        self.report.backend_bytes = self.backend_bytes_total();
+        self.report.tile_cache_bytes = self.tile_cache_bytes_total();
+        self.report.chunk_cache_bytes = self.chunk_cache_bytes_total();
+        self.report.by_source = self.by_source.to_report_map();
         self.report.finalize_derived_metrics();
         let mut metrics = NodeMetricsSnapshot::default();
         let mut histograms = NodeHistogramSnapshot::default();
@@ -659,15 +562,15 @@ impl SimCluster {
             .iter()
             .map(|node| {
                 let node_metrics = node.metrics.snapshot();
-                add_metrics(&mut metrics, node_metrics);
+                metrics.merge(&node_metrics);
                 let node_report = real_node_report(node, true);
-                add_histograms(&mut histograms, &node_report.histograms);
+                histograms.merge(&node_report.histograms);
                 node_report
             })
             .collect::<Vec<_>>();
         for node in &self.retired_nodes {
-            add_metrics(&mut metrics, node.metrics);
-            add_histograms(&mut histograms, &node.histograms);
+            metrics.merge(&node.metrics);
+            histograms.merge(&node.histograms);
         }
         let mut nodes = self.retired_nodes;
         nodes.extend(active_nodes);
@@ -675,61 +578,54 @@ impl SimCluster {
         self.report.set_histograms(&histograms);
         self.report.nodes = nodes;
         self.report.set_node_request_load();
-        self.report
+        Ok(self.report)
     }
 }
 
 fn build_node(
     config: &ClusterConfig,
+    tuning: ResolverTuning,
     node_index: usize,
     peer: Peer,
     membership: Membership,
-    directory: Arc<dyn PeerDirectory>,
     transport: Arc<dyn InternalTransport>,
 ) -> Result<SimNode> {
     let backend_latency = config.backend_latency.model_for_node(node_index)?;
     let metrics = NodeMetrics::new();
-    metrics.set_chunk_config(config.chunk_size_bytes, config.max_fetch_chunks);
     let peer_backend = PeerBackend::with_dependencies(
         peer.id.clone(),
-        directory,
-        HrwRouter::new(config.candidate_count, config.tile_group_size),
+        Arc::new(membership.clone()),
+        HrwRouter::new(tuning.candidate_count(), tuning.tile_group_size()),
         transport,
         metrics.clone(),
     );
     let resolver = Arc::new(ResourceResolver::with_peer_backend(
         ResourceResolverStorageConfig {
             tileset_sources: config.tileset_sources.clone(),
-            chunk_size_bytes: config.chunk_size_bytes,
-            max_fetch_chunks: config.max_fetch_chunks,
-            chunk_fetch_merge_window: Duration::from_millis(config.chunk_fetch_merge_window_ms),
-            backend_fetch_concurrency: config.backend_fetch_concurrency,
+            tuning,
+            cache_capacities: ishikari_core::storage::ResourceCacheCapacities::default(),
             backend_latency,
-            tile_cache_max_bytes: config.tile_cache_max_bytes,
             peer_tile_cache_policy: if config.cache_peer_tiles {
                 PeerTileCachePolicy::EntryAndOwner
             } else {
                 PeerTileCachePolicy::OwnerOnly
             },
-            chunk_cache_max_bytes: config.chunk_cache_max_bytes,
-            // Mirrors the production default. Simulator runs never republish an
-            // archive mid-run, so negative entries do not expire during a run
-            // regardless of this value.
-            tile_negative_ttl: std::time::Duration::from_secs(60),
-            object_store_registry: Arc::new(ObjectStoreRegistry::new()),
+            // The simulator is its own process boundary. Preserve support for
+            // authenticated object-store traces without making ishikari-core
+            // read ambient configuration.
+            object_store_registry: Arc::new(ObjectStoreRegistry::new(std::env::vars())),
             metrics: metrics.clone(),
         },
         peer_backend,
     )?);
     Ok(SimNode {
         id: peer.id,
-        gossip_addr: peer.addr,
         membership,
         resolver,
         metrics,
         requests: 0,
         served_bytes: 0,
-        by_source: BTreeMap::new(),
+        by_source: SourceCounts::default(),
     })
 }
 
@@ -740,7 +636,7 @@ fn real_node_report(node: &SimNode, active: bool) -> NodeReport {
         active,
         requests: node.requests,
         served_bytes: node.served_bytes,
-        by_source: node.by_source.clone(),
+        by_source: node.by_source.to_report_map(),
         backend_bytes: node.resolver.received_bytes(),
         tile_cache_bytes: node.resolver.tile_cache_weighted_size(),
         chunk_cache_bytes: node.resolver.chunk_cache_weighted_size(),
@@ -755,7 +651,7 @@ pub(crate) async fn execute_request(request: PreparedRequest) -> Result<ServedRe
         .resolver
         .route_tile(request.tileset_id, request.tile_id)
         .await?;
-    request.metrics.record_tile_served(source.served_label());
+    request.metrics.record_tile_served(source.report_label());
     for outcome in request.resolver.cache_outcomes(source) {
         request.metrics.record_tile_cache(outcome);
     }
@@ -771,74 +667,82 @@ pub(crate) async fn execute_request(request: PreparedRequest) -> Result<ServedRe
     })
 }
 
-pub(crate) fn source_name(source: TileSource) -> &'static str {
-    match source {
-        TileSource::SelfTileCache | TileSource::SelfChunkCache => "self_cache",
-        TileSource::SelfBackend => "self_backend",
-        TileSource::NegativeCache => "negative_cache",
-        TileSource::PeerCache => "peer_cache",
-        TileSource::PeerBackend => "peer_backend",
-        TileSource::SelfMiss => "self_miss",
-        TileSource::PeerMiss => "peer_miss",
-        TileSource::Miss => "miss",
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ClusterConfig, SimCluster};
-    use crate::BackendLatencyConfig;
+    use std::{sync::Arc, time::Duration};
+
+    use ishikari_core::storage::{InternalTransport, Peer, PeerFetchError, TileSource};
+    use tokio::time::Instant;
+
+    use super::{NodeRegistry, SimCluster, SimInternalTransport, TransportCounters};
+    use crate::{config::ClusterConfig, report::SourceCounts};
 
     #[test]
-    fn rejects_empty_cluster() {
-        let result = ClusterConfig {
-            node_count: 0,
-            ..ClusterConfig::default()
+    fn source_counts_preserve_labels_and_omit_zeroes_at_report_boundary() {
+        for source in [
+            TileSource::SelfTileCache,
+            TileSource::SelfChunkCache,
+            TileSource::SelfBackend,
+            TileSource::NegativeCache,
+            TileSource::PeerCache,
+            TileSource::PeerBackend,
+            TileSource::SelfMiss,
+            TileSource::PeerMiss,
+        ] {
+            assert_eq!(
+                crate::report::SourceCategory::from_tile_source(source).report_label(),
+                source.report_label()
+            );
         }
-        .validate();
 
-        assert!(result.is_err());
+        let mut counts = SourceCounts::default();
+        counts.increment(TileSource::SelfTileCache);
+        counts.increment(TileSource::SelfChunkCache);
+        counts.increment(TileSource::PeerCache);
+        let report = counts.to_report_map();
+
+        assert_eq!(report.get("self_cache"), Some(&2));
+        assert_eq!(report.get("peer_cache"), Some(&1));
+        assert_eq!(report.len(), 2);
     }
 
-    #[test]
-    fn rejects_invalid_cluster_dimensions_and_latency() {
-        let invalid = [
-            ClusterConfig {
-                candidate_count: 0,
-                ..ClusterConfig::default()
-            },
-            ClusterConfig {
-                tile_group_size: 0,
-                ..ClusterConfig::default()
-            },
-            ClusterConfig {
-                chunk_size_bytes: 0,
-                ..ClusterConfig::default()
-            },
-            ClusterConfig {
-                max_fetch_chunks: 0,
-                ..ClusterConfig::default()
-            },
-            ClusterConfig {
-                backend_fetch_concurrency: 0,
-                ..ClusterConfig::default()
-            },
-            ClusterConfig {
-                gossip_interval_ms: 0,
-                ..ClusterConfig::default()
-            },
-            ClusterConfig {
-                backend_latency: BackendLatencyConfig {
-                    lognormal_sigma: f64::NAN,
-                    ..BackendLatencyConfig::default()
-                },
-                ..ClusterConfig::default()
-            },
-        ];
+    #[tokio::test(start_paused = true)]
+    async fn simulated_peer_transport_uses_production_path_deadlines() {
+        let transport = SimInternalTransport {
+            registry: Arc::new(NodeRegistry::default()),
+            counters: Arc::new(TransportCounters::default()),
+            latency: Duration::from_secs(11),
+        };
+        let peer = Peer {
+            id: "missing-peer".to_string(),
+            addr: "127.0.0.1:1".parse().expect("peer address"),
+        };
 
-        for config in invalid {
-            assert!(config.validate().is_err(), "accepted {config:?}");
-        }
+        let started = Instant::now();
+        let Err(tile_error) = transport
+            .fetch(&peer, "/_internal/tiles/mierune%2Fomt/700")
+            .await
+        else {
+            panic!("ordinary peer request must time out at ten seconds");
+        };
+        assert!(matches!(
+            tile_error,
+            PeerFetchError::Retryable(message) if message.contains("timed out")
+        ));
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+
+        let started = Instant::now();
+        let Err(provider_error) = transport
+            .fetch(&peer, "/_internal/provider/fonts/Test/0-255.pbf")
+            .await
+        else {
+            panic!("missing provider peer should be observed after simulated latency");
+        };
+        assert!(matches!(
+            provider_error,
+            PeerFetchError::Retryable(message) if message.contains("unavailable")
+        ));
+        assert_eq!(started.elapsed(), Duration::from_secs(11));
     }
 
     #[tokio::test(start_paused = true)]
@@ -861,6 +765,29 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn real_cluster_constructs_with_normalized_resolver_boundaries() {
+        let cluster = SimCluster::new(ClusterConfig {
+            node_count: 1,
+            tileset_sources: env!("CARGO_MANIFEST_DIR").to_string(),
+            candidate_count: 0,
+            tile_group_size: 0,
+            max_fetch_chunks: 0,
+            chunk_fetch_merge_window_ms: 0,
+            backend_fetch_concurrency: 0,
+            ..ClusterConfig::default()
+        })
+        .await
+        .expect("normalized cluster");
+
+        assert_eq!(cluster.config.candidate_count, 0);
+        assert_eq!(cluster.resolver_tuning.candidate_count(), 1);
+        assert_eq!(cluster.resolver_tuning.tile_group_size(), 1);
+        assert_eq!(cluster.resolver_tuning.max_fetch_chunks(), 1);
+        assert_eq!(cluster.resolver_tuning.backend_fetch_concurrency(), 1);
+        assert!(cluster.resolver_tuning.chunk_fetch_merge_window().is_zero());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn empty_viewport_does_not_record_requests() {
         let mut cluster = SimCluster::new(ClusterConfig {
             node_count: 1,
@@ -872,7 +799,27 @@ mod tests {
 
         cluster.serve_viewport(&[]).await.expect("empty viewport");
 
-        assert_eq!(cluster.report().requests, 0);
+        assert_eq!(cluster.report().await.expect("report").requests, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_is_idempotent_and_preserves_report_state() {
+        let cluster = SimCluster::new(ClusterConfig {
+            node_count: 1,
+            tileset_sources: env!("CARGO_MANIFEST_DIR").to_string(),
+            ..ClusterConfig::default()
+        })
+        .await
+        .expect("cluster");
+
+        cluster.shutdown().await.expect("first shutdown");
+        assert!(cluster.gossip_network.seed_addresses().await.is_empty());
+        cluster.shutdown().await.expect("second shutdown");
+
+        let report = cluster.report().await.expect("report after shutdown");
+        assert_eq!(report.requests, 0);
+        assert_eq!(report.nodes.len(), 1);
+        assert!(report.nodes[0].active);
     }
 
     #[tokio::test(start_paused = true)]
@@ -890,7 +837,7 @@ mod tests {
         cluster.remove_node("node-0").await.expect("remove node");
 
         assert_eq!(cluster.active_node_ids(), ["node-1", "node-2"]);
-        let report = cluster.report();
+        let report = cluster.report().await.expect("report");
         assert_eq!(report.nodes.len(), 3);
         assert!(
             report

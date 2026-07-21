@@ -70,19 +70,30 @@ top-level `/livez` `/readyz`, and a separate cluster-internal port
 (`--internal-port`, default `9090`) for `/_internal/*` (including metrics) and
 peer-to-peer forwarding. The internal port is never exposed publicly; peers
 forward to the advertised internal address, so `--internal-advertise-addr` points at the
-internal port:
+internal port. Cluster mode also requires an explicit routable gossip address via
+`--gossip-advertise-addr` (env `BIEI_GOSSIP_ADVERTISE_ADDR`); `--gossip-bind`
+remains the local UDP listener and may use a wildcard IP:
 
 ```sh
 cargo run -p biei -- \
   --cluster \
+  --require-gossip-bootstrap \
   --style-templates 'http://style-provider.svc.cluster.local:8080/styles/{style_id}/style.json' \
   --tileset-url-template 'http://style-provider.svc.cluster.local:8080/tilesets/{tileset_id}/tileset.json' \
   --mln-resource-private-hosts style-provider.svc.cluster.local \
   --mln-resource-cache-bytes 268435456 \
   --internal-port 9090 \
   --internal-advertise-addr "$HOSTNAME.biei.default.svc.cluster.local:9090" \
+  --gossip-bind 0.0.0.0:7946 \
+  --gossip-advertise-addr "$HOSTNAME.biei.default.svc.cluster.local:7946" \
   --gossip-seeds biei-0.biei:7946
 ```
+
+`--require-gossip-bootstrap` (env `BIEI_REQUIRE_GOSSIP_BOOTSTRAP`) is an
+explicit startup-only readiness policy. It defaults to `false`, including when
+seeds are configured. When enabled, readiness waits for one raw live peer
+observation, fails open after 30 seconds, and remains open through later
+partitions.
 
 ### Style templates
 
@@ -138,7 +149,7 @@ process and does not persist across restarts.
 to `max(24, 4 * render_permits)`; tune it only when admission-wait and memory
 metrics show that the default is inappropriate.
 
-The `biei_mln_resource_*` metrics separate Database cache operations, deferred
+The `mmpf_mln_resource_*` metrics separate Database cache operations, deferred
 refreshes, admission wait, single-flight participation, and actual upstream
 HTTP attempts. Use `--disable-mln-file-sources` only as a diagnostic A/B mode
 when comparing the Rust cache/loader with MapLibre Native's default leaves.
@@ -155,4 +166,7 @@ unrelated internal services when resource URLs are not fully trusted.
 
 ## Documentation
 
+- [Production contract and guardrails](../../specs/biei-spec.md)
+- [Open Biei work and decisions](../../issues/biei-todo.md)
+- [Unlanded MapLibre Native binding needs](../../issues/mln-rs-wishlist.md)
 - [Simulator documentation](../../sims/biei-sim/README.md)

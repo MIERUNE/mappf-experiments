@@ -1,0 +1,11 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ishikari
+spec:
+  # At the HPA's two-pod floor, allow maintenance to evict one pod while one
+  # warm endpoint remains. PDBs do not protect against involuntary Spot loss.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: ishikari

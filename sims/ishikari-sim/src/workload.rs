@@ -1,6 +1,7 @@
 use std::{collections::HashSet, io::Read, sync::Arc};
 
 use anyhow::{Context, Result, bail, ensure};
+use mmpf_common::rng::{splitmix64, uniform_unit};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 
@@ -263,7 +264,7 @@ impl Workload {
             (lng, lat, zoom)
         } else {
             let (lng, lat, zoom) = state.position.expect("position checked above");
-            // Always consume the legacy pan draws so enabling zoom walks does not
+            // Always consume the baseline pan draws so enabling zoom walks does not
             // perturb later reset locations, reset zooms, or the underlying pan
             // stream. The zoom decision itself is stateless and domain-separated.
             let pan_x = random_signed(&mut state.rng);
@@ -295,8 +296,7 @@ impl Workload {
                 let x = (i64::from(center_x) + dx).rem_euclid(i64::from(dimension)) as u32;
                 let y = (i64::from(center_y) + dy).clamp(0, i64::from(dimension - 1)) as u32;
                 let tile = (zoom, x, y);
-                current_viewport.insert(tile);
-                if state.previous_viewport.contains(&tile) {
+                if !current_viewport.insert(tile) || state.previous_viewport.contains(&tile) {
                     continue;
                 }
                 let entry_node =
@@ -363,7 +363,7 @@ fn adjacent_zoom(zoom: u8, min_zoom: u8, max_zoom: u8, zoom_in: bool) -> u8 {
 }
 
 fn deterministic_unit(value: u64) -> f64 {
-    (splitmix64(value) >> 11) as f64 * (1.0 / ((1_u64 << 53) as f64))
+    uniform_unit(splitmix64(value))
 }
 
 fn sample_zoom(cdf: &[(u8, f64)], total: f64, rng: &mut StdRng) -> u8 {
@@ -412,13 +412,6 @@ fn wrap_unit(value: f64) -> f64 {
 
 fn derive_user_seed(seed: u64, user: u64) -> u64 {
     splitmix64(seed ^ user.wrapping_mul(0x9e37_79b9_7f4a_7c15))
-}
-
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
 }
 
 #[cfg(test)]
@@ -590,6 +583,63 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn zoom_zero_viewport_emits_one_unique_tile() {
+        let config = WorkloadConfig {
+            users: 1,
+            min_zoom: 0,
+            max_zoom: 0,
+            ..WorkloadConfig::default()
+        };
+        let mut workload = Workload::new(config, population()).expect("workload");
+
+        let entries = workload.step(0, 0).expect("zoom-zero step");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            (entries[0].ordinal, entries[0].z, entries[0].x, entries[0].y),
+            (0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn wrapped_and_clamped_viewport_order_is_unique_and_deterministic() {
+        let polar_population = Arc::new(
+            PopulationCdf::from_reader(Cursor::new(
+                r#"{"type":"FeatureCollection","features":[{"geometry":{"type":"Point","coordinates":[179.999,85.051]},"properties":{"population":1}}]}"#,
+            ))
+            .expect("polar population"),
+        );
+        let config = WorkloadConfig {
+            users: 1,
+            min_zoom: 1,
+            max_zoom: 1,
+            ..WorkloadConfig::default()
+        };
+        let mut first =
+            Workload::new(config.clone(), polar_population.clone()).expect("first workload");
+        let mut second = Workload::new(config, polar_population).expect("second workload");
+
+        let entries = first.step(0, 0).expect("first step");
+
+        assert_eq!(entries, second.step(0, 0).expect("second step"));
+        assert_eq!(entries.len(), 4);
+        assert!(
+            entries
+                .iter()
+                .enumerate()
+                .all(|(ordinal, entry)| entry.ordinal == ordinal)
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.z, entry.x, entry.y))
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            entries.len()
+        );
     }
 
     #[test]

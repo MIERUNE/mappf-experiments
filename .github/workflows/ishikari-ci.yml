@@ -7,7 +7,12 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".github/codecov.yml"
       - "crates/ishikari-core/**"
+      - "crates/mmpf-cluster/**"
+      - "crates/mmpf-common/**"
+      - "crates/mmpf-http/**"
+      - "crates/mmpf-pmtiles/**"
       - "crates/mmpf-terrain/**"
       - "servers/ishikari/**"
       - "sims/ishikari-sim/**"
@@ -17,7 +22,12 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".github/codecov.yml"
       - "crates/ishikari-core/**"
+      - "crates/mmpf-cluster/**"
+      - "crates/mmpf-common/**"
+      - "crates/mmpf-http/**"
+      - "crates/mmpf-pmtiles/**"
       - "crates/mmpf-terrain/**"
       - "servers/ishikari/**"
       - "sims/ishikari-sim/**"
@@ -34,25 +44,61 @@ concurrency:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WORKSPACE_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          components: clippy,rustfmt
-      # Reuse the Cargo registry and target graph across otherwise ephemeral
-      # GitHub-hosted runners. Pin the v2 action to an immutable commit.
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+          components: clippy,rustfmt,llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2
+        with:
+          tool: cargo-llvm-cov@0.8.6
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: v0.16.0
+      # rust-cache intentionally excludes workspace artifacts; sccache handles
+      # content-identical workspace compilation after Cargo's freshness check.
+      - name: Cache Cargo dependencies and build outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: . -> target
+          key: ishikari
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
         run: >-
-          cargo clippy -p ishikari-core -p ishikari -p ishikari-sim
-          -p mmpf-terrain --all-targets --locked -- -D warnings
-      - name: Test
-        run: >-
-          cargo test -p ishikari-core -p ishikari -p ishikari-sim
-          -p mmpf-terrain --all-targets --locked
-      - name: Test Ishikari without simulator support
-        run: cargo test -p ishikari-core --all-targets --no-default-features --locked
+          cargo clippy -p mmpf-cluster -p mmpf-common -p mmpf-http -p mmpf-pmtiles -p ishikari-core -p ishikari -p ishikari-sim
+          -p mmpf-terrain --all-targets --locked --
+          -D warnings
+          -D clippy::unchecked_time_subtraction
+          -D clippy::large_futures
+          -D clippy::large_stack_arrays
+          -D clippy::unused_async
+      # Accumulate both feature configurations into one report. --no-report
+      # also prevents cargo-llvm-cov from cleaning between the two test runs.
+      - name: Test workspace and collect coverage
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --no-report \
+            -p mmpf-cluster -p mmpf-common -p mmpf-http -p mmpf-pmtiles \
+            -p ishikari-core -p ishikari -p ishikari-sim -p mmpf-terrain \
+            --all-targets --locked
+          cargo llvm-cov --no-report \
+            -p ishikari-core --all-targets --no-default-features --locked
+          cargo llvm-cov report --lcov --output-path lcov-ishikari.info
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          files: lcov-ishikari.info
+          flags: ishikari,shared
+          name: ishikari
+          disable_search: true
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}

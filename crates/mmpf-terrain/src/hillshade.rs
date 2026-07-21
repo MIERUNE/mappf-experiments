@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use anyhow::{Context, Result};
 use fast_mvt::{MvtCoord, MvtFeature, MvtGeometry, MvtLayer, MvtLineString, MvtPolygon, MvtTile};
+#[cfg(feature = "raster-encode")]
 use image::{ExtendedColorType, ImageEncoder, codecs::webp::WebPEncoder};
 
 use super::{dem::DemNeighborhood, topology::trace_interpolated_shared_rings};
@@ -254,8 +255,10 @@ pub fn generate(neighborhood: &DemNeighborhood, zoom: u8, tile_y: u32) -> Result
 /// (`color-relief`'s custom encoding does not evaluate in the GPU shader);
 /// because the pixel is gray, Terrarium's high-byte sensitivity is harmless
 /// even under lossy codecs — a small byte error is a small, sub-level error.
+#[cfg(feature = "raster-encode")]
 pub const SHADE_CODE_SCALE: f64 = 5.0;
 
+#[cfg(feature = "raster-encode")]
 fn shade_byte(code: f64) -> u8 {
     (128.0 + code * SHADE_CODE_SCALE).round().clamp(0.0, 255.0) as u8
 }
@@ -264,6 +267,7 @@ fn shade_byte(code: f64) -> u8 {
 /// [`SHADE_CODE_SCALE`]). `continuous` reads the un-rounded field (best for
 /// lossy codecs, no banding); otherwise the quantized levels (best for lossless
 /// codecs, few distinct values).
+#[cfg(feature = "raster-encode")]
 fn shade_raster_rgb(grid: &ShadeGrid, continuous: bool) -> Vec<u8> {
     let offset = GRID_BUFFER as usize;
     let mut rgb = vec![0u8; GRID_SIZE * GRID_SIZE * 3];
@@ -289,6 +293,7 @@ fn shade_raster_rgb(grid: &ShadeGrid, continuous: bool) -> Vec<u8> {
 /// compressing a few dozen discrete values is compact and exact; recolor is
 /// deferred to a style-side `color-relief` ramp. Trade vs vector: fixed
 /// resolution (blurs when overzoomed) for far fewer bytes on rough terrain.
+#[cfg(feature = "raster-encode")]
 pub fn generate_raster(neighborhood: &DemNeighborhood, zoom: u8, tile_y: u32) -> Result<Vec<u8>> {
     let grid = illumination_labels(neighborhood, zoom, tile_y);
     let rgb = shade_raster_rgb(&grid, false);
@@ -308,6 +313,7 @@ pub fn generate_raster(neighborhood: &DemNeighborhood, zoom: u8, tile_y: u32) ->
 /// carries the full un-banded shade at a fraction of the bytes; its errors are
 /// sub-JND tone deviations, not artifacts, because a continuous ramp — not
 /// exact codes — drives the coloring. WebP keeps edges cleaner than JPEG.
+#[cfg(feature = "raster-encode")]
 pub fn generate_raster_webp_lossy(
     neighborhood: &DemNeighborhood,
     zoom: u8,
@@ -324,6 +330,7 @@ pub fn generate_raster_webp_lossy(
 /// Neutral shade raster as lossy JPEG over the continuous field: the size floor
 /// proxy (WebP/AVIF lossy beat it, and JPEG has no alpha). Same continuous,
 /// un-banded shade as [`generate_raster_webp_lossy`].
+#[cfg(feature = "raster-encode")]
 pub fn generate_raster_jpeg(
     neighborhood: &DemNeighborhood,
     zoom: u8,
@@ -607,15 +614,17 @@ fn remove_speckles(labels: &mut [i8], width: usize, height: usize) {
         touches_outer_edge: bool,
     }
 
-    let source = labels.to_vec();
-    let mut component_at = vec![usize::MAX; source.len()];
+    // `labels` is mutated only in the final relabel pass below; every read in
+    // the component/adjacency phases sees the original grid, so a defensive
+    // copy would just be a discarded per-tile allocation.
+    let mut component_at = vec![usize::MAX; labels.len()];
     let mut components = Vec::new();
-    for start in 0..source.len() {
+    for start in 0..labels.len() {
         if component_at[start] != usize::MAX {
             continue;
         }
         let id = components.len();
-        let label = source[start];
+        let label = labels[start];
         let mut queue = VecDeque::from([start]);
         let mut cells = Vec::new();
         let mut touches_outer_edge = false;
@@ -626,7 +635,7 @@ fn remove_speckles(labels: &mut [i8], width: usize, height: usize) {
             let y = index / width;
             touches_outer_edge |= x == 0 || y == 0 || x + 1 == width || y + 1 == height;
             for neighbor in neighbors4(x, y, width, height).into_iter().flatten() {
-                if component_at[neighbor] == usize::MAX && source[neighbor] == label {
+                if component_at[neighbor] == usize::MAX && labels[neighbor] == label {
                     component_at[neighbor] = id;
                     queue.push_back(neighbor);
                 }

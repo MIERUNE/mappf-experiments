@@ -7,13 +7,14 @@ resources:
   - healthcheck.yaml
   - httproute.yaml
   - podmonitoring.yaml
+  - networkpolicy.yaml
   - hpa.yaml
   - ../../base
 
 images:
   - name: ishikari
     newName: asia-northeast1-docker.pkg.dev/mappf-experiment/ishikari/ishikari
-    digest: sha256:9669857accf6e73a213a33415f49282f96011a8ffa0d7d0e8d15708679c5ece7
+    digest: sha256:f6ff987fdf875addc9fd8d620494fcde3003d8999638196ff68cffc656808315
 
 patches:
   - path: patch-serviceaccount.yaml

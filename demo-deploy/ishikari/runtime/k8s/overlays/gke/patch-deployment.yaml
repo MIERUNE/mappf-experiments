@@ -33,3 +33,5 @@ spec:
             # Bound aggregate GCS range-read concurrency across all archives.
             - name: ISKR_BACKEND_FETCH_CONCURRENCY
               value: "32"
+            - name: ISKR_BACKEND_FETCH_MAX_INFLIGHT
+              value: "128"

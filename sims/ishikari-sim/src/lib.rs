@@ -2,6 +2,7 @@
 
 mod churn;
 mod cluster;
+mod config;
 mod http_replay;
 mod latency;
 mod membership;
@@ -9,6 +10,7 @@ mod modeled;
 mod report;
 mod sweep;
 mod timed;
+mod topology;
 mod trace;
 mod visualization;
 mod workload;
@@ -17,7 +19,8 @@ pub use churn::{
     AppliedChurnEvent, ChurnConfig, ChurnPlan, ChurnReport, ChurnSample, run_churn_trace,
     run_modeled_churn_trace,
 };
-pub use cluster::{ClusterConfig, SimCluster};
+pub use cluster::SimCluster;
+pub use config::ClusterConfig;
 pub use http_replay::{
     HttpExecutionMode, HttpReplayConfig, HttpReplayReport, HttpReplayTarget, run_http_replay,
 };

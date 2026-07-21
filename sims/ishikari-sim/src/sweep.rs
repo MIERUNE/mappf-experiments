@@ -21,6 +21,7 @@ const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SweepSpec {
     schema_version: u32,
     trace: PathBuf,
@@ -41,6 +42,7 @@ struct SweepSpec {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SweepGrid {
     #[serde(default)]
     node_count: Vec<usize>,
@@ -338,7 +340,7 @@ fn resolve_path(base_dir: &Path, path: &Path) -> PathBuf {
 fn fingerprint_file(path: &Path) -> Result<FileFingerprint> {
     let mut file =
         File::open(path).with_context(|| format!("open {} for hashing", path.display()))?;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     let mut hash = FNV_OFFSET_BASIS;
     let mut bytes = 0_u64;
     loop {
@@ -469,6 +471,23 @@ mod tests {
                 .to_string()
                 .contains("exceeding max_runs=3")
         );
+    }
+
+    #[test]
+    fn rejects_unknown_spec_and_grid_fields() {
+        // A misspelled top-level field must fail parsing, not run a costly sweep
+        // with silent defaults.
+        let top_level: Result<SweepSpec, _> =
+            serde_json::from_str(r#"{"schema_version":1,"trace":"trace.jsonl","entry_seed":[1]}"#);
+        assert!(
+            top_level.is_err(),
+            "unknown top-level field must be rejected"
+        );
+
+        let grid_level: Result<SweepSpec, _> = serde_json::from_str(
+            r#"{"schema_version":1,"trace":"trace.jsonl","grid":{"nodecount":[2]}}"#,
+        );
+        assert!(grid_level.is_err(), "unknown grid field must be rejected");
     }
 
     #[test]

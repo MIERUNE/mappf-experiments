@@ -1,7 +1,9 @@
 [package]
 name = "biei-sim"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 publish = false
 
 [dependencies]
@@ -9,12 +11,16 @@ anyhow.workspace = true
 async-trait.workspace = true
 biei-core.workspace = true
 bytes.workspace = true
-chitchat.workspace = true
 clap.workspace = true
+mmpf-cluster = { workspace = true, features = ["simulation"] }
+mmpf-common.workspace = true
 rand.workspace = true
 rand_distr.workspace = true
 rand_xoshiro.workspace = true
 reqwest = { workspace = true, features = ["rustls", "http2", "gzip", "deflate", "stream"] }
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "test-util", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "net"] }

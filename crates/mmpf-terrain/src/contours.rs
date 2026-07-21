@@ -50,7 +50,7 @@ impl Fragment {
 
 /// Elevation intervals modeled after maplibre-contour's documented profile.
 /// The first value is the generated interval; later values classify major lines.
-pub fn levels_for_zoom(zoom: u8) -> &'static [i32] {
+fn levels_for_zoom(zoom: u8) -> &'static [i32] {
     // maplibre-contour-style [minor, major] profile; each entry applies at its
     // zoom and up to the next. Major (index/label) intervals stay values that
     // actually occur (500/200/100/50), unlike the old 2500 m at low zoom.

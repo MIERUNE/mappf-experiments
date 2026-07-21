@@ -7,7 +7,8 @@ use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
+pub use mmpf_http::request_id::RequestId;
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -23,43 +24,15 @@ pub type WorkerId = u32;
 pub type SourceHash = u64;
 pub type TaskId = u64;
 
-/// End-to-end request correlation ID. Public HTTP ingress accepts
-/// `X-Request-Id` and generates one when it is absent; internal forward keeps
-/// the same value so logs can be joined across hops without requiring OTel.
-#[derive(Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
-pub struct RequestId(String);
-
-impl RequestId {
-    pub fn new_random() -> Self {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let bytes: [u8; 16] = rand::random();
-        let mut out = String::with_capacity(bytes.len() * 2);
-        for byte in bytes {
-            out.push(HEX[(byte >> 4) as usize] as char);
-            out.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-        Self(out)
-    }
-
-    pub fn from_string(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Default for RequestId {
-    fn default() -> Self {
-        Self::new_random()
-    }
-}
-
-impl std::fmt::Display for RequestId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
+/// Deserialize an optional wire value while still requiring the field itself
+/// to be present. Serde otherwise treats a missing `Option<T>` as `None`, which
+/// would silently accept an older internal contract that never sent the field.
+pub(crate) fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 /// Cluster-wide node identity. Production should feed this from the chitchat
@@ -118,6 +91,16 @@ impl StyleId {
 
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
+    }
+
+    /// The authorization namespace: the first `/`-separated segment.
+    ///
+    /// Biei style ids are arbitrary-depth (`{namespace}/…/{id}`), so the coarsest
+    /// scope a future authorizer can grant is the leading segment; finer scopes
+    /// are longer prefixes of [`as_str`](Self::as_str). Returns the whole id when
+    /// it has no `/`. See `specs/auth-sketch.md` §8.3.
+    pub fn namespace(&self) -> &str {
+        self.0.split_once('/').map_or(self.0.as_str(), |(ns, _)| ns)
     }
 }
 
@@ -351,7 +334,7 @@ pub struct AddLayer {
     /// 64-bit value to be collision-free.
     pub hash: u64,
     /// Optional source definition carried by this addlayer.
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub source: Option<AddLayerSource>,
 }
 
@@ -363,10 +346,15 @@ pub struct LngLat {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PathOverlay {
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub stroke_width: Option<f32>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub stroke_color: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub stroke_opacity: Option<f32>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub fill_color: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub fill_opacity: Option<f32>,
     pub coordinates: Vec<LngLat>,
 }
@@ -391,10 +379,15 @@ pub enum PinSize {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PinOverlay {
     pub size: PinSize,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub label: Option<String>,
     pub color: String,
     pub coordinate: LngLat,
 }
+
+/// Maximum number of static overlays accepted by ingress and represented by
+/// the renderer's persistent overlay slot pool.
+pub const MAX_STATIC_OVERLAYS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StaticOverlay {
@@ -424,18 +417,17 @@ pub enum RenderRequest {
         /// `addlayer` is also present, the addlayer is placed in the same
         /// band, immediately below the overlays. `None` = the biei-added
         /// band sits on top of the entire base style.
-        #[serde(default)]
+        #[serde(deserialize_with = "deserialize_required_option")]
         before_layer: Option<String>,
         /// `padding={...}` URL query parameter: viewport insets applied to
         /// bounds-fitting positioning (`Bbox` and `Auto`). Ignored for
         /// `Center`. Default is zero padding on all sides.
-        #[serde(default)]
         padding: Padding,
         /// `addlayer={...}` URL query parameter: at most one request-local
         /// style layer injected by the caller. Sits below the overlay slot
         /// band; when `before_layer` is set, both addlayer and overlays go
         /// under the named base-style layer.
-        #[serde(default)]
+        #[serde(deserialize_with = "deserialize_required_option")]
         addlayer: Option<AddLayer>,
     },
 }
@@ -467,6 +459,36 @@ pub struct WorkerProfile {
     pub style: StyleRevision,
     pub render_mode: RenderMode,
     pub scale: Scale,
+}
+
+/// Runtime-independent task fields produced by an ingress adapter or workload
+/// generator. Starting the task applies the shared SLA/deadline policy.
+#[derive(Clone, Debug)]
+pub struct TaskSpec {
+    pub id: TaskId,
+    pub request_id: RequestId,
+    pub style: StyleRevision,
+    pub source: Option<SourceRef>,
+    pub request: RenderRequest,
+    pub pixel_ratio: PixelRatio,
+    pub output_format: ImageFormat,
+}
+
+impl TaskSpec {
+    pub fn start(self, arrived_at: Instant, budget: std::time::Duration) -> InternalTask {
+        InternalTask {
+            id: self.id,
+            request_id: self.request_id,
+            style: self.style,
+            source: self.source,
+            request: self.request,
+            pixel_ratio: self.pixel_ratio,
+            output_format: self.output_format,
+            arrived_at,
+            deadline: arrived_at + budget,
+            forwarding_hops: 0,
+        }
+    }
 }
 
 /// Process-local view of a task in flight. **Not wire-safe** — holds
@@ -519,10 +541,10 @@ pub type NodeKvs = BTreeMap<String, String>;
 
 /// Node-level admission state published alongside per-worker gossip.
 ///
-/// Absence is interpreted as `true` for rolling compatibility with nodes that
-/// predate this key. An explicit `false` means the node may still serve exact
+/// The key is required for render routing. Missing, malformed, and explicit
+/// `false` values all fail closed. A non-accepting node may still serve exact
 /// output-cache hits, but must not be selected for new native renders.
-pub(crate) const RENDER_ADMISSION_GOSSIP_KEY: &str = "renderer.accepting";
+pub const RENDER_ADMISSION_GOSSIP_KEY: &str = "renderer.accepting";
 
 /// Reconstructed worker info as the dispatcher sees it (decoded from gossip
 /// KVs).
@@ -573,10 +595,9 @@ impl NodeStateView {
             queue_depth: Option<usize>,
         }
         let mut by_worker: BTreeMap<WorkerId, Builder> = BTreeMap::new();
-        // Old nodes do not publish this key. Keep them routable during a
-        // rolling upgrade; once the key is present, fail closed on malformed
-        // values rather than feeding work to a node with ambiguous health.
-        let mut accepts_new_renders = true;
+        // Admission state is required. A partial gossip snapshot becomes
+        // routable only after the explicit current value arrives.
+        let mut accepts_new_renders = false;
         for (key, value) in kvs {
             let key = key.as_ref();
             let value = value.as_ref();
@@ -688,7 +709,7 @@ pub enum DeadlineStage {
     AcquireRenderPermit,
     StyleSwap,
     EnsureSource,
-    AcquireCpuPermit,
+    AcquireNativeRenderPermit,
     Render,
 }
 
@@ -710,10 +731,7 @@ pub enum TaskResult {
 /// Typed classification of a render failure, so the HTTP layer maps it to a
 /// status code by variant instead of matching on the error message string.
 ///
-/// `Default` is `Other`: the wire decodes frames from peers that predate this
-/// field via `#[serde(default)]`, and an unclassified failure maps to the
-/// generic 500 path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureKind {
     /// The render exceeded its deadline.
     RenderTimeout,
@@ -725,18 +743,50 @@ pub enum FailureKind {
     StyleNotReady,
     /// An addlayer/source fetch failed.
     SourceUnavailable,
+    /// The caller deadline elapsed during profile *preparation* (style/source
+    /// fetch), before any native render started. Kept distinct from
+    /// `RenderTimeout` so it never feeds the render-timeout censoring histogram
+    /// or is mistaken for a native-render timeout in calibration.
+    PreparationTimeout,
     /// Any other render failure.
-    #[default]
     Other,
 }
 
 impl FailureKind {
+    /// Every variant, for zero-initializing bounded metric series.
+    pub const ALL: [FailureKind; 7] = [
+        FailureKind::RenderTimeout,
+        FailureKind::RendererDead,
+        FailureKind::StyleUnavailable,
+        FailureKind::StyleNotReady,
+        FailureKind::SourceUnavailable,
+        FailureKind::PreparationTimeout,
+        FailureKind::Other,
+    ];
+
+    /// Stable, bounded-cardinality metric label for this failure kind.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            FailureKind::RenderTimeout => "render_timeout",
+            FailureKind::RendererDead => "renderer_dead",
+            FailureKind::StyleUnavailable => "style_unavailable",
+            FailureKind::StyleNotReady => "style_not_ready",
+            FailureKind::SourceUnavailable => "source_unavailable",
+            FailureKind::PreparationTimeout => "preparation_timeout",
+            FailureKind::Other => "other",
+        }
+    }
+
     /// Classifies a [`RendererError`] into a transport-stable [`FailureKind`].
     pub fn from_renderer_error(error: &RendererError) -> Self {
         match error {
             RendererError::Timeout => Self::RenderTimeout,
             RendererError::ActorDead => Self::RendererDead,
             RendererError::StyleLoadFailed { .. } => Self::StyleUnavailable,
+            // Setup failures are renderer-local, not a bad style document, so
+            // they classify as a generic failure and never negative-cache the
+            // revision (see `Node::process_local_task`).
+            RendererError::SetupFailed { .. } => Self::Other,
             RendererError::StyleNotReady { .. } => Self::StyleNotReady,
             RendererError::SourceFetchFailed { .. } => Self::SourceUnavailable,
             RendererError::RenderFailed(_) => Self::Other,
@@ -753,8 +803,8 @@ pub struct CompletedInfo {
     pub route_tier: RouteTier,
     pub started_at: Instant,
     /// Time spent holding the CPU/GPU-heavy render-stage permit.
-    pub cpu_started_at: Instant,
-    pub cpu_completed_at: Instant,
+    pub native_render_started_at: Instant,
+    pub native_render_completed_at: Instant,
     pub completed_at: Instant,
     pub style_swap: bool,
     pub cold_start: bool,
@@ -809,11 +859,131 @@ impl RenderObservation {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileContent {
+    Style(StyleId),
+    Source(SourceHash),
+}
+
+/// Failure while fetching or validating data before a task enters a renderer
+/// slot. This remains local to the preparation boundary and is converted to the
+/// existing wire-stable `FailureKind` or deadline rejection by `Node`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfilePreparationError {
+    StyleUnavailable {
+        style_id: StyleId,
+        source: String,
+    },
+    SourceUnavailable {
+        hash: SourceHash,
+        source: String,
+    },
+    CallerDeadlineExceeded,
+    InfrastructureFailure {
+        source: String,
+    },
+    InvalidPreparedContent {
+        content: ProfileContent,
+        source: String,
+    },
+}
+
+impl ProfilePreparationError {
+    pub fn style_unavailable(style_id: &StyleId, source: impl Into<String>) -> Self {
+        Self::StyleUnavailable {
+            style_id: style_id.clone(),
+            source: source.into(),
+        }
+    }
+
+    pub fn invalid_style(style_id: &StyleId, source: impl Into<String>) -> Self {
+        Self::InvalidPreparedContent {
+            content: ProfileContent::Style(style_id.clone()),
+            source: source.into(),
+        }
+    }
+
+    pub fn infrastructure(source: impl Into<String>) -> Self {
+        Self::InfrastructureFailure {
+            source: source.into(),
+        }
+    }
+
+    /// Re-label style-context errors produced by shared JSON helpers at the
+    /// addlayer boundary, while preserving caller deadlines and infrastructure
+    /// failures unchanged.
+    pub fn into_source(self, hash: SourceHash) -> Self {
+        match self {
+            Self::StyleUnavailable { source, .. } => Self::SourceUnavailable { hash, source },
+            Self::InvalidPreparedContent { source, .. } => Self::InvalidPreparedContent {
+                content: ProfileContent::Source(hash),
+                source,
+            },
+            other => other,
+        }
+    }
+
+    pub fn failure_kind(&self) -> FailureKind {
+        match self {
+            Self::StyleUnavailable { .. } => FailureKind::StyleUnavailable,
+            Self::SourceUnavailable { .. } => FailureKind::SourceUnavailable,
+            Self::CallerDeadlineExceeded => FailureKind::PreparationTimeout,
+            Self::InfrastructureFailure { .. } => FailureKind::Other,
+            Self::InvalidPreparedContent { content, .. } => match content {
+                ProfileContent::Style(_) => FailureKind::StyleUnavailable,
+                ProfileContent::Source(_) => FailureKind::SourceUnavailable,
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for ProfilePreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StyleUnavailable { style_id, source }
+            | Self::InvalidPreparedContent {
+                content: ProfileContent::Style(style_id),
+                source,
+            } => write!(f, "style load failed for {}: {source}", style_id.as_str()),
+            Self::SourceUnavailable { hash, source }
+            | Self::InvalidPreparedContent {
+                content: ProfileContent::Source(hash),
+                source,
+            } => write!(f, "source fetch failed for {hash}: {source}"),
+            Self::CallerDeadlineExceeded => write!(f, "profile preparation deadline exceeded"),
+            Self::InfrastructureFailure { source } => {
+                write!(f, "profile preparation infrastructure failure: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProfilePreparationError {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RendererError {
-    StyleLoadFailed { style_id: StyleId, source: String },
-    StyleNotReady { style_id: StyleId, version: u64 },
-    SourceFetchFailed { hash: SourceHash, source: String },
+    StyleLoadFailed {
+        style_id: StyleId,
+        source: String,
+    },
+    /// Renderer-state setup failed *after* a valid style document loaded — e.g.
+    /// overlay-slot installation collided, or a scale/slot-specific build step
+    /// failed. This is profile/renderer-local, NOT a property of the style
+    /// document, so it must not negative-cache the whole `StyleRevision` (a
+    /// static-only slot failure must not poison tile rendering for that style).
+    /// It still invalidates the worker's loaded state so the next render rebuilds.
+    SetupFailed {
+        style_id: StyleId,
+        source: String,
+    },
+    StyleNotReady {
+        style_id: StyleId,
+        version: u64,
+    },
+    SourceFetchFailed {
+        hash: SourceHash,
+        source: String,
+    },
     RenderFailed(String),
     Timeout,
     ActorDead,
@@ -824,6 +994,14 @@ impl std::fmt::Display for RendererError {
         match self {
             RendererError::StyleLoadFailed { style_id, source } => {
                 write!(f, "style load failed for {}: {}", style_id.as_str(), source)
+            }
+            RendererError::SetupFailed { style_id, source } => {
+                write!(
+                    f,
+                    "renderer setup failed for {}: {}",
+                    style_id.as_str(),
+                    source
+                )
             }
             RendererError::StyleNotReady { style_id, version } => {
                 write!(f, "style not ready for {}@{}", style_id.as_str(), version)
@@ -852,6 +1030,8 @@ pub struct RenderOutput {
 pub enum RejectionReason {
     QueueFull,
     NoCapacity,
+    /// A render was shed because local renderer admission was closed.
+    RendererDegraded,
     DrainTooSlow,
     UnknownStyle,
     HopLimitExceeded,
@@ -874,10 +1054,11 @@ pub enum ProcessError {
 }
 
 impl RejectionReason {
-    pub fn is_retryable_at_forward(self) -> bool {
+    pub(crate) fn is_retryable_at_forward(self) -> bool {
         match self {
             RejectionReason::QueueFull
             | RejectionReason::NoCapacity
+            | RejectionReason::RendererDegraded
             | RejectionReason::DrainTooSlow => true,
             RejectionReason::UnknownStyle
             | RejectionReason::HopLimitExceeded
@@ -946,6 +1127,71 @@ pub fn encode_worker_kvs(
 mod tests {
     use super::*;
 
+    #[test]
+    fn setup_failure_does_not_classify_as_style_unavailable() {
+        let style_id = StyleId("carto/voyager".to_string());
+        // A document-load failure is `StyleUnavailable` — it negative-caches the
+        // revision (see `Node::process_local_task`).
+        assert_eq!(
+            FailureKind::from_renderer_error(&RendererError::StyleLoadFailed {
+                style_id: style_id.clone(),
+                source: "bad style json".to_string(),
+            }),
+            FailureKind::StyleUnavailable,
+        );
+        // A renderer-setup failure (e.g. overlay-slot collision) is renderer-local
+        // and must NOT be `StyleUnavailable`, so it cannot poison the revision for
+        // tile or other-profile rendering.
+        assert_eq!(
+            FailureKind::from_renderer_error(&RendererError::SetupFailed {
+                style_id,
+                source: "overlay slot collision".to_string(),
+            }),
+            FailureKind::Other,
+        );
+    }
+
+    #[test]
+    fn style_id_namespace_is_the_leading_segment() {
+        assert_eq!(
+            StyleId("analysis/hrnowc/sample".to_string()).namespace(),
+            "analysis"
+        );
+        assert_eq!(
+            StyleId("carto/gl/voyager-gl-style".to_string()).namespace(),
+            "carto"
+        );
+        // A flat id (no `/`) is its own namespace.
+        assert_eq!(StyleId("voyager".to_string()).namespace(), "voyager");
+    }
+
+    #[test]
+    fn preparation_errors_have_bounded_terminal_classifications() {
+        let style_id = StyleId("style".to_string());
+        assert_eq!(
+            ProfilePreparationError::CallerDeadlineExceeded.failure_kind(),
+            FailureKind::PreparationTimeout,
+        );
+        assert_eq!(
+            ProfilePreparationError::style_unavailable(&style_id, "provider 503").failure_kind(),
+            FailureKind::StyleUnavailable,
+        );
+        assert_eq!(
+            ProfilePreparationError::invalid_style(&style_id, "invalid JSON")
+                .into_source(1)
+                .failure_kind(),
+            FailureKind::SourceUnavailable,
+        );
+        assert_eq!(
+            ProfilePreparationError::infrastructure("semaphore closed").failure_kind(),
+            FailureKind::Other,
+        );
+        assert_eq!(
+            FailureKind::from_renderer_error(&RendererError::Timeout),
+            FailureKind::RenderTimeout,
+        );
+    }
+
     fn kvs<const N: usize>(pairs: [(&str, &str); N]) -> NodeKvs {
         pairs
             .into_iter()
@@ -969,6 +1215,31 @@ mod tests {
     }
 
     #[test]
+    fn task_spec_applies_budget_and_initial_hop_state() {
+        let arrived_at = Instant::now();
+        let budget = std::time::Duration::from_secs(7);
+        let task = TaskSpec {
+            id: 42,
+            request_id: RequestId::from_string("task-spec-test"),
+            style: rev("style", 3),
+            source: None,
+            request: RenderRequest::Tile {
+                z: 1,
+                x: 0,
+                y: 1,
+                tile_size: 512,
+            },
+            pixel_ratio: PixelRatio::from(Scale::X2),
+            output_format: ImageFormat::Png,
+        }
+        .start(arrived_at, budget);
+
+        assert_eq!(task.arrived_at, arrived_at);
+        assert_eq!(task.deadline, arrived_at + budget);
+        assert_eq!(task.forwarding_hops, 0);
+    }
+
+    #[test]
     fn from_kvs_includes_workers_with_complete_profile_keys() {
         let m = kvs([
             ("worker.0.style", "style-3@0"),
@@ -988,15 +1259,12 @@ mod tests {
     }
 
     #[test]
-    fn from_kvs_defaults_old_nodes_to_renderable_but_honors_explicit_degradation() {
-        let old = NodeStateView::from_kvs(
+    fn from_kvs_requires_explicit_render_admission() {
+        let missing = NodeStateView::from_kvs(
             NodeId::from_index(0),
             kvs([("worker.0.style", ""), ("worker.0.queue", "0")]),
         );
-        assert!(
-            old.accepts_new_renders,
-            "missing node-level state stays compatible during a rolling upgrade"
-        );
+        assert!(!missing.accepts_new_renders);
 
         let degraded = NodeStateView::from_kvs(
             NodeId::from_index(0),
@@ -1048,6 +1316,7 @@ mod tests {
     #[test]
     fn from_kvs_decodes_many_workers_independently() {
         let m = kvs([
+            (RENDER_ADMISSION_GOSSIP_KEY, "true"),
             ("worker.0.style", "style-1@0"),
             ("worker.0.mode", "static"),
             ("worker.0.scale", "2x"),
@@ -1097,6 +1366,7 @@ mod tests {
     #[test]
     fn has_capacity_against_bl_limit() {
         let m = kvs([
+            (RENDER_ADMISSION_GOSSIP_KEY, "true"),
             ("worker.0.style", "style-1@0"),
             ("worker.0.mode", "tile"),
             ("worker.0.scale", "2x"),

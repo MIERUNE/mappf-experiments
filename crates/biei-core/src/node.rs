@@ -1,37 +1,40 @@
 //! `Node` — request/response entry point composing dispatcher + worker pool +
 //! gossip publisher.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::Instrument;
 
-use crate::activity::ProfileActivityTracker;
-use crate::config::{CostConfig, GossipConfig, RoutingConfig};
+use crate::config::ResolvedNodeConfig;
 use crate::dispatcher::{Dispatcher, DispatcherSpawn};
 use crate::gossip::GossipBus;
+use crate::internal_transport::{ForwardError, InternalTransport};
 use crate::metrics::NodeMetrics;
 use crate::render_cache::{
     RenderCacheLookup, RenderFlightLeader, RenderOutputCache, cache_hit_outcome,
 };
 use crate::renderer::{BoxRenderer, PreparedProfile, ProfilePreparer};
 use crate::style_catalog::StyleCatalog;
-use crate::transport::{ForwardError, Transport};
 use crate::types::{
-    ClusterView, Decision, InternalTask, NodeId, ProcessError, RENDER_ADMISSION_GOSSIP_KEY,
-    RejectionReason, RequestId, RouteTier, TaskOutcome, TaskResult, WorkerId, WorkerView,
+    Decision, InternalTask, NodeId, NodeStateView, ProcessError, ProfilePreparationError,
+    RENDER_ADMISSION_GOSSIP_KEY, RejectionReason, RequestId, RouteTier, TaskOutcome, TaskResult,
+    WorkerId, WorkerView,
 };
-use crate::util::lock_unpoisoned;
 use crate::wire::ForwardRequest;
+pub use crate::worker_pool::WorkerShutdown;
 use crate::worker_pool::{PoolSnapshotter, WorkerPool, WorkerPoolSpawn};
+
+mod view_cache;
+
+use view_cache::{ClusterViewCache, cluster_view_cache_ttl};
+#[cfg(test)]
+use view_cache::{MAX_TTL as MAX_CLUSTER_VIEW_CACHE_TTL, MIN_TTL as MIN_CLUSTER_VIEW_CACHE_TTL};
 
 const MIN_FORWARD_BUDGET_MS: u64 = 200;
 const MAX_FORWARDING_HOPS: u8 = 1;
-const MAX_CLUSTER_VIEW_CACHE_TTL: Duration = Duration::from_millis(100);
-const MIN_CLUSTER_VIEW_CACHE_TTL: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Copy)]
 enum CacheMissAdmission {
@@ -63,163 +66,17 @@ struct NodeInner {
     style_catalog: Arc<StyleCatalog>,
     gossip: Arc<dyn GossipBus>,
     view_cache: ClusterViewCache,
-    transport: Arc<dyn Transport>,
+    transport: Arc<dyn InternalTransport>,
     hop_latency: Duration,
     metrics: Arc<NodeMetrics>,
     render_output_cache: RenderOutputCache,
     profile_preparer: Arc<dyn ProfilePreparer>,
     snapshotter: PoolSnapshotter,
     publisher: JoinHandle<()>,
-    /// Render-admission probe (production wires it to the supervisor's
-    /// `can_start_render()`); unset means always-admit for the sim/tests.
-    render_admission: Arc<OnceLock<Arc<dyn Fn() -> bool + Send + Sync>>>,
-}
-
-struct ClusterViewCache {
-    ttl: Duration,
-    state: Mutex<ClusterViewCacheState>,
-    changed: watch::Sender<u64>,
-}
-
-#[derive(Default)]
-struct ClusterViewCacheState {
-    cached: Option<CachedClusterView>,
-    loading: bool,
-}
-
-struct CachedClusterView {
-    expires_at: Instant,
-    view: Arc<ClusterView>,
-}
-
-impl ClusterViewCache {
-    fn new(ttl: Duration) -> Self {
-        let (changed, _) = watch::channel(0);
-        Self {
-            ttl,
-            state: Mutex::new(ClusterViewCacheState::default()),
-            changed,
-        }
-    }
-
-    async fn get_or_load(
-        &self,
-        gossip: &dyn GossipBus,
-        deadline: Instant,
-    ) -> Option<Arc<ClusterView>> {
-        loop {
-            if Instant::now() >= deadline {
-                return None;
-            }
-            // Avoid constructing a watch receiver on the normal fresh-cache
-            // path. The second check below closes the completion race before
-            // a caller can wait.
-            if let Some(view) = {
-                let state = lock_unpoisoned(&self.state);
-                usable_cached_view(&state, self.ttl)
-            } {
-                return Some(view);
-            }
-
-            let mut changed = self.changed.subscribe();
-            let should_load = {
-                let mut state = lock_unpoisoned(&self.state);
-                if let Some(view) = usable_cached_view(&state, self.ttl) {
-                    return Some(view);
-                }
-                if state.loading {
-                    false
-                } else {
-                    state.loading = true;
-                    true
-                }
-            };
-
-            if should_load {
-                let load = ClusterViewLoad::new(self);
-                let view = match tokio::time::timeout_at(deadline, gossip.view()).await {
-                    Ok(view) => Arc::new(view),
-                    Err(_) => {
-                        drop(load);
-                        return None;
-                    }
-                };
-                load.complete(Arc::clone(&view));
-                return Some(view);
-            }
-
-            // `watch` remembers changes that happen after subscribe but
-            // before this await, avoiding a lost wakeup on the initial load.
-            if tokio::time::timeout_at(deadline, changed.changed())
-                .await
-                .is_err()
-            {
-                return None;
-            }
-        }
-    }
-}
-
-fn usable_cached_view(
-    state: &ClusterViewCacheState,
-    stale_grace: Duration,
-) -> Option<Arc<ClusterView>> {
-    let cached = state.cached.as_ref()?;
-    // A bounded stale snapshot is preferable to making a request wait behind
-    // the single refresh already in progress.
-    let now = Instant::now();
-    let bounded_stale = state.loading
-        && cached
-            .expires_at
-            .checked_add(stale_grace)
-            .is_some_and(|stale_until| stale_until > now);
-    (cached.expires_at > now || bounded_stale).then(|| Arc::clone(&cached.view))
-}
-
-struct ClusterViewLoad<'a> {
-    cache: &'a ClusterViewCache,
-    complete: bool,
-}
-
-impl<'a> ClusterViewLoad<'a> {
-    fn new(cache: &'a ClusterViewCache) -> Self {
-        Self {
-            cache,
-            complete: false,
-        }
-    }
-
-    fn complete(mut self, view: Arc<ClusterView>) {
-        let mut state = lock_unpoisoned(&self.cache.state);
-        state.cached = Some(CachedClusterView {
-            expires_at: Instant::now() + self.cache.ttl,
-            view,
-        });
-        state.loading = false;
-        self.complete = true;
-        drop(state);
-        self.cache.changed.send_modify(|version| {
-            *version = version.wrapping_add(1);
-        });
-    }
-}
-
-impl Drop for ClusterViewLoad<'_> {
-    fn drop(&mut self) {
-        if self.complete {
-            return;
-        }
-        lock_unpoisoned(&self.cache.state).loading = false;
-        self.cache.changed.send_modify(|version| {
-            *version = version.wrapping_add(1);
-        });
-    }
-}
-
-fn cluster_view_cache_ttl(publish_interval: Duration) -> Duration {
-    publish_interval
-        .min(MAX_CLUSTER_VIEW_CACHE_TTL)
-        .max(MIN_CLUSTER_VIEW_CACHE_TTL)
+    render_admission: RenderAdmission,
+    /// Set once by `shutdown`. Closes new local render admission so the pool can
+    /// drain and join without racing freshly admitted work.
+    draining: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for NodeInner {
@@ -233,19 +90,46 @@ pub struct NodeSpawn {
     pub renderers: Vec<BoxRenderer>,
     pub profile_preparer: Arc<dyn ProfilePreparer>,
     pub gossip: Arc<dyn GossipBus>,
-    pub transport: Arc<dyn Transport>,
+    pub transport: Arc<dyn InternalTransport>,
     pub style_catalog: Arc<StyleCatalog>,
-    pub activity: Arc<ProfileActivityTracker>,
-    pub routing: RoutingConfig,
-    pub costs: CostConfig,
-    pub gossip_cfg: GossipConfig,
-    pub bl_capacity: usize,
-    pub queue_capacity: usize,
-    pub render_permits: usize,
-    pub cpu_render_permits: usize,
-    pub source_cache_capacity: usize,
-    pub render_output_cache_capacity_bytes: u64,
-    pub dispatcher_seed: u64,
+    pub config: ResolvedNodeConfig,
+    pub dispatcher_entropy: DispatcherEntropy,
+    /// Decides whether this node may start new native render work. Cache hits
+    /// remain available while this returns false.
+    pub render_admission: RenderAdmission,
+}
+
+pub type RenderAdmission = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Node-scoped policy for the pseudo-random choices made by the dispatcher.
+///
+/// Production callers provide no raw seed: the stable node identity separates
+/// otherwise-correlated local task sequences. Simulations add a reproducible
+/// run seed while retaining the same per-node separation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DispatcherEntropy {
+    Production,
+    Deterministic { run_seed: u64 },
+}
+
+impl DispatcherEntropy {
+    fn resolve(self, node_id: &NodeId) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        const PRODUCTION_DOMAIN: u64 = 0x53b8_5adf_17b6_83e9;
+        const DETERMINISTIC_DOMAIN: u64 = 0x9a68_16cb_6fc2_7d31;
+
+        let node_hash = node_id.as_bytes().iter().fold(FNV_OFFSET, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+        });
+        let policy = match self {
+            Self::Production => PRODUCTION_DOMAIN,
+            Self::Deterministic { run_seed } => {
+                DETERMINISTIC_DOMAIN ^ mmpf_common::rng::splitmix64_finalize(run_seed)
+            }
+        };
+        mmpf_common::rng::splitmix64_finalize(node_hash ^ policy)
+    }
 }
 
 impl Node {
@@ -257,56 +141,53 @@ impl Node {
             gossip,
             transport,
             style_catalog,
-            activity,
+            config,
+            dispatcher_entropy,
+            render_admission,
+        } = spec;
+        let ResolvedNodeConfig {
             routing,
             costs,
-            gossip_cfg,
-            bl_capacity,
-            queue_capacity,
+            gossip: gossip_config,
+            queue_limits,
             render_permits,
-            cpu_render_permits,
+            native_render_permits,
             source_cache_capacity,
             render_output_cache_capacity_bytes,
-            dispatcher_seed,
-        } = spec;
+        } = config;
         let hop_latency = costs.hop_latency;
 
         let pool = WorkerPool::spawn(WorkerPoolSpawn {
             node_id: id.clone(),
             renderers,
-            activity: activity.clone(),
-            bl_capacity,
-            queue_capacity,
+            bl_capacity: queue_limits.soft,
+            queue_capacity: queue_limits.hard,
             render_permits,
-            cpu_render_permits,
+            native_render_permits,
             source_cache_capacity,
         });
         let metrics = Arc::new(NodeMetrics::default());
         let render_output_cache = RenderOutputCache::new(render_output_cache_capacity_bytes);
         let snapshotter = pool.snapshotter();
-        let render_admission: Arc<OnceLock<Arc<dyn Fn() -> bool + Send + Sync>>> =
-            Arc::new(OnceLock::new());
         let dispatcher = Dispatcher::new(DispatcherSpawn {
             node_id: id.clone(),
             config: routing,
             costs,
-            bl_capacity,
-            queue_capacity,
-            activity,
-            seed: dispatcher_seed,
+            bl_capacity: queue_limits.soft,
+            queue_capacity: queue_limits.hard,
+            resolved_seed: dispatcher_entropy.resolve(&id),
         });
 
         let publisher = {
             let snap = snapshotter.clone();
             let gossip = gossip.clone();
-            let interval = gossip_cfg.publish_interval;
-            let publisher_node_id = id.clone();
+            let interval = gossip_config.publish_interval;
             let render_admission = Arc::clone(&render_admission);
             tokio::spawn(async move {
                 let mut last_sent = crate::types::NodeKvs::new();
                 loop {
                     let mut kvs = snap.snapshot_kvs();
-                    let accepts_new_renders = render_admission.get().is_none_or(|probe| probe());
+                    let accepts_new_renders = render_admission();
                     kvs.insert(
                         RENDER_ADMISSION_GOSSIP_KEY.to_string(),
                         accepts_new_renders.to_string(),
@@ -317,7 +198,7 @@ impl Node {
                         .map(|(key, value)| (key.clone(), value.clone()))
                         .collect();
                     if !changed.is_empty() {
-                        gossip.set_many(publisher_node_id.clone(), changed).await;
+                        gossip.set_many(changed).await;
                     }
                     last_sent = kvs;
                     tokio::time::sleep(interval).await;
@@ -333,7 +214,7 @@ impl Node {
                 style_catalog,
                 gossip,
                 view_cache: ClusterViewCache::new(cluster_view_cache_ttl(
-                    gossip_cfg.publish_interval,
+                    gossip_config.publish_interval,
                 )),
                 transport,
                 hop_latency,
@@ -343,30 +224,53 @@ impl Node {
                 snapshotter,
                 publisher,
                 render_admission,
+                draining: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
 
-    /// Install the render-admission probe (wired once at startup). Gates
-    /// renders, not cache hits: a degraded node still serves hits and joins
-    /// in-flight single-flights, shedding only new native work.
-    pub fn set_render_admission_probe(&self, probe: Arc<dyn Fn() -> bool + Send + Sync>) {
-        let _ = self.inner.render_admission.set(probe);
-    }
-
     fn can_start_render(&self) -> bool {
-        self.inner
-            .render_admission
-            .get()
-            .is_none_or(|probe| probe())
+        !self
+            .inner
+            .draining
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && (self.inner.render_admission)()
     }
 
-    /// Shed a would-be render on a degraded renderer. Uses `NoCapacity` (a
-    /// wire-safe, forward-retryable reason); the public ingress relabels it to
-    /// `renderer_degraded`. Counts the distinct cause here at the shed moment.
-    fn renderer_degraded_reject(&self, task: &InternalTask) -> TaskOutcome {
+    /// Gracefully stop this node within `deadline`.
+    ///
+    /// Closes new local render admission, stops gossip publishing, then asks each
+    /// worker to drain its queued (non-preemptible) renders and exit, joining
+    /// them within the bound. The returned [`WorkerShutdown`] distinguishes a
+    /// clean shutdown from a forced one: a render still running at `deadline` is
+    /// detached (never aborted), so admitted native work is never cancelled.
+    /// Idempotent enough for repeated calls — later calls find workers already
+    /// joined.
+    pub async fn shutdown(&self, deadline: Instant) -> WorkerShutdown {
+        self.inner
+            .draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.publisher.abort();
+        self.inner.pool.shutdown(deadline).await
+    }
+
+    fn local_dispatch_state(&self) -> NodeStateView {
+        NodeStateView {
+            id: self.inner.id.clone(),
+            accepts_new_renders: self.can_start_render(),
+            workers: self.inner.snapshotter.snapshot_workers(),
+        }
+    }
+
+    fn renderer_degraded_reason(&self) -> RejectionReason {
         self.inner.metrics.record_render_admission_shed();
-        TaskMeta::of(task).reject(RejectionReason::NoCapacity)
+        RejectionReason::RendererDegraded
+    }
+
+    /// Shed a would-be render on a degraded renderer. Preserve the typed,
+    /// forward-retryable cause at this decision point and count it here.
+    fn renderer_degraded_reject(&self, task: &InternalTask) -> TaskOutcome {
+        TaskMeta::of(task).reject(self.renderer_degraded_reason())
     }
 
     pub fn id(&self) -> NodeId {
@@ -381,8 +285,8 @@ impl Node {
         self.inner.metrics.clone()
     }
 
-    pub fn cpu_permits_inuse(&self) -> usize {
-        self.inner.pool.cpu_permits_inuse()
+    pub fn native_render_permits_inuse(&self) -> usize {
+        self.inner.pool.native_render_permits_inuse()
     }
 
     /// Tasks currently executing locally on this node's workers (render permit
@@ -435,7 +339,13 @@ impl Node {
         if Instant::now() >= task.deadline {
             return self.record_ingress_outcome(meta.reject(RejectionReason::DeadlineExceeded));
         }
-        let outcome = match self.inner.dispatcher.decide(&task, &view) {
+        let local_state = self.local_dispatch_state();
+        let local_renderer_available = local_state.accepts_new_renders;
+        let outcome = match self
+            .inner
+            .dispatcher
+            .decide_with_local_state(&task, &view, local_state)
+        {
             Decision::Local {
                 route_tier,
                 worker_hint,
@@ -467,6 +377,11 @@ impl Node {
                     .await
             }
             Decision::Reject { reason } => {
+                let reason = if reason == RejectionReason::NoCapacity && !local_renderer_available {
+                    self.renderer_degraded_reason()
+                } else {
+                    reason
+                };
                 tracing::debug!(
                     task_id = meta.task_id,
                     style_id = %task.style.id.as_str(),
@@ -536,10 +451,7 @@ impl Node {
         let prepared_profile = match self.prepare_local_profile(&task).await {
             Ok(prepared) => prepared,
             Err(err) => {
-                return self.record_forwarded_outcome(meta.fail(
-                    err.to_string(),
-                    crate::types::FailureKind::from_renderer_error(&err),
-                ));
+                return self.record_forwarded_outcome(meta.preparation_error_outcome(err));
             }
         };
         let outcome = match self
@@ -547,6 +459,7 @@ impl Node {
             .await
         {
             Ok(o) => o,
+            Err(ProcessError::RenderAdmissionClosed(task)) => self.renderer_degraded_reject(&task),
             Err(err) => meta.process_error_outcome(err),
         };
         self.maybe_insert_render_output_cache(cache_flight.as_ref(), &outcome);
@@ -559,8 +472,9 @@ impl Node {
         miss_admission: CacheMissAdmission,
     ) -> Result<Option<RenderFlightLeader>, TaskOutcome> {
         let mut joined_existing_render = false;
+        let mut lookup = self.inner.render_output_cache.lookup_or_join(task);
         loop {
-            match self.inner.render_output_cache.lookup_or_join(task) {
+            match lookup {
                 RenderCacheLookup::Disabled => {
                     // No cache: a forwarded miss must render locally, so health
                     // gates it here (a public miss can still forward to a peer).
@@ -590,21 +504,22 @@ impl Node {
                     self.inner.metrics.record_render_output_cache_miss();
                     return Ok(Some(leader));
                 }
-                RenderCacheLookup::Wait(mut changed) => {
+                RenderCacheLookup::Wait(mut follower) => {
                     if !joined_existing_render {
                         self.inner.metrics.record_render_output_cache_coalesced();
                         joined_existing_render = true;
                     }
                     tokio::select! {
-                        result = changed.changed() => {
+                        _ = follower.changed() => {
                             // A leader may complete without a cacheable result.
-                            // Re-check both the cache and flight election state.
-                            let _ = result;
+                            // Re-check both the cache and flight election state
+                            // with the canonical key retained by the follower.
                         }
                         _ = tokio::time::sleep_until(task.deadline) => {
                             return Err(TaskMeta::of(task).reject(RejectionReason::DeadlineExceeded));
                         }
                     }
+                    lookup = follower.recheck();
                 }
             }
         }
@@ -613,7 +528,7 @@ impl Node {
     async fn prepare_local_profile(
         &self,
         task: &InternalTask,
-    ) -> Result<Option<PreparedProfile>, crate::types::RendererError> {
+    ) -> Result<Option<PreparedProfile>, ProfilePreparationError> {
         let started_at = Instant::now();
         let result = self.inner.profile_preparer.prepare_profile(task).await;
         self.inner
@@ -649,14 +564,8 @@ impl Node {
 
         let prepared_profile = match self.prepare_local_profile(&task).await {
             Ok(prepared) => prepared,
-            Err(err) => {
-                return meta.fail(
-                    err.to_string(),
-                    crate::types::FailureKind::from_renderer_error(&err),
-                );
-            }
+            Err(err) => return meta.preparation_error_outcome(err),
         };
-        let fallback_task = (!fallback_candidates.is_empty()).then(|| task.clone());
         match self
             .process_local_task(task, prepared_profile, route_tier, worker_hint)
             .await
@@ -670,19 +579,19 @@ impl Node {
                 self.forward_with_failover(*task, route_tier, fallback_candidates)
                     .await
             }
-            Err(err) if fallback_task.is_some() => {
+            Err(ProcessError::QueueFull(task)) if !fallback_candidates.is_empty() => {
                 tracing::debug!(
                     task_id = meta.task_id,
-                    error = ?err,
-                    "local admission failed; trying remaining HRW candidates"
+                    "local queue filled after dispatch; trying remaining HRW candidates"
                 );
-                self.forward_with_failover(
-                    fallback_task.expect("checked above"),
-                    route_tier,
-                    fallback_candidates,
-                )
-                .await
+                self.forward_with_failover(*task, route_tier, fallback_candidates)
+                    .await
             }
+            Err(ProcessError::RenderAdmissionClosed(task)) => self.renderer_degraded_reject(&task),
+            // Once a worker accepted the command, a disconnected response
+            // channel cannot tell us whether native execution started or even
+            // completed. Retrying remotely could duplicate non-cancellable work.
+            Err(err @ ProcessError::QueueDisconnected) => meta.process_error_outcome(err),
             Err(err) => meta.process_error_outcome(err),
         }
     }
@@ -880,12 +789,7 @@ impl Node {
             );
             let prepared_profile = match self.prepare_local_profile(&forwarded_task).await {
                 Ok(prepared) => prepared,
-                Err(err) => {
-                    return meta.fail(
-                        err.to_string(),
-                        crate::types::FailureKind::from_renderer_error(&err),
-                    );
-                }
+                Err(err) => return meta.preparation_error_outcome(err),
             };
             match self
                 .process_local_task(
@@ -977,10 +881,17 @@ impl TaskMeta {
         })
     }
 
+    fn preparation_error_outcome(&self, err: ProfilePreparationError) -> TaskOutcome {
+        let kind = err.failure_kind();
+        self.fail(err.to_string(), kind)
+    }
+
     fn process_error_outcome(&self, err: ProcessError) -> TaskOutcome {
         match err {
             ProcessError::QueueFull(_) => self.reject(RejectionReason::QueueFull),
-            ProcessError::RenderAdmissionClosed(_) => self.reject(RejectionReason::NoCapacity),
+            ProcessError::RenderAdmissionClosed(_) => {
+                self.reject(RejectionReason::RendererDegraded)
+            }
             ProcessError::QueueDisconnected => self.fail(
                 "worker queue disconnected",
                 crate::types::FailureKind::Other,
@@ -992,22 +903,27 @@ impl TaskMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        CostConfig, CostRange, GossipConfig, QueueLimits, RoutingConfig, Tier1Strategy,
+    };
     use crate::renderer::{NoopProfilePreparer, PreparedProfile, ProfilePreparer};
+    use mmpf_common::sync::{lock_unpoisoned, wait_for_change};
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::ops::ControlFlow;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use async_trait::async_trait;
     use tokio::sync::Notify;
     use tokio::time::Instant;
 
-    use crate::config::{CostRange, Tier1Strategy};
     use crate::renderer::{BoxRenderer, Renderer, RendererOutput};
     use crate::types::{
-        ClusterView, ImageFormat, InternalTask, NodeStateView, PixelRatio, RenderOutput,
-        RenderRequest, RendererError, Scale, SourceHash, StyleId, StyleRevision, TaskId, WorkerId,
-        WorkerView,
+        AddLayer, AddLayerSource, CachePolicy, ClusterView, FailureKind, ForwardCandidate,
+        ImageFormat, InternalTask, LngLat, NodeStateView, Padding, PinOverlay, PixelRatio,
+        Positioning, RenderOutput, RenderRequest, RendererError, Scale, SourceHash, SourceRef,
+        StaticOverlay, StyleId, StyleRevision, TaskId, WorkerId, WorkerView,
     };
     use crate::wire::{ForwardResponse, OutcomeHeader, OutcomeResult, WireTask};
 
@@ -1015,7 +931,7 @@ mod tests {
 
     #[async_trait]
     impl GossipBus for NoopGossip {
-        async fn set(&self, _node_id: NodeId, _key: String, _value: String) {}
+        async fn set(&self, _key: String, _value: String) {}
 
         async fn view(&self) -> ClusterView {
             ClusterView {
@@ -1034,12 +950,12 @@ mod tests {
 
     #[async_trait]
     impl GossipBus for CapturingGossip {
-        async fn set(&self, _node_id: NodeId, key: String, value: String) {
+        async fn set(&self, key: String, value: String) {
             lock_unpoisoned(&self.kvs).insert(key, value);
             self.changed.notify_waiters();
         }
 
-        async fn set_many(&self, _node_id: NodeId, kvs: crate::types::NodeKvs) {
+        async fn set_many(&self, kvs: crate::types::NodeKvs) {
             lock_unpoisoned(&self.kvs).extend(kvs);
             self.changed.notify_waiters();
         }
@@ -1061,7 +977,7 @@ mod tests {
 
     #[async_trait]
     impl GossipBus for CountingViewGossip {
-        async fn set(&self, _node_id: NodeId, _key: String, _value: String) {}
+        async fn set(&self, _key: String, _value: String) {}
 
         async fn view(&self) -> ClusterView {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -1073,7 +989,7 @@ mod tests {
     struct NoopTransport;
 
     #[async_trait]
-    impl Transport for NoopTransport {
+    impl InternalTransport for NoopTransport {
         async fn send(
             &self,
             _target: NodeId,
@@ -1088,12 +1004,17 @@ mod tests {
         sends: Arc<AtomicUsize>,
     }
 
+    struct RecordingTransport {
+        expected_target: NodeId,
+        requests: Arc<Mutex<Vec<ForwardRequest>>>,
+    }
+
     struct HangingTransport {
         started: Arc<Notify>,
     }
 
     #[async_trait]
-    impl Transport for HangingTransport {
+    impl InternalTransport for HangingTransport {
         async fn send(
             &self,
             _target: NodeId,
@@ -1104,8 +1025,40 @@ mod tests {
         }
     }
 
+    fn completed_forward_response(target: NodeId, fwd: &ForwardRequest) -> ForwardResponse {
+        let format = fwd.task.output_format;
+        let had_source = fwd.task.source.is_some() || fwd.task.request.has_addlayer_source();
+        ForwardResponse {
+            outcome: OutcomeHeader {
+                task_id: fwd.task.id,
+                request_id: fwd.task.request_id.clone(),
+                style_id: fwd.task.style.id.clone(),
+                had_source,
+                image_format: Some(format),
+                result: OutcomeResult::Completed {
+                    node_id: target,
+                    worker_id: Some(0),
+                    route_tier: fwd.route_tier,
+                    render_started_ms: 0,
+                    native_render_started_ms: 0,
+                    native_render_completed_ms: 0,
+                    completed_ms: 0,
+                    style_swap: false,
+                    cold_start: false,
+                    source_loaded: false,
+                    admitted_at_overflow: false,
+                    render_observation: None,
+                },
+            },
+            output: Some(RenderOutput {
+                bytes: vec![42].into(),
+                format,
+            }),
+        }
+    }
+
     #[async_trait]
-    impl Transport for CompletingTransport {
+    impl InternalTransport for CompletingTransport {
         async fn send(
             &self,
             target: NodeId,
@@ -1113,35 +1066,21 @@ mod tests {
         ) -> Result<ForwardResponse, ForwardError> {
             assert_eq!(target, self.expected_target);
             self.sends.fetch_add(1, Ordering::SeqCst);
-            let format = fwd.task.output_format;
-            let had_source = fwd.task.source.is_some() || fwd.task.request.has_addlayer_source();
-            Ok(ForwardResponse {
-                outcome: OutcomeHeader {
-                    task_id: fwd.task.id,
-                    request_id: fwd.task.request_id,
-                    style_id: fwd.task.style.id,
-                    had_source,
-                    image_format: Some(format),
-                    result: OutcomeResult::Completed {
-                        node_id: target,
-                        worker_id: Some(0),
-                        route_tier: fwd.route_tier,
-                        render_started_ms: 0,
-                        cpu_started_ms: 0,
-                        cpu_completed_ms: 0,
-                        completed_ms: 0,
-                        style_swap: false,
-                        cold_start: false,
-                        source_loaded: false,
-                        admitted_at_overflow: false,
-                        render_observation: None,
-                    },
-                },
-                output: Some(RenderOutput {
-                    bytes: vec![42].into(),
-                    format,
-                }),
-            })
+            Ok(completed_forward_response(target, &fwd))
+        }
+    }
+
+    #[async_trait]
+    impl InternalTransport for RecordingTransport {
+        async fn send(
+            &self,
+            target: NodeId,
+            fwd: ForwardRequest,
+        ) -> Result<ForwardResponse, ForwardError> {
+            assert_eq!(target, self.expected_target);
+            let response = completed_forward_response(target, &fwd);
+            lock_unpoisoned(&self.requests).push(fwd);
+            Ok(response)
         }
     }
 
@@ -1277,24 +1216,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dispatcher_entropy_is_node_scoped_and_simulation_reproducible() {
+        let node_a = NodeId::from("node-a");
+        let node_b = NodeId::from("node-b");
+
+        let production_a = DispatcherEntropy::Production.resolve(&node_a);
+        let production_b = DispatcherEntropy::Production.resolve(&node_b);
+        assert_ne!(production_a, production_b);
+
+        let deterministic = DispatcherEntropy::Deterministic { run_seed: 42 };
+        assert_eq!(
+            deterministic.resolve(&node_a),
+            deterministic.resolve(&node_a)
+        );
+        assert_ne!(
+            deterministic.resolve(&node_a),
+            deterministic.resolve(&node_b)
+        );
+        assert_ne!(
+            deterministic.resolve(&node_a),
+            DispatcherEntropy::Deterministic { run_seed: 43 }.resolve(&node_a)
+        );
+        assert_ne!(production_a, deterministic.resolve(&node_a));
+    }
+
     #[tokio::test]
     async fn publisher_gossips_render_admission_state_with_worker_snapshot() {
         let gossip = Arc::new(CapturingGossip::default());
-        let node = node_with_catalog_and_cache(registered_catalog(), Vec::new(), gossip.clone(), 0);
-        node.set_render_admission_probe(Arc::new(|| false));
+        let _node = node_with_catalog_and_cache_admission(
+            registered_catalog(),
+            Vec::new(),
+            gossip.clone(),
+            0,
+            Arc::new(|| false),
+        );
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let notified = gossip.changed.notified();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_change(&gossip.changed, || {
                 if lock_unpoisoned(&gossip.kvs)
                     .get(RENDER_ADMISSION_GOSSIP_KEY)
                     .is_some_and(|value| value == "false")
                 {
-                    break;
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
                 }
-                notified.await;
-            }
-        })
+            }),
+        )
         .await
         .expect("publisher advertises degraded render admission promptly");
 
@@ -1308,7 +1278,7 @@ mod tests {
 
     #[async_trait]
     impl GossipBus for StaticGossip {
-        async fn set(&self, _node_id: NodeId, _key: String, _value: String) {}
+        async fn set(&self, _key: String, _value: String) {}
 
         async fn view(&self) -> ClusterView {
             ClusterView {
@@ -1340,10 +1310,14 @@ mod tests {
         failures: Arc<AtomicUsize>,
     }
 
+    struct DeadlineFailingPreparer;
+
     struct BlockingRenderer {
         render_started: Option<Arc<Notify>>,
         render_continue: Option<Arc<Notify>>,
     }
+
+    struct PanickingRenderer;
 
     struct BlockingSecondPreparer {
         calls: AtomicUsize,
@@ -1410,6 +1384,16 @@ mod tests {
     }
 
     #[async_trait]
+    impl ProfilePreparer for DeadlineFailingPreparer {
+        async fn prepare_profile(
+            &self,
+            _task: &InternalTask,
+        ) -> Result<Option<PreparedProfile>, ProfilePreparationError> {
+            Err(ProfilePreparationError::CallerDeadlineExceeded)
+        }
+    }
+
+    #[async_trait]
     impl Renderer for BlockingRenderer {
         async fn setup_profile(
             &mut self,
@@ -1439,11 +1423,30 @@ mod tests {
     }
 
     #[async_trait]
+    impl Renderer for PanickingRenderer {
+        async fn setup_profile(
+            &mut self,
+            _task: &InternalTask,
+            _prepared: Option<PreparedProfile>,
+        ) -> Result<(), RendererError> {
+            Ok(())
+        }
+
+        async fn ensure_source(&mut self, _hash: SourceHash) -> Result<(), RendererError> {
+            Ok(())
+        }
+
+        async fn render(&mut self, _task: &InternalTask) -> Result<RendererOutput, RendererError> {
+            panic!("test renderer drops its worker response channel")
+        }
+    }
+
+    #[async_trait]
     impl ProfilePreparer for BlockingSecondPreparer {
         async fn prepare_profile(
             &self,
             _task: &InternalTask,
-        ) -> Result<Option<PreparedProfile>, RendererError> {
+        ) -> Result<Option<PreparedProfile>, ProfilePreparationError> {
             let call = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
             if call == 2 {
                 self.second_started.notify_one();
@@ -1458,7 +1461,7 @@ mod tests {
         async fn prepare_profile(
             &self,
             _task: &InternalTask,
-        ) -> Result<Option<PreparedProfile>, RendererError> {
+        ) -> Result<Option<PreparedProfile>, ProfilePreparationError> {
             self.started.notify_one();
             self.continue_prepare.notified().await;
             Ok(None)
@@ -1475,12 +1478,30 @@ mod tests {
         gossip: Arc<dyn GossipBus>,
         render_output_cache_capacity_bytes: u64,
     ) -> Node {
-        node_with_catalog_cache_and_preparer(
+        node_with_catalog_and_cache_admission(
             style_catalog,
             renderers,
             gossip,
             render_output_cache_capacity_bytes,
+            Arc::new(|| true),
+        )
+    }
+
+    fn node_with_catalog_and_cache_admission(
+        style_catalog: Arc<StyleCatalog>,
+        renderers: Vec<BoxRenderer>,
+        gossip: Arc<dyn GossipBus>,
+        render_output_cache_capacity_bytes: u64,
+        render_admission: RenderAdmission,
+    ) -> Node {
+        spawn_test_node(
+            style_catalog,
+            renderers,
+            gossip,
+            Arc::new(NoopTransport),
+            render_output_cache_capacity_bytes,
             Arc::new(NoopProfilePreparer),
+            render_admission,
         )
     }
 
@@ -1491,32 +1512,22 @@ mod tests {
         render_output_cache_capacity_bytes: u64,
         profile_preparer: Arc<dyn ProfilePreparer>,
     ) -> Node {
-        node_with_catalog_cache_preparer_and_transport(
+        spawn_test_node(
             style_catalog,
             renderers,
             gossip,
             Arc::new(NoopTransport),
             render_output_cache_capacity_bytes,
             profile_preparer,
+            Arc::new(|| true),
         )
     }
 
-    fn node_with_catalog_cache_preparer_and_transport(
-        style_catalog: Arc<StyleCatalog>,
-        renderers: Vec<BoxRenderer>,
-        gossip: Arc<dyn GossipBus>,
-        transport: Arc<dyn Transport>,
+    fn test_node_config(
+        queue_capacity: usize,
         render_output_cache_capacity_bytes: u64,
-        profile_preparer: Arc<dyn ProfilePreparer>,
-    ) -> Node {
-        Node::spawn(NodeSpawn {
-            id: NodeId::from_index(1),
-            renderers,
-            profile_preparer,
-            gossip,
-            transport,
-            style_catalog,
-            activity: Arc::new(ProfileActivityTracker::new()),
+    ) -> ResolvedNodeConfig {
+        ResolvedNodeConfig {
             routing: RoutingConfig {
                 tier1_strategy: Tier1Strategy::PowerOfTwo,
                 tier3_enabled: false,
@@ -1531,16 +1542,58 @@ mod tests {
                 hop_latency: Duration::ZERO,
                 sla: Duration::from_secs(1),
             },
-            gossip_cfg: GossipConfig {
+            gossip: GossipConfig {
                 publish_interval: Duration::from_secs(60),
             },
-            bl_capacity: 1,
-            queue_capacity: 1,
+            queue_limits: QueueLimits {
+                soft: 1,
+                hard: queue_capacity,
+            },
             render_permits: 1,
-            cpu_render_permits: 1,
+            native_render_permits: 1,
             source_cache_capacity: 1,
             render_output_cache_capacity_bytes,
-            dispatcher_seed: 0,
+        }
+    }
+
+    fn node_with_catalog_cache_preparer_and_transport(
+        style_catalog: Arc<StyleCatalog>,
+        renderers: Vec<BoxRenderer>,
+        gossip: Arc<dyn GossipBus>,
+        transport: Arc<dyn InternalTransport>,
+        render_output_cache_capacity_bytes: u64,
+        profile_preparer: Arc<dyn ProfilePreparer>,
+    ) -> Node {
+        spawn_test_node(
+            style_catalog,
+            renderers,
+            gossip,
+            transport,
+            render_output_cache_capacity_bytes,
+            profile_preparer,
+            Arc::new(|| true),
+        )
+    }
+
+    fn spawn_test_node(
+        style_catalog: Arc<StyleCatalog>,
+        renderers: Vec<BoxRenderer>,
+        gossip: Arc<dyn GossipBus>,
+        transport: Arc<dyn InternalTransport>,
+        render_output_cache_capacity_bytes: u64,
+        profile_preparer: Arc<dyn ProfilePreparer>,
+        render_admission: RenderAdmission,
+    ) -> Node {
+        Node::spawn(NodeSpawn {
+            id: NodeId::from_index(1),
+            renderers,
+            profile_preparer,
+            gossip,
+            transport,
+            style_catalog,
+            config: test_node_config(1, render_output_cache_capacity_bytes),
+            dispatcher_entropy: DispatcherEntropy::Deterministic { run_seed: 0 },
+            render_admission,
         })
     }
 
@@ -1577,6 +1630,74 @@ mod tests {
         }
     }
 
+    fn rich_static_task(id: TaskId, request_id: &str) -> InternalTask {
+        let mut task = internal_task(id, request_id);
+        task.source = Some(SourceRef {
+            hash: 0xfeed_beef,
+            policy: CachePolicy::OneShot,
+        });
+        task.request = RenderRequest::StaticImage {
+            positioning: Positioning::Center {
+                lon: 139.767,
+                lat: 35.681,
+                zoom: 11.5,
+                bearing: 22.0,
+                pitch: 35.0,
+            },
+            width: 913,
+            height: 557,
+            overlays: vec![StaticOverlay::Pin(PinOverlay {
+                size: crate::types::PinSize::Large,
+                label: Some("BIEI".to_string()),
+                color: "#336699".to_string(),
+                coordinate: LngLat {
+                    lon: 142.468,
+                    lat: 43.588,
+                },
+            })],
+            before_layer: Some("road-label".to_string()),
+            padding: Padding {
+                top: 11,
+                right: 22,
+                bottom: 33,
+                left: 44,
+            },
+            addlayer: Some(AddLayer {
+                json: r#"{"id":"original-rich-layer","type":"line"}"#.to_string(),
+                hash: 0xdead_beef,
+                source: Some(AddLayerSource {
+                    tileset_id: "tileset/original-rich-source".to_string(),
+                    json: r#"{"type":"vector","tiles":["https://tiles.test/{z}/{x}/{y}.mvt"]}"#
+                        .to_string(),
+                }),
+            }),
+        };
+        task.pixel_ratio = Scale::X2.into();
+        task.output_format = ImageFormat::Jpeg;
+        task.deadline = task.arrived_at + Duration::from_secs(5);
+        task
+    }
+
+    fn assert_original_rich_task_forwarded(
+        requests: &Mutex<Vec<ForwardRequest>>,
+        expected: &WireTask,
+    ) {
+        let requests = lock_unpoisoned(requests);
+        assert_eq!(requests.len(), 1, "exactly one peer render is issued");
+        let forwarded = &requests[0].task;
+        assert_eq!(forwarded.id, expected.id);
+        assert_eq!(forwarded.request_id, expected.request_id);
+        assert_eq!(forwarded.style, expected.style);
+        assert_eq!(forwarded.request, expected.request);
+        assert_eq!(forwarded.scale, expected.scale);
+        assert_eq!(forwarded.output_format, expected.output_format);
+        assert_eq!(forwarded.forwarding_hops, expected.forwarding_hops);
+        let source = forwarded.source.as_ref().expect("modeled source preserved");
+        let expected_source = expected.source.as_ref().expect("test source exists");
+        assert_eq!(source.hash, expected_source.hash);
+        assert_eq!(source.policy, expected_source.policy);
+    }
+
     fn forwarded_task(id: TaskId, request_id: &str, worker: WorkerId) -> ForwardRequest {
         ForwardRequest {
             task: internal_task(id, request_id).to_wire(Instant::now()),
@@ -1584,6 +1705,168 @@ mod tests {
             drain_worker: Some(worker),
             origin_response_budget_ms: 1_000,
         }
+    }
+
+    #[tokio::test]
+    async fn queue_full_failover_forwards_original_rich_static_task() {
+        let local_render_started = Arc::new(Notify::new());
+        let local_render_continue = Arc::new(Notify::new());
+        let remote_id = NodeId::from_index(2);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let node = node_with_catalog_cache_preparer_and_transport(
+            registered_catalog(),
+            vec![Box::new(BlockingRenderer {
+                render_started: Some(local_render_started.clone()),
+                render_continue: Some(local_render_continue.clone()),
+            })],
+            Arc::new(NoopGossip),
+            Arc::new(RecordingTransport {
+                expected_target: remote_id.clone(),
+                requests: requests.clone(),
+            }),
+            0,
+            Arc::new(NoopProfilePreparer),
+        );
+
+        let occupying_render = tokio::spawn({
+            let node = node.clone();
+            async move {
+                node.process_local_task(
+                    internal_task(1, "occupying-render"),
+                    None,
+                    RouteTier::Tier2HrwBl,
+                    None,
+                )
+                .await
+            }
+        });
+        local_render_started.notified().await;
+        assert_eq!(node.worker_snapshot()[0].queue_depth, 1);
+
+        let task = rich_static_task(2, "queue-full-rich-task");
+        let expected = task.to_forward_wire(Instant::now(), Duration::ZERO);
+        let outcome = node
+            .process_local_route(
+                task,
+                RouteTier::Tier2HrwBl,
+                None,
+                vec![ForwardCandidate {
+                    node_id: remote_id,
+                    drain_worker: None,
+                }],
+            )
+            .await;
+
+        assert!(matches!(outcome.result, TaskResult::Completed { .. }));
+        assert_original_rich_task_forwarded(&requests, &expected);
+
+        local_render_continue.notify_one();
+        let local_outcome = occupying_render
+            .await
+            .expect("occupying render task joins")
+            .expect("occupying render completes");
+        assert!(matches!(local_outcome.result, TaskResult::Completed { .. }));
+    }
+
+    #[tokio::test]
+    async fn render_admission_closed_failover_forwards_original_rich_static_task() {
+        let can_render = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let prepare_started = Arc::new(Notify::new());
+        let continue_prepare = Arc::new(Notify::new());
+        let remote_id = NodeId::from_index(2);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let admission = can_render.clone();
+        let renders = Arc::new(AtomicUsize::new(0));
+        let node = spawn_test_node(
+            registered_catalog(),
+            vec![Box::new(CountingRenderer {
+                renders: renders.clone(),
+            })],
+            Arc::new(NoopGossip),
+            Arc::new(RecordingTransport {
+                expected_target: remote_id.clone(),
+                requests: requests.clone(),
+            }),
+            0,
+            Arc::new(BlockingPreparer {
+                started: prepare_started.clone(),
+                continue_prepare: continue_prepare.clone(),
+            }),
+            Arc::new(move || admission.load(Ordering::SeqCst)),
+        );
+        let task = rich_static_task(3, "admission-closed-rich-task");
+        let expected = task.to_forward_wire(Instant::now(), Duration::ZERO);
+
+        let request = tokio::spawn({
+            let node = node.clone();
+            async move {
+                node.process_local_route(
+                    task,
+                    RouteTier::Tier2HrwBl,
+                    None,
+                    vec![ForwardCandidate {
+                        node_id: remote_id,
+                        drain_worker: None,
+                    }],
+                )
+                .await
+            }
+        });
+        prepare_started.notified().await;
+        can_render.store(false, Ordering::SeqCst);
+        continue_prepare.notify_one();
+
+        let outcome = request.await.expect("local route task joins");
+        assert!(matches!(outcome.result, TaskResult::Completed { .. }));
+        assert_original_rich_task_forwarded(&requests, &expected);
+        assert_eq!(
+            renders.load(Ordering::SeqCst),
+            0,
+            "closed admission must not start local native work"
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_disconnected_fails_without_issuing_peer_render() {
+        let remote_id = NodeId::from_index(2);
+        let sends = Arc::new(AtomicUsize::new(0));
+        let node = node_with_catalog_cache_preparer_and_transport(
+            registered_catalog(),
+            vec![Box::new(PanickingRenderer)],
+            Arc::new(NoopGossip),
+            Arc::new(CompletingTransport {
+                expected_target: remote_id.clone(),
+                sends: sends.clone(),
+            }),
+            0,
+            Arc::new(NoopProfilePreparer),
+        );
+
+        let outcome = node
+            .process_local_route(
+                internal_task(4, "disconnected-worker"),
+                RouteTier::Tier2HrwBl,
+                None,
+                vec![ForwardCandidate {
+                    node_id: remote_id,
+                    drain_worker: None,
+                }],
+            )
+            .await;
+
+        assert!(matches!(
+            outcome.result,
+            TaskResult::Failed {
+                ref error,
+                kind: FailureKind::Other,
+            } if error == "worker queue disconnected"
+        ));
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            node.worker_snapshot()[0].queue_depth,
+            0,
+            "accepted-work accounting is released when the worker response disappears"
+        );
     }
 
     #[tokio::test]
@@ -1614,31 +1897,9 @@ mod tests {
             gossip: Arc::new(NoopGossip),
             transport: Arc::new(NoopTransport),
             style_catalog: catalog,
-            activity: Arc::new(ProfileActivityTracker::new()),
-            routing: RoutingConfig {
-                tier1_strategy: Tier1Strategy::PowerOfTwo,
-                tier3_enabled: false,
-                drain_max_queue: 1,
-            },
-            costs: CostConfig {
-                style_setup_cost: CostRange::fixed(Duration::from_millis(1)),
-                source_load_cost: CostRange::fixed(Duration::from_millis(1)),
-                render_cpu_cost: CostRange::fixed(Duration::from_millis(1)),
-                render_resource_cost: CostRange::fixed(Duration::ZERO),
-                first_render_resource_cost: CostRange::fixed(Duration::ZERO),
-                hop_latency: Duration::ZERO,
-                sla: Duration::from_secs(1),
-            },
-            gossip_cfg: GossipConfig {
-                publish_interval: Duration::from_secs(60),
-            },
-            bl_capacity: 1,
-            queue_capacity: 2,
-            render_permits: 1,
-            cpu_render_permits: 1,
-            source_cache_capacity: 1,
-            render_output_cache_capacity_bytes: 0,
-            dispatcher_seed: 0,
+            config: test_node_config(2, 0),
+            dispatcher_entropy: DispatcherEntropy::Deterministic { run_seed: 0 },
+            render_admission: Arc::new(|| true),
         });
 
         let first = tokio::spawn({
@@ -1666,6 +1927,107 @@ mod tests {
         let second = second.await.expect("second task joins");
         assert!(matches!(first.result, TaskResult::Completed { .. }));
         assert!(matches!(second.result, TaskResult::Completed { .. }));
+    }
+
+    #[tokio::test]
+    async fn preparation_deadline_does_not_record_renderer_timeout_evidence() {
+        let renders = Arc::new(AtomicUsize::new(0));
+        let node = node_with_catalog_cache_and_preparer(
+            registered_catalog(),
+            vec![Box::new(CountingRenderer {
+                renders: renders.clone(),
+            })],
+            Arc::new(NoopGossip),
+            0,
+            Arc::new(DeadlineFailingPreparer),
+        );
+
+        let outcome = node
+            .handle_incoming(internal_task(1, "preparation-deadline"))
+            .await;
+
+        assert!(matches!(
+            outcome.result,
+            TaskResult::Failed {
+                kind: FailureKind::PreparationTimeout,
+                ..
+            }
+        ));
+        assert_eq!(renders.load(Ordering::SeqCst), 0);
+
+        let rendered = node.metrics().render_prometheus();
+        assert!(
+            rendered.contains("biei_profile_prepare_duration_seconds_count{outcome=\"failure\"} 1")
+        );
+        assert!(rendered.contains(
+            "biei_tasks_failed_by_kind_total{kind=\"preparation_timeout\",scope=\"ingress\"} 1"
+        ));
+        assert!(rendered.contains(
+            "biei_tasks_failed_by_kind_total{kind=\"render_timeout\",scope=\"ingress\"} 0"
+        ));
+        assert!(
+            rendered.contains("biei_render_timeout_lower_bound_seconds_count{scope=\"ingress\"} 0")
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_incoming_routes_before_local_worker_state_reaches_gossip() {
+        let renders = Arc::new(AtomicUsize::new(0));
+        let node = node_with_catalog_and_cache(
+            registered_catalog(),
+            vec![Box::new(CountingRenderer {
+                renders: renders.clone(),
+            })],
+            Arc::new(NoopGossip),
+            0,
+        );
+
+        let outcome = node.handle_incoming(internal_task(1, "startup")).await;
+
+        assert!(
+            matches!(outcome.result, TaskResult::Completed { .. }),
+            "authoritative local worker state should make the node immediately routable: {:?}",
+            outcome.result
+        );
+        assert_eq!(renders.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_workers_and_closes_admission() {
+        let renders = Arc::new(AtomicUsize::new(0));
+        let node = node_with_catalog_and_cache(
+            registered_catalog(),
+            vec![Box::new(CountingRenderer {
+                renders: renders.clone(),
+            })],
+            Arc::new(NoopGossip),
+            0,
+        );
+
+        // A render succeeds before shutdown.
+        let before = node.handle_incoming(internal_task(1, "before")).await;
+        assert!(matches!(before.result, TaskResult::Completed { .. }));
+        assert_eq!(renders.load(Ordering::SeqCst), 1);
+
+        // Graceful shutdown drains and joins the single worker cleanly within
+        // the bound (the old production path detached and never awaited it).
+        let outcome = node.shutdown(Instant::now() + Duration::from_secs(5)).await;
+        assert!(
+            outcome.is_complete(),
+            "worker should join cleanly: {outcome:?}"
+        );
+        assert_eq!(outcome.joined, 1);
+        assert_eq!(outcome.timed_out, 0);
+
+        // After shutdown, admission is closed: a new local task starts no native
+        // render (the worker is gone and `can_start_render` is false).
+        let after = node.handle_incoming(internal_task(2, "after")).await;
+        assert!(
+            !matches!(after.result, TaskResult::Completed { .. }),
+            "a drained node must not start new local renders: {:?}",
+            after.result
+        );
+        assert_eq!(renders.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1698,7 +2060,7 @@ mod tests {
     #[tokio::test]
     async fn degraded_node_sheds_output_cache_miss_before_rendering() {
         let renders = Arc::new(AtomicUsize::new(0));
-        let node = node_with_catalog_and_cache(
+        let node = node_with_catalog_and_cache_admission(
             registered_catalog(),
             vec![Box::new(CountingRenderer {
                 renders: renders.clone(),
@@ -1707,9 +2069,8 @@ mod tests {
                 node_id: NodeId::from_index(1),
             }),
             1024 * 1024,
+            Arc::new(|| false),
         );
-        // Renderer cannot start a native render (externally degraded).
-        node.set_render_admission_probe(Arc::new(|| false));
 
         let outcome = node.handle_incoming(internal_task(1, "miss")).await;
 
@@ -1717,10 +2078,10 @@ mod tests {
             matches!(
                 outcome.result,
                 TaskResult::Rejected {
-                    reason: RejectionReason::NoCapacity
+                    reason: RejectionReason::RendererDegraded
                 }
             ),
-            "degraded miss is shed as NoCapacity, got {:?}",
+            "degraded miss is shed as RendererDegraded, got {:?}",
             outcome.result
         );
         assert_eq!(
@@ -1770,7 +2131,7 @@ mod tests {
             ]),
             generated_at: Instant::now(),
         };
-        let node = node_with_catalog_cache_preparer_and_transport(
+        let node = spawn_test_node(
             registered_catalog(),
             vec![Box::new(CountingRenderer {
                 renders: renders.clone(),
@@ -1786,8 +2147,8 @@ mod tests {
             }),
             1024 * 1024,
             Arc::new(NoopProfilePreparer),
+            Arc::new(|| false),
         );
-        node.set_render_admission_probe(Arc::new(|| false));
 
         let first = node
             .handle_incoming(internal_task(1, "forwarded-miss"))
@@ -1893,7 +2254,8 @@ mod tests {
         let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let prepare_started = Arc::new(Notify::new());
         let continue_prepare = Arc::new(Notify::new());
-        let node = node_with_catalog_cache_and_preparer(
+        let probe = ready.clone();
+        let node = spawn_test_node(
             registered_catalog(),
             vec![Box::new(CountingRenderer {
                 renders: renders.clone(),
@@ -1901,14 +2263,14 @@ mod tests {
             Arc::new(StaticGossip {
                 node_id: NodeId::from_index(1),
             }),
+            Arc::new(NoopTransport),
             1024 * 1024,
             Arc::new(BlockingPreparer {
                 started: prepare_started.clone(),
                 continue_prepare: continue_prepare.clone(),
             }),
+            Arc::new(move || probe.load(Ordering::SeqCst)),
         );
-        let probe = ready.clone();
-        node.set_render_admission_probe(Arc::new(move || probe.load(Ordering::SeqCst)));
 
         let request = tokio::spawn({
             let node = node.clone();
@@ -1929,7 +2291,7 @@ mod tests {
         assert!(matches!(
             outcome.result,
             TaskResult::Rejected {
-                reason: RejectionReason::NoCapacity
+                reason: RejectionReason::RendererDegraded
             }
         ));
         assert_eq!(
@@ -1943,7 +2305,8 @@ mod tests {
     async fn degraded_node_still_serves_output_cache_hit() {
         let renders = Arc::new(AtomicUsize::new(0));
         let ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let node = node_with_catalog_and_cache(
+        let probe = ready.clone();
+        let node = node_with_catalog_and_cache_admission(
             registered_catalog(),
             vec![Box::new(CountingRenderer {
                 renders: renders.clone(),
@@ -1952,9 +2315,8 @@ mod tests {
                 node_id: NodeId::from_index(1),
             }),
             1024 * 1024,
+            Arc::new(move || probe.load(Ordering::SeqCst)),
         );
-        let probe = ready.clone();
-        node.set_render_admission_probe(Arc::new(move || probe.load(Ordering::SeqCst)));
 
         // Warm the cache while the renderer is healthy.
         let first = node.handle_incoming(internal_task(1, "warm")).await;
@@ -1986,7 +2348,8 @@ mod tests {
     async fn degraded_shed_releases_flight_so_render_recovers_when_ready() {
         let renders = Arc::new(AtomicUsize::new(0));
         let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let node = node_with_catalog_and_cache(
+        let probe = ready.clone();
+        let node = node_with_catalog_and_cache_admission(
             registered_catalog(),
             vec![Box::new(CountingRenderer {
                 renders: renders.clone(),
@@ -1995,9 +2358,8 @@ mod tests {
                 node_id: NodeId::from_index(1),
             }),
             1024 * 1024,
+            Arc::new(move || probe.load(Ordering::SeqCst)),
         );
-        let probe = ready.clone();
-        node.set_render_admission_probe(Arc::new(move || probe.load(Ordering::SeqCst)));
 
         // Degraded: the miss is shed and its temporary single-flight leader is
         // released on drop.
@@ -2005,7 +2367,7 @@ mod tests {
         assert!(matches!(
             shed.result,
             TaskResult::Rejected {
-                reason: RejectionReason::NoCapacity
+                reason: RejectionReason::RendererDegraded
             }
         ));
         assert_eq!(renders.load(Ordering::SeqCst), 0);
@@ -2025,13 +2387,16 @@ mod tests {
 
     #[tokio::test]
     async fn provider_outage_preserves_cache_sheds_miss_and_recovers_without_restart() {
+        // Node-level shed/recover behavior is driven entirely by the injected
+        // `can_start_render` admission probe. The concrete degraded/recovered
+        // health transitions of the renderer actor supervisor (external-degraded
+        // → internal-unrecoverable → full) are proven by the actor's own tests;
+        // here a plain toggle models the probe so `biei-core` needs no MapLibre
+        // FileSource or renderer-actor dependency.
         let renders = Arc::new(AtomicUsize::new(0));
-        let provider = crate::renderer::file_source::ProviderHealthTracker::new();
-        let supervisor = crate::renderer::actor::RendererActorSupervisor::with_provider_health(
-            1,
-            provider.clone(),
-        );
-        let node = node_with_catalog_and_cache(
+        let can_start_render = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let probe = can_start_render.clone();
+        let node = node_with_catalog_and_cache_admission(
             registered_catalog(),
             vec![Box::new(CountingRenderer {
                 renders: renders.clone(),
@@ -2040,9 +2405,8 @@ mod tests {
                 node_id: NodeId::from_index(1),
             }),
             1024 * 1024,
+            Arc::new(move || probe.load(Ordering::SeqCst)),
         );
-        let health = supervisor.clone();
-        node.set_render_admission_probe(Arc::new(move || health.can_start_render()));
 
         // Establish the warm output that must survive the upstream outage.
         let warm = node.handle_incoming(internal_task(1, "warm-cache")).await;
@@ -2053,16 +2417,7 @@ mod tests {
         // with an external provider failure. The pod stays ready/live so the
         // process and its in-memory cache are not discarded, but it stops
         // starting fresh native work.
-        let retry = provider.begin_retry();
-        let mut slot_available = true;
-        supervisor.set_slot_available(&mut slot_available, false);
-        assert_eq!(
-            supervisor.health(),
-            crate::renderer::actor::RendererHealth::ExternalDegraded
-        );
-        assert!(supervisor.is_ready());
-        assert!(supervisor.is_livable());
-        assert!(!supervisor.can_start_render());
+        can_start_render.store(false, Ordering::SeqCst);
 
         let cached = node
             .handle_incoming(internal_task(2, "hit-during-outage"))
@@ -2087,7 +2442,7 @@ mod tests {
         assert!(matches!(
             shed.result,
             TaskResult::Rejected {
-                reason: RejectionReason::NoCapacity
+                reason: RejectionReason::RendererDegraded
             }
         ));
         assert_eq!(
@@ -2096,20 +2451,10 @@ mod tests {
             "the outage miss must not feed another native render"
         );
 
-        // The retry evidence ends before autonomous actor repair completes;
-        // health briefly becomes internally unrecoverable. Restoring the slot
-        // models the repair tick proven separately by the real-actor test, and
-        // the previously shed flight must then render without a process restart.
-        drop(retry);
-        assert_eq!(
-            supervisor.health(),
-            crate::renderer::actor::RendererHealth::InternalUnrecoverable
-        );
-        supervisor.set_slot_available(&mut slot_available, true);
-        assert_eq!(
-            supervisor.health(),
-            crate::renderer::actor::RendererHealth::Full
-        );
+        // Restoring the admission probe models the repair tick proven
+        // separately by the real-actor test; the previously shed flight must
+        // then render without a process restart.
+        can_start_render.store(true, Ordering::SeqCst);
 
         cold.id = 4;
         cold.request_id = RequestId::from_string("recovered-miss");

@@ -1,0 +1,36 @@
+name: Deployment CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "demo-deploy/**"
+      - ".github/workflows/deployment-ci.yml"
+  pull_request:
+    paths:
+      - "demo-deploy/**"
+      - ".github/workflows/deployment-ci.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  manifests:
+    name: Rendered manifest contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Verify kubectl client
+        run: kubectl version --client
+
+      - name: Render manifests and check cluster contracts
+        run: bash demo-deploy/check-manifests.sh

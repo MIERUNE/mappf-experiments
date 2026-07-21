@@ -9,22 +9,22 @@ use tokio::sync::Semaphore;
 
 use crate::calibrated_costs::EmpiricalCostModel;
 use crate::channel_transport::{ChannelTransport, NodeEntry, NodeRegistry};
-use crate::chitchat_bus::ChitchatGossipBus;
+use crate::chitchat_bus::ChitchatGossipNetwork;
 use crate::churn::{ChurnPlan, ChurnReport, ChurnTracker, ClusterObservation, NodeObservation};
 use crate::config::SimConfig;
 use crate::metrics::{MetricsCollector, Report};
 use crate::report::RunReport;
 use crate::stub_renderer::StubRenderer;
 use crate::workload::run_workload;
-use biei_core::activity::ProfileActivityTracker;
 use biei_core::gossip::GossipBus;
-use biei_core::node::{Node, NodeSpawn};
+use biei_core::internal_transport::InternalTransport;
+use biei_core::node::{DispatcherEntropy, Node, NodeSpawn};
 use biei_core::renderer::{BoxRenderer, NoopProfilePreparer};
 use biei_core::style_catalog::StyleCatalog;
-use biei_core::transport::Transport;
 use biei_core::types::{NodeId, TaskOutcome, TaskResult};
 
 const SEED_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+const NODE_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct Simulation {
     pub config: SimConfig,
@@ -58,11 +58,6 @@ impl Simulation {
         self
     }
 
-    /// Compatibility entry point used by the existing sweep suite.
-    pub async fn run(self) -> Report {
-        self.execute(None, 1_000).await.expect("simulation run").0
-    }
-
     pub async fn run_report(self, options: SimulationOptions) -> Result<RunReport> {
         let config = self.config.clone();
         let empirical_sampling = self
@@ -85,10 +80,7 @@ impl Simulation {
         churn_plan: Option<ChurnPlan>,
         sample_every_requests: u64,
     ) -> Result<(Report, Option<ChurnReport>)> {
-        ensure!(
-            self.config.node_count > 0,
-            "simulation needs at least one node"
-        );
+        self.config.validate()?;
         if let Some(plan) = &churn_plan {
             plan.validate()?;
             ensure!(
@@ -96,17 +88,15 @@ impl Simulation {
                 "sample_every_requests must be greater than zero"
             );
         }
-        let native_render_permits = self.config.cluster.resolved_cpu_render_permits_per_node();
+        let native_render_permits = self
+            .config
+            .cluster
+            .resolved_native_render_permits_per_node();
         let metrics = Arc::new(MetricsCollector::with_native_render_permits(
             native_render_permits * self.config.node_count,
         ));
-        let activity = Arc::new(ProfileActivityTracker::new());
-        let mut cluster = WorkloadCluster::new(
-            self.config.clone(),
-            activity.clone(),
-            self.calibration_model.clone(),
-        )
-        .await?;
+        let mut cluster =
+            WorkloadCluster::new(self.config.clone(), self.calibration_model.clone()).await?;
         let mut churn = churn_plan
             .map(|plan| {
                 ChurnTracker::new(plan, sample_every_requests, cluster.observation(&metrics))
@@ -117,7 +107,7 @@ impl Simulation {
             self.config.workload.clone(),
             &mut cluster,
             metrics.clone(),
-            activity,
+            self.config.costs.sla,
             self.config.seed,
             churn.as_mut(),
         )
@@ -125,8 +115,12 @@ impl Simulation {
         let workload = match workload_result {
             Ok(workload) => workload,
             Err(error) => {
-                cluster.shutdown().await;
-                return Err(error);
+                return match cluster.shutdown().await {
+                    Ok(()) => Err(error),
+                    Err(shutdown_error) => Err(error.context(format!(
+                        "simulated membership cleanup also failed: {shutdown_error}"
+                    ))),
+                };
             }
         };
         let churn_report = churn.map(|tracker| {
@@ -138,15 +132,14 @@ impl Simulation {
             )
         });
         let report = metrics.report(self.config.costs.sla);
-        cluster.shutdown().await;
+        cluster.shutdown().await?;
         Ok((report, churn_report))
     }
 }
 
 pub(crate) struct WorkloadCluster {
     config: SimConfig,
-    gossip: Arc<ChitchatGossipBus>,
-    activity: Arc<ProfileActivityTracker>,
+    gossip: ChitchatGossipNetwork,
     style_catalog: Arc<StyleCatalog>,
     registry: Arc<NodeRegistry>,
     transport: Arc<ChannelTransport>,
@@ -222,17 +215,10 @@ impl NodeCounters {
 impl WorkloadCluster {
     async fn new(
         config: SimConfig,
-        activity: Arc<ProfileActivityTracker>,
         calibration_model: Option<Arc<EmpiricalCostModel>>,
     ) -> Result<Self> {
-        let gossip = Arc::new(
-            ChitchatGossipBus::new(
-                Vec::new(),
-                config.gossip.publish_interval,
-                config.costs.hop_latency,
-            )
-            .await?,
-        );
+        let gossip =
+            ChitchatGossipNetwork::new(config.gossip.publish_interval, config.costs.hop_latency);
         let catalog = StyleCatalog::new();
         catalog.set_url_template("http://simulator.local/styles/{style_id}/style.json");
         let registry = NodeRegistry::new();
@@ -244,7 +230,6 @@ impl WorkloadCluster {
         let mut cluster = Self {
             config,
             gossip,
-            activity,
             style_catalog: Arc::new(catalog),
             registry,
             transport,
@@ -256,8 +241,12 @@ impl WorkloadCluster {
         };
         for _ in 0..initial_nodes {
             if let Err(error) = cluster.add_node().await {
-                cluster.shutdown().await;
-                return Err(error);
+                return match cluster.shutdown().await {
+                    Ok(()) => Err(error),
+                    Err(shutdown_error) => Err(error.context(format!(
+                        "simulated membership cleanup also failed: {shutdown_error}"
+                    ))),
+                };
             }
         }
         Ok(cluster)
@@ -267,7 +256,7 @@ impl WorkloadCluster {
         let index = self.next_node_index;
         self.next_node_index += 1;
         let node_id = NodeId::from_index(index);
-        self.gossip.add_node(node_id.clone()).await?;
+        let gossip = Arc::new(self.gossip.add_node(node_id.clone()).await?);
 
         let cpu_cores = Arc::new(Semaphore::new(self.config.cpu_cores_per_node.max(1)));
         let renderers: Vec<BoxRenderer> = (0..self.config.cluster.renderer_slots_per_node)
@@ -290,12 +279,17 @@ impl WorkloadCluster {
                 ) as BoxRenderer
             })
             .collect();
-        let queue_limits = self
+        let node_config = self
             .config
             .cluster
-            .resolved_queue_limits(&self.config.costs);
-        let gossip: Arc<dyn GossipBus> = self.gossip.clone();
-        let transport: Arc<dyn Transport> = self.transport.clone();
+            .resolve_node_config(
+                self.config.routing.clone(),
+                self.config.costs.clone(),
+                self.config.gossip.clone(),
+            )
+            .map_err(anyhow::Error::msg)?;
+        let gossip: Arc<dyn GossipBus> = gossip;
+        let transport: Arc<dyn InternalTransport> = self.transport.clone();
         let node = Node::spawn(NodeSpawn {
             id: node_id.clone(),
             renderers,
@@ -303,23 +297,11 @@ impl WorkloadCluster {
             gossip,
             transport,
             style_catalog: self.style_catalog.clone(),
-            activity: self.activity.clone(),
-            routing: self.config.routing.clone(),
-            costs: self.config.costs.clone(),
-            gossip_cfg: self.config.gossip.clone(),
-            bl_capacity: queue_limits.soft,
-            queue_capacity: queue_limits.hard,
-            render_permits: self.config.cluster.resolved_render_permits_per_node(),
-            cpu_render_permits: self.config.cluster.resolved_cpu_render_permits_per_node(),
-            source_cache_capacity: self.config.cluster.source_cache_capacity,
-            render_output_cache_capacity_bytes: self
-                .config
-                .cluster
-                .render_output_cache_capacity_bytes,
-            dispatcher_seed: self
-                .config
-                .seed
-                .wrapping_add((index as u64 + 1).wrapping_mul(SEED_MIX.wrapping_mul(5))),
+            config: node_config,
+            dispatcher_entropy: DispatcherEntropy::Deterministic {
+                run_seed: self.config.seed,
+            },
+            render_admission: Arc::new(|| true),
         });
         let entry = self.registry.register(node_id.clone(), node.clone());
         self.nodes.push(ActiveNode {
@@ -353,7 +335,7 @@ impl WorkloadCluster {
         Ok(())
     }
 
-    pub(crate) fn reap_drained_nodes(&mut self) -> usize {
+    pub(crate) async fn reap_drained_nodes(&mut self) -> Result<usize> {
         let mut reaped = 0;
         let mut index = 0;
         while index < self.draining.len() {
@@ -372,16 +354,26 @@ impl WorkloadCluster {
                     .all(|worker| worker.queue_depth == 0);
             if drained {
                 let node = self.draining.swap_remove(index);
+                let shutdown = node
+                    .node
+                    .shutdown(tokio::time::Instant::now() + NODE_SHUTDOWN_TIMEOUT)
+                    .await;
                 self.retired.push(RetiredNode {
                     id: node.id,
                     counters: node.counters,
                 });
+                ensure!(
+                    shutdown.is_complete(),
+                    "retired node worker shutdown timed out: joined={} timed_out={}",
+                    shutdown.joined,
+                    shutdown.timed_out
+                );
                 reaped += 1;
             } else {
                 index += 1;
             }
         }
-        reaped
+        Ok(reaped)
     }
 
     pub(crate) fn select(&self, rng: &mut impl Rng) -> (Node, Arc<NodeCounters>) {
@@ -392,7 +384,10 @@ impl WorkloadCluster {
 
     pub(crate) fn native_render_permits_total(&self) -> usize {
         (self.nodes.len() + self.draining.len())
-            * self.config.cluster.resolved_cpu_render_permits_per_node()
+            * self
+                .config
+                .cluster
+                .resolved_native_render_permits_per_node()
     }
 
     pub(crate) fn observation(&self, metrics: &MetricsCollector) -> ClusterObservation {
@@ -441,10 +436,14 @@ impl WorkloadCluster {
         }));
         nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
         let transport = self.transport.snapshot();
+        let submitted_measured = nodes.iter().map(|node| node.submitted_measured).sum();
+        let terminal_outcomes_measured = metrics.total;
         ClusterObservation {
             submitted_total: nodes.iter().map(|node| node.submitted_total).sum(),
-            submitted_measured: nodes.iter().map(|node| node.submitted_measured).sum(),
-            measured_outcomes: metrics.total,
+            submitted_measured,
+            terminal_outcomes_measured,
+            outstanding_measured: submitted_measured
+                .saturating_sub(terminal_outcomes_measured as u64),
             completed: metrics.completed,
             rejected: metrics.rejected,
             failed: metrics.failed,
@@ -467,12 +466,19 @@ impl WorkloadCluster {
         }
     }
 
-    async fn shutdown(mut self) {
+    async fn shutdown(mut self) -> Result<()> {
+        // Join every live node's renderer workers within a bound so the
+        // simulation leaves no worker tasks running (a plain `Node` drop detaches
+        // them). Retired nodes were already dropped at reap time.
+        let deadline = tokio::time::Instant::now() + NODE_SHUTDOWN_TIMEOUT;
         for node in self.nodes.drain(..) {
+            node.node.shutdown(deadline).await;
             self.registry.unregister(&node.id);
         }
-        self.draining.clear();
-        self.gossip.shutdown_all().await;
+        for node in self.draining.drain(..) {
+            node.node.shutdown(deadline).await;
+        }
+        self.gossip.shutdown_all().await
     }
 }
 
@@ -515,6 +521,19 @@ mod tests {
         assert_eq!(churn.events.len(), 2);
         assert_eq!(churn.events[0].active_nodes, 3);
         assert_eq!(churn.events[1].active_nodes, 2);
+        assert_eq!(churn.submission_cohorts[0].submission_epoch, 0);
+        assert_eq!(churn.submission_cohorts[0].submitted, 5);
+        assert_eq!(churn.submission_cohorts[1].submission_epoch, 1);
+        assert_eq!(churn.submission_cohorts[1].submitted, 5);
+        assert!(churn.samples.iter().all(|sample| {
+            sample.observation.submitted_measured
+                == sample.observation.terminal_outcomes_measured as u64
+                    + sample.observation.outstanding_measured
+        }));
+        assert!(churn.submission_cohorts.iter().all(|cohort| {
+            cohort.submitted == cohort.terminal_outcomes as u64 + cohort.outstanding
+                && cohort.terminal_outcomes == cohort.completed + cohort.rejected + cohort.failed
+        }));
         let remove_sample = churn
             .samples
             .iter()

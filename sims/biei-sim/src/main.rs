@@ -1,13 +1,9 @@
-//! Simulator CLI. The legacy no-subcommand mode still runs the existing
-//! scenario suite; `run` produces a reproducible JSON report.
+//! Simulator CLI for calibration, reproducible runs, and visualization.
 
-mod legacy_sweeps;
-
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use biei_core::types::RouteTier;
 use biei_sim::{
     Simulation, SimulationOptions, calibrated_costs,
     calibration::{
@@ -16,16 +12,17 @@ use biei_sim::{
     },
     calibration_runner::{CalibrationExerciseOptions, run_calibration_exercise},
     churn::ChurnPlan,
-    config::{SimConfig, StyleDist},
-    scenarios, visualization,
+    config::SimConfig,
+    visualization,
 };
 use clap::{Parser, Subcommand};
+use mmpf_common::path::same_file_target;
 
 #[derive(Parser)]
 #[command(name = "biei-sim", about = "Biei cluster simulator")]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Subcommand)]
@@ -56,10 +53,9 @@ enum Command {
         duration_seconds: Option<u64>,
         #[arg(long)]
         warmup_seconds: Option<u64>,
-        /// Derive provisional global cost ranges from an exported profile;
-        /// measured node/permit provenance is applied, while hop latency and
-        /// SLA stay at their configured values.
-        #[arg(long)]
+        /// Realistic-traffic profile supplying render-wall distributions;
+        /// requires a separately verified --cpu-profile.
+        #[arg(long, requires = "cpu_profile")]
         cost_profile: Option<PathBuf>,
         /// Verified resource-warm reference profile supplying CPU service
         /// demand (two-window fusion); requires --cost-profile for the
@@ -148,7 +144,7 @@ enum CalibrationCommand {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     match Cli::parse().command {
-        Some(Command::Calibration { command }) => match command {
+        Command::Calibration { command } => match command {
             CalibrationCommand::Exercise {
                 urls,
                 warmup_requests_per_url,
@@ -201,6 +197,11 @@ async fn main() -> Result<()> {
                 timeout_seconds,
                 output,
             } => {
+                let token_inputs = bearer_token_file
+                    .as_deref()
+                    .map(|path| vec![(path, "bearer-token file")])
+                    .unwrap_or_default();
+                reject_output_collisions(&[(output.as_path(), "output")], &token_inputs)?;
                 let parsed_match_labels = parse_match_labels(match_labels)?;
                 let bearer_token = bearer_token_file.map(read_bearer_token).transpose()?;
                 let profile = export_calibration_profile(CalibrationExportOptions {
@@ -235,11 +236,15 @@ async fn main() -> Result<()> {
                 println!("written: {}", output.display());
             }
         },
-        Some(Command::Visualize { input, output }) => {
+        Command::Visualize { input, output } => {
+            reject_output_collisions(
+                &[(output.as_path(), "output")],
+                &[(input.as_path(), "input")],
+            )?;
             visualization::write_visualization(input, &output)?;
             println!("written: {}", output.display());
         }
-        Some(Command::Run {
+        Command::Run {
             report,
             churn_plan,
             sample_every_requests,
@@ -252,7 +257,26 @@ async fn main() -> Result<()> {
             cost_profile,
             cpu_profile,
             html,
-        }) => {
+        } => {
+            // Reject output paths that alias an input or each other before any
+            // input is read, so a run cannot succeed and then truncate the very
+            // artifacts (trace/churn/calibration) needed to reproduce it.
+            let mut outputs: Vec<(&Path, &str)> = vec![(report.as_path(), "report")];
+            if let Some(html) = &html {
+                outputs.push((html.as_path(), "html"));
+            }
+            let mut inputs: Vec<(&Path, &str)> = Vec::new();
+            if let Some(path) = &churn_plan {
+                inputs.push((path.as_path(), "churn-plan"));
+            }
+            if let Some(path) = &cost_profile {
+                inputs.push((path.as_path(), "cost-profile"));
+            }
+            if let Some(path) = &cpu_profile {
+                inputs.push((path.as_path(), "cpu-profile"));
+            }
+            reject_output_collisions(&outputs, &inputs)?;
+
             tokio::time::pause();
             let mut config = SimConfig::default();
             let cpu_reference = cpu_profile
@@ -261,20 +285,19 @@ async fn main() -> Result<()> {
                     Ok((path, profile))
                 })
                 .transpose()?;
-            let calibration = cost_profile
-                .map(|path| -> Result<_> {
+            let calibration = match (cost_profile, cpu_reference.as_ref()) {
+                (Some(path), Some((_, reference))) => {
                     let profile = calibrated_costs::load_calibration_profile(&path)?;
-                    let derived = match &cpu_reference {
-                        Some((_, reference)) => calibrated_costs::derive_costs_with_cpu_reference(
-                            &profile,
-                            reference,
-                            &config.costs,
-                        )?,
-                        None => calibrated_costs::derive_costs(&profile, &config.costs)?,
-                    };
-                    Ok((path, profile, derived))
-                })
-                .transpose()?;
+                    let derived = calibrated_costs::derive_costs_with_cpu_reference(
+                        &profile,
+                        reference,
+                        &config.costs,
+                    )?;
+                    Some((path, profile, derived))
+                }
+                (None, None) => None,
+                _ => unreachable!("clap requires cost and CPU profiles together"),
+            };
             if let Some((path, profile, derived)) = &calibration {
                 calibrated_costs::apply_profile_provenance(profile, &mut config)?;
                 config.costs = derived.costs.clone();
@@ -359,306 +382,112 @@ async fn main() -> Result<()> {
                 println!("written: {}", html.display());
             }
         }
-        None => run_legacy().await,
     }
     Ok(())
 }
 
-async fn run_legacy() {
-    tokio::time::pause();
-
-    if std::env::var_os("RUN_LARGE_SCALE_ONLY").is_some() {
-        legacy_sweeps::run_selected().await;
-        return;
-    }
-
-    // ---- Default config: full report ------------------------------------
-    let config = SimConfig::default();
-    print_config(&config);
-    let report = Simulation::new(config).run().await;
-    println!("{}", report.to_human_readable());
-
-    // ---- Production sanity ----------------------------------------------
-    println!("--- Sanity: production-realistic config (no overload expected) ---");
-    println!("4 nodes × 16 renderer slots, 15 styles Zipf α=1.2, 1000 req/s");
-    {
-        let cfg = scenarios::production_sanity();
-        let sla = cfg.costs.sla;
-        let r = Simulation::new(cfg).run().await;
-        let pct = |n: usize| n as f64 / r.completed.max(1) as f64 * 100.0;
-        let tier = |t: RouteTier| r.tier_counts.get(&t).copied().unwrap_or(0);
-        let rejected = r.rejected;
-        println!(
-            "submitted={} completed={} rejected={} | tier1={:.1}% tier2={:.1}% tier3={:.1}% | swaps={:.1}% | p50={:?} p99={:?} max={:?} (SLA={:?})",
-            r.total,
-            r.completed,
-            rejected,
-            pct(tier(RouteTier::Tier1WarmTracking)),
-            pct(tier(RouteTier::Tier2HrwBl)),
-            pct(tier(RouteTier::Tier3DrainSwap)),
-            pct(r.style_swaps),
-            r.latency_p50,
-            r.latency_p99,
-            r.latency_max,
-            sla,
-        );
-    }
-
-    // ---- Source pattern sweep -------------------------------------------
-    println!("\n--- Source pattern sweep (rate=1000, production sizing, 30s) ---");
-    println!(
-        "{:<54} | w/src | hits | loads | p50      p99      max",
-        "source pattern"
-    );
-    println!("{}", "-".repeat(110));
-    for (label, pat) in scenarios::source_pattern_scenarios() {
-        let cfg = scenarios::with_source_pattern(pat);
-        let r = Simulation::new(cfg).run().await;
-        let hit_pct = if r.tasks_with_sources > 0 {
-            format!(
-                "{:5.1}%",
-                r.source_hits as f64 / r.tasks_with_sources as f64 * 100.0
-            )
-        } else {
-            String::from("  n/a")
-        };
-        println!(
-            "{:<54} | {:>5} | {:>4} ({}) | {:>5} | {:>7?} {:>7?} {:>7?}",
-            label,
-            r.tasks_with_sources,
-            r.source_hits,
-            hit_pct,
-            r.source_loads,
-            r.latency_p50,
-            r.latency_p99,
-            r.latency_max,
-        );
-    }
-
-    // ---- BL × Zipf α sweep ----------------------------------------------
-    println!("\n--- BL capacity × Zipf α sweep (S=250ms, P=17.5ms → S/P≈14, ~77% util) ---");
-    println!("Expect: best p99 + lowest reject near BL ≈ S/P ≈ 14");
-    println!("{:<22} | reject | p50      p99      tier1   ovrfl", "label");
-    println!("{}", "-".repeat(80));
-    let mut bl_alpha_results = Vec::new();
-    for &bl in &[1usize, 2, 5, 10, 25, 50, 100] {
-        for &alpha in &[0.5_f64, 1.0, 1.5, 2.0] {
-            let cfg = scenarios::bl_alpha_sweep(bl, alpha);
-            let label = format!("bl={},alpha={}", bl, alpha);
-            let r = Simulation::new(cfg).run().await;
-            let pct = |n: usize| n as f64 / r.total.max(1) as f64 * 100.0;
-            let tier = |t: RouteTier| r.tier_counts.get(&t).copied().unwrap_or(0);
-            println!(
-                "{:<22} | {:>5.1}% | {:>7?} {:>7?} {:>5.1}% {:>5.1}%",
-                label,
-                pct(r.rejected),
-                r.latency_p50,
-                r.latency_p99,
-                pct(tier(RouteTier::Tier1WarmTracking)),
-                pct(tier(RouteTier::Tier4Overflow)),
-            );
-            bl_alpha_results.push((label, r));
+/// Rejects any output that resolves to the same file as another output or an
+/// input, before the run reads inputs or truncates outputs. Resolution uses
+/// filesystem identity, so `./`, `..`, and symlink aliases are caught — not just
+/// lexically-equal path strings.
+fn reject_output_collisions(outputs: &[(&Path, &str)], inputs: &[(&Path, &str)]) -> Result<()> {
+    for (index, (output, output_name)) in outputs.iter().enumerate() {
+        for (other, other_name) in outputs.iter().skip(index + 1) {
+            if same_file_target(output, other) {
+                bail!(
+                    "outputs `{output_name}` and `{other_name}` resolve to the same file ({}); \
+                     refusing to overwrite",
+                    output.display()
+                );
+            }
+        }
+        for (input, input_name) in inputs {
+            if same_file_target(output, input) {
+                bail!(
+                    "output `{output_name}` would overwrite input `{input_name}` ({}); \
+                     choose a distinct output path",
+                    output.display()
+                );
+            }
         }
     }
-    biei_sim::sweep::write_csv("sweep_bl_alpha.csv", &bl_alpha_results).expect("csv write");
-    println!(
-        "→ written: sweep_bl_alpha.csv ({} rows)",
-        bl_alpha_results.len()
-    );
-
-    // ---- Production cluster sizing sweep --------------------------------
-    println!("\n--- Production cluster sizing sweep (10 styles Zipf 1.2, rate=1000) ---");
-    println!("Small clusters (<32 slots) are stress-only and excluded from the primary axis");
-    println!("{:<22} | reject | sla_viol | p99      ovrfl", "label");
-    println!("{}", "-".repeat(80));
-    let mut sizing_results = Vec::new();
-    for &(node_count, renderer_slots_per_node) in
-        &[(8usize, 4usize), (16, 4), (32, 4), (16, 16), (25, 16)]
-    {
-        let cfg = scenarios::cluster_sizing_sweep(node_count, renderer_slots_per_node);
-        let actual_slots = node_count * renderer_slots_per_node;
-        let label = format!("slots={}", actual_slots);
-        let r = Simulation::new(cfg).run().await;
-        let pct = |n: usize| n as f64 / r.total.max(1) as f64 * 100.0;
-        let tier = |t: RouteTier| r.tier_counts.get(&t).copied().unwrap_or(0);
-        println!(
-            "{:<22} | {:>5.1}% | {:>5.2}%   | {:>7?} {:>5.1}%",
-            label,
-            pct(r.rejected),
-            r.sla_violations as f64 / r.completed.max(1) as f64 * 100.0,
-            r.latency_p99,
-            pct(tier(RouteTier::Tier4Overflow)),
-        );
-        sizing_results.push((label, r));
-    }
-    biei_sim::sweep::write_csv("sweep_cluster_sizing.csv", &sizing_results).expect("csv write");
-    println!(
-        "→ written: sweep_cluster_sizing.csv ({} rows)",
-        sizing_results.len()
-    );
-
-    if std::env::var_os("RUN_SMALL_CLUSTER_STRESS").is_some() {
-        println!("\n--- Small-cluster stress sweep (non-production) ---");
-        println!("{:<22} | reject | sla_viol | p99      ovrfl", "label");
-        println!("{}", "-".repeat(80));
-        let mut stress_results = Vec::new();
-        for &(node_count, renderer_slots_per_node) in &[(1usize, 4usize), (2, 4), (3, 4), (4, 4)] {
-            let cfg = scenarios::cluster_sizing_sweep(node_count, renderer_slots_per_node);
-            let actual_slots = node_count * renderer_slots_per_node;
-            let label = format!("slots={}", actual_slots);
-            let r = Simulation::new(cfg).run().await;
-            let pct = |n: usize| n as f64 / r.total.max(1) as f64 * 100.0;
-            let tier = |t: RouteTier| r.tier_counts.get(&t).copied().unwrap_or(0);
-            println!(
-                "{:<22} | {:>5.1}% | {:>5.2}%   | {:>7?} {:>5.1}%",
-                label,
-                pct(r.rejected),
-                r.sla_violations as f64 / r.completed.max(1) as f64 * 100.0,
-                r.latency_p99,
-                pct(tier(RouteTier::Tier4Overflow)),
-            );
-            stress_results.push((label, r));
-        }
-        biei_sim::sweep::write_csv("sweep_small_cluster_stress.csv", &stress_results)
-            .expect("csv write");
-        println!(
-            "→ written: sweep_small_cluster_stress.csv ({} rows)",
-            stress_results.len()
-        );
-    } else {
-        println!("Small-cluster stress sweep skipped. Set RUN_SMALL_CLUSTER_STRESS=1 to run it.");
-    }
-
-    if std::env::var_os("RUN_LARGE_SCALE").is_some() {
-        legacy_sweeps::run_selected().await;
-    } else {
-        println!("\n--- Large-scale production sizing skipped ---");
-        println!("Set RUN_LARGE_SCALE=1 for a short 25-node smoke sweep.");
-        println!("Set RUN_LARGE_SCALE_FULL=1 as well for the full high-rate sweep.");
-        println!(
-            "Set RUN_STANDBY_SWEEP=1, RUN_EXECUTION_SWEEP=1, RUN_STEADY_SWEEP=1, RUN_MULTIPLIER_SWEEP=1, or RUN_STYLE_SHIFT=1 for extra large-scale sweeps."
-        );
-        println!(
-            "Set RUN_LARGE_SCALE_ONLY=1 to skip the general report and run only large-scale benchmarks."
-        );
-    }
-
-    // ---- Style distribution sweep ---------------------------------------
-    println!("\n--- Style distribution sweep (rate=100, 50 styles, 20s) ---");
-    println!(
-        "{:<28} | tier1   | swaps        | cold | p50      p99      max",
-        "distribution"
-    );
-    println!("{}", "-".repeat(96));
-    for dist in [
-        StyleDist::Uniform,
-        StyleDist::Zipf { alpha: 0.5 },
-        StyleDist::Zipf { alpha: 1.0 },
-        StyleDist::Zipf { alpha: 2.0 },
-    ] {
-        let cfg = scenarios::style_dist_sweep(dist.clone());
-        let r = Simulation::new(cfg).run().await;
-        let pct = |n: usize| n as f64 / r.completed.max(1) as f64 * 100.0;
-        let tier1 = r
-            .tier_counts
-            .get(&RouteTier::Tier1WarmTracking)
-            .copied()
-            .unwrap_or(0);
-        println!(
-            "{:<28} | {:5.1}% | {:>4} ({:5.1}%) | {:>4} | {:>7?} {:>7?} {:>7?}",
-            format!("{:?}", dist),
-            pct(tier1),
-            r.style_swaps,
-            pct(r.style_swaps),
-            r.cold_starts,
-            r.latency_p50,
-            r.latency_p99,
-            r.latency_max,
-        );
-    }
+    Ok(())
 }
 
-fn print_config(config: &SimConfig) {
-    let slots_total = config.cluster.renderer_slots_per_node * config.node_count;
-    let permits_per_node = config.cluster.resolved_render_permits_per_node();
-    let permits_total = permits_per_node * config.node_count;
-    let cpu_permits_per_node = config.cluster.resolved_cpu_render_permits_per_node();
-    let cpu_permits_total = cpu_permits_per_node * config.node_count;
-    let warm_residency_mid = config.costs.warm_render_cost().mid().as_secs_f64();
-    let cpu_mid = config.costs.render_cpu_cost.mid().as_secs_f64();
-    let native_capacity = cpu_permits_total as f64 / warm_residency_mid;
-    let cpu_capacity = (config.cpu_cores_per_node * config.node_count) as f64 / cpu_mid;
-    let max_throughput = native_capacity.min(cpu_capacity);
-    let queue_limits = config.cluster.resolved_queue_limits(&config.costs);
+#[cfg(test)]
+mod tests {
+    use super::{Cli, reject_output_collisions};
+    use clap::Parser;
 
-    println!("--- Config ---");
-    println!("nodes:             {}", config.node_count);
-    println!(
-        "renderer slots:    {} per node ({} total)",
-        config.cluster.renderer_slots_per_node, slots_total
-    );
-    println!(
-        "render permits:    {} per node ({} total)",
-        permits_per_node, permits_total
-    );
-    println!(
-        "native permits:    {} per node ({} total)",
-        cpu_permits_per_node, cpu_permits_total
-    );
-    println!(
-        "CPU cores:         {} per node ({} total)",
-        config.cpu_cores_per_node,
-        config.cpu_cores_per_node * config.node_count
-    );
-    println!(
-        "style setup (S):   {:?}–{:?}",
-        config.costs.style_setup_cost.min, config.costs.style_setup_cost.max
-    );
-    println!(
-        "render CPU:        {:?}–{:?}",
-        config.costs.render_cpu_cost.min, config.costs.render_cpu_cost.max
-    );
-    println!(
-        "warm resource I/O: {:?}–{:?}",
-        config.costs.render_resource_cost.min, config.costs.render_resource_cost.max
-    );
-    println!(
-        "first resource I/O:{:?}–{:?}",
-        config.costs.first_render_resource_cost.min, config.costs.first_render_resource_cost.max
-    );
-    println!("hop latency:       {:?}", config.costs.hop_latency);
-    println!("sla (L):           {:?}", config.costs.sla);
-    println!(
-        "soft queue limit:  {} per slot (BL/SLA target)",
-        queue_limits.soft
-    );
-    println!(
-        "hard queue limit:  {} per slot (backpressure cap)",
-        queue_limits.hard
-    );
-    println!(
-        "gossip:            chitchat publish={:?}",
-        config.gossip.publish_interval
-    );
-    println!(
-        "styles:            {} initial (+{}/s new)",
-        config.workload.style_count, config.workload.new_style_rate
-    );
-    println!(
-        "style dist:        {:?}",
-        config.workload.style_distribution
-    );
-    if let Some(b) = &config.workload.burst_pattern {
-        println!(
-            "burst:             period={:?}, dur={:?}, x{}, focus={:?}",
-            b.period, b.duration, b.multiplier, b.style_focus
+    #[test]
+    fn rejects_output_aliasing_input_and_other_output() {
+        let dir = std::env::temp_dir();
+        let report = dir.join("biei_sim_collision_report.json");
+        let html = dir.join("biei_sim_collision_report.html");
+        let trace = dir.join("biei_sim_collision_report.json"); // same as report
+
+        // Output equal to an input is rejected before any write.
+        assert!(
+            reject_output_collisions(
+                &[(report.as_path(), "report")],
+                &[(trace.as_path(), "churn-plan")],
+            )
+            .is_err()
+        );
+        // Two outputs resolving to the same file are rejected.
+        assert!(
+            reject_output_collisions(
+                &[(report.as_path(), "report"), (report.as_path(), "html")],
+                &[],
+            )
+            .is_err()
+        );
+        // Distinct outputs and inputs are accepted.
+        assert!(
+            reject_output_collisions(
+                &[(report.as_path(), "report"), (html.as_path(), "html")],
+                &[(dir.join("input.json").as_path(), "cost-profile")],
+            )
+            .is_ok()
         );
     }
-    println!("arrival rate:      {:.2} req/s", config.workload.total_rate);
-    println!(
-        "max throughput:    {:.2} req/s (min(native residency, CPU service))",
-        max_throughput,
-    );
-    println!("duration:          {:?}", config.workload.duration);
-    println!();
+
+    #[test]
+    fn rejects_dot_relative_alias_of_the_same_output() {
+        let dir = std::env::temp_dir();
+        let direct = dir.join("biei_sim_dot_alias.json");
+        let dotted = dir.join(".").join("biei_sim_dot_alias.json");
+        assert!(
+            reject_output_collisions(
+                &[(direct.as_path(), "report"), (dotted.as_path(), "html")],
+                &[],
+            )
+            .is_err(),
+            "`./` alias of the same file must be detected"
+        );
+    }
+
+    #[test]
+    fn command_is_required() {
+        assert!(Cli::try_parse_from(["biei-sim"]).is_err());
+    }
+
+    #[test]
+    fn calibration_profiles_must_be_supplied_as_a_pair() {
+        assert!(
+            Cli::try_parse_from(["biei-sim", "run", "--cost-profile", "traffic.json"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["biei-sim", "run", "--cpu-profile", "cpu.json"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "biei-sim",
+                "run",
+                "--cost-profile",
+                "traffic.json",
+                "--cpu-profile",
+                "cpu.json",
+            ])
+            .is_ok()
+        );
+    }
 }

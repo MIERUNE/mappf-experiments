@@ -1,4 +1,4 @@
-//! In-process `Transport` impl: `NodeRegistry` (Weak refs) + per-hop sleep,
+//! In-process `InternalTransport` impl: `NodeRegistry` (Weak refs) + per-hop sleep,
 //! calling the target node's `handle_forwarded` directly.
 
 use std::collections::HashMap;
@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use biei_core::internal_transport::{ForwardError, InternalTransport};
 use biei_core::node::Node;
-use biei_core::transport::{ForwardError, Transport};
 use biei_core::types::NodeId;
 use biei_core::wire::{ForwardRequest, ForwardResponse};
 
@@ -91,26 +91,80 @@ impl ChannelTransport {
 }
 
 #[async_trait]
-impl Transport for ChannelTransport {
+impl InternalTransport for ChannelTransport {
     async fn send(
         &self,
         target: NodeId,
         fwd: ForwardRequest,
     ) -> Result<ForwardResponse, ForwardError> {
         self.attempts.fetch_add(1, Ordering::Relaxed);
-        let deadline = tokio::time::Instant::now()
-            + Duration::from_millis(fwd.task.remaining_budget_ms as u64);
-        tokio::time::sleep(self.hop_latency).await;
-        if tokio::time::Instant::now() >= deadline {
-            return Err(ForwardError::Retryable("deadline_exceeded".to_string()));
-        }
+        let response_deadline = tokio::time::Instant::now()
+            + Duration::from_millis(fwd.origin_response_budget_ms as u64);
+        wait_for_hop(self.hop_latency, response_deadline).await?;
         let style_id = fwd.task.style.id.clone();
         let node = self
             .registry
             .get(&target)
             .ok_or_else(|| ForwardError::Retryable(format!("unknown node {target}")))?;
         let outcome = node.handle_forwarded(fwd).await;
+        wait_for_hop(self.hop_latency, response_deadline).await?;
         self.successes.fetch_add(1, Ordering::Relaxed);
         Ok(ForwardResponse::from_task_outcome(outcome, style_id))
+    }
+}
+
+async fn wait_for_hop(
+    hop_latency: Duration,
+    response_deadline: tokio::time::Instant,
+) -> Result<(), ForwardError> {
+    if !hop_latency.is_zero() {
+        tokio::time::sleep(hop_latency).await;
+    }
+    if tokio::time::Instant::now() >= response_deadline {
+        Err(ForwardError::Retryable("deadline_exceeded".to_string()))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn simulated_round_trip_charges_both_network_hops() {
+        let hop = Duration::from_millis(40);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let started = tokio::time::Instant::now();
+
+        wait_for_hop(hop, deadline).await.unwrap();
+        wait_for_hop(hop, deadline).await.unwrap();
+
+        assert_eq!(started.elapsed(), hop * 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_duration_hop_still_checks_the_origin_response_deadline() {
+        let now = tokio::time::Instant::now();
+
+        wait_for_hop(Duration::ZERO, now + Duration::from_secs(1))
+            .await
+            .expect("future deadline");
+        assert_eq!(tokio::time::Instant::now(), now);
+        assert!(matches!(
+            wait_for_hop(Duration::ZERO, now).await,
+            Err(ForwardError::Retryable(message)) if message == "deadline_exceeded"
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn simulated_hop_fails_at_the_origin_response_deadline() {
+        let hop = Duration::from_millis(40);
+        let deadline = tokio::time::Instant::now() + hop;
+
+        assert!(matches!(
+            wait_for_hop(hop, deadline).await,
+            Err(ForwardError::Retryable(message)) if message == "deadline_exceeded"
+        ));
     }
 }

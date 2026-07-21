@@ -4,7 +4,7 @@
 # Linux userspace generation. It builds and links on newer Ubuntu releases, but
 # has been observed to crash at render time there. Keep build and runtime on the
 # same 24.04 base unless mbgl is built from source.
-FROM ubuntu:24.04 AS chef
+FROM ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 AS chef
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -53,19 +53,28 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 COPY Cargo.toml Cargo.lock ./
 COPY crates/biei-core/Cargo.toml crates/biei-core/Cargo.toml
 COPY crates/ishikari-core/Cargo.toml crates/ishikari-core/Cargo.toml
+COPY crates/mmpf-cluster/Cargo.toml crates/mmpf-cluster/Cargo.toml
+COPY crates/mmpf-common/Cargo.toml crates/mmpf-common/Cargo.toml
+COPY crates/mmpf-http/Cargo.toml crates/mmpf-http/Cargo.toml
+COPY crates/mmpf-mln-filesource/Cargo.toml crates/mmpf-mln-filesource/Cargo.toml
+COPY crates/mmpf-pmtiles/Cargo.toml crates/mmpf-pmtiles/Cargo.toml
 COPY crates/mmpf-terrain/Cargo.toml crates/mmpf-terrain/Cargo.toml
 COPY servers/biei/Cargo.toml servers/biei/Cargo.toml
 COPY servers/ishikari/Cargo.toml servers/ishikari/Cargo.toml
 COPY sims/biei-sim/Cargo.toml sims/biei-sim/Cargo.toml
 COPY sims/ishikari-sim/Cargo.toml sims/ishikari-sim/Cargo.toml
 COPY crates/biei-core/src crates/biei-core/src
+COPY crates/mmpf-cluster/src crates/mmpf-cluster/src
+COPY crates/mmpf-common/src crates/mmpf-common/src
+COPY crates/mmpf-http/src crates/mmpf-http/src
+COPY crates/mmpf-mln-filesource/src crates/mmpf-mln-filesource/src
 COPY servers/biei/src servers/biei/src
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     cargo build --release --locked -p biei --features gl-opengl \
     && cp target/release/biei /biei
 
-FROM ubuntu:24.04 AS runtime
+FROM ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 AS runtime
 
 # Mesa EGL + software GL (llvmpipe). The `opengl` backend renders through an EGL
 # surfaceless context — no GPU, no X server.

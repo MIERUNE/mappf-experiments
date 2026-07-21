@@ -162,7 +162,7 @@ const METRIC_SPECS: &[MetricSpec] = &[
     // attempts during the window mean warm render walls still contained
     // provider I/O, so they must not be read as CPU service demand.
     MetricSpec {
-        metric: "biei_mln_resource_upstream_attempt_duration_seconds",
+        metric: "mmpf_mln_resource_upstream_attempt_duration_seconds",
         group_labels: &["kind", "priority"],
         ingress_only: false,
     },

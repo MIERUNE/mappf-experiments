@@ -5,7 +5,12 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".github/codecov.yml"
       - "crates/biei-core/**"
+      - "crates/mmpf-cluster/**"
+      - "crates/mmpf-common/**"
+      - "crates/mmpf-http/**"
+      - "crates/mmpf-mln-filesource/**"
       - "servers/biei/**"
       - "sims/biei-sim/**"
       - "demo-deploy/biei/**"
@@ -16,7 +21,12 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".github/codecov.yml"
       - "crates/biei-core/**"
+      - "crates/mmpf-cluster/**"
+      - "crates/mmpf-common/**"
+      - "crates/mmpf-http/**"
+      - "crates/mmpf-mln-filesource/**"
       - "servers/biei/**"
       - "sims/biei-sim/**"
       - "demo-deploy/biei/**"
@@ -31,9 +41,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Match the Ubuntu 24.04 production image and avoid rebuilding mbgl-core in
-  # every runner. Runtime compatibility still belongs to the container smoke
-  # test; this job covers compilation, unit/integration tests, and linting.
   MLN_PRECOMPILE: "1"
 
 jobs:
@@ -47,10 +54,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Audit Cargo.lock
-        uses: rustsec/audit-check@v2.0.0
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -58,10 +65,17 @@ jobs:
     name: Rust workspace
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      # Fresh checkouts can make Cargo conservatively invoke rustc again. Cache
+      # compiler outputs by content instead of fetching all Git history solely
+      # to reconstruct source mtimes.
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WORKSPACE_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install native build dependencies
         run: |
@@ -76,125 +90,71 @@ jobs:
       - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal \
-            --component rustfmt --component clippy
+            --component rustfmt --component clippy --component llvm-tools-preview
           rustup default stable
 
-      - name: Cache Cargo artifacts
-        uses: actions/cache@v4
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-gl-opengl-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-gl-opengl-
+          tool: cargo-llvm-cov@0.8.6
+
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: v0.16.0
+
+      # Keep dependency caching alongside sccache for MapLibre/native build
+      # outputs and linking inputs that rustc's compiler cache does not cover.
+      # rust-cache intentionally excludes workspace artifacts; sccache handles
+      # content-identical workspace compilation after Cargo's freshness check.
+      - name: Cache Cargo dependencies and native outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: . -> target
+          key: biei-gl-opengl-mln-precompile
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Build workspace
+      # cargo-llvm-cov runs the same test suite as cargo test. Keeping coverage
+      # in this job avoids a second MapLibre Native build in a dedicated job.
+      - name: Test workspace and collect coverage
         run: >-
-          cargo build --locked -p biei-core -p biei -p biei-sim
-          --features biei/gl-opengl
+          cargo llvm-cov --locked
+          -p mmpf-cluster -p mmpf-common -p mmpf-http -p mmpf-mln-filesource -p biei-core -p biei -p biei-sim
+          --features biei/gl-opengl --lcov --output-path lcov-biei.info
 
-      - name: Test workspace
-        run: >-
-          cargo test --locked -p biei-core -p biei -p biei-sim
-          --features biei/gl-opengl
-
-      # The precompiled mbgl archive can build and link successfully while
-      # still being incompatible with the runner userspace at render time.
-      # Exercise the real native/EGL path with a local resource-free style.
-      - name: Smoke native MapLibre rendering
-        run: |
-          cargo run --locked -p biei-core --example maplibre_smoke \
-            --features biei-core/gl-opengl -- \
-            --style-url .github/fixtures/biei/empty-style.json \
-            --scale 1x --output /tmp/biei-native-smoke.png
-          test -s /tmp/biei-native-smoke.png
-          cargo run --locked -p biei-core --example maplibre_smoke \
-            --features biei-core/gl-opengl -- \
-            --style-url .github/fixtures/biei/empty-style.json \
-            --scale 1x --output /tmp/biei-native-smoke.webp
-          test -s /tmp/biei-native-smoke.webp
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          files: lcov-biei.info
+          flags: biei,shared
+          name: biei
+          disable_search: true
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Lint workspace
         run: >-
-          cargo clippy -p biei-core -p biei -p biei-sim --all-targets --locked
-          --features biei/gl-opengl -- -D warnings
+          cargo clippy -p mmpf-cluster -p mmpf-common -p mmpf-http -p mmpf-mln-filesource -p biei-core -p biei -p biei-sim
+          --all-targets --locked --features biei/gl-opengl --
+          -D warnings
+          -D clippy::unchecked_time_subtraction
+          -D clippy::large_futures
+          -D clippy::large_stack_arrays
+          -D clippy::unused_async
 
-  container-smoke:
-    name: Production container native smoke
+  container-e2e:
+    name: Production container cluster E2E
     runs-on: ubuntu-24.04
     timeout-minutes: 45
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Build production image
         run: docker build -f demo-deploy/biei/runtime/Dockerfile -t biei-ci:smoke .
 
-      - name: Render PNG and WebP inside the production image
-        run: |
-          set -euo pipefail
-          python3 -m http.server 18081 --bind 127.0.0.1 \
-            --directory .github/fixtures/biei >/tmp/biei-fixture-server.log 2>&1 &
-          fixture_pid=$!
-          container_id="$(docker run -d --network host --read-only \
-            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
-            --tmpfs /var/cache/biei:rw,noexec,nosuid,size=64m \
-            -e BIEI_HTTP_BIND=127.0.0.1:18080 \
-            -e 'BIEI_STYLE_TEMPLATES=smoke=http://127.0.0.1:18081/{style_id}.json' \
-            -e BIEI_MLN_RESOURCE_PRIVATE_HOSTS=127.0.0.1 \
-            biei-ci:smoke)"
-          cleanup() {
-            docker logs "$container_id" || true
-            docker rm -f "$container_id" >/dev/null 2>&1 || true
-            kill "$fixture_pid" >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
-          for _ in $(seq 1 30); do
-            if curl --fail --silent --max-time 1 http://127.0.0.1:18080/readyz >/dev/null; then
-              break
-            fi
-            sleep 1
-          done
-          curl --fail --silent --show-error --max-time 30 \
-            'http://127.0.0.1:18080/smoke/empty-style/static/0,0,1/64x64.png' \
-            --output /tmp/biei-container-smoke.png
-          curl --fail --silent --show-error --max-time 30 \
-            'http://127.0.0.1:18080/smoke/empty-style/static/0,0,1/64x64.webp' \
-            --output /tmp/biei-container-smoke.webp
-          test "$(od -An -tx1 -N8 /tmp/biei-container-smoke.png | tr -d ' \n')" = 89504e470d0a1a0a
-          test "$(od -An -tx1 -N4 /tmp/biei-container-smoke.webp | tr -d ' \n')" = 52494646
-          test "$(dd if=/tmp/biei-container-smoke.webp bs=1 skip=8 count=4 status=none | od -An -tx1 | tr -d ' \n')" = 57454250
-          file /tmp/biei-container-smoke.png | grep -F '64 x 64'
-
-  manifests:
-    name: Deployment manifests
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v4
-        with:
-          version: v1.32.0
-
-      - name: Install manifest assertion dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends jq ruby
-
-      - name: Check shell syntax
-        run: >-
-          bash -n demo-deploy/biei/runtime/check-hpa.sh
-          demo-deploy/biei/runtime/smoke.sh
-          demo-deploy/biei/dev-cluster.sh
-
-      - name: Check deployment overlay invariants
-        run: bash demo-deploy/biei/runtime/check-hpa.sh
+      - name: Exercise two-node membership and peer rendering
+        run: BIEI_IMAGE=biei-ci:smoke bash demo-deploy/biei/runtime/cluster-smoke.sh

@@ -14,7 +14,7 @@ use crate::types::{
     PathOverlay, PinOverlay, PinSize, Positioning, RenderOutput, RenderRequest, RouteTier, Scale,
     SourceHash, StaticOverlay, TaskOutcome, TaskResult,
 };
-use crate::util::lock_unpoisoned;
+use mmpf_common::sync::lock_unpoisoned;
 
 // Rendered output freshness is independent from the style revision: base
 // tiles and other referenced resources may change at stable URLs. Keep the
@@ -22,15 +22,15 @@ use crate::util::lock_unpoisoned;
 const RENDER_OUTPUT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const RENDER_FLIGHT_SHARDS: usize = 16;
 const _: () = assert!(RENDER_FLIGHT_SHARDS.is_power_of_two());
-type RenderFlightMap = Mutex<HashMap<RenderCacheKey, watch::Sender<u64>>>;
+type RenderFlightMap = Mutex<HashMap<Arc<RenderCacheKey>, watch::Sender<u64>>>;
 
 #[derive(Clone, Default)]
-pub struct RenderOutputCache {
+pub(crate) struct RenderOutputCache {
     inner: Option<Arc<RenderOutputCacheInner>>,
 }
 
 struct RenderOutputCacheInner {
-    cache: Cache<RenderCacheKey, Arc<RenderOutput>>,
+    cache: Cache<Arc<RenderCacheKey>, Arc<RenderOutput>>,
     in_flight: Box<[RenderFlightMap]>,
 }
 
@@ -46,18 +46,26 @@ pub(crate) enum RenderCacheLookup {
     Disabled,
     Hit(RenderOutput),
     Leader(RenderFlightLeader),
-    Wait(watch::Receiver<u64>),
+    Wait(RenderFlightFollower),
+}
+
+/// Retains the canonical key while waiting so a follower can recheck the cache
+/// or become the next leader without rebuilding an overlay-heavy key.
+pub(crate) struct RenderFlightFollower {
+    inner: Arc<RenderOutputCacheInner>,
+    key: Arc<RenderCacheKey>,
+    changed: watch::Receiver<u64>,
 }
 
 /// Owns one cache key's render flight. Dropping the guard always wakes
 /// followers, including when rendering fails or the leader future is aborted.
 pub(crate) struct RenderFlightLeader {
     inner: Arc<RenderOutputCacheInner>,
-    key: Option<RenderCacheKey>,
+    key: Option<Arc<RenderCacheKey>>,
 }
 
 impl RenderOutputCache {
-    pub fn new(max_capacity_bytes: u64) -> Self {
+    pub(crate) fn new(max_capacity_bytes: u64) -> Self {
         Self::with_ttl(max_capacity_bytes, RENDER_OUTPUT_CACHE_TTL)
     }
 
@@ -68,7 +76,7 @@ impl RenderOutputCache {
         let cache = Cache::builder()
             .max_capacity(max_capacity_bytes)
             .time_to_live(ttl)
-            .weigher(|key: &RenderCacheKey, output: &Arc<RenderOutput>| {
+            .weigher(|key: &Arc<RenderCacheKey>, output: &Arc<RenderOutput>| {
                 key.estimated_size_bytes()
                     .saturating_add(output.bytes.len())
                     .clamp(1, u32::MAX as usize) as u32
@@ -84,7 +92,7 @@ impl RenderOutputCache {
         }
     }
 
-    pub fn is_enabled_for(&self, task: &InternalTask) -> bool {
+    pub(crate) fn is_enabled_for(&self, task: &InternalTask) -> bool {
         self.inner.is_some()
             && task
                 .source
@@ -101,7 +109,13 @@ impl RenderOutputCache {
         let Some(inner) = &self.inner else {
             return RenderCacheLookup::Disabled;
         };
-        let key = RenderCacheKey::from_task(task);
+        Self::lookup_or_join_key(Arc::clone(inner), Arc::new(RenderCacheKey::from_task(task)))
+    }
+
+    fn lookup_or_join_key(
+        inner: Arc<RenderOutputCacheInner>,
+        key: Arc<RenderCacheKey>,
+    ) -> RenderCacheLookup {
         if let Some(output) = inner.cache.get(&key) {
             return RenderCacheLookup::Hit((*output).clone());
         }
@@ -112,17 +126,34 @@ impl RenderOutputCache {
         if let Some(output) = inner.cache.get(&key) {
             return RenderCacheLookup::Hit((*output).clone());
         }
-        if let Some(changed) = in_flight.get(&key) {
-            return RenderCacheLookup::Wait(changed.subscribe());
+        if let Some((key, changed)) = in_flight.get_key_value(&key) {
+            let follower = RenderFlightFollower {
+                inner: Arc::clone(&inner),
+                key: Arc::clone(key),
+                changed: changed.subscribe(),
+            };
+            drop(in_flight);
+            return RenderCacheLookup::Wait(follower);
         }
 
         let (changed, _) = watch::channel(0);
-        in_flight.insert(key.clone(), changed);
+        in_flight.insert(Arc::clone(&key), changed);
         drop(in_flight);
         RenderCacheLookup::Leader(RenderFlightLeader {
-            inner: Arc::clone(inner),
+            inner,
             key: Some(key),
         })
+    }
+}
+
+impl RenderFlightFollower {
+    pub(crate) async fn changed(&mut self) {
+        let _ = self.changed.changed().await;
+    }
+
+    pub(crate) fn recheck(self) -> RenderCacheLookup {
+        let Self { inner, key, .. } = self;
+        RenderOutputCache::lookup_or_join_key(inner, key)
     }
 }
 
@@ -136,7 +167,7 @@ impl RenderFlightLeader {
         };
         self.inner
             .cache
-            .insert(key.clone(), Arc::new(output.clone()));
+            .insert(Arc::clone(key), Arc::new(output.clone()));
         true
     }
 }
@@ -153,7 +184,7 @@ impl Drop for RenderFlightLeader {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct RenderCacheKey {
     style_id: String,
     style_version: u64,
@@ -182,7 +213,7 @@ impl RenderCacheKey {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 enum RenderRequestKey {
     Tile {
         z: u8,
@@ -283,7 +314,7 @@ impl From<&RenderRequest> for RenderRequestKey {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 enum StaticOverlayKey {
     Path(PathOverlayKey),
     GeoJson(GeoJsonOverlayKey),
@@ -326,7 +357,7 @@ impl From<&StaticOverlay> for StaticOverlayKey {
 /// entries. Acceptable here because the cache is keyed on what the client
 /// actually sent, and dropping a few near-miss hits is cheaper than running a
 /// canonical-form normalizer on every request.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct GeoJsonOverlayKey {
     feature_collection: String,
 }
@@ -339,7 +370,7 @@ impl From<&GeoJsonOverlay> for GeoJsonOverlayKey {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct PathOverlayKey {
     stroke_width: Option<u32>,
     stroke_color: Option<String>,
@@ -349,7 +380,7 @@ struct PathOverlayKey {
     coordinates: Vec<LngLatKey>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct PinOverlayKey {
     size: PinSize,
     label: Option<String>,
@@ -446,7 +477,7 @@ impl From<&Positioning> for PositioningKey {
     }
 }
 
-pub fn cache_hit_outcome(
+pub(crate) fn cache_hit_outcome(
     node_id: NodeId,
     task: &InternalTask,
     output: RenderOutput,
@@ -464,8 +495,8 @@ pub fn cache_hit_outcome(
                 worker_id: None,
                 route_tier: RouteTier::RenderCacheHit,
                 started_at: task.arrived_at,
-                cpu_started_at: now,
-                cpu_completed_at: now,
+                native_render_started_at: now,
+                native_render_completed_at: now,
                 completed_at: now,
                 style_swap: false,
                 cold_start: false,
@@ -482,9 +513,10 @@ pub fn cache_hit_outcome(
 mod tests {
     use super::*;
     use crate::types::{
-        LngLat, NodeId, PathOverlay, PixelRatio, RequestId, SourceRef, StaticOverlay, StyleId,
-        StyleRevision, TaskResult,
+        AddLayer, AddLayerSource, GeoJsonOverlay, LngLat, NodeId, PathOverlay, PinOverlay,
+        PixelRatio, RequestId, SourceRef, StaticOverlay, StyleId, StyleRevision, TaskResult,
     };
+    use std::hash::BuildHasherDefault;
     use std::time::Duration;
 
     fn task(y: u32, source: Option<SourceRef>) -> InternalTask {
@@ -511,6 +543,83 @@ mod tests {
         }
     }
 
+    fn rich_static_task(feature_name: &str) -> InternalTask {
+        let mut task = task(0, None);
+        task.request = RenderRequest::StaticImage {
+            positioning: Positioning::Auto,
+            width: 1024,
+            height: 768,
+            overlays: vec![
+                StaticOverlay::Path(PathOverlay {
+                    stroke_width: Some(5.0),
+                    stroke_color: Some("f44".to_string()),
+                    stroke_opacity: Some(0.8),
+                    fill_color: Some("00ff00".to_string()),
+                    fill_opacity: Some(0.25),
+                    coordinates: vec![
+                        LngLat {
+                            lon: 139.0,
+                            lat: 35.0,
+                        },
+                        LngLat {
+                            lon: 140.0,
+                            lat: 36.0,
+                        },
+                    ],
+                }),
+                StaticOverlay::GeoJson(GeoJsonOverlay {
+                    feature_collection: serde_json::json!({
+                        "type": "FeatureCollection",
+                        "features": [{
+                            "type": "Feature",
+                            "properties": { "name": feature_name },
+                            "geometry": {
+                                "type": "Point",
+                                "coordinates": [139.5, 35.5]
+                            }
+                        }]
+                    }),
+                }),
+                StaticOverlay::Pin(PinOverlay {
+                    size: PinSize::Large,
+                    label: Some("A".to_string()),
+                    color: "336699".to_string(),
+                    coordinate: LngLat {
+                        lon: 139.5,
+                        lat: 35.5,
+                    },
+                }),
+            ],
+            before_layer: Some("labels".to_string()),
+            padding: crate::types::Padding {
+                top: 10,
+                right: 20,
+                bottom: 30,
+                left: 40,
+            },
+            addlayer: Some(AddLayer {
+                json: r#"{"id":"route","type":"line","source":"route-source"}"#.to_string(),
+                hash: 42,
+                source: Some(AddLayerSource {
+                    tileset_id: "routes".to_string(),
+                    json: r#"{"type":"vector","url":"mapbox://routes"}"#.to_string(),
+                }),
+            }),
+        };
+        task
+    }
+
+    #[derive(Default)]
+    struct CollisionHasher;
+
+    impl Hasher for CollisionHasher {
+        fn finish(&self) -> u64 {
+            0
+        }
+
+        fn write(&mut self, _bytes: &[u8]) {}
+    }
+
     fn output(bytes: &[u8], format: ImageFormat) -> RenderOutput {
         RenderOutput {
             bytes: bytes.to_vec().into(),
@@ -532,8 +641,8 @@ mod tests {
                     worker_id: Some(0),
                     route_tier: RouteTier::Tier1WarmTracking,
                     started_at: task.arrived_at,
-                    cpu_started_at: now,
-                    cpu_completed_at: now,
+                    native_render_started_at: now,
+                    native_render_completed_at: now,
                     completed_at: now,
                     style_swap: false,
                     cold_start: false,
@@ -552,6 +661,24 @@ mod tests {
         let b = RenderCacheKey::from_task(&task(1, None));
 
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn rich_static_keys_use_full_equality_even_when_hashes_collide() {
+        let key_a = Arc::new(RenderCacheKey::from_task(&rich_static_task("alpha")));
+        let key_b = Arc::new(RenderCacheKey::from_task(&rich_static_task("beta")));
+        let mut keys =
+            HashMap::<Arc<RenderCacheKey>, (), BuildHasherDefault<CollisionHasher>>::default();
+
+        keys.insert(Arc::clone(&key_a), ());
+        keys.insert(Arc::clone(&key_b), ());
+
+        assert_ne!(key_a, key_b);
+        assert_eq!(
+            keys.len(),
+            2,
+            "content equality must resolve hash collisions"
+        );
     }
 
     #[test]
@@ -745,6 +872,42 @@ mod tests {
     }
 
     #[test]
+    fn rich_static_key_ownership_is_shared_across_flight_and_cache() {
+        let cache = RenderOutputCache::new(1024 * 1024);
+        let task = rich_static_task("shared");
+        let leader = match cache.lookup_or_join(&task) {
+            RenderCacheLookup::Leader(leader) => leader,
+            _ => panic!("first cache miss should elect a leader"),
+        };
+        let leader_key = Arc::clone(leader.key.as_ref().expect("leader should own its key"));
+        let inner = cache.inner.as_ref().expect("cache should be enabled");
+
+        {
+            let in_flight = lock_unpoisoned(inner.flight_shard(&leader_key));
+            let (flight_key, _) = in_flight
+                .get_key_value(&leader_key)
+                .expect("leader key should be registered in the flight map");
+            assert!(Arc::ptr_eq(&leader_key, flight_key));
+        }
+
+        let follower = match cache.lookup_or_join(&task) {
+            RenderCacheLookup::Wait(follower) => follower,
+            _ => panic!("matching cache miss should follow the existing flight"),
+        };
+        assert!(Arc::ptr_eq(&leader_key, &follower.key));
+
+        assert!(leader.insert_from_outcome(&completed_outcome(
+            &task,
+            output(&[1, 2, 3], ImageFormat::Png),
+        )));
+        let (cached_key, _) = inner.cache.iter().next().expect("output should be cached");
+        assert!(Arc::ptr_eq(&leader_key, cached_key.as_ref()));
+
+        drop(leader);
+        assert!(matches!(follower.recheck(), RenderCacheLookup::Hit(_)));
+    }
+
+    #[test]
     fn insert_and_get_roundtrip_render_output() {
         let cache = RenderOutputCache::new(1024);
         let t = task(0, None);
@@ -792,20 +955,19 @@ mod tests {
             RenderCacheLookup::Leader(leader) => leader,
             _ => panic!("first cache miss should lead the render"),
         };
-        let mut changed = match cache.lookup_or_join(&t) {
-            RenderCacheLookup::Wait(changed) => changed,
+        let mut follower = match cache.lookup_or_join(&t) {
+            RenderCacheLookup::Wait(follower) => follower,
             _ => panic!("concurrent cache miss should wait for the leader"),
         };
         let rendered = output(&[1, 2, 3], ImageFormat::Png);
 
         assert!(leader.insert_from_outcome(&completed_outcome(&t, rendered.clone())));
         drop(leader);
-        tokio::time::timeout(Duration::from_secs(1), changed.changed())
+        tokio::time::timeout(Duration::from_secs(1), follower.changed())
             .await
-            .expect("leader completion should wake followers")
-            .expect("flight notification should remain open");
+            .expect("leader completion should wake followers");
 
-        match cache.lookup_or_join(&t) {
+        match follower.recheck() {
             RenderCacheLookup::Hit(output) => assert_eq!(output, rendered),
             _ => panic!("follower should observe the leader's cached output"),
         }
@@ -819,21 +981,17 @@ mod tests {
             RenderCacheLookup::Leader(leader) => leader,
             _ => panic!("first cache miss should lead the render"),
         };
-        let mut changed = match cache.lookup_or_join(&t) {
-            RenderCacheLookup::Wait(changed) => changed,
+        let mut follower = match cache.lookup_or_join(&t) {
+            RenderCacheLookup::Wait(follower) => follower,
             _ => panic!("concurrent cache miss should wait for the leader"),
         };
 
         drop(leader);
-        tokio::time::timeout(Duration::from_secs(1), changed.changed())
+        tokio::time::timeout(Duration::from_secs(1), follower.changed())
             .await
-            .expect("failed leader should wake followers")
-            .expect("flight notification should remain open");
+            .expect("failed leader should wake followers");
 
-        assert!(matches!(
-            cache.lookup_or_join(&t),
-            RenderCacheLookup::Leader(_)
-        ));
+        assert!(matches!(follower.recheck(), RenderCacheLookup::Leader(_)));
     }
 
     #[test]

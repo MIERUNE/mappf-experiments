@@ -61,6 +61,7 @@ pub fn viewport_batch_ranges(entries: &[TraceEntry]) -> Result<Vec<Range<usize>>
             );
         }
 
+        let mut batch_tiles = HashSet::new();
         let mut end = start;
         while end < entries.len() && (entries[end].step, entries[end].user) == key {
             let expected_ordinal = end - start;
@@ -71,6 +72,19 @@ pub fn viewport_batch_ranges(entries: &[TraceEntry]) -> Result<Vec<Range<usize>>
                     key.1,
                     entries[end].ordinal,
                     expected_ordinal
+                );
+            }
+            let entry = &entries[end];
+            if !batch_tiles.insert((entry.tileset.as_str(), entry.z, entry.x, entry.y)) {
+                bail!(
+                    "trace batch step={} user={} repeats tile {} z={} x={} y={} at ordinal {}",
+                    key.0,
+                    key.1,
+                    entry.tileset,
+                    entry.z,
+                    entry.x,
+                    entry.y,
+                    entry.ordinal
                 );
             }
             end += 1;
@@ -104,7 +118,9 @@ mod tests {
 
     #[test]
     fn jsonl_round_trip_preserves_batches() {
-        let expected = vec![entry(0, 0, 0), entry(0, 0, 1), entry(0, 1, 0)];
+        let mut second = entry(0, 0, 1);
+        second.x += 1;
+        let expected = vec![entry(0, 0, 0), second, entry(0, 1, 0)];
         let mut bytes = Vec::new();
         for entry in &expected {
             write_trace_entry(&mut bytes, entry).expect("write entry");
@@ -135,6 +151,28 @@ mod tests {
         let error = viewport_batch_ranges(&entries).expect_err("ordinal gap must fail");
 
         assert!(error.to_string().contains("has ordinal 2, expected 1"));
+    }
+
+    #[test]
+    fn rejects_duplicate_tile_within_viewport_batch() {
+        let entries = vec![entry(0, 7, 0), entry(0, 7, 1)];
+
+        let error = viewport_batch_ranges(&entries).expect_err("duplicate tile must fail");
+        let message = error.to_string();
+
+        assert!(message.contains("step=0 user=7"));
+        assert!(message.contains("repeats tile japan z=10 x=900 y=400 at ordinal 1"));
+    }
+
+    #[test]
+    fn permits_same_coordinate_for_different_tilesets() {
+        let mut second = entry(0, 0, 1);
+        second.tileset = "regional".to_string();
+        let entries = vec![entry(0, 0, 0), second];
+
+        let ranges = viewport_batch_ranges(&entries).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 0..2);
     }
 
     #[test]

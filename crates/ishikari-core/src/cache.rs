@@ -5,18 +5,18 @@ use std::time::{Duration, Instant};
 
 use moka::{Expiry, sync::Cache};
 
-use crate::{interned::TilesetId, storage::TilesetInfo};
+use crate::{cache_policy::tile_cache_entry_weight, interned::TilesetId, storage::TilesetInfo};
 
 /// Identifies a cached tile payload within a tileset.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct TileCacheKey {
+pub(crate) struct TileCacheKey {
     pub tileset_id: TilesetId,
     pub tile_id: u64,
 }
 
 impl TileCacheKey {
     /// Builds a tile cache key from a tileset id and PMTiles tile id.
-    pub fn new(tileset_id: &TilesetId, tile_id: u64) -> Self {
+    pub(crate) fn new(tileset_id: &TilesetId, tile_id: u64) -> Self {
         Self {
             tileset_id: tileset_id.clone(),
             tile_id,
@@ -24,30 +24,9 @@ impl TileCacheKey {
     }
 }
 
-/// Identifies a cached resource.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum ResourceCacheKey {
-    TilesetInfo { tileset_id: TilesetId },
-}
-
-impl ResourceCacheKey {
-    /// Builds the cache key for a cached tileset metadata resource.
-    pub fn tileset_info(tileset_id: &TilesetId) -> Self {
-        Self::TilesetInfo {
-            tileset_id: tileset_id.clone(),
-        }
-    }
-}
-
-/// Cacheable resources.
-#[derive(Clone)]
-pub enum Resource {
-    TilesetInfo(Arc<TilesetInfo>),
-}
-
 /// Cache entry for a tile, including negative lookups.
 #[derive(Clone)]
-pub enum CachedTile {
+pub(crate) enum CachedTile {
     Found {
         bytes: bytes::Bytes,
         content_type: &'static str,
@@ -58,14 +37,14 @@ pub enum CachedTile {
 
 /// Per-node L1 cache of tile payloads.
 #[derive(Clone)]
-pub struct TileCache {
+pub(crate) struct TileCache {
     cache: Cache<TileCacheKey, CachedTile>,
 }
 
-/// Per-node cache of resources such as [`TilesetInfo`].
+/// Per-node cache of tileset metadata.
 #[derive(Clone)]
-pub struct ResourceCache {
-    cache: Cache<ResourceCacheKey, Resource>,
+pub(crate) struct TilesetInfoCache {
+    cache: Cache<TilesetId, Arc<TilesetInfo>>,
 }
 
 /// Per-entry expiry policy for the tile cache.
@@ -118,7 +97,7 @@ impl Expiry<TileCacheKey, CachedTile> for TileExpiry {
 impl TileCache {
     /// Creates a tile cache with a byte-based capacity limit. Negative entries
     /// expire after `negative_ttl`; positive entries live until eviction.
-    pub fn new(max_capacity_bytes: u64, negative_ttl: Duration) -> Self {
+    pub(crate) fn new(max_capacity_bytes: u64, negative_ttl: Duration) -> Self {
         let cache = Cache::builder()
             .max_capacity(max_capacity_bytes)
             .weigher(tile_cache_weight)
@@ -128,12 +107,12 @@ impl TileCache {
     }
 
     /// Returns a cached tile payload if present.
-    pub fn get(&self, key: &TileCacheKey) -> Option<CachedTile> {
+    pub(crate) fn get(&self, key: &TileCacheKey) -> Option<CachedTile> {
         self.cache.get(key)
     }
 
     /// Inserts or replaces a cached tile payload.
-    pub fn put(&self, key: TileCacheKey, value: CachedTile) {
+    pub(crate) fn put(&self, key: TileCacheKey, value: CachedTile) {
         self.cache.insert(key, value);
     }
 
@@ -141,15 +120,15 @@ impl TileCache {
     ///
     /// Flushes pending maintenance first so the value reflects recent inserts
     /// and evictions rather than moka's lazily-updated estimate.
-    pub fn weighted_size(&self) -> u64 {
+    pub(crate) fn weighted_size(&self) -> u64 {
         self.cache.run_pending_tasks();
         self.cache.weighted_size()
     }
 }
 
-impl ResourceCache {
-    /// Creates a resource cache with a byte-based capacity limit.
-    pub fn new(max_capacity_bytes: u64) -> Self {
+impl TilesetInfoCache {
+    /// Creates a tileset metadata cache with a byte-based capacity limit.
+    pub(crate) fn new(max_capacity_bytes: u64) -> Self {
         let cache = Cache::builder()
             .max_capacity(max_capacity_bytes)
             .weigher(resource_cache_weight)
@@ -158,38 +137,35 @@ impl ResourceCache {
     }
 
     /// Returns a cached tileset metadata bundle if present.
-    pub fn get_tileset_info(&self, tileset_id: &TilesetId) -> Option<Arc<TilesetInfo>> {
-        let key = ResourceCacheKey::tileset_info(tileset_id);
-        self.cache.get(&key).map(|Resource::TilesetInfo(info)| info)
+    pub(crate) fn get(&self, tileset_id: &TilesetId) -> Option<Arc<TilesetInfo>> {
+        self.cache.get(tileset_id)
     }
 
     /// Inserts or replaces a cached tileset metadata bundle.
-    pub fn put_tileset_info(&self, tileset_id: &TilesetId, info: Arc<TilesetInfo>) {
-        self.cache.insert(
-            ResourceCacheKey::tileset_info(tileset_id),
-            Resource::TilesetInfo(info),
-        );
+    pub(crate) fn put(&self, tileset_id: &TilesetId, info: Arc<TilesetInfo>) {
+        self.cache.insert(tileset_id.clone(), info);
+    }
+
+    /// Returns the current weighted byte size of cached tileset metadata.
+    pub(crate) fn weighted_size(&self) -> u64 {
+        self.cache.run_pending_tasks();
+        self.cache.weighted_size()
     }
 }
 
 /// Estimates the weight of a cached tile entry.
-fn tile_cache_weight(key: &TileCacheKey, value: &CachedTile) -> u32 {
-    let value_size = match value {
-        CachedTile::Found { bytes, .. } => bytes.len(),
-        CachedTile::NotFound => 0,
+fn tile_cache_weight(_key: &TileCacheKey, value: &CachedTile) -> u32 {
+    let payload_bytes = match value {
+        CachedTile::Found { bytes, .. } => Some(bytes.len()),
+        CachedTile::NotFound => None,
     };
-    let total = std::mem::size_of_val(key).saturating_add(value_size);
-    total.min(u32::MAX as usize) as u32
+    tile_cache_entry_weight(payload_bytes)
 }
 
-/// Estimates the weight of a cached resource entry.
-fn resource_cache_weight(key: &ResourceCacheKey, value: &Resource) -> u32 {
-    match (key, value) {
-        (ResourceCacheKey::TilesetInfo { tileset_id }, Resource::TilesetInfo(info)) => {
-            let total = std::mem::size_of_val(tileset_id).saturating_add(info.approx_byte_size());
-            total.min(u32::MAX as usize) as u32
-        }
-    }
+/// Estimates the weight of cached tileset metadata.
+fn resource_cache_weight(tileset_id: &TilesetId, info: &Arc<TilesetInfo>) -> u32 {
+    let total = std::mem::size_of_val(tileset_id).saturating_add(info.approx_byte_size());
+    total.min(u32::MAX as usize) as u32
 }
 
 #[cfg(test)]
@@ -223,7 +199,8 @@ mod tests {
             negative_ttl: Duration::from_secs(30),
         };
         let now = Instant::now();
-        let key = TileCacheKey::new(&TilesetId::new_unchecked("demo/streets"), 42);
+        let tileset_id = TilesetId::try_new("demo/streets").unwrap();
+        let key = TileCacheKey::new(&tileset_id, 42);
         // A NotFound→Found update (tile published) must clear the negative TTL.
         assert_eq!(
             expiry.expire_after_update(&key, &found(), now, Some(Duration::from_secs(30))),

@@ -1,15 +1,38 @@
 [package]
 name = "ishikari"
 version = "0.1.0"
-edition = "2024"
-license = "Apache-2.0 OR MIT"
+edition.workspace = true
+license.workspace = true
 description = "The Ishikari tile and map resource server"
-repository = "https://github.com/MIERUNE/biei"
+repository.workspace = true
 publish = false
 
 [dependencies]
 anyhow.workspace = true
-ishikari-core.workspace = true
-tokio.workspace = true
+axum.workspace = true
+brotli.workspace = true
+bytes.workspace = true
+clap.workspace = true
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+httpdate.workspace = true
+ishikari-core = { workspace = true, features = ["cloud"] }
+mlt-core.workspace = true
+mmpf-cluster.workspace = true
+mmpf-common.workspace = true
+mmpf-http = { workspace = true, features = ["serve"] }
+mmpf-terrain = { workspace = true, features = ["raster-encode"] }
+moka.workspace = true
+object_store.workspace = true
+reqwest = { workspace = true, features = ["rustls", "http2"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+twox-hash.workspace = true
+url.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "test-util"] }
+tower = { version = "0.5", features = ["util"] }

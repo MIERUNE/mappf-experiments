@@ -10,26 +10,15 @@ use serde::{Deserialize, Serialize};
 
 /// Serializable object-store latency parameters used by the simulator.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackendLatencyConfig {
-    #[serde(default, rename = "artificial_backend_delay_ms", alias = "median_ms")]
+    #[serde(default)]
     pub median_ms: u64,
-    #[serde(
-        default,
-        rename = "artificial_backend_delay_sigma",
-        alias = "lognormal_sigma"
-    )]
+    #[serde(default)]
     pub lognormal_sigma: f64,
-    #[serde(
-        default,
-        rename = "artificial_backend_transfer_ms_per_mib",
-        alias = "transfer_ms_per_mib"
-    )]
+    #[serde(default)]
     pub transfer_ms_per_mib: f64,
-    #[serde(
-        default = "default_seed",
-        rename = "artificial_backend_delay_seed",
-        alias = "seed"
-    )]
+    #[serde(default = "default_seed")]
     pub seed: u64,
 }
 
@@ -125,5 +114,18 @@ mod tests {
         .expect_err("unsupported version");
 
         assert!(error.to_string().contains("schema version 2"));
+    }
+
+    #[test]
+    fn profile_rejects_deprecated_latency_field_names() {
+        let error = BackendLatencyProfile::from_reader(Cursor::new(
+            br#"{
+                "schema_version": 1,
+                "model": { "artificial_backend_delay_ms": 55 }
+            }"#,
+        ))
+        .expect_err("deprecated model fields must not be ignored");
+
+        assert!(error.to_string().contains("artificial_backend_delay_ms"));
     }
 }

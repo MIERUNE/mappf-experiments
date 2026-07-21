@@ -7,8 +7,12 @@ use image::ImageFormat;
 
 const MIN_VALID_ELEVATION: f32 = -12_000.0;
 const MAX_VALID_ELEVATION: f32 = 9_000.0;
-/// Maximum accepted DEM source-tile edge (px). Real tiles are 256/512.
-const MAX_DEM_TILE_DIM: u32 = 2048;
+/// Default maximum accepted DEM source-tile edge (px).
+///
+/// This is a generic library safety ceiling, not a source contract. Callers
+/// that know their source dimensions should use
+/// [`decode_terrarium_with_dimension_limit`] with the tighter bound.
+pub const DEFAULT_MAX_DEM_TILE_DIMENSION: u32 = 2048;
 
 #[derive(Debug)]
 pub struct DemTile {
@@ -40,9 +44,7 @@ pub struct DemNeighborhood {
 
 impl DemNeighborhood {
     pub fn from_tiles(tiles: [Option<Arc<DemTile>>; 9]) -> Result<Self> {
-        let center = tiles[4]
-            .as_ref()
-            .context("center Mapterhorn DEM tile is missing")?;
+        let center = tiles[4].as_ref().context("center DEM tile is missing")?;
         let (width, height) = (center.width, center.height);
         if width < 3 || height < 3 {
             bail!("DEM tile is too small: {width}x{height}");
@@ -63,11 +65,11 @@ impl DemNeighborhood {
         })
     }
 
-    pub fn width(&self) -> usize {
+    pub(crate) fn width(&self) -> usize {
         self.width
     }
 
-    pub fn height(&self) -> usize {
+    pub(crate) fn height(&self) -> usize {
         self.height
     }
 
@@ -76,6 +78,13 @@ impl DemNeighborhood {
     pub(crate) fn get(&self, x: i32, y: i32) -> f32 {
         let width = self.width as i32;
         let height = self.height as i32;
+        // Reads are defined only over the 3x3 neighborhood. Saturate anything
+        // beyond it to the outer border so an unexpected out-of-range sample
+        // degrades to an edge value instead of indexing a neighbor tile out of
+        // bounds. In-range callers are unaffected; this mirrors the clamp the
+        // missing-neighbor fallback below already applies.
+        let x = x.clamp(-width, 2 * width - 1);
+        let y = y.clamp(-height, 2 * height - 1);
         let (column, local_x) = tile_axis(x, width);
         let (row, local_y) = tile_axis(y, height);
         let index = ((row + 1) * 3 + column + 1) as usize;
@@ -126,18 +135,27 @@ fn tile_axis(value: i32, size: i32) -> (i32, i32) {
 }
 
 pub fn decode_terrarium(bytes: &[u8]) -> Result<DemTile> {
+    decode_terrarium_with_dimension_limit(bytes, DEFAULT_MAX_DEM_TILE_DIMENSION)
+}
+
+/// Decodes a Terrarium WebP after bounding both image dimensions.
+///
+/// The limit is applied by the image decoder before it materializes the RGB
+/// image, preventing a small compressed payload from expanding beyond the
+/// caller's source contract. It is deliberately a caller-supplied policy:
+/// Terrarium itself does not prescribe one tile dimension.
+pub fn decode_terrarium_with_dimension_limit(bytes: &[u8], max_dimension: u32) -> Result<DemTile> {
     // Cap decode dimensions so a crafted WebP declaring huge dimensions cannot
-    // expand a tiny payload into a multi-gigabyte buffer. Real DEM source tiles
-    // are 256/512 px; the bound leaves generous headroom.
+    // expand a tiny payload into an unexpectedly large buffer.
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
     reader.set_format(ImageFormat::WebP);
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_DEM_TILE_DIM);
-    limits.max_image_height = Some(MAX_DEM_TILE_DIM);
+    limits.max_image_width = Some(max_dimension);
+    limits.max_image_height = Some(max_dimension);
     reader.limits(limits);
     let image = reader
         .decode()
-        .context("decode Mapterhorn WebP")?
+        .context("decode Terrarium WebP")?
         .into_rgb8();
     let (width, height) = image.dimensions();
     let elevations = image
@@ -211,6 +229,14 @@ mod tests {
     }
 
     #[test]
+    fn caller_dimension_limit_is_enforced_before_decode() {
+        let error = decode_terrarium_with_dimension_limit(&webp_tile([128, 0, 0], 4, 3), 3)
+            .expect_err("width above the caller's source contract must fail");
+
+        assert!(error.to_string().contains("decode Terrarium WebP"));
+    }
+
+    #[test]
     fn reads_neighbor_and_falls_back_for_missing_neighbor() {
         let mut tiles: [Option<Arc<DemTile>>; 9] = std::array::from_fn(|_| None);
         tiles[4] = Some(Arc::new(
@@ -222,5 +248,16 @@ mod tests {
         let neighborhood = DemNeighborhood::from_tiles(tiles).unwrap();
         assert_eq!(neighborhood.get(3, 1), 1.0);
         assert_eq!(neighborhood.get(-1, 1), 0.0);
+    }
+
+    #[test]
+    fn get_saturates_reads_beyond_the_neighborhood_without_panicking() {
+        let size = 4;
+        let neighborhood = DemNeighborhood::synthetic(size, |x, y| (x + y) as f32);
+        // Coordinates far outside the 3x3 neighborhood must not index a tile out
+        // of bounds; they saturate to the outer border.
+        let far = neighborhood.get(1_000_000, -1_000_000);
+        assert!(far.is_finite());
+        assert_eq!(far, neighborhood.get(2 * size as i32 - 1, -(size as i32)));
     }
 }

@@ -2,14 +2,13 @@
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
+use mmpf_common::rng::splitmix64_finalize;
 use rand::{RngExt, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use tokio::time::Instant;
 
-use crate::activity::ProfileActivityTracker;
 use crate::config::{CostConfig, RoutingConfig, Tier1Strategy};
 use crate::hrw::hrw_weight;
 use crate::types::{
@@ -19,7 +18,7 @@ use crate::types::{
 
 const DEFAULT_FORWARD_CANDIDATES: usize = 2;
 
-type Tier3SortKey = (bool, bool, Reverse<usize>, Option<Instant>);
+type Tier3SortKey = (bool, bool, Reverse<usize>);
 
 struct WarmCandidate<'a> {
     node: &'a NodeStateView,
@@ -27,36 +26,75 @@ struct WarmCandidate<'a> {
     style_spare_bl: usize,
 }
 
-pub struct Dispatcher {
+/// Dispatcher-facing cluster state with an optional authoritative local entry.
+/// Remote state remains borrowed directly from the gossip-derived view.
+struct DispatchView<'a> {
+    cluster: &'a ClusterView,
+    local: Option<NodeStateView>,
+}
+
+impl<'a> DispatchView<'a> {
+    fn new(cluster: &'a ClusterView, local: Option<NodeStateView>) -> Self {
+        let local = local.filter(|state| cluster.members.contains(&state.id));
+        Self { cluster, local }
+    }
+
+    fn members(&self) -> &[NodeId] {
+        &self.cluster.members
+    }
+
+    fn state(&self, id: &NodeId) -> Option<&NodeStateView> {
+        self.local
+            .as_ref()
+            .filter(|local| &local.id == id)
+            .or_else(|| self.cluster.states.get(id))
+    }
+
+    fn states(&self) -> impl Iterator<Item = &NodeStateView> {
+        self.cluster
+            .states
+            .iter()
+            .filter(move |(id, _)| self.local.as_ref().is_none_or(|local| &local.id != *id))
+            .map(|(_, state)| state)
+            .chain(self.local.iter())
+    }
+
+    fn state_entries(&self) -> impl Iterator<Item = (&NodeId, &NodeStateView)> {
+        self.cluster
+            .states
+            .iter()
+            .filter(move |(id, _)| self.local.as_ref().is_none_or(|local| &local.id != *id))
+            .chain(self.local.iter().map(|state| (&state.id, state)))
+    }
+}
+
+pub(crate) struct Dispatcher {
     pub node_id: NodeId,
     pub config: RoutingConfig,
     pub costs: CostConfig,
     pub bl_capacity: usize,
     pub queue_capacity: usize,
-    pub activity: Arc<ProfileActivityTracker>,
     seed: u64,
 }
 
-pub struct DispatcherSpawn {
+pub(crate) struct DispatcherSpawn {
     pub node_id: NodeId,
     pub config: RoutingConfig,
     pub costs: CostConfig,
     pub bl_capacity: usize,
     pub queue_capacity: usize,
-    pub activity: Arc<ProfileActivityTracker>,
-    pub seed: u64,
+    pub resolved_seed: u64,
 }
 
 impl Dispatcher {
-    pub fn new(spec: DispatcherSpawn) -> Self {
+    pub(crate) fn new(spec: DispatcherSpawn) -> Self {
         let DispatcherSpawn {
             node_id,
             config,
             costs,
             bl_capacity,
             queue_capacity,
-            activity,
-            seed,
+            resolved_seed,
         } = spec;
 
         Self {
@@ -65,8 +103,7 @@ impl Dispatcher {
             costs,
             bl_capacity,
             queue_capacity: queue_capacity.max(bl_capacity),
-            activity,
-            seed,
+            seed: resolved_seed,
         }
     }
 
@@ -88,19 +125,30 @@ impl Dispatcher {
         queue_wait.saturating_add(own)
     }
 
+    /// Warm renderers for `profile` across the propagated cluster view. The four
+    /// tier-1 selection strategies iterate this identically, so the filter lives
+    /// in one place — the sampling indices rely on all passes seeing the same set.
+    fn warm_candidates<'a>(
+        &self,
+        view: &'a DispatchView<'_>,
+        profile: &'a WorkerProfile,
+    ) -> impl Iterator<Item = WarmCandidate<'a>> {
+        let bl_capacity = self.bl_capacity;
+        view.states()
+            .filter_map(move |node| warm_candidate(node, profile, bl_capacity))
+    }
+
     fn select_warm_target(
         &self,
         task: &InternalTask,
-        view: &ClusterView,
+        view: &DispatchView<'_>,
         profile: &WorkerProfile,
     ) -> Option<NodeId> {
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(routing_seed(self.seed, task.id));
         match self.config.tier1_strategy {
             Tier1Strategy::WeightedRandom => {
-                let total_weight: u64 = view
-                    .states
-                    .values()
-                    .filter_map(|node| warm_candidate(node, profile, self.bl_capacity))
+                let total_weight: u64 = self
+                    .warm_candidates(view, profile)
                     .map(|candidate| u64::from(candidate.warm_count))
                     .sum();
                 if total_weight == 0 {
@@ -108,11 +156,7 @@ impl Dispatcher {
                 }
 
                 let mut ticket = rng.random_range(0..total_weight);
-                for candidate in view
-                    .states
-                    .values()
-                    .filter_map(|node| warm_candidate(node, profile, self.bl_capacity))
-                {
+                for candidate in self.warm_candidates(view, profile) {
                     let weight = u64::from(candidate.warm_count);
                     if ticket < weight {
                         return Some(candidate.node.id.clone());
@@ -122,19 +166,14 @@ impl Dispatcher {
                 unreachable!("positive warm weight must select a node")
             }
             Tier1Strategy::PowerOfTwo => {
-                let candidate_count = view
-                    .states
-                    .values()
-                    .filter_map(|node| warm_candidate(node, profile, self.bl_capacity))
-                    .count();
+                let candidate_count = self.warm_candidates(view, profile).count();
                 if candidate_count == 0 {
                     return None;
                 }
                 if candidate_count == 1 {
-                    return view
-                        .states
-                        .values()
-                        .find_map(|node| warm_candidate(node, profile, self.bl_capacity))
+                    return self
+                        .warm_candidates(view, profile)
+                        .next()
                         .map(|candidate| candidate.node.id.clone());
                 }
 
@@ -145,12 +184,7 @@ impl Dispatcher {
                 }
                 let mut first = None;
                 let mut second = None;
-                for (idx, candidate) in view
-                    .states
-                    .values()
-                    .filter_map(|node| warm_candidate(node, profile, self.bl_capacity))
-                    .enumerate()
-                {
+                for (idx, candidate) in self.warm_candidates(view, profile).enumerate() {
                     if idx == first_idx {
                         first = Some(candidate);
                     } else if idx == second_idx {
@@ -172,7 +206,21 @@ impl Dispatcher {
         }
     }
 
-    pub fn decide(&self, task: &InternalTask, view: &ClusterView) -> Decision {
+    pub(crate) fn decide_with_local_state(
+        &self,
+        task: &InternalTask,
+        cluster: &ClusterView,
+        local: NodeStateView,
+    ) -> Decision {
+        self.decide_view(task, &DispatchView::new(cluster, Some(local)))
+    }
+
+    #[cfg(test)]
+    fn decide(&self, task: &InternalTask, cluster: &ClusterView) -> Decision {
+        self.decide_view(task, &DispatchView::new(cluster, None))
+    }
+
+    fn decide_view(&self, task: &InternalTask, view: &DispatchView<'_>) -> Decision {
         let profile = task.worker_profile();
 
         // ---- Tier 1: warm tracking (over propagated states only) ----
@@ -186,13 +234,12 @@ impl Dispatcher {
                 drain_worker: None,
             }];
             candidates.extend(
-                top_hrw_candidates(&view.members, &profile, DEFAULT_FORWARD_CANDIDATES, |id| {
+                top_hrw_candidates(view.members(), &profile, DEFAULT_FORWARD_CANDIDATES, |id| {
                     id != &target_id
                         && view
-                            .states
-                            .get(id)
+                            .state(id)
                             .map(|node| node.has_capacity(self.bl_capacity))
-                            .unwrap_or(true)
+                            .unwrap_or(false)
                 })
                 .into_iter()
                 .take(DEFAULT_FORWARD_CANDIDATES.saturating_sub(1)),
@@ -200,16 +247,15 @@ impl Dispatcher {
             return self.materialize_candidates(task, RouteTier::Tier1WarmTracking, candidates);
         }
 
-        // ---- Tier 2: HRW over static members, optimistic when state missing ----
+        // ---- Tier 2: HRW over members with complete current state ----
         // HRW input is stable style id + render mode + scale (not the style
         // revision version) so version bumps do not reshuffle routing. Tier 4
         // reuses the same ordering.
         let tier2_candidates =
-            top_hrw_candidates(&view.members, &profile, DEFAULT_FORWARD_CANDIDATES, |id| {
-                view.states
-                    .get(id)
+            top_hrw_candidates(view.members(), &profile, DEFAULT_FORWARD_CANDIDATES, |id| {
+                view.state(id)
                     .map(|n| n.has_capacity(self.bl_capacity))
-                    .unwrap_or(true)
+                    .unwrap_or(false)
             });
         if !tier2_candidates.is_empty() {
             return self.materialize_candidates(task, RouteTier::Tier2HrwBl, tier2_candidates);
@@ -217,7 +263,8 @@ impl Dispatcher {
 
         // ---- Tier 3: drain-and-swap ----
         if self.config.tier3_enabled {
-            let tier3_candidates = self.tier3_candidates(view, task, DEFAULT_FORWARD_CANDIDATES);
+            let tier3_candidates =
+                self.tier3_candidates_view(view, task, DEFAULT_FORWARD_CANDIDATES);
             if !tier3_candidates.is_empty() {
                 return self.materialize_candidates(
                     task,
@@ -229,11 +276,10 @@ impl Dispatcher {
 
         // ---- Tier 4: overflow queue admission ----
         let tier4_candidates =
-            top_hrw_candidates(&view.members, &profile, DEFAULT_FORWARD_CANDIDATES, |id| {
-                view.states
-                    .get(id)
+            top_hrw_candidates(view.members(), &profile, DEFAULT_FORWARD_CANDIDATES, |id| {
+                view.state(id)
                     .map(|n| n.has_admission_capacity(self.queue_capacity))
-                    .unwrap_or(true)
+                    .unwrap_or(false)
             });
         if !tier4_candidates.is_empty() {
             return self.materialize_candidates(task, RouteTier::Tier4Overflow, tier4_candidates);
@@ -244,9 +290,19 @@ impl Dispatcher {
         }
     }
 
+    #[cfg(test)]
     fn tier3_candidates(
         &self,
-        view: &ClusterView,
+        cluster: &ClusterView,
+        task: &InternalTask,
+        limit: usize,
+    ) -> Vec<ForwardCandidate> {
+        self.tier3_candidates_view(&DispatchView::new(cluster, None), task, limit)
+    }
+
+    fn tier3_candidates_view(
+        &self,
+        view: &DispatchView<'_>,
         task: &InternalTask,
         limit: usize,
     ) -> Vec<ForwardCandidate> {
@@ -259,7 +315,7 @@ impl Dispatcher {
         // Static/Tile and @1x/@2x allocations stay independent.
         let mut cluster_counts: HashMap<WorkerProfile, usize> = HashMap::new();
         let mut candidates: Vec<(NodeId, &WorkerView)> = Vec::new();
-        for (nid, node) in &view.states {
+        for (nid, node) in view.state_entries() {
             if !node.accepts_new_renders {
                 continue;
             }
@@ -286,9 +342,23 @@ impl Dispatcher {
         }
 
         // Prefer over-allocated profiles first. Within that group, reuse the
-        // same renderer shape (mode + scale), then fall back to count/age.
-        candidates.sort_by_key(|(_, w)| {
-            self.tier3_sort_key(w.loaded_profile.as_ref(), &task_profile, &cluster_counts)
+        // same renderer shape (mode + scale), then use queue depth and stable
+        // identity so the worker used for the SLA estimate is the one hinted
+        // to the owner.
+        candidates.sort_by(|(a_nid, a), (b_nid, b)| {
+            tier3_sort_key(a.loaded_profile.as_ref(), &task_profile, &cluster_counts)
+                .cmp(&tier3_sort_key(
+                    b.loaded_profile.as_ref(),
+                    &task_profile,
+                    &cluster_counts,
+                ))
+                // Break ties only on cluster-visible, deterministic state so every
+                // dispatcher with the same `ClusterView` picks the same eviction
+                // target regardless of local request history: least-queued worker
+                // first, then a stable (node, worker) identity order.
+                .then_with(|| a.queue_depth.cmp(&b.queue_depth))
+                .then_with(|| a_nid.cmp(b_nid))
+                .then_with(|| a.id.cmp(&b.id))
         });
 
         let mut selected = Vec::new();
@@ -308,23 +378,6 @@ impl Dispatcher {
             }
         }
         selected
-    }
-
-    fn tier3_sort_key(
-        &self,
-        loaded_profile: Option<&WorkerProfile>,
-        task_profile: &WorkerProfile,
-        cluster_counts: &HashMap<WorkerProfile, usize>,
-    ) -> Tier3SortKey {
-        let Some(profile) = loaded_profile else {
-            // Fresh workers have no profile to protect and no activity age.
-            return (false, true, Reverse(usize::MAX), None);
-        };
-        let count = cluster_counts.get(profile).copied().unwrap_or(0);
-        let shape_mismatch =
-            profile.render_mode != task_profile.render_mode || profile.scale != task_profile.scale;
-        let last_seen = self.activity.last_seen(profile);
-        (count <= 1, shape_mismatch, Reverse(count), last_seen)
     }
 
     fn materialize_candidates(
@@ -378,10 +431,8 @@ impl Dispatcher {
 }
 
 fn routing_seed(seed: u64, task_id: u64) -> u64 {
-    let mut value = seed ^ task_id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    value ^ (value >> 31)
+    let value = seed ^ task_id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    splitmix64_finalize(value)
 }
 
 fn warm_candidate<'a>(
@@ -447,11 +498,30 @@ where
         .collect()
 }
 
+/// Tier-3 eviction ranking key derived only from cluster-visible state (so it is
+/// identical on every dispatcher observing the same `ClusterView`). Lower sorts
+/// first: protect singleton profiles, prefer a matching renderer shape, then
+/// favor more over-allocated profiles. Ties are broken by the caller using
+/// queue depth and stable node/worker identity.
+fn tier3_sort_key(
+    loaded_profile: Option<&WorkerProfile>,
+    task_profile: &WorkerProfile,
+    cluster_counts: &HashMap<WorkerProfile, usize>,
+) -> Tier3SortKey {
+    let Some(profile) = loaded_profile else {
+        // Fresh workers have no profile to protect.
+        return (false, true, Reverse(usize::MAX));
+    };
+    let count = cluster_counts.get(profile).copied().unwrap_or(0);
+    let shape_mismatch =
+        profile.render_mode != task_profile.render_mode || profile.scale != task_profile.scale;
+    (count <= 1, shape_mismatch, Reverse(count))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use crate::activity::ProfileActivityTracker;
     use crate::config::{CostRange, RoutingConfig, Tier1Strategy};
     use crate::types::{
         ClusterView, ImageFormat, NodeStateView, PixelRatio, RenderMode, RenderRequest, Scale,
@@ -479,15 +549,11 @@ mod tests {
         }
     }
 
-    fn dispatcher(activity: Arc<ProfileActivityTracker>) -> Dispatcher {
-        dispatcher_with_caps(activity, 1, 1)
+    fn dispatcher() -> Dispatcher {
+        dispatcher_with_caps(1, 1)
     }
 
-    fn dispatcher_with_caps(
-        activity: Arc<ProfileActivityTracker>,
-        bl_capacity: usize,
-        queue_capacity: usize,
-    ) -> Dispatcher {
+    fn dispatcher_with_caps(bl_capacity: usize, queue_capacity: usize) -> Dispatcher {
         Dispatcher::new(DispatcherSpawn {
             node_id: NodeId::from_index(0),
             config: RoutingConfig {
@@ -506,8 +572,7 @@ mod tests {
             },
             bl_capacity,
             queue_capacity,
-            activity,
-            seed: 0,
+            resolved_seed: 0,
         })
     }
 
@@ -529,6 +594,283 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dispatch_view_replaces_only_the_local_member_state() {
+        let local_id = NodeId::from_index(0);
+        let remote_id = NodeId::from_index(1);
+        let cluster = ClusterView {
+            members: vec![local_id.clone(), remote_id.clone()],
+            states: [
+                (
+                    local_id.clone(),
+                    NodeStateView {
+                        id: local_id.clone(),
+                        accepts_new_renders: false,
+                        workers: vec![WorkerView {
+                            id: 0,
+                            loaded_profile: Some(profile(1)),
+                            queue_depth: 9,
+                        }],
+                    },
+                ),
+                (
+                    remote_id.clone(),
+                    NodeStateView {
+                        id: remote_id.clone(),
+                        accepts_new_renders: true,
+                        workers: vec![WorkerView {
+                            id: 4,
+                            loaded_profile: Some(profile(2)),
+                            queue_depth: 3,
+                        }],
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            generated_at: Instant::now(),
+        };
+        let dispatch = DispatchView::new(
+            &cluster,
+            Some(NodeStateView {
+                id: local_id.clone(),
+                accepts_new_renders: true,
+                workers: vec![WorkerView {
+                    id: 0,
+                    loaded_profile: Some(profile(3)),
+                    queue_depth: 1,
+                }],
+            }),
+        );
+
+        let local = dispatch.state(&local_id).expect("local state is present");
+        assert!(local.accepts_new_renders);
+        assert_eq!(local.workers[0].loaded_profile.as_ref(), Some(&profile(3)));
+        assert_eq!(local.workers[0].queue_depth, 1);
+
+        let remote = dispatch.state(&remote_id).expect("remote state is present");
+        assert!(remote.accepts_new_renders);
+        assert_eq!(remote.workers[0].id, 4);
+        assert_eq!(remote.workers[0].loaded_profile.as_ref(), Some(&profile(2)));
+        assert_eq!(remote.workers[0].queue_depth, 3);
+        assert_eq!(
+            dispatch.states().count(),
+            2,
+            "local state is not duplicated"
+        );
+    }
+
+    #[test]
+    fn dispatch_view_does_not_add_local_state_outside_membership() {
+        let local_id = NodeId::from_index(0);
+        let remote_id = NodeId::from_index(1);
+        let cluster = ClusterView {
+            members: vec![remote_id.clone()],
+            states: [(
+                remote_id.clone(),
+                NodeStateView {
+                    id: remote_id,
+                    accepts_new_renders: true,
+                    workers: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            generated_at: Instant::now(),
+        };
+        let dispatch = DispatchView::new(
+            &cluster,
+            Some(NodeStateView {
+                id: local_id.clone(),
+                accepts_new_renders: true,
+                workers: vec![WorkerView {
+                    id: 0,
+                    loaded_profile: None,
+                    queue_depth: 0,
+                }],
+            }),
+        );
+
+        assert!(dispatch.state(&local_id).is_none());
+        assert_eq!(dispatch.states().count(), 1);
+    }
+
+    #[test]
+    fn authoritative_local_state_suppresses_stale_warm_routing() {
+        let dispatcher = dispatcher_with_caps(1, 1);
+        let local_id = NodeId::from_index(0);
+        let remote_id = NodeId::from_index(1);
+        let task = make_task(9, Instant::now());
+        let cluster = ClusterView {
+            members: vec![local_id.clone(), remote_id.clone()],
+            states: [
+                (
+                    local_id.clone(),
+                    NodeStateView {
+                        id: local_id.clone(),
+                        accepts_new_renders: true,
+                        workers: vec![WorkerView {
+                            id: 0,
+                            loaded_profile: Some(task.worker_profile()),
+                            queue_depth: 0,
+                        }],
+                    },
+                ),
+                (
+                    remote_id.clone(),
+                    NodeStateView {
+                        id: remote_id.clone(),
+                        accepts_new_renders: true,
+                        workers: vec![WorkerView {
+                            id: 0,
+                            loaded_profile: None,
+                            queue_depth: 0,
+                        }],
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            generated_at: Instant::now(),
+        };
+        let local = NodeStateView {
+            id: local_id,
+            accepts_new_renders: true,
+            workers: vec![WorkerView {
+                id: 0,
+                loaded_profile: Some(profile(7)),
+                queue_depth: 1,
+            }],
+        };
+
+        let decision = dispatcher.decide_with_local_state(&task, &cluster, local);
+        let Decision::Forward {
+            route_tier,
+            candidates,
+        } = decision
+        else {
+            panic!("stale local warmth must not beat current remote capacity");
+        };
+        assert_eq!(route_tier, RouteTier::Tier2HrwBl);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].node_id, remote_id);
+    }
+
+    #[test]
+    fn authoritative_local_state_exposes_new_local_capacity() {
+        let dispatcher = dispatcher_with_caps(1, 1);
+        let local_id = NodeId::from_index(0);
+        let task = make_task(9, Instant::now());
+        let cluster = ClusterView {
+            members: vec![local_id.clone()],
+            states: [(
+                local_id.clone(),
+                NodeStateView {
+                    id: local_id.clone(),
+                    accepts_new_renders: true,
+                    workers: vec![WorkerView {
+                        id: 0,
+                        loaded_profile: Some(profile(7)),
+                        queue_depth: 1,
+                    }],
+                },
+            )]
+            .into_iter()
+            .collect(),
+            generated_at: Instant::now(),
+        };
+        let local = NodeStateView {
+            id: local_id,
+            accepts_new_renders: true,
+            workers: vec![WorkerView {
+                id: 0,
+                loaded_profile: None,
+                queue_depth: 0,
+            }],
+        };
+
+        assert!(matches!(
+            dispatcher.decide_with_local_state(&task, &cluster, local),
+            Decision::Local {
+                route_tier: RouteTier::Tier2HrwBl,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn tier3_uses_live_local_admission_without_duplicating_stale_state() {
+        let dispatcher = dispatcher_with_caps(1, 1);
+        let local_id = NodeId::from_index(0);
+        let remote_id = NodeId::from_index(1);
+        let task = make_task(9, Instant::now());
+        let cluster = ClusterView {
+            members: vec![local_id.clone(), remote_id.clone()],
+            states: [
+                (
+                    local_id.clone(),
+                    NodeStateView {
+                        id: local_id.clone(),
+                        accepts_new_renders: true,
+                        workers: vec![WorkerView {
+                            id: 0,
+                            loaded_profile: Some(profile(7)),
+                            queue_depth: 0,
+                        }],
+                    },
+                ),
+                (
+                    remote_id.clone(),
+                    NodeStateView {
+                        id: remote_id.clone(),
+                        accepts_new_renders: true,
+                        workers: vec![WorkerView {
+                            id: 0,
+                            loaded_profile: Some(profile(8)),
+                            queue_depth: 1,
+                        }],
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            generated_at: Instant::now(),
+        };
+        let local = NodeStateView {
+            id: local_id,
+            accepts_new_renders: false,
+            workers: vec![WorkerView {
+                id: 0,
+                loaded_profile: Some(profile(7)),
+                queue_depth: 0,
+            }],
+        };
+
+        let decision = dispatcher.decide_with_local_state(&task, &cluster, local);
+        let Decision::Forward {
+            route_tier,
+            candidates,
+        } = decision
+        else {
+            panic!("Tier 3 must use the remote candidate after live local admission closes");
+        };
+        assert_eq!(route_tier, RouteTier::Tier3DrainSwap);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].node_id, remote_id);
+    }
+
+    #[test]
+    fn routing_seed_keeps_task_id_splitmix_contract() {
+        const TASK_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+
+        assert_eq!(routing_seed(0, 0), splitmix64_finalize(0));
+        assert_eq!(routing_seed(0, 1), splitmix64_finalize(TASK_MIX));
+        assert_eq!(
+            routing_seed(7, 2),
+            splitmix64_finalize(7 ^ TASK_MIX.wrapping_mul(2))
+        );
+    }
+
     fn make_task(style_index: u32, arrived_at: Instant) -> InternalTask {
         InternalTask {
             id: 1,
@@ -545,40 +887,6 @@ mod tests {
             output_format: ImageFormat::Png,
             arrived_at,
             deadline: arrived_at + Duration::from_secs(10),
-            forwarding_hops: 0,
-        }
-    }
-
-    fn production_profile(style_id: &str) -> WorkerProfile {
-        WorkerProfile {
-            style: StyleRevision {
-                id: StyleId(style_id.to_string()),
-                version: 1,
-            },
-            render_mode: RenderMode::Tile,
-            scale: Scale::X1,
-        }
-    }
-
-    fn production_task(style_id: &str, now: Instant) -> InternalTask {
-        InternalTask {
-            id: 1,
-            request_id: crate::types::RequestId::from_string("dispatcher-production-test"),
-            style: StyleRevision {
-                id: StyleId(style_id.to_string()),
-                version: 1,
-            },
-            source: None,
-            request: RenderRequest::Tile {
-                z: 14,
-                x: 0,
-                y: 0,
-                tile_size: 256,
-            },
-            pixel_ratio: PixelRatio::X1,
-            output_format: ImageFormat::Png,
-            arrived_at: now,
-            deadline: now + Duration::from_secs(10),
             forwarding_hops: 0,
         }
     }
@@ -652,11 +960,8 @@ mod tests {
 
     #[test]
     fn tier3_allows_eviction_when_cluster_has_multiple_workers() {
-        let activity = Arc::new(ProfileActivityTracker::new());
         let now = Instant::now();
-        activity.record(profile(1), now);
-        activity.record(profile(2), now - Duration::from_secs(20));
-        let d = dispatcher(activity);
+        let d = dispatcher();
 
         let task = make_task(9, now);
         let picked = d.tier3_candidates(
@@ -692,10 +997,8 @@ mod tests {
 
     #[test]
     fn tier3_does_not_pick_incoming_profile_as_eviction_candidate() {
-        let activity = Arc::new(ProfileActivityTracker::new());
         let now = Instant::now();
-        activity.record(profile(9), now);
-        let d = dispatcher(activity);
+        let d = dispatcher();
 
         let task = make_task(9, now);
         let picked = d.tier3_candidates(
@@ -720,10 +1023,8 @@ mod tests {
 
     #[test]
     fn tier3_can_fall_back_to_single_worker_other_style() {
-        let activity = Arc::new(ProfileActivityTracker::new());
         let now = Instant::now();
-        activity.record(profile(1), now);
-        let d = dispatcher(activity);
+        let d = dispatcher();
 
         let task = make_task(9, now);
         let picked = d.tier3_candidates(
@@ -747,14 +1048,8 @@ mod tests {
 
     #[test]
     fn tier3_prefers_same_renderer_shape_within_over_allocated_profiles() {
-        let activity = Arc::new(ProfileActivityTracker::new());
         let now = Instant::now();
-        activity.record(
-            profile_with(1, RenderMode::Static, Scale::X1),
-            now - Duration::from_secs(20),
-        );
-        activity.record(profile(2), now);
-        let d = dispatcher(activity);
+        let d = dispatcher();
 
         let task = make_task(9, now);
         let picked = d.tier3_candidates(
@@ -794,53 +1089,9 @@ mod tests {
     }
 
     #[test]
-    fn tier3_uses_activity_for_production_style_ids() {
-        let activity = Arc::new(ProfileActivityTracker::new());
-        let streets = StyleId("demo/streets-v12".to_string());
-        let satellite = StyleId("demo/satellite-v9".to_string());
-        let incoming = StyleId("demo/outdoors-v12".to_string());
-
-        let now = Instant::now();
-        activity.record(production_profile(streets.as_str()), now);
-        activity.record(
-            production_profile(satellite.as_str()),
-            now - Duration::from_secs(20),
-        );
-        let d = dispatcher(activity);
-        let task = production_task(incoming.as_str(), now);
-
-        let picked = d.tier3_candidates(
-            &view(vec![
-                WorkerView {
-                    id: 0,
-                    loaded_profile: Some(production_profile(streets.as_str())),
-                    queue_depth: 1,
-                },
-                WorkerView {
-                    id: 1,
-                    loaded_profile: Some(production_profile(satellite.as_str())),
-                    queue_depth: 1,
-                },
-            ]),
-            &task,
-            1,
-        );
-
-        assert_eq!(
-            picked,
-            vec![ForwardCandidate {
-                node_id: NodeId::from_index(0),
-                drain_worker: Some(1),
-            }]
-        );
-    }
-
-    #[test]
     fn decide_uses_overflow_when_tier3_is_too_slow_but_hard_capacity_remains() {
-        let activity = Arc::new(ProfileActivityTracker::new());
         let now = Instant::now();
-        activity.record(profile(9), now);
-        let d = dispatcher_with_caps(activity, 1, 4);
+        let d = dispatcher_with_caps(1, 4);
 
         let task = make_task(9, now);
 
@@ -866,10 +1117,8 @@ mod tests {
 
     #[test]
     fn explicit_renderer_degradation_excludes_node_from_every_routing_tier() {
-        let activity = Arc::new(ProfileActivityTracker::new());
         let now = Instant::now();
-        activity.record(profile(9), now);
-        let dispatcher = dispatcher_with_caps(activity, 2, 8);
+        let dispatcher = dispatcher_with_caps(2, 8);
         let task = make_task(9, now);
         let mut cluster = view(vec![WorkerView {
             id: 0,
@@ -892,9 +1141,8 @@ mod tests {
 
     #[test]
     fn decide_forwards_top_two_candidates_when_remote_capacity_exists() {
-        let activity = Arc::new(ProfileActivityTracker::new());
         let now = Instant::now();
-        let d = dispatcher_with_caps(activity, 2, 8);
+        let d = dispatcher_with_caps(2, 8);
         let task = make_task(9, now);
         let view = ClusterView {
             members: vec![
@@ -960,8 +1208,7 @@ mod tests {
 
     #[test]
     fn local_decision_retains_remaining_remote_candidates() {
-        let activity = Arc::new(ProfileActivityTracker::new());
-        let dispatcher = dispatcher(activity);
+        let dispatcher = dispatcher();
         let task = make_task(9, Instant::now());
         let remote = ForwardCandidate {
             node_id: NodeId::from_index(1),
@@ -992,7 +1239,7 @@ mod tests {
 
     #[test]
     fn tier1_warm_local_route_keeps_remote_fallback_for_stale_health() {
-        let dispatcher = dispatcher(Arc::new(ProfileActivityTracker::new()));
+        let dispatcher = dispatcher();
         let now = Instant::now();
         let task = make_task(9, now);
         let local_id = NodeId::from_index(0);

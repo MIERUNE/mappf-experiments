@@ -229,7 +229,7 @@ fn boundary_graph(
             if west != east {
                 let vertex = (origin + x, origin + y);
                 let crossing = tones.map(|_| {
-                    interpolated_crossing(
+                    edge_crossing(
                         vertex,
                         VERTICAL,
                         west,
@@ -238,7 +238,6 @@ fn boundary_graph(
                         tone_at(x as isize, y as isize),
                         output_scale,
                     )
-                    .unwrap_or_else(|| edge_midpoint(vertex, VERTICAL, output_scale))
                 });
                 grid.set((origin + x, origin + y), VERTICAL, west, east, crossing);
             }
@@ -253,7 +252,7 @@ fn boundary_graph(
             if north != south {
                 let vertex = (origin + x, origin + y);
                 let crossing = tones.map(|_| {
-                    interpolated_crossing(
+                    edge_crossing(
                         vertex,
                         HORIZONTAL,
                         north,
@@ -262,13 +261,35 @@ fn boundary_graph(
                         tone_at(x as isize, y as isize),
                         output_scale,
                     )
-                    .unwrap_or_else(|| edge_midpoint(vertex, HORIZONTAL, output_scale))
                 });
                 grid.set((origin + x, origin + y), HORIZONTAL, south, north, crossing);
             }
         }
     }
     grid
+}
+
+/// Crossing point for an edge: the tone-interpolated position when both tones
+/// are finite, falling back to the geometric edge midpoint otherwise.
+fn edge_crossing(
+    vertex: Point,
+    kind: usize,
+    first_label: i8,
+    second_label: i8,
+    first_tone: Option<f64>,
+    second_tone: Option<f64>,
+    output_scale: i32,
+) -> Point {
+    interpolated_crossing(
+        vertex,
+        kind,
+        first_label,
+        second_label,
+        first_tone,
+        second_tone,
+        output_scale,
+    )
+    .unwrap_or_else(|| edge_midpoint(vertex, kind, output_scale))
 }
 
 fn interpolated_crossing(
@@ -321,6 +342,9 @@ fn edge_midpoint(vertex: Point, kind: usize, output_scale: i32) -> Point {
 fn build_arcs(grid: &EdgeGrid, tile_size: i32) -> Vec<SharedArc> {
     let mut remaining = grid.info.iter().map(Option::is_some).collect::<Vec<_>>();
     let mut arcs = Vec::new();
+    // `graph_has_crossings` reads only the immutable `grid`, so its full-grid
+    // scan is loop-invariant — compute it once instead of per seed arc.
+    let interpolated = graph_has_crossings(grid);
     // Dense ids ascend in the same order the map-based `remaining.first()`
     // yielded, and extending an arc only consumes edges at or after the
     // smallest remaining one, so a single forward scan seeds identically.
@@ -355,7 +379,6 @@ fn build_arcs(grid: &EdgeGrid, tile_size: i32) -> Vec<SharedArc> {
         let topology_end = *points.last().expect("arc has endpoints");
         let raw_start_direction = direction(points[0], points[1]);
         let raw_end_direction = direction(points[points.len() - 2], points[points.len() - 1]);
-        let interpolated = graph_has_crossings(grid);
         let shared_render_endpoints = !interpolated || topology_start != topology_end;
         let points = if interpolated {
             interpolated_arc_points(&points, grid, right, left)

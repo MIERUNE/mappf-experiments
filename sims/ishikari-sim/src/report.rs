@@ -1,7 +1,69 @@
 use std::collections::BTreeMap;
 
-use ishikari_core::metrics::{HistogramSnapshot, NodeHistogramSnapshot, NodeMetricsSnapshot};
+use ishikari_core::{
+    metrics::{HistogramSnapshot, NodeHistogramSnapshot, NodeMetricsSnapshot},
+    storage::TileSource,
+};
 use serde::Serialize;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(usize)]
+pub(crate) enum SourceCategory {
+    SelfCache,
+    SelfBackend,
+    Miss,
+    PeerCache,
+    PeerBackend,
+}
+
+impl SourceCategory {
+    const ALL: [Self; 5] = [
+        Self::SelfCache,
+        Self::SelfBackend,
+        Self::Miss,
+        Self::PeerCache,
+        Self::PeerBackend,
+    ];
+
+    pub(crate) fn from_tile_source(source: TileSource) -> Self {
+        match source {
+            TileSource::SelfTileCache | TileSource::SelfChunkCache => Self::SelfCache,
+            TileSource::SelfBackend => Self::SelfBackend,
+            TileSource::NegativeCache | TileSource::SelfMiss | TileSource::PeerMiss => Self::Miss,
+            TileSource::PeerCache => Self::PeerCache,
+            TileSource::PeerBackend => Self::PeerBackend,
+        }
+    }
+
+    pub(crate) const fn report_label(self) -> &'static str {
+        match self {
+            Self::SelfCache => "self_cache",
+            Self::SelfBackend => "self_backend",
+            Self::Miss => "miss",
+            Self::PeerCache => "peer_cache",
+            Self::PeerBackend => "peer_backend",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SourceCounts([u64; SourceCategory::ALL.len()]);
+
+impl SourceCounts {
+    pub(crate) fn increment(&mut self, source: TileSource) {
+        self.0[SourceCategory::from_tile_source(source) as usize] += 1;
+    }
+
+    pub(crate) fn to_report_map(&self) -> BTreeMap<String, u64> {
+        SourceCategory::ALL
+            .into_iter()
+            .filter_map(|source| {
+                let count = self.0[source as usize];
+                (count != 0).then(|| (source.report_label().to_owned(), count))
+            })
+            .collect()
+    }
+}
 
 #[derive(Debug, Default, Serialize)]
 pub struct SimReport {
@@ -264,79 +326,11 @@ pub struct ClusterObservation {
     pub chunk_cache_bytes: u64,
 }
 
-pub(crate) fn add_metrics(total: &mut NodeMetricsSnapshot, node: NodeMetricsSnapshot) {
-    total.peer_forward_successes += node.peer_forward_successes;
-    total.peer_forward_not_found += node.peer_forward_not_found;
-    total.peer_forward_retryable += node.peer_forward_retryable;
-    total.peer_forward_fatal += node.peer_forward_fatal;
-    total.peer_forward_backoff_skips += node.peer_forward_backoff_skips;
-    total.peer_tile_fetches += node.peer_tile_fetches;
-    total.peer_bootstrap_fetches += node.peer_bootstrap_fetches;
-    total.peer_leaf_fetches += node.peer_leaf_fetches;
-    total.peer_provider_fetches += node.peer_provider_fetches;
-    total.peer_tile_duplicate_inflight += node.peer_tile_duplicate_inflight;
-    total.peer_bootstrap_duplicate_inflight += node.peer_bootstrap_duplicate_inflight;
-    total.peer_leaf_duplicate_inflight += node.peer_leaf_duplicate_inflight;
-    total.peer_provider_duplicate_inflight += node.peer_provider_duplicate_inflight;
-    total.internal_tile_requests += node.internal_tile_requests;
-    total.internal_bootstrap_requests += node.internal_bootstrap_requests;
-    total.internal_leaf_requests += node.internal_leaf_requests;
-    total.internal_provider_requests += node.internal_provider_requests;
-    total.backend_fetches += node.backend_fetches;
-    total.backend_fetch_successes += node.backend_fetch_successes;
-    total.backend_fetch_not_found += node.backend_fetch_not_found;
-    total.backend_fetch_errors += node.backend_fetch_errors;
-    total.backend_fetch_timeouts += node.backend_fetch_timeouts;
-    total.backend_fetched_chunks += node.backend_fetched_chunks;
-    total.chunk_cache_hits += node.chunk_cache_hits;
-    total.chunk_cache_misses += node.chunk_cache_misses;
-    total.chunk_cache_post_fetch_hits += node.chunk_cache_post_fetch_hits;
-    total.chunk_fetch_queued += node.chunk_fetch_queued;
-    total.chunk_fetch_joined_pending += node.chunk_fetch_joined_pending;
-    total.chunk_fetch_joined_inflight += node.chunk_fetch_joined_inflight;
-    total.chunk_dispatch_immediate += node.chunk_dispatch_immediate;
-    total.chunk_dispatch_window += node.chunk_dispatch_window;
-    total.chunk_dispatch_pending_chunks += node.chunk_dispatch_pending_chunks;
-    total.chunk_waiters_released += node.chunk_waiters_released;
-}
-
-pub(crate) fn add_histograms(total: &mut NodeHistogramSnapshot, node: &NodeHistogramSnapshot) {
-    total.merge(node);
-}
-
 #[cfg(test)]
 mod tests {
-    use ishikari_core::metrics::{HistogramBucketSnapshot, HistogramSnapshot, NodeMetricsSnapshot};
+    use ishikari_core::metrics::{HistogramBucketSnapshot, HistogramSnapshot};
 
-    use super::{DistributionSummary, NodeReport, SimReport, add_metrics};
-
-    #[test]
-    fn aggregates_peer_forward_metrics() {
-        let mut total = NodeMetricsSnapshot::default();
-        add_metrics(
-            &mut total,
-            NodeMetricsSnapshot {
-                peer_forward_successes: 7,
-                peer_forward_retryable: 2,
-                peer_forward_backoff_skips: 11,
-                peer_bootstrap_fetches: 3,
-                peer_leaf_fetches: 5,
-                peer_tile_duplicate_inflight: 2,
-                internal_bootstrap_requests: 13,
-                internal_leaf_requests: 17,
-                ..NodeMetricsSnapshot::default()
-            },
-        );
-
-        assert_eq!(total.peer_forward_successes, 7);
-        assert_eq!(total.peer_forward_retryable, 2);
-        assert_eq!(total.peer_forward_backoff_skips, 11);
-        assert_eq!(total.peer_bootstrap_fetches, 3);
-        assert_eq!(total.peer_leaf_fetches, 5);
-        assert_eq!(total.peer_tile_duplicate_inflight, 2);
-        assert_eq!(total.internal_bootstrap_requests, 13);
-        assert_eq!(total.internal_leaf_requests, 17);
-    }
+    use super::{DistributionSummary, NodeReport, SimReport};
 
     #[test]
     fn derives_rates_from_common_report_counters() {

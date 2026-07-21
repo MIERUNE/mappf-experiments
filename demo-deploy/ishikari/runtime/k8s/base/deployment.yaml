@@ -30,7 +30,19 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
+      # App bound: 2s drain publication + 2s propagation + 15s HTTP grace +
+      # 3s membership teardown. The remaining 3s covers process/kubelet overhead.
       terminationGracePeriodSeconds: 25
+      # Prefer separate nodes so one node loss does not remove both pods at the
+      # HPA floor. Keep this soft: the demo must still schedule in a one-node
+      # local/Spot pool.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: ishikari
       containers:
         - name: ishikari
           image: ishikari:dev
@@ -45,6 +57,7 @@ spec:
               containerPort: 9090
             - name: gossip
               containerPort: 7946
+              protocol: UDP
           env:
             - name: POD_IP
               valueFrom:
@@ -66,8 +79,24 @@ spec:
               value: "$(POD_IP):7946"
             - name: ISKR_INTERNAL_HTTP_ADVERTISE_ADDR
               value: "$(POD_IP):9090"
+            # Wait for one peer during startup so the initial HRW view is not
+            # needlessly single-node. The application fails open after 30s and
+            # never re-closes readiness during a later partition.
+            - name: ISKR_REQUIRE_GOSSIP_BOOTSTRAP
+              value: "true"
             - name: ISKR_TILESET_SOURCES
               value: "https://REPLACE-ME.example.com/"
+            # Material-cache weights are capped at 1 GiB in this 2 GiB pod.
+            # The other 1 GiB is RSS headroom, not another cache allocation.
+            - name: ISKR_CACHE_WEIGHT_BUDGET_BYTES
+              value: "1073741824"
+            - name: ISKR_TILE_CACHE_MAX_BYTES
+              value: "268435456"
+            - name: ISKR_CHUNK_CACHE_MAX_BYTES
+              value: "268435456"
+            # 32 active fetches × 4 chunks × 1 MiB per chunk.
+            - name: ISKR_BACKEND_ACTIVE_BODY_BUDGET_BYTES
+              value: "134217728"
             - name: RUST_LOG
               value: "ishikari=info"
           readinessProbe:

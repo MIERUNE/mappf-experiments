@@ -17,6 +17,16 @@ CPU-heavy DEM decode, terrain generation, and MLT transcoding share one bounded
 worker budget. `ISKR_CPU_WORK_CONCURRENCY` defaults to the process's available
 parallelism and can be set explicitly per deployment.
 
+Ishikari also validates one aggregate ceiling for its byte-weighted material
+caches. The defaults allocate 1 GiB in total: 256 MiB each for tile and chunk
+data, with the remaining 512 MiB assigned to resource, PMTiles index, provider,
+MLT, derived-tile, and decoded-DEM caches. Override
+`ISKR_CACHE_WEIGHT_BUDGET_BYTES` only when the process has additional RSS
+headroom; Moka cache weights do not include every allocation made by the
+process. Separately, startup verifies that the configured chunk size, fetch
+width, and backend concurrency fit `ISKR_BACKEND_ACTIVE_BODY_BUDGET_BYTES`
+(128 MiB by default) without arithmetic overflow.
+
 LICENSE: MIT OR Apache-2.0
 
 
@@ -26,13 +36,13 @@ LICENSE: MIT OR Apache-2.0
 # Serve from a local PMTiles file with an artificial backend delay.
 mkdir data
 pmtiles extract https://build.protomaps.com/20260206.pmtiles --bbox=122,24,155,46 data/japan.pmtiles
-ISKR_ARTIFICIAL_BACKEND_DELAY_MS=50 bash demo.sh
+ISKR_ARTIFICIAL_BACKEND_DELAY_MS=50 bash demo-deploy/ishikari/demo.sh
 open http://localhost:8080/tilesets/japan/preview
 ```
 
 ```bash
 # Serve from a remote HTTP server (slow).
-ISKR_TILESET_SOURCES=https://demo-bucket.protomaps.com/ bash demo.sh
+ISKR_TILESET_SOURCES=https://demo-bucket.protomaps.com/ bash demo-deploy/ishikari/demo.sh
 open http://localhost:8080/tilesets/v4/preview
 ```
 
@@ -44,7 +54,7 @@ Ishikari can proxy MapLibre style JSON, glyph PBFs, and sprite assets from upstr
 ISKR_STYLE_TEMPLATES='carto=https://basemaps.cartocdn.com/{style_id}/style.json;default=https://styles.example/{style_id}/style.json' \
 ISKR_GLYPH_URL_TEMPLATE='https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf' \
 ISKR_SPRITE_TEMPLATES='carto=https://basemaps.cartocdn.com/{style_id}/sprite' \
-cargo run -- --tileset-sources data
+cargo run -p ishikari -- --tileset-sources data
 ```
 
 The style endpoint rewrites provider-relative `/{tileset_key}` sources to
@@ -97,9 +107,12 @@ reports end-to-end HTTP latency by route and status class, object-store range
 fetch duration, size, admission queue delay, and concurrency saturation; chunk
 batching and waiter fan-in; weighted cache bytes; and peer-routing outcomes.
 `ISKR_BACKEND_FETCH_CONCURRENCY` bounds range fetches across all tilesets in a
-process and defaults to 32. `ISKR_CHUNK_FETCH_MERGE_WINDOW_MS` controls how long
-nearby missing chunks are collected before dispatch (10 ms by default; 0 removes
-the intentional wait while preserving pending/inflight sharing). CPU-heavy DEM
+process and defaults to 32. `ISKR_BACKEND_FETCH_MAX_INFLIGHT` bounds active plus
+permit-waiting fetch groups and defaults to four times that concurrency; excess
+distinct work is shed with 503 while callers joining an admitted group still
+coalesce. `ISKR_CHUNK_FETCH_MERGE_WINDOW_MS` controls how long nearby missing
+chunks are collected before dispatch (10 ms by default; 0 removes the intentional
+wait while preserving pending/inflight sharing). CPU-heavy DEM
 decode, terrain generation, and MLT
 transcoding expose admission, queue delay, current saturation, and shed counts.
 Derived terrain cold-generation metrics separate source fetch/decode time from
@@ -205,7 +218,7 @@ scrapes each node before and after replay and reports restart-checked deltas for
 tile sources, client/peer/backend bytes, backend fetches, and chunk-cache work:
 
 ```bash
-# Start `bash demo.sh` in another terminal, then run:
+# Start `bash demo-deploy/ishikari/demo.sh` in another terminal, then run:
 cargo run -p ishikari-sim --release -- replay-http trace.jsonl \
   --node-url http://[::1]:8080 \
   --node-url http://[::1]:8081 \
@@ -385,7 +398,7 @@ supplied directly.
 
 ## Development documents
 
-- [Design contract and guardrails](../../specs/ishikari/ishikari-spec.md)
-- [Open work and decisions](../../issues/ishikari/ishikari-todo.md)
-- [Derived isoline and hillshade specification](../../specs/ishikari/isoline-and-hillshade-spec.md)
-- [Simulator specification](../../specs/ishikari/simulator-spec.md)
+- [Design contract and guardrails](../../specs/ishikari-spec.md)
+- [Open work and decisions](../../issues/ishikari-todo.md)
+- [Derived isoline and hillshade specification](../../specs/isoline-and-hillshade-spec.md)
+- [Simulator specification](../../specs/ishikari-sim-spec.md)

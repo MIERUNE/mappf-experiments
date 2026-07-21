@@ -1,7 +1,6 @@
 //! Object-store fetch implementation for chunked reads.
 
 use std::{
-    collections::HashSet,
     ops::Range,
     path::PathBuf,
     sync::{
@@ -13,6 +12,10 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
+use mmpf_common::resource_templates::{
+    NamespaceKeyPolicy, NamespacedEntries, NamespacedEntriesPolicy,
+};
+use mmpf_common::rng::{splitmix64, uniform_open};
 use object_store::{
     Error as ObjectStoreError, ObjectStore, ObjectStoreExt, path::Path as ObjectPath,
 };
@@ -21,9 +24,13 @@ use tokio::sync::Semaphore;
 use tracing::debug;
 use url::Url;
 
-use crate::{interned::TilesetId, metrics::NodeMetrics, storage::ObjectStoreRegistry};
+use crate::{
+    interned::TilesetId,
+    metrics::NodeMetrics,
+    storage::{ObjectStoreRegistry, store_registry::redacted_source_label},
+};
 
-const BACKEND_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const BACKEND_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const MIB_BYTES: f64 = (1024 * 1024) as f64;
 
 /// Deterministic latency injected before an object-store range fetch.
@@ -92,27 +99,22 @@ impl BackendLatencyModel {
     }
 }
 
-fn uniform_open(value: u64) -> f64 {
-    ((value >> 11) as f64 + 0.5) / (1_u64 << 53) as f64
-}
-
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
-}
-
 /// Errors produced while fetching raw backend chunks.
 #[derive(Clone, Debug, Error)]
-pub enum ChunkFetchError {
+pub(crate) enum ChunkFetchError {
     #[error("object not found")]
     NotFound,
+    #[error("{0}")]
+    Overloaded(String),
     /// The backend read exceeded `PROVIDER_FETCH_TIMEOUT` / the range-read
     /// timeout. Kept as a typed variant so callers classify timeouts without
     /// matching on the message string.
     #[error("{0}")]
     Timeout(String),
+    /// The object-store operation failed for a reason other than authoritative
+    /// absence. Preserved separately from local range and coordination errors.
+    #[error("{0}")]
+    Backend(String),
     #[error("{0}")]
     Message(String),
 }
@@ -133,49 +135,43 @@ struct TilesetSource {
 /// (`analysis/hrnowc` → `{default}/analysis/hrnowc.pmtiles`).
 #[derive(Clone)]
 struct TilesetSources {
-    namespaces: Vec<(String, Arc<TilesetSource>)>,
-    default: Option<Arc<TilesetSource>>,
+    entries: NamespacedEntries<Arc<TilesetSource>>,
 }
 
 impl TilesetSources {
     fn parse(spec: &str, registry: &ObjectStoreRegistry) -> Result<Self> {
-        let mut namespaces = Vec::new();
-        let mut default = None;
-        for (namespace, url) in parse_source_entries(spec)? {
-            let source = Arc::new(build_source(&url, registry)?);
-            match namespace {
-                None => default = Some(source),
-                Some(name) => namespaces.push((name, source)),
-            }
-        }
-        Ok(Self {
-            namespaces,
-            default,
-        })
+        let entries = NamespacedEntries::parse(
+            spec,
+            NamespacedEntriesPolicy {
+                config_name: "TILESET_SOURCES",
+                entry_name: "source",
+                namespace_keys: NamespaceKeyPolicy::AsciiIdentifier,
+            },
+        )
+        .map_err(anyhow::Error::new)?
+        .try_map(|namespace, source_url| {
+            let source_name = namespace.unwrap_or("default");
+            build_source(&source_url, registry)
+                .with_context(|| format!("failed to configure tileset source {source_name:?}"))
+                .map(Arc::new)
+        })?;
+        Ok(Self { entries })
     }
 
     /// Returns the backing store and object path for a tileset key, or `None`
     /// when no namespace matches and no default root is configured.
     fn resolve(&self, tileset_id: &str) -> Option<(Arc<dyn ObjectStore>, ObjectPath)> {
-        let names: Vec<&str> = self
-            .namespaces
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect();
-        let (selected, relative) = select_namespace(tileset_id, &names);
-        let source = match selected {
-            Some(index) => &self.namespaces[index].1,
-            None => self.default.as_ref()?,
-        };
+        let selected = self.entries.select(tileset_id)?;
+        let source = selected.value();
         Some((
             source.object_store.clone(),
-            object_path_under(&source.base_path, relative),
+            object_path_under(&source.base_path, selected.relative_key()),
         ))
     }
 }
 
 #[derive(Clone)]
-pub struct ChunkFetcher {
+pub(super) struct ChunkFetcher {
     sources: TilesetSources,
     chunk_size: u64,
     backend_latency: BackendLatencyModel,
@@ -186,7 +182,7 @@ pub struct ChunkFetcher {
 }
 
 impl ChunkFetcher {
-    pub fn new(
+    pub(super) fn new(
         tileset_sources: String,
         chunk_size: u64,
         backend_fetch_concurrency: usize,
@@ -208,15 +204,15 @@ impl ChunkFetcher {
         })
     }
 
-    pub fn chunk_size(&self) -> u64 {
+    pub(super) fn chunk_size(&self) -> u64 {
         self.chunk_size
     }
 
-    pub fn received_bytes(&self) -> u64 {
+    pub(super) fn received_bytes(&self) -> u64 {
         self.received_bytes.load(Ordering::Relaxed)
     }
 
-    pub async fn fetch_chunk_group(
+    pub(super) async fn fetch_chunk_group(
         &self,
         tileset_id: &TilesetId,
         chunk_range: Range<u64>,
@@ -226,11 +222,6 @@ impl ChunkFetcher {
             return Ok(Bytes::new());
         }
 
-        let (object_store, path) = self.sources.resolve(tileset_id.as_str()).ok_or_else(|| {
-            ChunkFetchError::Message(format!(
-                "no data source configured for tileset {tileset_id}"
-            ))
-        })?;
         let start_chunk = chunk_range.start;
         let end_chunk = chunk_range.end;
         // Chunk indices derive from PMTiles offsets read off the backend; guard the
@@ -246,34 +237,94 @@ impl ChunkFetcher {
             )));
         };
         let range_end = range_end.min(archive_len);
-        if range_start > range_end {
+        if range_start >= range_end {
             return Err(ChunkFetchError::Message(format!(
-                "chunk range start {range_start} exceeds end {range_end} (archive_len={archive_len})"
+                "chunk range start {range_start} does not precede end {range_end} (archive_len={archive_len})"
             )));
         }
         let prefetched_chunks = end_chunk - start_chunk;
-        let prefetched_bytes = range_end - range_start;
         debug!(
             tileset_id = %tileset_id,
             start_chunk = start_chunk,
             end_chunk = end_chunk,
             prefetched_chunks = prefetched_chunks,
-            prefetched_bytes = prefetched_bytes,
+            prefetched_bytes = range_end - range_start,
             "fetching backend chunks"
         );
 
-        // The per-tileset coordinator bounds one archive, while this semaphore
-        // bounds the process as a whole. Distinct missing ids therefore cannot
-        // multiply object-store concurrency without limit. The metric guard is
-        // cancellation-safe while a request waits for admission.
+        self.fetch_range(
+            tileset_id,
+            range_start..range_end,
+            prefetched_chunks,
+            RangeLengthPolicy::Exact,
+        )
+        .await
+    }
+
+    /// Fetches a bounded non-cacheable range before the archive length is known.
+    /// `object_store` defines a bounded range past EOF as the available
+    /// remainder, so valid short archives need no preceding metadata request.
+    pub(super) async fn fetch_exact_range(
+        &self,
+        tileset_id: &TilesetId,
+        range: Range<u64>,
+    ) -> std::result::Result<Bytes, ChunkFetchError> {
+        if range.start >= range.end {
+            return Ok(Bytes::new());
+        }
+        self.fetch_range(tileset_id, range, 1, RangeLengthPolicy::AllowShortAtEof)
+            .await
+    }
+
+    async fn fetch_range(
+        &self,
+        tileset_id: &TilesetId,
+        range: Range<u64>,
+        fetched_chunks: u64,
+        range_length_policy: RangeLengthPolicy,
+    ) -> std::result::Result<Bytes, ChunkFetchError> {
+        let (object_store, path) = self.sources.resolve(tileset_id.as_str()).ok_or_else(|| {
+            ChunkFetchError::Message(format!(
+                "no data source configured for tileset {tileset_id}"
+            ))
+        })?;
+        let range_start = range.start;
+        let requested_range_end = range.end;
+        let group_started_at = tokio::time::Instant::now();
+        let deadline = group_started_at + BACKEND_FETCH_TIMEOUT;
+
+        // The coordinator bounds all admitted groups process-wide; this second
+        // semaphore bounds the subset actively using object-store capacity.
+        // The metric guard is cancellation-safe while a group waits here.
         let queue_started_at = tokio::time::Instant::now();
         let waiting = BackendFetchGaugeGuard::new(self.metrics.clone(), "waiting");
-        let permit = self
-            .backend_fetch_permits
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| ChunkFetchError::Message("backend fetch admission closed".into()))?;
+        let permit = match tokio::time::timeout_at(
+            deadline,
+            self.backend_fetch_permits.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                return Err(ChunkFetchError::Message(
+                    "backend fetch admission closed".into(),
+                ));
+            }
+            Err(error) => {
+                drop(waiting);
+                self.metrics
+                    .record_backend_fetch_queue(queue_started_at.elapsed());
+                self.metrics.record_backend_fetch(
+                    "timeout",
+                    group_started_at.elapsed(),
+                    fetched_chunks,
+                    0,
+                );
+                return Err(ChunkFetchError::Timeout(format!(
+                    "timed out waiting for backend fetch admission: {error}"
+                )));
+            }
+        };
         drop(waiting);
         self.metrics
             .record_backend_fetch_queue(queue_started_at.elapsed());
@@ -286,74 +337,79 @@ impl ChunkFetcher {
         let fetch_started_at = tokio::time::Instant::now();
 
         let sequence = self.fetch_sequence.fetch_add(1, Ordering::Relaxed);
-        let backend_delay = self
-            .backend_latency
-            .delay(sequence, range_start, prefetched_bytes);
-        if !backend_delay.is_zero() {
-            tokio::time::sleep(backend_delay).await;
-        }
-
-        let fetch_result = tokio::time::timeout(
-            BACKEND_FETCH_TIMEOUT,
-            object_store.get_range(&path, range_start..range_end),
-        )
+        let fetch_result = tokio::time::timeout_at(deadline, async {
+            let requested_bytes = requested_range_end.saturating_sub(range_start);
+            let backend_delay = self
+                .backend_latency
+                .delay(sequence, range_start, requested_bytes);
+            if !backend_delay.is_zero() {
+                tokio::time::sleep(backend_delay).await;
+            }
+            object_store
+                .get_range(&path, range_start..requested_range_end)
+                .await
+        })
         .await;
+        let record_backend_fetch = |outcome: &str, bytes: u64| {
+            self.metrics.record_backend_fetch(
+                outcome,
+                fetch_started_at.elapsed(),
+                fetched_chunks,
+                bytes,
+            );
+        };
         let bytes = match fetch_result {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(error)) => {
-                let outcome = backend_fetch_outcome(&error);
-                self.metrics.record_backend_fetch(
-                    outcome,
-                    fetch_started_at.elapsed(),
-                    prefetched_chunks,
-                    prefetched_bytes,
-                );
+                record_backend_fetch(backend_fetch_outcome(&error), 0);
                 return Err(ChunkFetchError::from(error));
             }
             Err(error) => {
-                self.metrics.record_backend_fetch(
-                    "timeout",
-                    fetch_started_at.elapsed(),
-                    prefetched_chunks,
-                    prefetched_bytes,
-                );
+                record_backend_fetch("timeout", 0);
                 return Err(ChunkFetchError::Timeout(format!(
-                    "timed out fetching chunk range from object store: path={path} range={range_start}..{range_end}: {error}"
+                    "timed out fetching object-store range {range_start}..{requested_range_end}: {error}"
                 )));
             }
         };
-        let expected_len = (range_end - range_start) as usize;
-        if bytes.len() != expected_len {
-            self.metrics.record_backend_fetch(
-                "error",
-                fetch_started_at.elapsed(),
-                prefetched_chunks,
-                prefetched_bytes,
-            );
+        let requested_bytes = requested_range_end.saturating_sub(range_start);
+        let expected_len = usize::try_from(requested_bytes).map_err(|_| {
+            ChunkFetchError::Message(format!(
+                "backend range length does not fit memory: range={range_start}..{requested_range_end}"
+            ))
+        })?;
+        let invalid_length = bytes.len() > expected_len
+            || (range_length_policy == RangeLengthPolicy::Exact && bytes.len() != expected_len);
+        if invalid_length {
+            let received_bytes = bytes.len() as u64;
+            self.received_bytes
+                .fetch_add(received_bytes, Ordering::Relaxed);
+            record_backend_fetch("error", received_bytes);
             return Err(ChunkFetchError::Message(format!(
-                "short range read from object store: path={path} range={range_start}..{range_end} expected_bytes={expected_len} actual_bytes={}",
+                "unexpected object-store range length: range={range_start}..{requested_range_end} expected_bytes={expected_len} actual_bytes={} policy={range_length_policy:?}",
                 bytes.len()
             )));
         }
         self.received_bytes
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        self.metrics.record_backend_fetch(
-            "success",
-            fetch_started_at.elapsed(),
-            prefetched_chunks,
-            bytes.len() as u64,
-        );
+        record_backend_fetch("success", bytes.len() as u64);
         debug!(
             tileset_id = %tileset_id,
-            start_chunk = start_chunk,
-            end_chunk = end_chunk - 1,
+            range_start,
+            requested_range_end,
+            fetched_chunks,
             backend_fetched_bytes = bytes.len(),
             duration_ms = fetch_started_at.elapsed().as_millis() as u64,
-            "fetched backend chunk bytes"
+            "fetched backend bytes"
         );
 
         Ok(bytes)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RangeLengthPolicy {
+    Exact,
+    AllowShortAtEof,
 }
 
 struct BackendFetchGaugeGuard {
@@ -388,69 +444,8 @@ impl From<ObjectStoreError> for ChunkFetchError {
         if matches!(error, ObjectStoreError::NotFound { .. }) {
             return Self::NotFound;
         }
-        Self::Message(format!(
-            "failed to fetch chunk range from object store: {error}"
-        ))
+        Self::Backend(format!("object-store backend failure: {error}"))
     }
-}
-
-/// Parses a `TILESET_SOURCES` spec into `(namespace, url)` entries without building any
-/// object stores. `None` namespace is the default root.
-fn parse_source_entries(spec: &str) -> Result<Vec<(Option<String>, String)>> {
-    let mut entries = Vec::new();
-    let mut seen_default = false;
-    let mut seen_namespaces = HashSet::new();
-
-    for entry in spec.split(';') {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        let (namespace, url) = match entry.split_once('=') {
-            Some((key, value)) if is_namespace_key(key.trim()) => {
-                let key = key.trim();
-                if key == "default" {
-                    (None, value.trim())
-                } else {
-                    (Some(key.to_string()), value.trim())
-                }
-            }
-            // A bare URL (or anything with no namespace key before `=`, such as a
-            // URL with a query string) is the default root.
-            _ => (None, entry),
-        };
-        match &namespace {
-            None => {
-                if seen_default {
-                    bail!("TILESET_SOURCES has multiple default sources");
-                }
-                seen_default = true;
-            }
-            Some(name) => {
-                if !seen_namespaces.insert(name.clone()) {
-                    bail!("TILESET_SOURCES has duplicate namespace {name:?}");
-                }
-            }
-        }
-        entries.push((namespace, url.to_string()));
-    }
-
-    if entries.is_empty() {
-        bail!("TILESET_SOURCES must define at least one source");
-    }
-    Ok(entries)
-}
-
-/// Selects the namespace source for a tileset key. Returns the matched namespace
-/// index (or `None` for the default root) and the key relative to that root: the
-/// namespace is stripped on a match, otherwise the whole key is used.
-fn select_namespace<'a>(tileset_id: &'a str, namespace_names: &[&str]) -> (Option<usize>, &'a str) {
-    if let Some((namespace, rest)) = tileset_id.split_once('/')
-        && let Some(index) = namespace_names.iter().position(|name| *name == namespace)
-    {
-        return (Some(index), rest);
-    }
-    (None, tileset_id)
 }
 
 /// Builds an object path under `base` from a `/`-delimited key, appending the
@@ -474,18 +469,13 @@ fn build_source(source_url: &str, registry: &ObjectStoreRegistry) -> Result<Tile
     let url = normalize_source_url(source_url)?;
     // The registry dedups stores by bucket/host, so multiple namespaces (or the
     // provider layer) backed by the same bucket share one store and pool.
-    let (object_store, base_path) = registry.resolve(&url)?;
+    let (object_store, base_path) = registry
+        .resolve(&url)
+        .with_context(|| format!("failed to resolve {}", redacted_source_label(&url)))?;
     Ok(TilesetSource {
         object_store,
         base_path,
     })
-}
-
-fn is_namespace_key(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn normalize_source_url(source_url: &str) -> Result<Url> {
@@ -493,8 +483,12 @@ fn normalize_source_url(source_url: &str) -> Result<Url> {
         return Ok(url);
     }
 
-    let path = std::fs::canonicalize(PathBuf::from(source_url))
-        .with_context(|| format!("failed to resolve local data path {source_url}"))?;
+    let path = std::fs::canonicalize(PathBuf::from(source_url)).map_err(|error| {
+        anyhow!(
+            "failed to resolve configured local data path ({:?})",
+            error.kind()
+        )
+    })?;
     Url::from_directory_path(path)
         .map_err(|_| anyhow!("failed to convert local path to file:// URL"))
 }
@@ -504,62 +498,44 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BackendLatencyModel, ChunkFetcher, object_path_under, parse_source_entries,
-        select_namespace,
+        BACKEND_FETCH_TIMEOUT, BackendLatencyModel, ChunkFetchError, ChunkFetcher, TilesetSources,
+        object_path_under,
     };
     use crate::{interned::TilesetId, metrics::NodeMetrics, storage::ObjectStoreRegistry};
-    use object_store::path::Path as ObjectPath;
+    use object_store::{Error as ObjectStoreError, path::Path as ObjectPath};
 
     #[test]
-    fn parses_default_and_namespaced_entries() {
-        let entries = parse_source_entries("carto=gs://a;regional=gs://b;default=gs://c").unwrap();
-        assert_eq!(
-            entries,
-            vec![
-                (Some("carto".to_string()), "gs://a".to_string()),
-                (Some("regional".to_string()), "gs://b".to_string()),
-                (None, "gs://c".to_string()),
-            ]
-        );
+    fn source_configuration_errors_do_not_echo_raw_values() {
+        let secret = "do-not-log-this-password";
+        let spec = format!("regional=http://alice:{secret}@[invalid");
+
+        let error = match TilesetSources::parse(&spec, &ObjectStoreRegistry::without_options()) {
+            Ok(_) => panic!("malformed source must fail"),
+            Err(error) => error,
+        };
+        let diagnostic = format!("{error:#}");
+
+        assert!(diagnostic.contains("tileset source \"regional\""));
+        assert!(diagnostic.contains("configured local data path"));
+        for sensitive in [secret, "alice", "[invalid", &spec] {
+            assert!(
+                !diagnostic.contains(sensitive),
+                "error leaked {sensitive:?}: {diagnostic}"
+            );
+        }
     }
 
     #[test]
-    fn bare_url_is_the_default_source() {
-        assert_eq!(
-            parse_source_entries("gs://bucket/prefix").unwrap(),
-            vec![(None, "gs://bucket/prefix".to_string())]
-        );
-        // A URL with a query string has no namespace key before `=`.
-        assert_eq!(
-            parse_source_entries("https://h/p?t=1").unwrap(),
-            vec![(None, "https://h/p?t=1".to_string())]
-        );
-    }
+    fn object_store_failures_remain_typed_as_backend_errors() {
+        let error = ObjectStoreError::Generic {
+            store: "test",
+            source: Box::new(std::io::Error::other("service unavailable")),
+        };
 
-    #[test]
-    fn rejects_duplicate_and_empty_specs() {
-        assert!(parse_source_entries("carto=gs://a;carto=gs://b").is_err());
-        assert!(parse_source_entries("gs://a;default=gs://b").is_err());
-        assert!(parse_source_entries("   ").is_err());
-    }
-
-    #[test]
-    fn namespace_match_strips_prefix_else_default_keeps_whole_key() {
-        let names = ["carto", "regional"];
-        assert_eq!(
-            select_namespace("carto/voyager", &names),
-            (Some(0), "voyager")
-        );
-        assert_eq!(
-            select_namespace("regional/streets", &names),
-            (Some(1), "streets")
-        );
-        // No namespace match -> default root with the full key (nested path).
-        assert_eq!(
-            select_namespace("analysis/hrnowc", &names),
-            (None, "analysis/hrnowc")
-        );
-        assert_eq!(select_namespace("japan", &names), (None, "japan"));
+        assert!(matches!(
+            ChunkFetchError::from(error),
+            ChunkFetchError::Backend(message) if message.contains("service unavailable")
+        ));
     }
 
     #[test]
@@ -597,7 +573,10 @@ mod tests {
         let first = model.delay(11, 2_000_000, 1024 * 1024);
         assert_eq!(first, model.delay(11, 2_000_000, 1024 * 1024));
         assert_eq!(
-            model.delay(11, 2_000_000, 2 * 1024 * 1024) - first,
+            model
+                .delay(11, 2_000_000, 2 * 1024 * 1024)
+                .checked_sub(first)
+                .expect("larger transfer delay must not be shorter"),
             std::time::Duration::from_millis(6)
         );
     }
@@ -636,7 +615,7 @@ mod tests {
             4,
             32,
             BackendLatencyModel::fixed(100),
-            &ObjectStoreRegistry::new(),
+            &ObjectStoreRegistry::without_options(),
             metrics.clone(),
         )
         .unwrap();
@@ -646,6 +625,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(bytes.as_ref(), b"abcd");
+        assert_eq!(fetcher.received_bytes(), 4);
+        assert!(
+            metrics
+                .encode()
+                .contains("ishikari_backend_fetch_bytes_total 4")
+        );
         let duration = metrics.histogram_snapshot().backend_fetch_duration_seconds;
         assert_eq!(duration.count, 1);
         assert!((duration.sum - 0.1).abs() < 1e-9, "sum={}", duration.sum);
@@ -673,7 +658,7 @@ mod tests {
             4,
             1,
             BackendLatencyModel::fixed(100),
-            &ObjectStoreRegistry::new(),
+            &ObjectStoreRegistry::without_options(),
             metrics.clone(),
         )
         .unwrap();
@@ -709,6 +694,49 @@ mod tests {
             .backend_fetch_queue_duration_seconds;
         assert_eq!(queue.count, 2);
         assert!(queue.sum >= 0.1, "queue sum={}", queue.sum);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_deadline_includes_waiting_for_the_active_fetch_permit() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "ishikari-fetcher-deadline-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("first.pmtiles"), b"abcdefgh").unwrap();
+        std::fs::write(directory.join("second.pmtiles"), b"ijklmnop").unwrap();
+
+        let fetcher = ChunkFetcher::new(
+            directory.to_string_lossy().into_owned(),
+            4,
+            1,
+            BackendLatencyModel::fixed(9_000),
+            &ObjectStoreRegistry::without_options(),
+            NodeMetrics::new(),
+        )
+        .unwrap();
+        let first_fetcher = fetcher.clone();
+        let first = tokio::spawn(async move {
+            first_fetcher
+                .fetch_chunk_group(&TilesetId::try_new("first").unwrap(), 0..1, 8)
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let started_at = tokio::time::Instant::now();
+        let error = fetcher
+            .fetch_chunk_group(&TilesetId::try_new("second").unwrap(), 0..1, 8)
+            .await
+            .expect_err("second fetch must exhaust its end-to-end deadline");
+        assert!(matches!(error, ChunkFetchError::Timeout(_)));
+        assert_eq!(started_at.elapsed(), BACKEND_FETCH_TIMEOUT);
+        assert_eq!(first.await.unwrap().unwrap().as_ref(), b"abcd");
 
         std::fs::remove_dir_all(directory).unwrap();
     }

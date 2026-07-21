@@ -3,20 +3,21 @@
 use bytes::Bytes;
 use moka::{policy::EvictionPolicy, sync::Cache};
 
-use crate::interned::TilesetId;
-
-const CHUNK_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+use crate::{
+    cache_policy::{chunk_cache_entry_weight, effective_chunk_cache_capacity},
+    interned::TilesetId,
+};
 
 /// Identifies a cached fixed-size chunk within an object.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct ChunkCacheKey {
+pub(super) struct ChunkCacheKey {
     pub tileset_id: TilesetId,
     pub chunk_index: u64,
 }
 
 impl ChunkCacheKey {
     /// Builds a chunk cache key from an object id and fixed-size chunk index.
-    pub fn new(tileset_id: &TilesetId, chunk_index: u64) -> Self {
+    pub(super) fn new(tileset_id: &TilesetId, chunk_index: u64) -> Self {
         Self {
             tileset_id: tileset_id.clone(),
             chunk_index,
@@ -26,28 +27,28 @@ impl ChunkCacheKey {
 
 /// Per-node cache of backend tileset chunks.
 #[derive(Clone)]
-pub struct ChunkCache {
+pub(super) struct ChunkCache {
     cache: Cache<ChunkCacheKey, Bytes>,
 }
 
 impl ChunkCache {
     /// Creates a chunk cache with a byte-based capacity limit.
-    pub fn new(max_capacity_bytes: u64) -> Self {
+    pub(super) fn new(max_capacity_bytes: u64) -> Self {
         let cache = Cache::builder()
             .eviction_policy(EvictionPolicy::lru())
-            .max_capacity(max_capacity_bytes.min(CHUNK_CACHE_MAX_BYTES))
+            .max_capacity(effective_chunk_cache_capacity(max_capacity_bytes))
             .weigher(chunk_cache_weight)
             .build();
         Self { cache }
     }
 
     /// Returns a cached chunk if present.
-    pub fn get(&self, key: &ChunkCacheKey) -> Option<Bytes> {
+    pub(super) fn get(&self, key: &ChunkCacheKey) -> Option<Bytes> {
         self.cache.get(key)
     }
 
     /// Inserts or replaces a cached chunk.
-    pub fn put(&self, key: ChunkCacheKey, data: Bytes) {
+    pub(super) fn put(&self, key: ChunkCacheKey, data: Bytes) {
         self.cache.insert(key, data);
     }
 
@@ -55,15 +56,13 @@ impl ChunkCache {
     ///
     /// Flushes pending maintenance first so the value reflects recent inserts
     /// and evictions rather than moka's lazily-updated estimate.
-    pub fn weighted_size(&self) -> u64 {
+    pub(super) fn weighted_size(&self) -> u64 {
         self.cache.run_pending_tasks();
         self.cache.weighted_size()
     }
 }
 
 /// Estimates the weight of a cached chunk entry.
-fn chunk_cache_weight(key: &ChunkCacheKey, value: &Bytes) -> u32 {
-    let key_size = std::mem::size_of_val(key);
-    let total = key_size.saturating_add(value.len());
-    total.min(u32::MAX as usize) as u32
+fn chunk_cache_weight(_key: &ChunkCacheKey, value: &Bytes) -> u32 {
+    chunk_cache_entry_weight(value.len())
 }

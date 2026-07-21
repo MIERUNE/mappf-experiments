@@ -10,10 +10,10 @@ use std::{
 use anyhow::anyhow;
 use bytes::Bytes;
 use tokio::{
-    sync::{Mutex, Notify, oneshot},
+    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError, oneshot},
     time::{self, Instant},
 };
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::{interned::TilesetId, metrics::NodeMetrics};
 
@@ -28,11 +28,14 @@ const MAX_CONCURRENT_FETCHES_PER_TILESET: usize = 32;
 
 /// Coordinates shared inflight chunk fetches.
 #[derive(Clone)]
-pub struct ChunkFetchCoordinator {
+pub(super) struct ChunkFetchCoordinator {
     fetcher: ChunkFetcher,
     metrics: NodeMetrics,
     max_fetch_chunks: u64,
     merge_window: Duration,
+    /// Hard process-wide bound over groups waiting for an active backend slot
+    /// plus groups performing I/O. Reserved before a detached task is spawned.
+    backend_group_permits: Arc<Semaphore>,
     /// Per-tileset fetch state keyed by tileset id.
     tileset_states: Arc<Mutex<HashMap<TilesetId, TilesetFetchState>>>,
 }
@@ -71,6 +74,86 @@ struct EnqueuedChunk {
     chunk_index: u64,
     receiver: oneshot::Receiver<Result<Bytes, ChunkFetchError>>,
     outcome: EnqueueOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GroupWaiterOutcome {
+    delivered: usize,
+    cancelled: usize,
+}
+
+/// Ensures a dispatched group reaches the state-completion path even when its
+/// task is aborted or unwinds before normal completion.
+struct GroupCompletionGuard {
+    tileset_states: Arc<Mutex<HashMap<TilesetId, TilesetFetchState>>>,
+    metrics: NodeMetrics,
+    tileset_id: TilesetId,
+    chunk_range: Range<u64>,
+    result: Option<Result<HashMap<u64, Bytes>, ChunkFetchError>>,
+    completed: bool,
+}
+
+impl GroupCompletionGuard {
+    fn new(
+        coordinator: &ChunkFetchCoordinator,
+        tileset_id: TilesetId,
+        chunk_range: Range<u64>,
+    ) -> Self {
+        Self {
+            tileset_states: Arc::clone(&coordinator.tileset_states),
+            metrics: coordinator.metrics.clone(),
+            tileset_id,
+            chunk_range,
+            result: None,
+            completed: false,
+        }
+    }
+
+    async fn complete(mut self, result: Result<HashMap<u64, Bytes>, ChunkFetchError>) {
+        self.result = Some(result);
+        complete_dispatched_group(
+            Arc::clone(&self.tileset_states),
+            self.metrics.clone(),
+            self.tileset_id.clone(),
+            self.chunk_range.clone(),
+            self.result
+                .as_ref()
+                .expect("completion result was just installed"),
+        )
+        .await;
+        self.completed = true;
+    }
+}
+
+impl Drop for GroupCompletionGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+
+        let result = self.result.take().unwrap_or_else(|| {
+            Err(ChunkFetchError::Message(
+                "chunk fetch task cancelled or panicked".to_string(),
+            ))
+        });
+        let tileset_states = Arc::clone(&self.tileset_states);
+        let metrics = self.metrics.clone();
+        let tileset_id = self.tileset_id.clone();
+        let chunk_range = self.chunk_range.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            error!(
+                tileset_id = %tileset_id,
+                start_chunk = chunk_range.start,
+                end_chunk = chunk_range.end,
+                "unable to schedule chunk fetch completion outside a Tokio runtime"
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            complete_dispatched_group(tileset_states, metrics, tileset_id, chunk_range, &result)
+                .await;
+        });
+    }
 }
 
 impl EnqueueOutcome {
@@ -146,6 +229,25 @@ impl TilesetFetchState {
         joined
     }
 
+    /// Removes closed receivers before dispatch. Pending chunks with no live
+    /// waiters are unscheduled; already-inflight chunks are left running so a
+    /// shared read may still warm the cache for later callers.
+    fn prune_cancelled_waiters(&mut self) -> usize {
+        let mut cancelled_waiters = 0;
+        self.waiters.retain(|_, waiters| {
+            let before = waiters.len();
+            waiters.retain(|waiter| !waiter.is_closed());
+            cancelled_waiters += before - waiters.len();
+            !waiters.is_empty()
+        });
+        self.pending_chunks
+            .retain(|chunk_index| self.waiters.contains_key(chunk_index));
+        if self.pending_chunks.is_empty() {
+            self.first_pending_at = None;
+        }
+        cancelled_waiters
+    }
+
     /// Selects the next batch of contiguous chunk ranges to dispatch, moving
     /// them from pending to inflight and reserving fetch slots. Stops the
     /// scheduler when nothing is pending.
@@ -192,13 +294,14 @@ impl TilesetFetchState {
     }
 
     /// Releases a finished fetch group: frees its slot, clears the inflight
-    /// chunks, and delivers `result` to every waiter. Returns the number of
-    /// waiters released (for the group-waiters metric).
+    /// chunks, and delivers `result` to every live waiter. Closed receivers are
+    /// classified as cancellations at the send boundary so completion races do
+    /// not inflate the released-waiter metric.
     fn complete_group(
         &mut self,
         chunk_range: Range<u64>,
         result: &Result<HashMap<u64, Bytes>, ChunkFetchError>,
-    ) -> usize {
+    ) -> GroupWaiterOutcome {
         let scheduler_needs_capacity = self.inflight_fetch_count
             >= MAX_CONCURRENT_FETCHES_PER_TILESET
             && !self.pending_chunks.is_empty();
@@ -206,11 +309,10 @@ impl TilesetFetchState {
         if scheduler_needs_capacity {
             self.capacity_available.notify_one();
         }
-        let mut released_waiters = 0;
+        let mut waiter_outcome = GroupWaiterOutcome::default();
         for chunk_index in chunk_range.start..chunk_range.end {
             self.inflight_chunks.remove(&chunk_index);
             if let Some(waiters) = self.waiters.remove(&chunk_index) {
-                released_waiters += waiters.len();
                 let chunk_result = match result {
                     Ok(chunks) => chunks.get(&chunk_index).cloned().ok_or_else(|| {
                         ChunkFetchError::Message(format!(
@@ -220,45 +322,79 @@ impl TilesetFetchState {
                     Err(error) => Err(error.clone()),
                 };
                 for waiter in waiters {
-                    let _ = waiter.send(chunk_result.clone());
+                    if waiter.send(chunk_result.clone()).is_ok() {
+                        waiter_outcome.delivered += 1;
+                    } else {
+                        waiter_outcome.cancelled += 1;
+                    }
                 }
             }
         }
-        released_waiters
+        waiter_outcome
     }
 }
 
 impl ChunkFetchCoordinator {
-    pub fn new(
+    pub(super) fn new(
         fetcher: ChunkFetcher,
         max_fetch_chunks: u64,
         merge_window: Duration,
+        backend_fetch_max_inflight: usize,
         metrics: NodeMetrics,
     ) -> Self {
         metrics.set_chunk_fetch_merge_window(merge_window);
+        let backend_fetch_max_inflight = backend_fetch_max_inflight.max(1);
+        metrics.set_backend_fetch_max_inflight(backend_fetch_max_inflight);
         Self {
             fetcher,
             metrics,
             max_fetch_chunks,
             merge_window,
+            backend_group_permits: Arc::new(Semaphore::new(backend_fetch_max_inflight)),
             tileset_states: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub fn chunk_size(&self) -> u64 {
+    pub(super) fn chunk_size(&self) -> u64 {
         self.fetcher.chunk_size()
     }
 
-    pub fn received_bytes(&self) -> u64 {
+    pub(super) fn received_bytes(&self) -> u64 {
         self.fetcher.received_bytes()
     }
 
-    pub fn metrics(&self) -> &NodeMetrics {
+    pub(super) fn metrics(&self) -> &NodeMetrics {
         &self.metrics
     }
 
+    /// Reads the format-defined initial bootstrap without expanding it to a
+    /// chunk boundary. Bootstrap singleflight lives one layer above, so this
+    /// direct fetch does not need per-chunk waiter coordination.
+    pub(super) async fn fetch_exact_range(
+        &self,
+        tileset_id: &TilesetId,
+        range: Range<u64>,
+    ) -> std::result::Result<Bytes, ChunkFetchError> {
+        let _group_permit = self.try_reserve_backend_group()?;
+        self.fetcher.fetch_exact_range(tileset_id, range).await
+    }
+
+    fn try_reserve_backend_group(
+        &self,
+    ) -> std::result::Result<OwnedSemaphorePermit, ChunkFetchError> {
+        match self.backend_group_permits.clone().try_acquire_owned() {
+            Ok(permit) => Ok(permit),
+            Err(TryAcquireError::NoPermits) => Err(ChunkFetchError::Overloaded(
+                "backend fetch group limit reached".to_string(),
+            )),
+            Err(TryAcquireError::Closed) => Err(ChunkFetchError::Message(
+                "backend fetch group admission closed".to_string(),
+            )),
+        }
+    }
+
     /// Fetches chunks for a tileset while coalescing concurrent requests.
-    pub async fn fetch_chunks(
+    pub(super) async fn fetch_chunks(
         &self,
         store: ChunkedStore,
         tileset_id: &TilesetId,
@@ -327,12 +463,14 @@ impl ChunkFetchCoordinator {
                 let Some(state) = tileset_states.get_mut(&tileset_id) else {
                     return;
                 };
+                let cancelled_waiters = state.prune_cancelled_waiters();
+                if cancelled_waiters > 0 {
+                    self.metrics
+                        .record_cancelled_chunk_fetch_waiters(cancelled_waiters);
+                }
                 match state.select_dispatch_groups(self.max_fetch_chunks) {
                     DispatchDecision::Idle => {
-                        if state.is_drainable() {
-                            tileset_states.remove(&tileset_id);
-                            debug!(tileset_id = %tileset_id, "removed empty chunk fetch state");
-                        }
+                        remove_drainable_state(&mut tileset_states, &tileset_id);
                         return;
                     }
                     DispatchDecision::Throttled(capacity_available) => {
@@ -370,14 +508,34 @@ impl ChunkFetchCoordinator {
             };
 
             for chunk_range in groups {
-                let coordinator = self.clone();
-                let tileset_id = tileset_id.clone();
-                let store = store.clone();
-                tokio::spawn(async move {
-                    coordinator
-                        .run_fetch_chunk_group(store, tileset_id, chunk_range, archive_len)
+                match self.try_reserve_backend_group() {
+                    Ok(group_permit) => {
+                        let coordinator = self.clone();
+                        let tileset_id = tileset_id.clone();
+                        let store = store.clone();
+                        tokio::spawn(async move {
+                            coordinator
+                                .run_fetch_chunk_group(
+                                    store,
+                                    tileset_id,
+                                    chunk_range,
+                                    archive_len,
+                                    group_permit,
+                                )
+                                .await;
+                        });
+                    }
+                    Err(error) => {
+                        complete_dispatched_group(
+                            Arc::clone(&self.tileset_states),
+                            self.metrics.clone(),
+                            tileset_id.clone(),
+                            chunk_range,
+                            &Err(error),
+                        )
                         .await;
-                });
+                    }
+                }
             }
         }
     }
@@ -388,47 +546,76 @@ impl ChunkFetchCoordinator {
         tileset_id: TilesetId,
         chunk_range: Range<u64>,
         archive_len: u64,
+        _group_permit: OwnedSemaphorePermit,
     ) {
+        let completion = GroupCompletionGuard::new(self, tileset_id.clone(), chunk_range.clone());
         let result = self
             .fetcher
             .fetch_chunk_group(&tileset_id, chunk_range.clone(), archive_len)
             .await
             .and_then(|bytes| {
                 store
-                    .cache_chunk_group(&tileset_id, chunk_range.clone(), archive_len, bytes)
+                    .cache_chunk_group(&tileset_id, chunk_range, archive_len, bytes)
                     .map_err(|error| ChunkFetchError::Message(error.to_string()))
             });
-
-        let mut tileset_states = self.tileset_states.lock().await;
-        let Some(state) = tileset_states.get_mut(&tileset_id) else {
-            return;
-        };
-
-        let released_waiters = state.complete_group(chunk_range.clone(), &result);
-        self.metrics.record_chunk_fetch_group_waiters(
-            if result.is_ok() { "success" } else { "error" },
-            released_waiters,
-        );
-
-        let waiter_count: usize = state.waiters.values().map(Vec::len).sum();
-        debug!(
-            tileset_id = %tileset_id,
-            start_chunk = chunk_range.start,
-            end_chunk = chunk_range.end,
-            fetch_succeeded = result.is_ok(),
-            pending_chunks = ?state.pending_chunks,
-            inflight_chunks = ?state.inflight_chunks,
-            inflight_fetches = state.inflight_fetch_count,
-            waiter_keys = state.waiters.len(),
-            waiters = waiter_count,
-            "completed chunk fetch group"
-        );
-
-        if state.is_drainable() {
-            tileset_states.remove(&tileset_id);
-            debug!(tileset_id = %tileset_id, "removed empty chunk fetch state");
-        }
+        completion.complete(result).await;
     }
+}
+
+async fn complete_dispatched_group(
+    tileset_states: Arc<Mutex<HashMap<TilesetId, TilesetFetchState>>>,
+    metrics: NodeMetrics,
+    tileset_id: TilesetId,
+    chunk_range: Range<u64>,
+    result: &Result<HashMap<u64, Bytes>, ChunkFetchError>,
+) {
+    let mut tileset_states = tileset_states.lock().await;
+    let Some(state) = tileset_states.get_mut(&tileset_id) else {
+        return;
+    };
+
+    let waiter_outcome = state.complete_group(chunk_range.clone(), result);
+    let completion_outcome = match result {
+        Ok(_) => "success",
+        Err(ChunkFetchError::Overloaded(_)) => "shed",
+        Err(_) => "error",
+    };
+    metrics.record_chunk_fetch_group_waiters(completion_outcome, waiter_outcome.delivered);
+    metrics.record_cancelled_chunk_fetch_waiters(waiter_outcome.cancelled);
+
+    let waiter_count: usize = state.waiters.values().map(Vec::len).sum();
+    debug!(
+        tileset_id = %tileset_id,
+        start_chunk = chunk_range.start,
+        end_chunk = chunk_range.end,
+        fetch_succeeded = result.is_ok(),
+        pending_chunks = ?state.pending_chunks,
+        inflight_chunks = ?state.inflight_chunks,
+        inflight_fetches = state.inflight_fetch_count,
+        waiter_keys = state.waiters.len(),
+        waiters = waiter_count,
+        "completed chunk fetch group"
+    );
+
+    remove_drainable_state(&mut tileset_states, &tileset_id);
+}
+
+/// Removes a fully drained per-tileset coordination state while the coordinator
+/// map lock is held. Both scheduler-idle and final-fetch completion use this
+/// single lifecycle transition.
+fn remove_drainable_state(
+    tileset_states: &mut HashMap<TilesetId, TilesetFetchState>,
+    tileset_id: &TilesetId,
+) -> bool {
+    if !tileset_states
+        .get(tileset_id)
+        .is_some_and(TilesetFetchState::is_drainable)
+    {
+        return false;
+    }
+    tileset_states.remove(tileset_id);
+    debug!(tileset_id = %tileset_id, "removed empty chunk fetch state");
+    true
 }
 
 fn contiguous_chunk_ranges(
@@ -473,6 +660,38 @@ mod tests {
         values.iter().copied().collect()
     }
 
+    type CompletionGuardFixture = (
+        GroupCompletionGuard,
+        oneshot::Receiver<Result<Bytes, ChunkFetchError>>,
+        Arc<Mutex<HashMap<TilesetId, TilesetFetchState>>>,
+        TilesetId,
+    );
+
+    fn completion_guard_fixture() -> CompletionGuardFixture {
+        let tileset_id = TilesetId::try_new("completion-guard").expect("tileset id");
+        let mut state = TilesetFetchState::default();
+        let receiver = state
+            .enqueue_chunks(&[7], Instant::now())
+            .pop()
+            .expect("enqueued chunk")
+            .receiver;
+        let DispatchDecision::Dispatch { groups, .. } = state.select_dispatch_groups(1) else {
+            panic!("expected a dispatch");
+        };
+        assert_eq!(groups, vec![7..8]);
+
+        let tileset_states = Arc::new(Mutex::new(HashMap::from([(tileset_id.clone(), state)])));
+        let guard = GroupCompletionGuard {
+            tileset_states: Arc::clone(&tileset_states),
+            metrics: NodeMetrics::new(),
+            tileset_id: tileset_id.clone(),
+            chunk_range: 7..8,
+            result: None,
+            completed: false,
+        };
+        (guard, receiver, tileset_states, tileset_id)
+    }
+
     #[test]
     fn enqueue_queues_new_chunks_then_joins_existing() {
         let mut state = TilesetFetchState::default();
@@ -495,6 +714,72 @@ mod tests {
             EnqueueOutcome::JoinedInflight
         ));
         assert!(!state.pending_chunks.contains(&9));
+    }
+
+    #[test]
+    fn cancelled_pending_waiters_are_pruned_before_dispatch() {
+        let mut state = TilesetFetchState {
+            scheduler_running: true,
+            ..Default::default()
+        };
+        let receivers = state.enqueue_chunks(&[1, 2], Instant::now());
+        drop(receivers);
+
+        assert_eq!(state.prune_cancelled_waiters(), 2);
+        assert!(state.pending_chunks.is_empty());
+        assert!(state.waiters.is_empty());
+        assert!(state.first_pending_at.is_none());
+        assert!(matches!(
+            state.select_dispatch_groups(4),
+            DispatchDecision::Idle
+        ));
+        assert!(state.is_drainable());
+
+        let tileset_id = TilesetId::try_new("cancelled").expect("tileset id");
+        let mut states = HashMap::from([(tileset_id.clone(), state)]);
+        assert!(remove_drainable_state(&mut states, &tileset_id));
+        assert!(states.is_empty());
+    }
+
+    #[test]
+    fn one_live_waiter_preserves_shared_pending_work() {
+        let mut state = TilesetFetchState::default();
+        let cancelled = state
+            .enqueue_chunks(&[5], Instant::now())
+            .pop()
+            .expect("cancelled waiter");
+        let live = state
+            .enqueue_chunks(&[5], Instant::now())
+            .pop()
+            .expect("live waiter");
+        drop(cancelled.receiver);
+
+        assert_eq!(state.prune_cancelled_waiters(), 1);
+        assert!(state.pending_chunks.contains(&5));
+        assert_eq!(state.waiters.get(&5).map(Vec::len), Some(1));
+        assert!(matches!(
+            state.select_dispatch_groups(4),
+            DispatchDecision::Dispatch { .. }
+        ));
+        drop(live.receiver);
+    }
+
+    #[test]
+    fn cancelled_inflight_waiter_does_not_cancel_active_work() {
+        let mut state = TilesetFetchState::default();
+        let receiver = state
+            .enqueue_chunks(&[9], Instant::now())
+            .pop()
+            .expect("waiter")
+            .receiver;
+        let _ = state.select_dispatch_groups(4);
+        drop(receiver);
+
+        assert_eq!(state.prune_cancelled_waiters(), 1);
+        assert!(state.waiters.is_empty());
+        assert!(state.inflight_chunks.contains(&9));
+        assert_eq!(state.inflight_fetch_count, 1);
+        assert!(!state.is_drainable());
     }
 
     #[test]
@@ -553,8 +838,14 @@ mod tests {
             (1, Bytes::from_static(b"chunk one")),
             (2, Bytes::from_static(b"chunk two")),
         ]);
-        let released = state.complete_group(1..3, &Ok(chunks));
-        assert_eq!(released, 2);
+        let waiter_outcome = state.complete_group(1..3, &Ok(chunks));
+        assert_eq!(
+            waiter_outcome,
+            GroupWaiterOutcome {
+                delivered: 2,
+                cancelled: 0,
+            }
+        );
         assert_eq!(state.inflight_fetch_count, 0);
         assert!(state.inflight_chunks.is_empty());
         assert_eq!(
@@ -566,6 +857,93 @@ mod tests {
             "chunk two"
         );
         assert!(state.is_drainable());
+    }
+
+    #[test]
+    fn completion_classifies_closed_inflight_receivers_as_cancelled() {
+        let mut state = TilesetFetchState::default();
+        let receiver = state
+            .enqueue_chunks(&[3], Instant::now())
+            .pop()
+            .expect("waiter")
+            .receiver;
+        let _ = state.select_dispatch_groups(4);
+        drop(receiver);
+
+        let waiter_outcome = state.complete_group(
+            3..4,
+            &Ok(HashMap::from([(3, Bytes::from_static(b"chunk"))])),
+        );
+
+        assert_eq!(
+            waiter_outcome,
+            GroupWaiterOutcome {
+                delivered: 0,
+                cancelled: 1,
+            }
+        );
+        assert!(state.is_drainable());
+    }
+
+    #[tokio::test]
+    async fn completion_guard_releases_waiters_on_normal_error() {
+        let (guard, receiver, tileset_states, tileset_id) = completion_guard_fixture();
+        guard
+            .complete(Err(ChunkFetchError::Message(
+                "simulated fetch error".to_string(),
+            )))
+            .await;
+
+        let error = receiver
+            .await
+            .expect("completion sender dropped")
+            .expect_err("fetch error must fail the waiter");
+        assert_eq!(error.to_string(), "simulated fetch error");
+        assert!(!tileset_states.lock().await.contains_key(&tileset_id));
+    }
+
+    #[tokio::test]
+    async fn completion_guard_releases_waiters_when_group_task_panics() {
+        let (guard, receiver, tileset_states, tileset_id) = completion_guard_fixture();
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            panic!("simulated fetch panic");
+        });
+        assert!(task.await.expect_err("task must panic").is_panic());
+
+        let error = time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("waiter release timed out")
+            .expect("completion sender dropped")
+            .expect_err("panic must fail the waiter");
+        assert!(error.to_string().contains("cancelled or panicked"));
+        assert!(!tileset_states.lock().await.contains_key(&tileset_id));
+    }
+
+    #[tokio::test]
+    async fn completion_guard_releases_waiters_when_group_task_is_cancelled() {
+        let (guard, receiver, tileset_states, tileset_id) = completion_guard_fixture();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            let _ = ready_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        ready_rx.await.expect("guard installed");
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("task must be cancelled")
+                .is_cancelled()
+        );
+
+        let error = time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("waiter release timed out")
+            .expect("completion sender dropped")
+            .expect_err("cancellation must fail the waiter");
+        assert!(error.to_string().contains("cancelled or panicked"));
+        assert!(!tileset_states.lock().await.contains_key(&tileset_id));
     }
 
     #[tokio::test]

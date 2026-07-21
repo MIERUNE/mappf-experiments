@@ -10,12 +10,12 @@ paused time. Rendering, network transfer, and resource loading are represented
 by deterministic or sampled delays.
 
 Production code lives in `biei-core`. Simulator-only adapters, workloads,
-scenarios, and reports live in `biei-sim`, which consumes the core crate's
-public traits and types as a downstream crate.
+and reports live in `biei-sim`, which consumes the core crate's public traits
+and types as a downstream crate.
 
 The production meaning of `StyleRevision`, wire types, HTTP forwarding,
 membership, MapLibre Native integration, and rendered output is defined in
-[`../../specs/biei/biei-spec.md`](../../specs/biei/biei-spec.md). Concrete Rust
+[`../../specs/biei-spec.md`](../../specs/biei-spec.md). Concrete Rust
 definitions are authoritative.
 
 This is a current-state specification. Unqualified statements describe the
@@ -36,7 +36,10 @@ In-render work is split into CPU service, warm-profile resource wait, and the
 first resource wait after profile setup. Resource waits retain native-render
 residency but do not consume a modeled CPU core. The model does not yet expand
 individual tile/glyph/sprite requests, cache state, provider capacity, or the
-critical path from production traces; imported distributions remain pending.
+resource critical path into causal sub-operations. It can import
+shape-conditioned wall distributions through the two-window calibration path,
+but direct renderer-thread CPU/non-CPU attribution and validation against
+production end-to-end latency remain pending.
 
 ## 2. Goals and Non-goals
 
@@ -97,7 +100,7 @@ Completed outcomes --> simulator MetricsCollector --> Report / CSV / JSON / HTML
 - execution permits: bound concurrent setup/render work independently from warm
   slot count.
 - native-render permits: bound `renderStill` residency, including FileSource
-  waits; the implementation retains the historical `cpu_render_permits` name.
+  waits.
 - CPU cores: bound only sampled CPU service after resource waiting.
 - `GossipBus`: publishes per-worker KVs and produces cluster views.
 - `Transport`: applies simulated hop latency and invokes the target node.
@@ -235,8 +238,9 @@ profile could herd onto the only node with visible state.
 ### 6.4 Tier 3: drain and swap
 
 Choose slots whose current profile is over-allocated before singleton slots.
-Use recent profile activity only as a tie-breaker. Prefer a candidate with the
-same renderer shape when that avoids a production rebuild.
+Prefer a candidate with the same renderer shape when that avoids a production
+rebuild, then use queue depth and stable node/worker identity. Profile recency
+is local-only state and is not currently used for cluster-wide eviction.
 
 The candidate is acceptable only when estimated queue drain plus setup and
 render work fits the task deadline. Warm work uses `P_w`; a profile change uses
@@ -357,9 +361,6 @@ cargo run -p biei-sim -- run \
   --html biei-sim-report.html
 ```
 
-Running `cargo run -p biei-sim` without a subcommand retains the legacy sweep
-suite.
-
 `biei-sim run --report <path>` writes a schema-versioned JSON report containing
 the complete effective simulation configuration and final result. When a churn
 plan is supplied, the report also contains observations before and after every
@@ -370,14 +371,20 @@ Churn `at_request` and the sampling interval use a dedicated measured-request
 clock that starts after warmup. Task IDs and `submitted_total` still cover the
 entire workload, while `submitted_measured`, aggregate outcomes, latency,
 tier, source, and swap counters all cover the same post-warmup population.
-Each sample also includes interval deltas for monotonic counters so cold-start,
-style-swap, routing-tier, and forwarding bursts appear as spikes rather than
-requiring consumers to difference cumulative values. Interval p50, p99, and
-maximum latency are computed only from requests completed between adjacent
-samples, so scale-up and scale-down latency spikes do not disappear into the
-whole-run distribution. Events beyond the generated measured workload are
-retained as `unapplied_events`; they warn at the CLI but never discard an
-otherwise completed report.
+Each sample exposes cumulative terminal and outstanding work plus a
+`completion_window` containing outcomes observed between adjacent boundaries.
+Its p50, p99, and maximum latency therefore describe completion time, not the
+topology under which each request was submitted. Physical forwarding fields
+say whether attempts were *started* or successes were *observed* in that
+window; a success may correspond to an attempt from the preceding window.
+
+Requests are also grouped in `submission_cohorts` by the topology epoch stamped
+at submission. A slow request remains in its original cohort even if it
+completes after a membership event. Cohort `submitted`, `terminal_outcomes`,
+and `outstanding` counts reconcile independently of the completion windows.
+Events beyond the generated measured workload are retained as
+`unapplied_events`; they warn at the CLI but never discard an otherwise
+completed report.
 
 `biei-sim visualize <report> --output <path>` embeds that JSON into a
 self-contained HTML report. It requires no server or external JavaScript and
@@ -406,8 +413,8 @@ export. Bearer tokens are read only from an optional file and are never
 serialized. Snapshot creation refuses to overwrite an existing path.
 
 The M12b bridge is implemented by `biei-sim run --cost-profile
-<traffic-snapshot> [--cpu-profile <resource-warm-snapshot>]`. The preferred
-two-window form derives setup and warm/first-render wall distributions from the
+<traffic-snapshot> --cpu-profile <resource-warm-snapshot>`. The two-window form
+derives setup and warm/first-render wall distributions from the
 realistic traffic window, while the verified resource-warm reference supplies
 the representative CPU+encode service-wall proxy. The reference must contain
 non-empty upstream instrumentation, have at most 0.05 regular upstream attempts
@@ -418,9 +425,7 @@ Every sufficiently sampled traffic render shape must also have a matching warm
 reference shape. The importer samples CPU from the exact reference shape and
 reweights the routing-level global CPU range to the traffic mix; it rejects
 cross-shape subtraction instead of interpreting format/size encoding cost as
-resource I/O. The single-window
-form remains a provisional compatibility path that estimates CPU+encode from
-the fastest warm-render quantiles.
+resource I/O.
 
 The importer applies each stage independently. A family with enough samples is
 measured or derived; a missing, sparse, or unsafe family keeps its simulator
@@ -597,19 +602,17 @@ Completed:
   are separate; resource wait does not consume a modeled core.
 - M12a: time-bounded schema-v1 Prometheus profile export with disjoint bucket
   counts and deployment/hardware/permit provenance.
-- M12b import: `--cost-profile` derives representative routing ranges and
+- M12b import: `--cost-profile` with `--cpu-profile` derives representative routing ranges and
   shape-conditioned empirical runtime samplers, applies measured node/permit
   provenance and partial stage evidence independently, and records structured
   coverage plus every approximation in the run report.
 - Bounded calibration exercise runner for collecting representative stage
   samples without production-scale traffic.
-- Resource-warm capture verification: warm render walls approximate CPU
-  service only when the capture window was resource-cache-warm. The profile
-  carries in-render upstream fetch activity over the same window; the import
-  rejects that render stage when the upstream family is missing or empty,
-  fails it when render-blocking fetches exceed one per two renders, and reports
-  the verified ratio otherwise. Other independently measured stages remain
-  usable. `state="warm"` alone means style-warm, not resource-warm.
+- Resource-warm capture verification: the CPU-reference window must carry
+  upstream instrumentation and stay below 0.05 regular-lane fetches per render.
+  The realistic-traffic window is expected to contain provider I/O; its fetch
+  ratio is recorded as context and its render walls are never promoted to CPU
+  evidence. `state="warm"` alone means style-warm, not resource-warm.
 - Two-window fusion (`--cpu-profile` + `--cost-profile`): a verified
   resource-warm reference window supplies a CPU+encode service-wall proxy and a
   realistic-traffic window supplies the walls that become resource waits.
@@ -630,7 +633,7 @@ Completed:
 Pending calibration:
 
 - Measure renderer-thread CPU and same-render non-CPU wall directly; retain
-  two-window fusion only as a schema-v1 fallback and cross-check.
+  two-window fusion as an independent validation cross-check.
 - Validate the imported distributions against production end-to-end latency;
   do not feed end-to-end latency back as service time.
 - Split style setup and renderer rebuild further only if those measurements
@@ -641,21 +644,20 @@ Pending calibration:
 
 ```text
 crates/biei-core/src/              # production core and public traits
-specs/biei/biei-spec.md            # production contracts
-issues/biei/mln-rs-wishlist.md
+specs/biei-spec.md                 # production contracts
+issues/mln-rs-wishlist.md
 sims/biei-sim/
     |-- README.md                  # all simulator documentation
     `-- src/
         |-- main.rs
         |-- lib.rs
         |-- calibration.rs
+        |-- calibration_runner.rs
         |-- calibrated_costs.rs
         |-- config.rs
         |-- churn.rs
         |-- harness.rs
         |-- workload.rs
-        |-- scenarios.rs
-        |-- sweep.rs
         |-- metrics.rs
         |-- report.rs
         |-- visualization.rs
@@ -722,7 +724,7 @@ Predictive prewarming and scheduled prefetch are outside the current model.
 |---|---|
 | renderer slot | one worker capable of holding one active renderer/profile warm |
 | execution permit | node-wide concurrent setup/render allowance |
-| native-render permit | `renderStill` residency allowance, including resource waits; historically named CPU render permit in code |
+| native-render permit | `renderStill` residency allowance, including resource waits |
 | CPU core | simulated service capacity consumed only by render/encode CPU work |
 | warm profile | exact `WorkerProfile` already loaded in a slot |
 | cold start | first task after a profile setup or renderer rebuild |

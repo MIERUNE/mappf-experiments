@@ -72,6 +72,15 @@ forward-auth, or other network call merely to authenticate one request. Registry
 or secret refresh happens out of band and atomically replaces the local
 snapshot.
 
+A dynamic registry has one bounded cold-start exception to this rule. If a pod
+has no valid snapshot for a configured `registry_id`, concurrent requests may
+join one single-flight snapshot load or receive a temporary-unavailable response
+while that load runs. This is a registry activation event, not a per-token
+lookup: once loaded, every request verifies locally. Unknown registry IDs are
+rejected without storage access. Deployments may preload known active
+registries when avoiding even that first-request delay is more important than
+startup time and memory.
+
 Authentication should run before admission to expensive work:
 
 - Biei verifies the caller before render admission or native rendering;
@@ -93,15 +102,23 @@ The initial built-in credential can be an opaque key with a public lookup part
 and a random secret, for example:
 
 ```text
-<token_id>.<random_secret>
+<registry_id>.<token_id>.<random_secret>
 ```
 
-`token_id` selects one bounded registry entry; it grants no authority by
-itself. `random_secret` must contain enough entropy to resist online and
-offline guessing. Because the secret is machine-generated and high entropy, a
-fast keyed digest or cryptographic hash with constant-time comparison is
-appropriate. A password-hardening function such as Argon2 on every tile request
-would spend CPU without compensating for weak human passwords.
+`registry_id` selects one entry in a bounded trusted registry catalog, and
+`token_id` selects one bounded entry in that registry. Both are public routing
+hints and grant no authority by themselves. An unknown `registry_id` is rejected
+without constructing a storage URI or performing I/O. `random_secret` must
+contain enough entropy to resist online and offline guessing. Because the secret
+is machine-generated and high entropy, a fast keyed digest or cryptographic hash
+with constant-time comparison is appropriate. A password-hardening function
+such as Argon2 on every tile request would spend CPU without compensating for
+weak human passwords.
+
+The verifier construction must domain-separate at least `registry_id` and
+`token_id` with unambiguous encoding. Editing either public routing component of
+an issued token must not accidentally preserve a valid secret verifier in
+another registry.
 
 The preferred transport is the standard `Authorization: Bearer` header, but it
 can be the deployment default only after the supported browser and MapLibre
@@ -113,14 +130,40 @@ must not silently fall back to putting the long-lived key in every URL.
 
 ### 4.2 Registry entry
 
+A request parses the token's `registry_id`, resolves it through trusted local
+configuration, verifies the key in that registry, and evaluates its grants
+against the canonical resource identity already parsed by the route. The
+initial design deliberately does not require a global principal or token index.
 A delivery-key entry should contain only bounded policy needed on the hot path:
 
 - token identifier and secret verifier;
 - stable customer or project identifier;
 - enabled or disabled state;
 - rate/egress tier;
-- optional coarse product or namespace scope; and
+- allowed namespace/action grants or other coarse resource selectors;
+- optional browser-origin policy; and
 - optional validity bounds used for rotation overlap.
+
+A browser-origin policy may contain exact origins and narrowly bounded wildcard
+subdomains. When `Origin` is present it is checked first; otherwise the verifier
+may compare the origin component of `Referer`. The policy must explicitly say
+whether a request with neither header is allowed. Both headers are forgeable by
+non-browser clients, so this is an anti-hotlink and abuse-control signal rather
+than proof of client identity. Comparisons operate on parsed scheme, host, and
+port, never string prefixes.
+
+Namespace and action grants live in the token entry. The first design has no
+`namespace -> allowed registry IDs` table and no trusted registry-level
+`namespace_scopes` ceiling. Consequently, anyone allowed to write a registry
+can grant its tokens access to any namespace. Registry mutation therefore
+remains a centrally trusted management-plane capability; customer-delegated
+registry writers require a separately designed trusted scope ceiling before
+they are enabled.
+
+Authorization uses the service's existing parsed resource model. It does not
+require Biei to replace a deep style ID with a new universal
+`namespace/style_id` domain type, and authentication must not independently
+split or reinterpret an identifier that the router has already parsed.
 
 It should not grow into an end-user directory, fine-grained RBAC system, or
 arbitrary policy language. If authorization requires remote relationships or
@@ -444,15 +487,15 @@ configuration or a mounted secret is sufficient to validate the request path,
 metrics, limits, and operational behavior.
 
 If dynamic credential management becomes necessary, a registry may publish
-immutable snapshots to object storage or another distribution channel. The
+validated snapshots to object storage or another distribution channel. The
 minimum properties are:
 
 - a single writer or compare-and-swap semantics for management mutations;
-- immutable, validated snapshots with an explicit revision;
+- complete, validated registry snapshots with an explicit revision;
 - atomic replacement of the in-process reader view;
 - last-known-good operation and freshness telemetry;
 - separate read and write identities; and
-- no per-request dependency on registry storage.
+- no steady-state per-request dependency on registry storage.
 
 This is a control-plane optimization and availability mechanism, not a reason
 to invent a general database inside either server. The schema should be driven
@@ -465,6 +508,143 @@ The maximum acceptable snapshot age is a tier-specific availability decision,
 not a universal hard-coded timeout. Commodity delivery may intentionally keep
 serving a last-known-good snapshot while raising a loud stale-registry alert;
 strong/private access should fail closed after its documented bound.
+
+### 10.1 Registry-local current object
+
+The initial object-store shape is one self-contained object per registry:
+
+```text
+{auth_root}/current.json
+```
+
+`current.json` contains all of that registry's delivery-key identifiers, one-way
+secret verifiers, namespace/action grants, origin restrictions, limits, status,
+validity bounds, and an explicit monotonic revision. It never contains raw API
+keys, recoverable secrets, private signing keys, or arbitrary secret-manager
+payloads.
+
+The object is conditionally replaced as a whole. Readers use its strong object
+validator or generation for conditional refresh and never list a prefix or
+infer current state from object names. Keeping one complete registry in one
+object minimizes storage operations and makes one candidate revision the unit
+of validation and in-process replacement. Per-token objects, one global
+all-token `current.json`, manifests, and registry shards are intentionally not
+the starting design. Split one registry only after measured compressed size,
+decode time, update amplification, or resident memory demonstrates a problem.
+
+A bounded trusted catalog maps each `registry_id` to its auth root and reader
+configuration. A shared root template may contain `{registry_id}`, but expansion
+happens only after the ID is found in that catalog. Request parameters, styles,
+delivery keys, and registry contents must never supply an arbitrary auth-root
+URI. The loader allows only configured schemes and sources, and its cache
+identity includes the registry ID and resolved auth-source identity so a root
+change cannot reuse bytes loaded from the previous source.
+
+The first design deliberately omits a registry-level namespace ceiling. The
+centrally controlled writer is authoritative for the namespace/action grants in
+each token entry. If registry roots or writers are later delegated to customers,
+that changes the trust boundary and must first add a trusted ceiling outside the
+customer-written registry.
+
+### 10.2 Local cache and refresh behavior
+
+Every ingress pod keeps a separate, size-bounded auth cache keyed by
+`(registry_id, auth_source_id)`. It is not part of the tile, PMTiles, style,
+resource, or rendered-output caches: content-cache eviction pressure must not
+silently discard security state. Each cache entry is an immutable snapshot
+shared by readers and replaced atomically only after complete validation.
+
+Loading and refresh use:
+
+- single-flight per registry and auth source;
+- conditional reads using a strong validator or generation;
+- bounded document size, token count, field lengths, and decode work;
+- short negative caching for configured-but-missing registry objects;
+- size-weighted eviction of inactive registry snapshots; and
+- last-known-good retention when a replacement is missing, malformed,
+  unverifiable, or temporarily unavailable.
+
+Cold activation and negative caching are bounded independently of attacker-
+controlled token strings. Unknown registry IDs never reach the loader. A
+deployment using a root template must expand only IDs already present in the
+trusted catalog, apply pre-auth request limits, and cap negative entries so
+malformed tokens cannot produce unbounded storage reads or cache growth.
+
+Verification of one request remains an O(1) local token lookup followed by one
+bounded secret-verifier comparison and authorization against the same captured
+snapshot revision. Caching individual allow/deny decisions is not initially
+useful: a correct key would include credential, action, origin, resource
+selector, and policy revision, adding cardinality and invalidation risk around
+an already cheap lookup.
+
+### 10.3 Gossip, HRW, and peer-assisted distribution
+
+Object storage is the durable authority. Pods do not vote on auth state and do
+not create a second consensus system. Cluster mechanisms may accelerate
+convergence and collapse duplicate reads without becoming authoritative:
+
+- Gossip carries only a bounded update hint such as
+  `(registry_id, revision, digest)`. It never carries tokens,
+  verifier digests, grants, registry bodies, or auth-root URLs.
+- Chitchat state must not grow one persistent key per registry. A node may
+  overwrite one bounded latest-update hint; periodic polling is the correctness
+  backstop when rapid updates overwrite an intermediate hint.
+- A received hint schedules a jittered, single-flight refresh. It cannot force
+  a downgrade, change the configured source, or install policy by itself.
+- HRW may select bounded peer candidates for a cold snapshot or refresh using
+  `(registry_id, revision)`. It must not route every authentication
+  decision to an auth owner; warm request verification remains local on every
+  ingress pod.
+- The selected peer may serve a cached snapshot, and object storage remains the
+  fallback when peers miss, disagree, drain, or are unavailable.
+
+Peer identity alone is not sufficient authority for registry contents. Letting
+one compromised pod publish unsigned policy would expand a one-pod bypass into
+cluster-wide authorization poisoning. A peer-provided snapshot is installable
+without an object-store validation read only when it carries a management-plane
+signature over its exact registry identity, revision, validity bounds, and
+payload digest. Validators hold only the public verification key.
+Without that signature, a peer may save body bandwidth only after the receiver
+has anchored the expected digest or generation independently in object storage.
+
+A signature proves authorship and integrity, not that a revision is still the
+current object-store value. Running pods reject revisions below their observed
+floor and periodically reconcile with `current.json`. Fresh pods in a
+strong/private tier bootstrap each registry from object storage before accepting
+peer state; the commodity-read tier may accept an unexpired signed peer snapshot
+only under its explicit last-known-good and anti-replay policy.
+
+Signing the registry snapshot is distinct from signing every delivery token:
+opaque browser-visible delivery keys still use the cheap local registry lookup,
+while one signature is verified only when a registry snapshot changes.
+
+### 10.4 Internal refresh control
+
+An internal endpoint may expose an idempotent refresh trigger, conceptually:
+
+```text
+POST /_internal/auth/refresh
+{ "registry_id": "customer-a", "observed_revision": 42 }
+```
+
+The endpoint treats its body only as a hint. It validates a bounded canonical
+registry ID against the trusted catalog, resolves the auth root from local
+configuration, coalesces the work with the registry single-flight, schedules
+refresh, and returns without accepting caller-supplied policy. It must not
+accept an auth-root URL, registry body, secret, signing key, or authoritative
+revision from the caller.
+
+This endpoint lives only on the existing internal listener. That listener's
+network trust boundary, bounded body and concurrency limits, configured-
+registry validation, and per-registry refresh cooldown must prevent an
+internal caller from turning reloads into object-store or CPU amplification.
+Gossip receivers normally invoke the same refresh service directly in-process;
+HTTP remains useful for operational reloads, tests, and a management-triggered
+hint.
+
+Biei and Ishikari converge independently inside their own gossip clusters.
+Their shared authority is the configured registry and central writer, not a new
+cross-service gossip or consensus cluster.
 
 ## 11. Code and ownership boundaries
 
@@ -528,6 +708,24 @@ should demonstrate that:
 - requests carrying credentials for multiple mechanisms are rejected; and
 - the deployment documents every CDN capability assumed by its access,
   enforcement, cache, and accounting claims.
+
+When the dynamic registry is introduced, its additional tests must
+prove that:
+
+- an unknown `registry_id` is rejected without constructing an auth-root URI or
+  performing storage I/O;
+- a token cannot authorize a namespace or action absent from its registry entry;
+- `Origin`, `Referer`, and missing-browser-context cases follow the captured
+  token policy without string-prefix matching;
+- concurrent cold loads and refresh hints collapse to one bounded load;
+- a malformed, stale, oversized, or unverifiable candidate never replaces the
+  last-known-good snapshot;
+- changing a registry's auth root cannot reuse a cache entry from the previous
+  source;
+- gossip and the internal refresh endpoint cannot inject an auth-root URI or
+  install policy; and
+- unsigned, substituted, expired, or downgraded peer snapshots are rejected
+  whenever peer-assisted loading is enabled.
 
 Latency and CPU measurements should include cache-hit-heavy traffic. A verifier
 that looks cheap only beside a cold render can still be a significant regression

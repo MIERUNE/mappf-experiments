@@ -612,6 +612,7 @@ impl Node {
             return Err(ProcessError::RenderAdmissionClosed(Box::new(task)));
         }
         let revision = task.style.clone();
+        let authorization = task.authorization.clone();
         let outcome = self
             .inner
             .pool
@@ -626,7 +627,7 @@ impl Node {
         ) {
             self.inner
                 .profile_preparer
-                .mark_style_load_failed(&revision);
+                .mark_style_load_failed(&revision, authorization.as_ref());
         }
         Ok(outcome)
     }
@@ -1378,7 +1379,11 @@ mod tests {
 
     #[async_trait]
     impl ProfilePreparer for FailureRecordingPreparer {
-        fn mark_style_load_failed(&self, _revision: &StyleRevision) {
+        fn mark_style_load_failed(
+            &self,
+            _revision: &StyleRevision,
+            _authorization: Option<&crate::types::RenderAuthorization>,
+        ) {
             self.failures.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -1611,6 +1616,7 @@ mod tests {
         InternalTask {
             id,
             request_id: RequestId::from_string(request_id),
+            authorization: None,
             style: StyleRevision {
                 id: StyleId("cached/style".to_string()),
                 version: 1,
@@ -2598,6 +2604,7 @@ mod tests {
                 task: WireTask {
                     id: 42,
                     request_id: crate::types::RequestId::from_string("node-test"),
+                    authorization: None,
                     style: StyleRevision {
                         id: StyleId("missing/style".to_string()),
                         version: 1,

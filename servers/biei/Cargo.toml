@@ -19,12 +19,14 @@ humantime.workspace = true
 image = "0.25"
 maplibre_native.workspace = true
 mmpf-cluster.workspace = true
+mmpf-auth.workspace = true
 mmpf-common.workspace = true
 mmpf-http = { workspace = true, features = ["serve"] }
 mmpf-mln-filesource.workspace = true
 moka.workspace = true
 prometheus.workspace = true
 reqwest = { workspace = true, features = ["rustls", "http2", "gzip", "deflate", "stream"] }
+serde.workspace = true
 serde_json.workspace = true
 tiny-skia.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

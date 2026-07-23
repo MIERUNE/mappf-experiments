@@ -15,6 +15,7 @@ use mmpf_terrain::hillshade;
 pub(crate) use tilejson::DerivedTileJsonQuery;
 
 use axum::{
+    Extension,
     body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
@@ -25,7 +26,8 @@ use tracing::{debug, warn};
 
 use crate::provider::path_percent_encode;
 use crate::server::{
-    AppState, HttpError, bytes_response, cache, derived_json_response, get_origin,
+    AppState, HttpError, auth::PropagatedAccessToken, bytes_response, cache, derived_json_response,
+    get_origin,
 };
 use ishikari_core::pmtiles::{MLT_CONTENT_TYPE, TileData, TileType};
 
@@ -58,8 +60,17 @@ pub(crate) async fn derived_tilejson_handler(
     Path((tileset_id, product)): Path<(String, String)>,
     headers: HeaderMap,
     Query(query): Query<DerivedTileJsonQuery>,
+    token: Option<Extension<PropagatedAccessToken>>,
 ) -> Result<Response, HttpError> {
-    serve_tilejson(state, tileset_id, product, headers, query).await
+    serve_tilejson(
+        state,
+        tileset_id,
+        product,
+        headers,
+        query,
+        token.map(|value| value.0),
+    )
+    .await
 }
 
 pub(crate) async fn namespaced_derived_tilejson_handler(
@@ -67,6 +78,7 @@ pub(crate) async fn namespaced_derived_tilejson_handler(
     Path((namespace, tileset_id, product)): Path<(String, String, String)>,
     headers: HeaderMap,
     Query(query): Query<DerivedTileJsonQuery>,
+    token: Option<Extension<PropagatedAccessToken>>,
 ) -> Result<Response, HttpError> {
     serve_tilejson(
         state,
@@ -74,6 +86,7 @@ pub(crate) async fn namespaced_derived_tilejson_handler(
         product,
         headers,
         query,
+        token.map(|value| value.0),
     )
     .await
 }
@@ -84,6 +97,7 @@ async fn serve_tilejson(
     product: String,
     headers: HeaderMap,
     query: DerivedTileJsonQuery,
+    token: Option<PropagatedAccessToken>,
 ) -> Result<Response, HttpError> {
     let tileset_id = validated_mapterhorn(&state, tileset_id)?;
     let product = DerivedProduct::parse(&product)?;
@@ -104,6 +118,7 @@ async fn serve_tilejson(
         &info,
         maxzoom,
         query.wants_mlt(),
+        token.as_ref(),
     );
     // Origin-derived like the base TileJSON: validate by a strong ETag over the
     // exact bytes served so conditional requests can 304.

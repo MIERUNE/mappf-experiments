@@ -875,6 +875,7 @@ mod tests {
         InternalTask {
             id: 1,
             request_id: crate::types::RequestId::from_string("dispatcher-test"),
+            authorization: None,
             style: rev(style_index),
             source: None,
             request: RenderRequest::Tile {

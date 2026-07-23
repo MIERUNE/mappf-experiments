@@ -84,6 +84,11 @@ impl IngressResponse {
         self
     }
 
+    pub(crate) fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
+        self.headers.push((name, value.to_string()));
+        self
+    }
+
     pub(crate) fn with_request_id(mut self, request_id: &RequestId) -> Self {
         self.headers
             .push((REQUEST_ID_HEADER, request_id.as_str().to_string()));

@@ -1,0 +1,88 @@
+name: Runtime E2E
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/biei-core/**"
+      - "crates/ishikari-core/**"
+      - "crates/mmpf-auth/**"
+      - "crates/mmpf-cluster/**"
+      - "crates/mmpf-common/**"
+      - "crates/mmpf-http/**"
+      - "crates/mmpf-mln-filesource/**"
+      - "crates/mmpf-pmtiles/**"
+      - "servers/biei/**"
+      - "servers/ishikari/**"
+      - "demo-deploy/biei/runtime/**"
+      - "demo-deploy/ishikari/runtime/**"
+      - ".github/workflows/runtime-e2e.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/biei-core/**"
+      - "crates/ishikari-core/**"
+      - "crates/mmpf-auth/**"
+      - "crates/mmpf-cluster/**"
+      - "crates/mmpf-common/**"
+      - "crates/mmpf-http/**"
+      - "crates/mmpf-mln-filesource/**"
+      - "crates/mmpf-pmtiles/**"
+      - "servers/biei/**"
+      - "servers/ishikari/**"
+      - "demo-deploy/biei/runtime/**"
+      - "demo-deploy/ishikari/runtime/**"
+      - ".github/workflows/runtime-e2e.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  production-containers:
+    name: Production container integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build Biei production image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: demo-deploy/biei/runtime/Dockerfile
+          load: true
+          tags: biei-ci:smoke
+          cache-from: type=gha,scope=runtime-e2e-biei
+          cache-to: type=gha,mode=max,scope=runtime-e2e-biei
+
+      - name: Exercise two-node Biei membership and peer rendering
+        run: BIEI_IMAGE=biei-ci:smoke bash demo-deploy/biei/runtime/cluster-smoke.sh
+
+      - name: Build Ishikari production image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: demo-deploy/ishikari/runtime/Dockerfile
+          load: true
+          tags: ishikari-ci:smoke
+          cache-from: type=gha,scope=runtime-e2e-ishikari
+          cache-to: type=gha,mode=max,scope=runtime-e2e-ishikari
+
+      - name: Exercise authenticated Biei-to-Ishikari rendering
+        run: >-
+          BIEI_IMAGE=biei-ci:smoke
+          ISHIKARI_IMAGE=ishikari-ci:smoke
+          bash demo-deploy/biei/runtime/authenticated-provider-smoke.sh

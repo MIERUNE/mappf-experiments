@@ -204,6 +204,7 @@ fn tile_task(scale: Scale, format: ImageFormat, tile_size: u16) -> InternalTask 
     InternalTask {
         id: 1,
         request_id: biei_core::types::RequestId::from_string("calibration-test"),
+        authorization: None,
         style: biei_core::types::StyleRevision {
             id: biei_core::types::StyleId("style-0".to_owned()),
             version: 1,

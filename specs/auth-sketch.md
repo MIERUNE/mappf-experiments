@@ -1,8 +1,9 @@
 # Authentication boundaries for Biei and Ishikari — design sketch
 
-Status: exploratory. This document describes design boundaries, not an
-implementation commitment. Open decisions are tracked in
-[`issues/auth-todo.md`](../issues/auth-todo.md).
+Status: exploratory overall. Biei now has a disabled-by-default first slice for
+object-storage-backed authentication of static renders. It is implementation
+evidence, not yet a production or demo commitment. Open decisions are tracked
+in [`issues/auth-todo.md`](../issues/auth-todo.md).
 
 ## 1. Purpose
 
@@ -39,7 +40,7 @@ Two distinctions are fundamental:
 | Human administration | employee or operator | one or more corporate OIDC providers | manage configuration, content, and delivery credentials |
 | Automated publishing | workload or service account | workload identity or narrowly scoped service credential | publish and update approved content |
 | Map delivery | customer or project | high-entropy opaque delivery key | read ordinary delivery routes within a coarse scope |
-| Internal service | Biei or another trusted workload | dedicated service identity | call the required Ishikari internal/read APIs |
+| Internal service | Biei or another trusted workload | optional dedicated workload identity | authenticate the workload without enlarging the caller's delivery grants |
 
 These planes are deliberately not interchangeable:
 
@@ -98,35 +99,37 @@ metrics because disagreement between those parsers can create bypasses.
 
 ### 4.1 Token shape
 
-The initial built-in credential can be an opaque key with a public lookup part
-and a random secret, for example:
+The public envelope contains a registry selector followed by a registry-specific
+opaque credential:
 
 ```text
-<registry_id>.<token_id>.<random_secret>
+<registry_id>.<opaque_registry_credential>
 ```
 
-`registry_id` selects one entry in a bounded trusted registry catalog, and
-`token_id` selects one bounded entry in that registry. Both are public routing
-hints and grant no authority by themselves. An unknown `registry_id` is rejected
-without constructing a storage URI or performing I/O. `random_secret` must
-contain enough entropy to resist online and offline guessing. Because the secret
-is machine-generated and high entropy, a fast keyed digest or cryptographic hash
-with constant-time comparison is appropriate. A password-hardening function
-such as Argon2 on every tile request would spend CPU without compensating for
-weak human passwords.
+The envelope is split only at its first `.`. `registry_id` selects one entry in
+a bounded trusted local catalog and grants no authority by itself; the entire
+suffix is passed unchanged to that registry's verifier. It may therefore be a
+random opaque key, a JWT, or another bounded representation without changing
+the delivery API. Unknown registry IDs are rejected without constructing a
+storage URI or performing I/O.
 
-The verifier construction must domain-separate at least `registry_id` and
-`token_id` with unambiguous encoding. Editing either public routing component of
-an issued token must not accidentally preserve a valid secret verifier in
-another registry.
+The first object-storage adapter treats the suffix as a high-entropy bearer
+secret and indexes a SHA-256 verifier for the complete suffix. Its verifier
+construction domain-separates `registry_id` with length-prefixed encoding, and
+confirms a hash-table match with constant-time comparison. Other adapters may
+validate the opaque suffix differently. Password-hardening such as Argon2 does
+not belong on every delivery request; an adapter accepting human passwords
+would need a different exchange flow.
 
 The preferred transport is the standard `Authorization: Bearer` header, but it
 can be the deployment default only after the supported browser and MapLibre
 clients are proven to attach it to every required style subresource. Putting a
 stable delivery key in a query string makes it more likely to appear in browser
 history, referrers, screenshots, CDN logs, and support transcripts. A client
-that cannot set the header therefore needs an explicit alternative design; it
-must not silently fall back to putting the long-lived key in every URL.
+that cannot set the header may use the explicit `access_token` parameter now
+implemented by both servers, but a deployment must first configure URL-log redaction,
+referrer policy, and CDN cache-key behavior. Clients must not silently switch
+transports, and a request carrying both is rejected.
 
 ### 4.2 Registry entry
 
@@ -136,7 +139,7 @@ against the canonical resource identity already parsed by the route. The
 initial design deliberately does not require a global principal or token index.
 A delivery-key entry should contain only bounded policy needed on the hot path:
 
-- token identifier and secret verifier;
+- registry-specific credential verifier;
 - stable customer or project identifier;
 - enabled or disabled state;
 - rate/egress tier;
@@ -152,7 +155,17 @@ non-browser clients, so this is an anti-hotlink and abuse-control signal rather
 than proof of client identity. Comparisons operate on parsed scheme, host, and
 port, never string prefixes.
 
-Namespace and action grants live in the token entry. The first design has no
+Namespace and action grants live in the token entry. The ordinary token format
+and registry are shared by Biei and Ishikari: one token may carry
+`render.static` and `read`, and each service enforces only the action relevant
+to its route. The initial `read` grammar is deliberately coarse. It grants
+ordinary style, tileset, tile, glyph, sprite, and derived-resource reads within
+the allowed namespaces; it does not create separate basemap, terrain, glyph,
+or sprite permission classes. A deployment that genuinely needs a harder
+boundary should express it with a namespace rather than accumulating resource-
+kind flags.
+
+The first design has no
 `namespace -> allowed registry IDs` table and no trusted registry-level
 `namespace_scopes` ceiling. Consequently, anyone allowed to write a registry
 can grant its tokens access to any namespace. Registry mutation therefore
@@ -163,7 +176,10 @@ they are enabled.
 Authorization uses the service's existing parsed resource model. It does not
 require Biei to replace a deep style ID with a new universal
 `namespace/style_id` domain type, and authentication must not independently
-split or reinterpret an identifier that the router has already parsed.
+split or reinterpret an identifier that the router has already parsed. In
+particular, namespace checks use the same percent-decoded canonical path
+identity as the handler; a raw URI spelling such as `%66oo` must not become a
+different authorization namespace from `foo`.
 
 It should not grow into an end-user directory, fine-grained RBAC system, or
 arbitrary policy language. If authorization requires remote relationships or
@@ -348,6 +364,83 @@ credential, or has confidentiality requirements. Identical, credential-free
 responses can remain shareable when an authenticating edge enforces access
 before its cache.
 
+### 6.3 Namespace requirements on cached renders
+
+Token identity is not the semantic render-cache boundary. A verified caller
+has a bounded set of readable namespaces, while a cached render carries the
+bounded namespace requirements needed to produce its bytes. A cache hit is
+eligible only when the current caller is authenticated and its current grants
+satisfy one recorded requirement set:
+
+```text
+required_namespaces ⊆ caller.readable_namespaces
+```
+
+This check occurs before returning bytes on every protected cache hit. Token
+revocation and grant removal therefore take effect when the local registry
+snapshot advances even if the rendered bytes remain resident. In the target
+model, raw tokens are not the semantic rendered-cache partition and never
+appear in exported cache metadata, logs, or metrics. Until namespace
+requirements are enforced end to end, an in-process transport cache may retain
+the complete token-bearing URL as its conservative isolation key; it must not
+export or log that key.
+
+The implemented first Biei slice applies the cache-hit check without claiming
+to know the exact dependency closure. A protected task carries its normalized
+namespace grant set, a domain-separated one-way credential-and-policy cache
+partition, and a bounded redacted provider bearer token over the trusted
+internal render wire. The verifier digest and principal do not cross. The
+partition changes when the authenticated registry revision advances. A newly
+rendered output records the complete grant set as a conservative upper bound
+on its requirements; neither the credential partition nor bearer token is part
+of rendered-output cache identity. Thus equivalent grants can share final
+images, a superset can reuse an entry, and a weaker, incomparable, protected,
+or unprotected caller cannot cross the recorded boundary.
+
+The credential-and-policy partition isolates Biei's positive and negative style/TileJSON
+caches, in-flight profile fetches, and worker-local loaded native style. This is
+required because a rewritten profile can contain a token-bearing URL even when
+two credentials have identical grants. The partition deliberately does not
+enter gossip warmth or metric labels. A render completed under a weaker grant
+does not replace a resident stronger requirement. Component contracts prove
+that Biei sends the token on the actual exact-origin profile request, FileSource
+uses the complete token-bearing URL in positive-cache and single-flight
+identity, and Ishikari authorizes the current token before consulting a shared
+resource cache. A production-container E2E also composes authenticated Biei,
+authenticated Ishikari, and a real native render: after a broad token warms
+both services' caches, a weaker token cannot read the protected tile, receive
+the broad render, or poison the authorized cache entry. The trusted dependency
+descriptor is not implemented. The conservative rule is safe but may discard
+valid hits; the descriptor below is the mechanism for narrowing the requirement
+from “everything the producer could read” to “what these bytes actually
+required.”
+
+The conservative first requirement for a render is the bounded, sorted set of
+namespaces in the trusted Ishikari-rewritten style dependency descriptor,
+including the style namespace. Ishikari may return that descriptor with the
+rewritten style because it owns the canonical rewrite from provider-relative
+references to its delivery routes. Biei accepts it only from its explicitly
+trusted style provider or with cryptographic integrity; an arbitrary style
+origin cannot claim weaker requirements. Until this descriptor and its cache-
+hit check are implemented end to end, Biei must retain token-bearing URLs in
+FileSource cache identity, retain the credential partition in profile cache and
+loaded-renderer identity, and must not treat a broad workload credential as
+sufficient authority for user-selected resources.
+
+A later optimization may attach an additional, weaker requirement set to one
+exact cached render when a strictly weaker namespace grant independently
+produces byte-identical output for the same complete render key, style revision,
+and policy epoch. The proof is valid only when the weaker render cannot consume
+resource or style-cache entries populated under broader grants. Equality after
+such cache contamination proves nothing. Do not take the intersection of
+incomparable grant sets: equal bytes produced under `{a,b}` and `{a,c}` do not
+prove that `{a}` is sufficient. Keep alternative requirement sets bounded and
+discard them on style or authorization-policy revision changes.
+
+This adaptive relaxation is optional. Namespace-closure checking is the safe,
+simple baseline, and separate basemap/terrain permission kinds are explicitly
+out of scope for the ordinary delivery tier.
+
 ## 7. Human management and automated publishing
 
 ### 7.1 Human administration
@@ -398,15 +491,47 @@ to invoke one management API.
 
 ### 7.3 Biei to Ishikari
 
-Biei calls Ishikari as Biei, using a dedicated internal service identity. It
-does not forward the user's delivery credential as proof of its own authority.
-The original customer/project identity may be propagated separately as trusted,
-bounded attribution metadata only when the transport authenticates Biei and the
-receiving route explicitly expects it. Biei derives and overwrites that metadata
-after verification; it never relays a client-supplied identity header unchanged.
+Biei and Ishikari accept the same ordinary delivery token at their public
+boundaries. The selected experimental model forwards that same verified token
+with the render task and then only to the explicitly configured exact
+Ishikari/style-provider origin. Biei represents it as a bounded, redacted wire
+value. It is absent from cache identities, rendered-output authorization
+requirements, gossip, outcomes, metrics, and logs. The profile preparer appends
+it as `access_token` only for the exact configured origin so Ishikari's existing
+same-origin style and TileJSON rewrites propagate it through the MapLibre
+resource waterfall. Arbitrary external URLs retained from a provider style
+never receive it.
 
-This separation supports distributed tracing and attribution without making
-Ishikari trust arbitrary client-supplied identity headers.
+Because this model carries the original reusable bearer credential, each
+deployment must decide whether its internal network is an accepted trusted
+boundary. When node-to-node confidentiality or authenticated workload identity
+is required, protect both Biei peer forwarding and Biei-to-Ishikari traffic
+with mesh mTLS or an equivalent deployment-layer mechanism. The application
+protocol does not add a second partial encryption, signing, or peer-token
+scheme. The production-container E2E composes this credential path and its
+cache non-interference boundary; deployment-specific mTLS and workload policy
+remain outside that application-level test.
+
+A short-lived namespace-attenuated capability remains a possible future
+defense-in-depth layer, but is not the baseline. It would not replace mTLS and
+would not provide transport confidentiality or peer identity where those are
+required. It would add issuance, signing-key, expiry, rotation, revocation,
+URL-leakage, and FileSource-cache policy. Revisit it only if bearer reuse after
+a renderer compromise is a demonstrated threat that the service trust boundary
+does not accept.
+
+A dedicated workload or service identity may additionally authenticate that
+the caller is Biei, but it is not a replacement for the ordinary token and
+cannot widen its grants. Effective authority is the intersection of workload
+policy and caller delivery grants. In particular, a broad Biei service token
+must not allow rendering a tile namespace that the caller cannot read merely
+because the caller can read the style. A service-token-only resource path would
+make Biei a confused deputy.
+
+Bounded customer/project attribution may be propagated separately only when
+the transport authenticates Biei and the receiving route explicitly expects
+it. Biei derives and overwrites such metadata after verification; it never
+relays a client-supplied identity header unchanged.
 
 ## 8. Portable verifier seam and composition
 
@@ -481,23 +606,34 @@ service merely because the URL contains a signature.
 
 ## 10. Configuration and registry distribution
 
-The first delivery implementation does not require an online management system
-or object-store registry. A bounded static key set supplied through deployment
-configuration or a mounted secret is sufficient to validate the request path,
-metrics, limits, and operational behavior.
+The implemented experimental slice is shared by Biei and Ishikari and uses an
+object-store registry. It is enabled only when `BIEI_AUTH_REGISTRIES` or
+`ISKR_AUTH_REGISTRIES` is non-empty. Biei protects static-render routes;
+Ishikari protects public delivery content while leaving operational and
+cluster-internal peer routes on their existing network trust boundary. Both
+accept either `Authorization: Bearer` or an explicit `access_token` query
+parameter. Mixed or repeated transports are rejected. Query transport exists
+for browser/map clients that cannot set headers and requires URL-log redaction,
+restrictive referrer policy, and deliberate CDN cache-key handling.
 
-If dynamic credential management becomes necessary, a registry may publish
-validated snapshots to object storage or another distribution channel. The
-minimum properties are:
+Ishikari propagates a verified query token only into same-origin URLs produced
+by its own style, TileJSON, derived TileJSON, and preview transformations. It
+does not attach the token to external URLs retained from provider style JSON,
+and it never converts an Authorization header into a URL credential.
 
-- a single writer or compare-and-swap semantics for management mutations;
+The reader implementation currently establishes:
+
 - complete, validated registry snapshots with an explicit revision;
 - atomic replacement of the in-process reader view;
-- last-known-good operation and freshness telemetry;
-- separate read and write identities; and
+- resident last-known-good operation; and
 - no steady-state per-request dependency on registry storage.
 
-This is a control-plane optimization and availability mechanism, not a reason
+Production-like enablement additionally requires a single writer or
+compare-and-swap semantics for management mutations, freshness telemetry, and
+separate read and write identities. Those are deployment gates, not properties
+provided by the current reader merely because it can load `current.json`.
+
+This is a control-plane distribution and availability mechanism, not a reason
 to invent a general database inside either server. The schema should be driven
 by implemented policy rather than speculative claim fields.
 
@@ -517,11 +653,14 @@ The initial object-store shape is one self-contained object per registry:
 {auth_root}/current.json
 ```
 
-`current.json` contains all of that registry's delivery-key identifiers, one-way
-secret verifiers, namespace/action grants, origin restrictions, limits, status,
-validity bounds, and an explicit monotonic revision. It never contains raw API
-keys, recoverable secrets, private signing keys, or arbitrary secret-manager
-payloads.
+The current v1 shared schema contains `schema_version`, `registry_id`, a monotonic
+`revision`, and a bounded `credentials` array. Each credential entry contains a
+one-way `credential_sha256`, bounded `principal_id`, enabled state, namespace
+and exact `render.static` or `read` grants, exact allowed origins, and an explicit
+`allow_missing_origin` policy. It never contains raw API keys, recoverable
+secrets, private signing keys, or arbitrary secret-manager payloads. Rate tiers,
+validity windows, additional actions, and external verifier descriptions remain
+future schema work rather than ignored fields.
 
 The object is conditionally replaced as a whole. Readers use its strong object
 validator or generation for conditional refresh and never list a prefix or
@@ -548,8 +687,8 @@ customer-written registry.
 
 ### 10.2 Local cache and refresh behavior
 
-Every ingress pod keeps a separate, size-bounded auth cache keyed by
-`(registry_id, auth_source_id)`. It is not part of the tile, PMTiles, style,
+Every ingress pod keeps a separate bounded auth cache keyed by configured
+`registry_id`; the source URL is immutable for that process. It is not part of the tile, PMTiles, style,
 resource, or rendered-output caches: content-cache eviction pressure must not
 silently discard security state. Each cache entry is an immutable snapshot
 shared by readers and replaced atomically only after complete validation.
@@ -557,10 +696,12 @@ shared by readers and replaced atomically only after complete validation.
 Loading and refresh use:
 
 - single-flight per registry and auth source;
+- a process-wide bound on concurrent registry loads;
 - conditional reads using a strong validator or generation;
 - bounded document size, token count, field lengths, and decode work;
 - short negative caching for configured-but-missing registry objects;
-- size-weighted eviction of inactive registry snapshots; and
+- an independent 64 MiB weighted snapshot cache, isolated from content-cache
+  eviction pressure; and
 - last-known-good retention when a replacement is missing, malformed,
   unverifiable, or temporarily unavailable.
 
@@ -655,14 +796,17 @@ configuration and reusable service code:
 - service core crates consume typed verifier/configuration objects;
 - domain routers own route-level authorization decisions;
 - cache keys describe representations, not credentials;
-- gossip and internal wire formats do not carry raw external credentials; and
+- gossip never carries raw external credentials; Biei's render wire may carry
+  the bounded redacted ordinary provider token only under the selected
+  trusted service boundary, alongside namespace grants and a one-way
+  credential-and-policy cache partition;
 - simulators model authentication cost only when a measured question requires
   it.
 
-Do not extract a shared authentication crate merely because both servers may
-eventually authenticate requests. Keep the first implementation with its owner,
-then extract only stable, service-independent primitives with at least two real
-consumers.
+The extracted `mmpf-auth` crate remains limited to the stable verifier, registry
+reader, credential-carrier parsing, and bounded namespace-grant model consumed
+by both servers. HTTP response policy, style rewriting, render-cache admission,
+content storage, peer routing, and rate limiting remain with their owners.
 
 Errors exposed to callers should remain coarse (`missing`, `invalid`,
 `forbidden`, or temporarily unavailable where appropriate). Detailed verifier
@@ -676,8 +820,10 @@ secret material.
 2. Add a local `StaticApiKeys` verifier, typed delivery principal, bounded
    metrics, and tests proving authentication happens before expensive work.
 3. Add edge request/egress limits and validate CDN log-based usage accounting.
-4. Add the dedicated Biei-to-Ishikari service identity before treating internal
-   routes as trusted.
+4. Carry the ordinary delivery token through the trusted Biei-to-Ishikari style
+   path and enforce namespace requirements on Biei cache hits. Add a workload
+   identity only as an additional transport identity, never as broader content
+   authorization.
 5. Add portable OIDC management and workload publishing identity when a
    management/publishing API exists.
 6. Introduce a dynamic registry only when static distribution is an observed
@@ -702,15 +848,19 @@ should demonstrate that:
   an implicit allow-all state;
 - startup without required verification material remains unready or rejects the
   protected routes;
-- Biei's internal credential, rather than the caller's delivery key, is used on
-  Biei-to-Ishikari requests;
+- management/internal-only Biei-to-Ishikari requests may use a workload
+  identity, while caller-selected content never relies on that identity for
+  authority broader than the caller's delivery namespaces;
+- a rendered cache entry is returned only when the caller's freshly verified
+  readable namespaces satisfy one of the entry's bounded requirement sets;
+- warming Biei and Ishikari caches with a broader token cannot make inaccessible
+  resource bytes or rendered output visible to a weaker token;
 - an invalid recognized credential never falls through to another mechanism;
 - requests carrying credentials for multiple mechanisms are rejected; and
 - the deployment documents every CDN capability assumed by its access,
   enforcement, cache, and accounting claims.
 
-When the dynamic registry is introduced, its additional tests must
-prove that:
+The object-store registry tests must continue to prove that:
 
 - an unknown `registry_id` is rejected without constructing an auth-root URI or
   performing storage I/O;

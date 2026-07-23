@@ -31,6 +31,7 @@ use tower::util::ServiceExt;
 
 use super::{
     AppState, ServerRuntimeConfig, cache, internal_router, public_router, with_common_layers,
+    with_public_layers,
 };
 use crate::provider::ProviderConfig;
 use crate::{
@@ -148,7 +149,9 @@ async fn spawn_upstream() -> (
                 let mut encoder =
                     flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
                 encoder
-                    .write_all(br#"{"version":8,"sources":{},"layers":[]}"#)
+                    .write_all(
+                        br#"{"version":8,"sources":{"base":{"type":"vector","url":"/fixture"}},"layers":[]}"#,
+                    )
                     .unwrap();
                 (headers, encoder.finish().unwrap())
             }),
@@ -481,10 +484,22 @@ async fn spawn_provider_peer() -> SocketAddr {
 }
 
 async fn harness(label: &str) -> Harness {
-    harness_with_provider_peer(label, None).await
+    harness_config(label, None, false).await
 }
 
 async fn harness_with_provider_peer(label: &str, provider_peer: Option<SocketAddr>) -> Harness {
+    harness_config(label, provider_peer, false).await
+}
+
+async fn harness_with_auth(label: &str) -> Harness {
+    harness_config(label, None, true).await
+}
+
+async fn harness_config(
+    label: &str,
+    provider_peer: Option<SocketAddr>,
+    auth_enabled: bool,
+) -> Harness {
     let (
         upstream,
         uncached_upstream_requests,
@@ -504,6 +519,54 @@ async fn harness_with_provider_peer(label: &str, provider_peer: Option<SocketAdd
     ));
     std::fs::create_dir_all(&tiles_dir).expect("tiles dir");
     write_mvt_pmtiles_fixture(&tiles_dir.join("fixture.pmtiles"));
+    let delivery_auth = if auth_enabled {
+        let auth_root = tiles_dir.join("auth");
+        std::fs::create_dir_all(&auth_root).expect("auth root");
+        let snapshot = serde_json::json!({
+            "schema_version": 1,
+            "registry_id": "public",
+            "revision": 1,
+            "credentials": [
+                {
+                    "credential_sha256": mmpf_auth::credential_sha256("public", "secret"),
+                    "principal_id": "contract-browser",
+                    "enabled": true,
+                    "namespaces": ["base", "fixture"],
+                    "actions": ["read"],
+                    "allow_missing_origin": true
+                },
+                {
+                    "credential_sha256": mmpf_auth::credential_sha256("public", "style-only"),
+                    "principal_id": "contract-style-only",
+                    "enabled": true,
+                    "namespaces": ["base"],
+                    "actions": ["read"],
+                    "allow_missing_origin": true
+                },
+                {
+                    "credential_sha256": mmpf_auth::credential_sha256("public", "encoded-alias"),
+                    "principal_id": "contract-encoded-alias",
+                    "enabled": true,
+                    "namespaces": ["%62ase"],
+                    "actions": ["read"],
+                    "allow_missing_origin": true
+                }
+            ]
+        });
+        std::fs::write(
+            auth_root.join("current.json"),
+            serde_json::to_vec(&snapshot).expect("auth snapshot JSON"),
+        )
+        .expect("auth snapshot");
+        let root_url = url::Url::from_directory_path(&auth_root)
+            .expect("auth root URL")
+            .to_string();
+        let catalog =
+            mmpf_auth::RegistryCatalog::parse(&format!("public={root_url}")).expect("auth catalog");
+        mmpf_auth::DeliveryAuth::new(catalog, std::iter::empty::<(String, String)>())
+    } else {
+        None
+    };
 
     // Membership still backs operational state. Provider-route contract tests
     // can inject a fixed remote owner into the resolver independently.
@@ -583,6 +646,7 @@ async fn harness_with_provider_peer(label: &str, provider_peer: Option<SocketAdd
                 false,
                 Duration::from_secs(30),
             ),
+            delivery_auth,
             mapterhorn: None,
             cpu_work_concurrency: 1,
             cpu_work_max_inflight: 4,
@@ -592,7 +656,7 @@ async fn harness_with_provider_peer(label: &str, provider_peer: Option<SocketAdd
     );
 
     Harness {
-        public: with_common_layers(public_router(), state.clone()),
+        public: with_public_layers(public_router(), state.clone()),
         internal: with_common_layers(internal_router(), state),
         membership_owner,
         tiles_dir,
@@ -658,6 +722,201 @@ async fn remote_provider_negatives_require_an_exact_private_marker() {
         harness.fallback_upstream_requests.load(Ordering::Relaxed),
         expected_fallbacks,
         "retryable peer failures must retain local-origin fallback"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn delivery_auth_is_optional_and_covers_only_public_content_routes() {
+    let harness = harness_with_auth("delivery-auth-boundary").await;
+
+    let (status, headers, _) = harness
+        .get(&harness.public, "/styles/base/style.json")
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(headers[header::WWW_AUTHENTICATE], "Bearer");
+    assert_eq!(headers[header::CACHE_CONTROL], "private, no-store");
+
+    assert_eq!(
+        harness.get(&harness.public, "/readyz").await.0,
+        StatusCode::OK,
+        "delivery auth must not protect operational probes"
+    );
+    assert_eq!(
+        harness
+            .get(
+                &harness.internal,
+                "/_internal/provider/styles/base/style.json"
+            )
+            .await
+            .0,
+        StatusCode::OK,
+        "peer traffic uses the internal trust boundary, not browser credentials"
+    );
+
+    let (status, _, _) = harness
+        .get_with(
+            &harness.public,
+            "/styles/base/style.json?access_token=public.secret",
+            &[(header::AUTHORIZATION, "Bearer public.secret")],
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "mixed transports are ambiguous"
+    );
+
+    let (status, _, _) = harness
+        .get(
+            &harness.public,
+            "/styles/regional/base/style.json?access_token=public.secret",
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "namespace grants are exact");
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn delivery_auth_uses_the_percent_decoded_namespace_identity() {
+    let harness = harness_with_auth("delivery-auth-canonical-namespace").await;
+
+    assert_eq!(
+        harness
+            .get(
+                &harness.public,
+                "/styles/%62ase/style.json?access_token=public.secret",
+            )
+            .await
+            .0,
+        StatusCode::OK,
+        "the canonical base grant should authorize an equivalent encoded path"
+    );
+    let (status, headers, _) = harness
+        .get(
+            &harness.public,
+            "/styles/%62ase/style.json?access_token=public.encoded-alias",
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a raw encoded alias grant must not authorize the decoded base namespace"
+    );
+    assert_eq!(headers[header::CACHE_CONTROL], "private, no-store");
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn verified_query_tokens_propagate_only_to_generated_ishikari_urls() {
+    let harness = harness_with_auth("delivery-auth-propagation").await;
+
+    let (status, _, body) = harness
+        .get(
+            &harness.public,
+            "/styles/base/style.json?access_token=public.secret",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let style: serde_json::Value = serde_json::from_slice(&body).expect("style JSON");
+    assert!(
+        style["glyphs"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("?access_token=public.secret"))
+    );
+    assert!(
+        style["sprite"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("?access_token=public.secret"))
+    );
+    assert!(
+        style["sources"]["base"]["url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/tilesets/fixture?access_token=public.secret"))
+    );
+
+    let (status, _, body) = harness
+        .get(
+            &harness.public,
+            "/tilesets/fixture?access_token=public.secret",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let tilejson: serde_json::Value = serde_json::from_slice(&body).expect("TileJSON");
+    assert!(tilejson["tiles"][0].as_str().is_some_and(|url| {
+        url.ends_with("/tilesets/fixture/{z}/{x}/{y}?access_token=public.secret")
+    }));
+
+    let (status, _, body) = harness
+        .get_with(
+            &harness.public,
+            "/styles/base/style.json",
+            &[(header::AUTHORIZATION, "Bearer public.secret")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !String::from_utf8_lossy(&body).contains("access_token"),
+        "a header credential must never be converted into a URL credential"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn warmed_resource_cache_never_bypasses_current_token_namespace_grants() {
+    let harness = harness_with_auth("delivery-auth-cache-noninterference").await;
+
+    let broad_tile = "/tilesets/fixture/0/0/0?access_token=public.secret";
+    assert_eq!(
+        harness.get(&harness.public, broad_tile).await.0,
+        StatusCode::OK,
+        "the broad credential should populate the shared tile cache"
+    );
+    assert_eq!(
+        harness.get(&harness.public, broad_tile).await.0,
+        StatusCode::OK,
+        "the broad credential should be able to consume the warm entry"
+    );
+
+    let (status, _, style_body) = harness
+        .get(
+            &harness.public,
+            "/styles/base/style.json?access_token=public.style-only",
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the weaker credential still grants its exact style namespace"
+    );
+    let style: serde_json::Value =
+        serde_json::from_slice(&style_body).expect("style JSON for weaker credential");
+    assert!(
+        style["sources"]["base"]["url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/tilesets/fixture?access_token=public.style-only")),
+        "generated URLs must retain the currently verified credential"
+    );
+
+    assert_eq!(
+        harness
+            .get(
+                &harness.public,
+                "/tilesets/fixture/0/0/0?access_token=public.style-only",
+            )
+            .await
+            .0,
+        StatusCode::FORBIDDEN,
+        "a warm resource entry must not bypass the weaker credential's namespace grants"
+    );
+    assert_eq!(
+        harness.get(&harness.public, broad_tile).await.0,
+        StatusCode::OK,
+        "a denied request must not poison the authorized cached entry"
     );
 
     harness.cleanup().await;

@@ -7,7 +7,9 @@ use crate::cli;
 
 pub(crate) async fn run() -> Result<()> {
     init_tracing();
-    crate::runtime::run(cli::load()?, mmpf_http::serve::wait_for_shutdown_signal()).await
+    let options = cli::load()?;
+    let auth = mmpf_auth::DeliveryAuth::new(options.auth_registries.clone(), std::env::vars());
+    crate::runtime::run(options, auth, mmpf_http::serve::wait_for_shutdown_signal()).await
 }
 
 fn init_tracing() {

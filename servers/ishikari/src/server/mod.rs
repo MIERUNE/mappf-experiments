@@ -40,6 +40,14 @@ fn with_common_layers(router: Router<AppState>, state: AppState) -> Router {
         .with_state(state)
 }
 
+fn with_public_layers(router: Router<AppState>, state: AppState) -> Router {
+    let router = router.route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        auth::authorize_delivery,
+    ));
+    with_common_layers(router, state)
+}
+
 /// Public-facing routes (served on the Gateway-fronted port): content plus the
 /// top-level `/livez` `/readyz` health endpoints (k8s convention, matching the
 /// sibling `biei` service). Metrics, `/_internal/*` and peer-to-peer forwarding
@@ -159,7 +167,7 @@ pub(crate) async fn run_http_server(
     internal_addr: SocketAddr,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
-    let public = with_common_layers(public_router(), state.clone());
+    let public = with_public_layers(public_router(), state.clone());
     let internal = with_common_layers(internal_router(), state);
 
     let public_listener = TcpListener::bind(public_addr)
@@ -342,6 +350,7 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
+mod auth;
 pub(crate) mod cache;
 pub(crate) mod conditional;
 #[cfg(test)]

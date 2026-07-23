@@ -64,6 +64,32 @@ single-flight coordination to absorb cold concurrent renders. Stale provider
 entries revalidate conditionally, so an unchanged HTTP or object-store origin
 can refresh freshness without sending the body again.
 
+## Optional delivery authentication
+
+Authentication is disabled by default. Set `ISKR_AUTH_REGISTRIES` to a
+semicolon-separated `registry_id=auth-root` catalog to protect all public
+styles, sprites, glyphs, TileJSON, tiles, derived products, and previews. Each
+root must end in `/` and contain a complete `current.json` snapshot:
+
+```bash
+ISKR_AUTH_REGISTRIES='public=gs://example-auth/registries/public/'
+```
+
+The shared MMPF verifier accepts exactly one `Authorization: Bearer ...` header
+or `access_token` query parameter. A token with the `read` action is checked
+against the first segment of a style or tileset key; a flat key uses its own ID
+as that segment. Glyph ranges are shared globally and therefore require the
+action but no fabricated namespace. Health, metrics, and cluster-internal peer
+routes are outside this delivery-auth boundary.
+
+When a verified request uses `access_token`, Ishikari copies it only into
+same-origin style, sprite, glyph, TileJSON, tile, derived-tile, and preview URLs
+that Ishikari generated itself. It never adds the token to arbitrary upstream
+URLs from a style. A Bearer header is never converted into a URL credential.
+Query credentials are intended for browser clients that cannot set headers;
+enable them only with URL-log redaction and an explicit CDN query/cache-key
+policy. This experimental mechanism is not enabled by the demo deployment.
+
 `ISKR_TILESET_SOURCES` accepts `namespace=value;…;default=value`, so tilesets can
 be backed by multiple object-store locations. A value may be a root or an
 absolute URL template. Roots preserve the original behavior: a namespace match

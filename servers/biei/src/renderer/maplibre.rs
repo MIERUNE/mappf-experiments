@@ -134,7 +134,14 @@ impl Renderer for MapLibreRenderer {
         prepared: Option<PreparedProfile>,
     ) -> Result<(), RendererError> {
         let prepared = prepared
-            .filter(|prepared| prepared.revision == task.style)
+            .filter(|prepared| {
+                prepared.revision == task.style
+                    && prepared.authorization_partition
+                        == task
+                            .authorization
+                            .as_ref()
+                            .map(|authorization| authorization.cache_partition)
+            })
             .ok_or_else(|| RendererError::StyleLoadFailed {
                 style_id: task.style.id.clone(),
                 source: "prepared style JSON is missing or stale".to_string(),
@@ -190,8 +197,9 @@ mod tests {
     use crate::renderer::{ProfilePreparer, StyleAvailabilityError, actor::BlockingRenderBackend};
     use biei_core::style_catalog::{StyleCatalog, StyleDefinition};
     use biei_core::types::{
-        AddLayer, AddLayerSource, ImageFormat, PixelRatio, Positioning, ProfileContent,
-        ProfilePreparationError, RenderRequest, StyleId, StyleRevision,
+        AddLayer, AddLayerSource, CredentialCachePartition, ImageFormat, NamespaceSet, PixelRatio,
+        Positioning, ProfileContent, ProfilePreparationError, RenderAuthorization, RenderRequest,
+        StyleId, StyleRevision,
     };
     use std::{
         sync::{
@@ -257,6 +265,7 @@ mod tests {
         InternalTask {
             id: 9,
             request_id: biei_core::types::RequestId::from_string("maplibre-test"),
+            authorization: None,
             style,
             source: None,
             request: RenderRequest::StaticImage {
@@ -428,6 +437,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn renderer_rejects_profile_prepared_for_another_credential() {
+        let actor = RendererActor::spawn_with_backend(
+            RendererActorConfig {
+                worker_id: 11,
+                ambient_cache_path: None,
+            },
+            FakeBackend,
+        )
+        .expect("actor spawns");
+        let rev = revision();
+        let catalog = Arc::new(StyleCatalog::new());
+        catalog.upsert_definition(
+            rev.id.clone(),
+            StyleDefinition::new(
+                write_test_style_json(
+                    "credential-partition",
+                    r#"{"version":8,"sources":{},"layers":[]}"#,
+                ),
+                rev.version,
+            ),
+        );
+        let preparer = MapLibreProfilePreparer::for_tests(catalog);
+        let mut first = internal_task(rev.clone());
+        first.authorization = Some(RenderAuthorization {
+            readable_namespaces: NamespaceSet::try_new(vec!["carto".to_string()]).unwrap(),
+            cache_partition: CredentialCachePartition::from_digest([1; 32]),
+            provider_bearer_token: biei_core::types::ProviderBearerToken::try_new(
+                "public.first".to_string(),
+            )
+            .unwrap(),
+        });
+        let prepared = preparer
+            .prepare_profile(&first)
+            .await
+            .expect("first credential prepares");
+        let mut second = internal_task(rev);
+        second.authorization = Some(RenderAuthorization {
+            readable_namespaces: NamespaceSet::try_new(vec!["carto".to_string()]).unwrap(),
+            cache_partition: CredentialCachePartition::from_digest([2; 32]),
+            provider_bearer_token: biei_core::types::ProviderBearerToken::try_new(
+                "public.second".to_string(),
+            )
+            .unwrap(),
+        });
+        let mut renderer = MapLibreRenderer::from_actor(actor);
+
+        let error = renderer
+            .setup_profile(&second, prepared)
+            .await
+            .expect_err("prepared profile is credential-partitioned");
+
+        assert!(matches!(error, RendererError::StyleLoadFailed { .. }));
+    }
+
+    #[tokio::test]
     async fn autonomous_repair_restores_slot_without_another_render_task() {
         let supervisor = RendererActorSupervisor::new(1);
         let config = RendererActorConfig {
@@ -501,6 +565,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protected_profile_cache_is_partitioned_by_verified_credential() {
+        let (style_url, request_count, server) = spawn_counting_style_server(
+            axum::http::StatusCode::OK,
+            r#"{"version":8,"sources":{},"layers":[]}"#,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let (tileset_url, tileset_request_count, tileset_server) = spawn_counting_style_server(
+            axum::http::StatusCode::OK,
+            r#"{"tiles":["tiles/{z}/{x}/{y}.pbf"]}"#,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let rev = revision();
+        let catalog = Arc::new(StyleCatalog::new());
+        catalog.upsert_definition(rev.id.clone(), StyleDefinition::new(style_url, rev.version));
+        let preparer = MapLibreProfilePreparer::for_tests(catalog);
+
+        let mut first_credential = internal_task(rev.clone());
+        attach_addlayer_source(&mut first_credential, tileset_url);
+        first_credential.authorization = Some(RenderAuthorization {
+            readable_namespaces: NamespaceSet::try_new(vec!["carto".to_string()]).unwrap(),
+            cache_partition: CredentialCachePartition::from_digest([1; 32]),
+            provider_bearer_token: biei_core::types::ProviderBearerToken::try_new(
+                "public.first".to_string(),
+            )
+            .unwrap(),
+        });
+        let mut second_credential = first_credential.clone();
+        second_credential.authorization = Some(RenderAuthorization {
+            readable_namespaces: NamespaceSet::try_new(vec!["carto".to_string()]).unwrap(),
+            cache_partition: CredentialCachePartition::from_digest([2; 32]),
+            provider_bearer_token: biei_core::types::ProviderBearerToken::try_new(
+                "public.second".to_string(),
+            )
+            .unwrap(),
+        });
+
+        let first = preparer
+            .prepare_profile(&first_credential)
+            .await
+            .expect("first credential prepares")
+            .expect("prepared profile");
+        let same = preparer
+            .prepare_profile(&first_credential)
+            .await
+            .expect("same credential reuses profile")
+            .expect("prepared profile");
+        let second = preparer
+            .prepare_profile(&second_credential)
+            .await
+            .expect("second credential prepares independently")
+            .expect("prepared profile");
+
+        preparer.mark_style_load_failed(&rev, first_credential.authorization.as_ref());
+        assert!(
+            preparer.prepare_profile(&first_credential).await.is_err(),
+            "negative cache applies to the rejected credential partition"
+        );
+        assert!(
+            preparer.prepare_profile(&second_credential).await.is_ok(),
+            "one credential's native rejection must not poison another partition"
+        );
+
+        server.abort();
+        tileset_server.abort();
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(tileset_request_count.load(Ordering::SeqCst), 2);
+        assert!(Arc::ptr_eq(&first.style_json, &same.style_json));
+        assert!(!Arc::ptr_eq(&first.style_json, &second.style_json));
+        assert_eq!(
+            first.authorization_partition,
+            Some(CredentialCachePartition::from_digest([1; 32]))
+        );
+        assert_eq!(
+            second.authorization_partition,
+            Some(CredentialCachePartition::from_digest([2; 32]))
+        );
+    }
+
+    #[tokio::test]
     async fn production_profile_preparer_blocks_unallowlisted_private_style_host() {
         let (style_url, request_count, server) = spawn_counting_style_server(
             axum::http::StatusCode::OK,
@@ -555,7 +700,7 @@ mod tests {
                 .expect("style fetch succeeds")
                 .is_some()
         );
-        preparer.mark_style_load_failed(&rev);
+        preparer.mark_style_load_failed(&rev, task.authorization.as_ref());
         assert!(
             !preparer.has_cached_style(&rev),
             "MLN rejection invalidates the positive JSON cache"

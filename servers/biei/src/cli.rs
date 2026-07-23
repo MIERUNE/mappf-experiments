@@ -22,6 +22,14 @@ const DEFAULT_TILESET_URL_TEMPLATE: &str =
 #[derive(Parser, Debug)]
 #[command(name = "biei", version, about = "Distributed MapLibre renderer")]
 struct Cli {
+    /// Optional delivery-auth registries as `registry_id=auth-root;...`.
+    /// Each root contains a `current.json` registry snapshot.
+    #[arg(long, env = "BIEI_AUTH_REGISTRIES", default_value = "")]
+    auth_registries: String,
+    /// Exact Ishikari/provider origin allowed to receive verified delivery
+    /// credentials, for example `http://ishikari:8080`.
+    #[arg(long, env = "BIEI_AUTH_PROVIDER_ORIGIN")]
+    auth_provider_origin: Option<String>,
     /// Style templates: `;`-separated entries, each either `namespace=<tmpl>`,
     /// the reserved `default=<tmpl>`, or a bare `<tmpl>` (treated as the
     /// default). Each `<tmpl>` must be http(s) and contain `{style_id}` in its
@@ -122,6 +130,8 @@ pub(crate) fn load() -> anyhow::Result<Options> {
 
 fn resolve(cli: Cli) -> anyhow::Result<Options> {
     Options::resolve(OptionsInput {
+        auth_registries: cli.auth_registries,
+        auth_provider_origin: cli.auth_provider_origin,
         style_templates: cli.style_templates,
         tileset_url_template: cli.tileset_url_template,
         cluster: cli.cluster,

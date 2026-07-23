@@ -126,6 +126,75 @@ bare entry) is the catch-all and receives the whole id:
 Without a `default`, an unregistered namespace returns `unknown_style` (404),
 which keeps the catalog scoped to providers you list.
 
+### Experimental static-render authentication
+
+Authentication is disabled by default. Setting `BIEI_AUTH_REGISTRIES` to a
+semicolon-separated `registry_id=auth-root` catalog protects only static-render
+routes; tile, preview, health, metrics, and internal routes keep their current
+behavior. For example:
+
+```sh
+BIEI_AUTH_REGISTRIES='public=gs://example-auth/registries/public/' \
+BIEI_AUTH_PROVIDER_ORIGIN='https://ishikari.example.internal'
+```
+
+Each root is resolved to `current.json`. Requests use either
+`Authorization: Bearer <registry_id>.<opaque_registry_credential>` or
+`?access_token=<registry_id>.<opaque_registry_credential>`. Supplying both, or
+repeating either one, is rejected. The token is split only at its first dot, so
+the suffix may itself contain dots. Unknown registry IDs are rejected locally
+without storage I/O. Query transport is intended for browser/map clients that
+cannot set headers; configure Gateway/CDN/request logging to redact it and use a
+restrictive `Referrer-Policy`. The current v1 snapshot shape is:
+
+```json
+{
+  "schema_version": 1,
+  "registry_id": "public",
+  "revision": 1,
+  "credentials": [{
+    "credential_sha256": "<64 lowercase hex characters>",
+    "principal_id": "demo-browser",
+    "enabled": true,
+    "namespaces": ["demo"],
+    "actions": ["render.static"],
+    "allowed_origins": ["https://maps.example"],
+    "allow_missing_origin": false
+  }]
+}
+```
+
+For this object-store adapter, `credential_sha256` is SHA-256 over the fixed
+bytes `mmpf-object-store-auth-v1\0`, followed by the registry ID's 64-bit
+big-endian byte length and bytes, then the opaque credential's 64-bit big-endian
+byte length and bytes. The registry stores no raw bearer credential. Loaded
+snapshots are verified locally, refreshed conditionally once per minute, and
+retained as last-known-good state after refresh failures. This first slice is
+not enabled by the demo deployment and has no key issuance tooling yet; see
+[the auth sketch](../../specs/auth-sketch.md).
+
+Protected rendered-output cache hits are authorized on every request. Cache
+entries currently record the producing caller's complete normalized namespace
+grant set as a conservative requirement: callers with equivalent or broader
+grants may reuse the image, while weaker and unauthenticated callers miss. This
+is intentionally separate from Biei's credential-and-registry-revision-derived
+profile cache partition, which prevents style/TileJSON cache, single-flight,
+and loaded native style reuse across different credentials or policy revisions
+without putting the raw credential in a cache key. Biei carries the bounded,
+redacted verified token across its trusted render wire and appends it as
+`access_token` only when fetching from `BIEI_AUTH_PROVIDER_ORIGIN`. Ishikari's
+same-origin rewrites then propagate it to generated tile, glyph, and sprite
+URLs; retained external provider URLs never receive it.
+
+Because this is the original reusable bearer token, deployments must decide
+whether their internal network is an accepted trust boundary. If node-to-node
+confidentiality or workload identity is required, protect both Biei peer
+forwarding and Biei-to-Ishikari traffic with mesh mTLS or an equivalent
+deployment-layer mechanism. Biei does not add a second application-level
+cryptographic protocol. The demo does not enable this auth mode. End-to-end
+cache non-interference and the narrower style dependency descriptor remain
+deployment gates.
+
 ### Admission knobs
 
 `BIEI_QUEUE_CAPACITY_MULTIPLIER` controls the hard per-renderer-slot queue

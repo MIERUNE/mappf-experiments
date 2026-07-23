@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use axum::{
+    Extension,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::Response,
@@ -10,7 +11,9 @@ use axum::{
 use serde::Deserialize;
 use tracing::debug;
 
-use crate::server::{AppState, HttpError, cache, derived_json_response, get_origin};
+use crate::server::{
+    AppState, HttpError, auth::PropagatedAccessToken, cache, derived_json_response, get_origin,
+};
 use ishikari_core::{
     interned::TilesetId,
     pmtiles::{TileType, Tilestats, VectorLayer},
@@ -62,8 +65,16 @@ pub(crate) async fn tilejson_handler(
     Path(tileset_id): Path<String>,
     headers: HeaderMap,
     Query(query): Query<TileJsonQuery>,
+    token: Option<Extension<PropagatedAccessToken>>,
 ) -> Result<Response, HttpError> {
-    serve_tilejson(state, tileset_id, headers, query).await
+    serve_tilejson(
+        state,
+        tileset_id,
+        headers,
+        query,
+        token.map(|value| value.0),
+    )
+    .await
 }
 
 /// Serves TileJSON for a `{namespace}/{tileset_id}` key.
@@ -72,12 +83,14 @@ pub(crate) async fn namespaced_tilejson_handler(
     Path((namespace, tileset_id)): Path<(String, String)>,
     headers: HeaderMap,
     Query(query): Query<TileJsonQuery>,
+    token: Option<Extension<PropagatedAccessToken>>,
 ) -> Result<Response, HttpError> {
     serve_tilejson(
         state,
         super::join_tileset_key(&namespace, &tileset_id),
         headers,
         query,
+        token.map(|value| value.0),
     )
     .await
 }
@@ -88,6 +101,7 @@ async fn serve_tilejson(
     tileset_id: String,
     headers: HeaderMap,
     query: TileJsonQuery,
+    token: Option<PropagatedAccessToken>,
 ) -> Result<Response, HttpError> {
     let tileset_id = TilesetId::try_from(tileset_id)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
@@ -110,6 +124,7 @@ async fn serve_tilejson(
         &data,
         query.encoding.as_deref(),
         maxzoom_override,
+        token.as_ref(),
     );
     // TileJSON embeds the request origin in its tile URLs, so it is a derived
     // representation: validate by a strong ETag over the exact bytes served
@@ -131,6 +146,7 @@ fn tilejson(
     data: &TilesetInfo,
     requested_encoding: Option<&str>,
     maxzoom_override: Option<u8>,
+    token: Option<&PropagatedAccessToken>,
 ) -> TileJson {
     let metadata = &data.metadata;
     let format = data.header.tile_type.tilejson_format().map(str::to_string);
@@ -151,11 +167,14 @@ fn tilejson(
     };
     let tile_suffix = if wants_mlt { ".mlt" } else { "" };
 
+    let mut tile_url = format!("{base_url}/tilesets/{tileset_id}/{{z}}/{{x}}/{{y}}{tile_suffix}");
+    if let Some(token) = token {
+        tile_url = token.append_to(&tile_url);
+    }
+
     TileJson {
         tilejson: "3.0.0".to_string(),
-        tiles: vec![format!(
-            "{base_url}/tilesets/{tileset_id}/{{z}}/{{x}}/{{y}}{tile_suffix}"
-        )],
+        tiles: vec![tile_url],
         vector_layers: metadata.vector_layers().to_vec(),
         attribution: metadata.attribution.clone(),
         bounds: Some([
@@ -234,6 +253,7 @@ mod tests {
             &info(6, Metadata::default()),
             None,
             None,
+            None,
         );
 
         assert_eq!(document.format.as_deref(), Some("pbf"));
@@ -259,6 +279,7 @@ mod tests {
             ),
             None,
             None,
+            None,
         );
 
         assert_eq!(document.encoding.as_deref(), Some("terrarium"));
@@ -272,6 +293,7 @@ mod tests {
             "https://ishikari.example",
             &info(1, Metadata::default()),
             Some("mlt"),
+            None,
             None,
         );
 
@@ -291,6 +313,7 @@ mod tests {
             "https://ishikari.example",
             &info(4, Metadata::default()),
             Some("mlt"),
+            None,
             None,
         );
 

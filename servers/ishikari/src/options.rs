@@ -4,6 +4,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use crate::{mapterhorn::MapterhornConfig, membership::MembershipConfig, provider::ProviderConfig};
 use ishikari_core::storage::{ResolverTuning, ResolverTuningInput};
+use mmpf_auth::RegistryCatalog;
 use mmpf_cluster::GossipEndpoint;
 use mmpf_common::resource_templates::{
     NamespaceKeyPolicy, NamespacedEntries, NamespacedEntriesPolicy,
@@ -150,6 +151,7 @@ impl Default for CacheCapacities {
 /// globals.
 #[non_exhaustive]
 pub(crate) struct Options {
+    pub(crate) auth_registries: RegistryCatalog,
     pub(crate) http_listen_addr: SocketAddr,
     /// Cluster-internal listener (metrics and peer forwarding).
     pub(crate) internal_listen_addr: SocketAddr,
@@ -245,6 +247,7 @@ fn backend_kind(source: &str) -> &'static str {
 /// and derivation while the CLI remains responsible only for parsing and
 /// choosing process-local defaults.
 pub(crate) struct OptionsInput {
+    pub(crate) auth_registries: String,
     pub(crate) node_id: String,
     pub(crate) gossip_seeds: Vec<String>,
     pub(crate) gossip_advertise_addr: Option<SocketAddr>,
@@ -282,6 +285,8 @@ pub(crate) struct OptionsInput {
 impl Options {
     /// Validate entry-point configuration and resolve derived addresses and capacities.
     pub(crate) fn resolve(input: OptionsInput) -> Result<Self, String> {
+        let auth_registries =
+            RegistryCatalog::parse(&input.auth_registries).map_err(|error| error.to_string())?;
         let tileset_source_inventory =
             TilesetSourceInventory::parse(input.tileset_sources.as_str())?;
         let cache_capacities = CacheCapacities::resolve(
@@ -368,6 +373,7 @@ impl Options {
         };
         let cpu_work_concurrency = input.cpu_work_concurrency.max(1);
         Ok(Self {
+            auth_registries,
             http_listen_addr,
             internal_listen_addr,
             membership: MembershipConfig {
@@ -439,6 +445,7 @@ mod tests {
 
     fn input() -> OptionsInput {
         OptionsInput {
+            auth_registries: String::new(),
             node_id: "node-a".to_string(),
             gossip_seeds: Vec::new(),
             gossip_advertise_addr: None,

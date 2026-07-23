@@ -11,14 +11,19 @@ NODE0_PUBLIC_PORT="${BIEI_NODE0_PUBLIC_PORT:-18080}"
 NODE1_PUBLIC_PORT="${BIEI_NODE1_PUBLIC_PORT:-18082}"
 NODE0_INTERNAL_PORT="${BIEI_NODE0_INTERNAL_PORT:-19090}"
 NODE1_INTERNAL_PORT="${BIEI_NODE1_INTERNAL_PORT:-19091}"
+HOST_ALIAS="${BIEI_E2E_HOST_ALIAS:-host.docker.internal}"
 NETWORK_SUBNET="${BIEI_E2E_SUBNET:-172.29.0.0/24}"
 NODE0_IP="${BIEI_NODE0_IP:-172.29.0.2}"
 NODE1_IP="${BIEI_NODE1_IP:-172.29.0.3}"
-NETWORK="biei-e2e-${BASHPID}"
-NODE_PREFIX="biei-e2e-${BASHPID}"
+NETWORK="biei-e2e-$$"
+NODE_PREFIX="biei-e2e-$$"
 WORK_DIR="$(mktemp -d)"
 FIXTURE_PID=""
 CONTAINERS=()
+HOST_GATEWAY_ARGS=()
+if [[ "$HOST_ALIAS" == "host.docker.internal" ]]; then
+  HOST_GATEWAY_ARGS=(--add-host host.docker.internal:host-gateway)
+fi
 
 cleanup() {
   local status=$?
@@ -104,7 +109,7 @@ start_node() {
     --name "${NODE_PREFIX}-${index}" \
     --network "$NETWORK" \
     --ip "$ip" \
-    --add-host host.docker.internal:host-gateway \
+    ${HOST_GATEWAY_ARGS[@]+"${HOST_GATEWAY_ARGS[@]}"} \
     --read-only \
     --tmpfs /tmp:rw,noexec,nosuid,size=64m \
     --tmpfs /var/cache/biei:rw,noexec,nosuid,size=64m \
@@ -118,10 +123,10 @@ start_node() {
     -e "BIEI_INTERNAL_ADVERTISE_ADDR=${ip}:9090" \
     -e "BIEI_GOSSIP_BIND=${ip}:7946" \
     -e "BIEI_GOSSIP_ADVERTISE_ADDR=${ip}:7946" \
-    "${seed_env[@]}" \
+    ${seed_env[@]+"${seed_env[@]}"} \
     -e BIEI_CORES=1 \
-    -e "BIEI_STYLE_TEMPLATES=smoke=http://host.docker.internal:${FIXTURE_PORT}/{style_id}.json" \
-    -e BIEI_MLN_RESOURCE_PRIVATE_HOSTS=host.docker.internal \
+    -e "BIEI_STYLE_TEMPLATES=smoke=http://${HOST_ALIAS}:${FIXTURE_PORT}/{style_id}.json" \
+    -e "BIEI_MLN_RESOURCE_PRIVATE_HOSTS=${HOST_ALIAS}" \
     -e BIEI_RENDER_OUTPUT_CACHE_BYTES=16777216 \
     -e BIEI_MLN_RESOURCE_CACHE_BYTES=16777216 \
     "$BIEI_IMAGE"

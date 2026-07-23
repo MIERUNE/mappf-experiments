@@ -3,7 +3,7 @@
 use std::hash::Hasher;
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{Html, IntoResponse, Response},
@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 use tracing::debug;
 use twox_hash::XxHash64;
 
-use crate::server::{AppState, HttpError, apply_origin_vary, cache, get_origin};
+use crate::server::{
+    AppState, HttpError, apply_origin_vary, auth::PropagatedAccessToken, cache, get_origin,
+};
 use ishikari_core::{interned::TilesetId, pmtiles::TileType, storage::TilesetInfo};
 
 use super::error::tileset_error_response;
@@ -57,8 +59,9 @@ pub(crate) async fn preview_handler(
     State(state): State<AppState>,
     Path(tileset_id): Path<String>,
     Query(query): Query<PreviewQuery>,
+    token: Option<Extension<PropagatedAccessToken>>,
 ) -> Result<([(header::HeaderName, &'static str); 1], Html<String>), HttpError> {
-    serve_preview(state, tileset_id, query).await
+    serve_preview(state, tileset_id, query, token.map(|value| value.0)).await
 }
 
 /// Serves the HTML preview shell for a `{namespace}/{tileset_id}` key.
@@ -66,11 +69,13 @@ pub(crate) async fn namespaced_preview_handler(
     State(state): State<AppState>,
     Path((namespace, tileset_id)): Path<(String, String)>,
     Query(query): Query<PreviewQuery>,
+    token: Option<Extension<PropagatedAccessToken>>,
 ) -> Result<([(header::HeaderName, &'static str); 1], Html<String>), HttpError> {
     serve_preview(
         state,
         super::join_tileset_key(&namespace, &tileset_id),
         query,
+        token.map(|value| value.0),
     )
     .await
 }
@@ -80,6 +85,7 @@ async fn serve_preview(
     state: AppState,
     tileset_id: String,
     query: PreviewQuery,
+    token: Option<PropagatedAccessToken>,
 ) -> Result<([(header::HeaderName, &'static str); 1], Html<String>), HttpError> {
     let tileset_id = TilesetId::try_from(tileset_id)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
@@ -97,6 +103,7 @@ async fn serve_preview(
         query.encoding.as_deref(),
         info.header.tile_type,
         is_mapterhorn,
+        token.as_ref(),
     );
     debug!(
         endpoint = "preview",
@@ -113,8 +120,16 @@ pub(crate) async fn preview_style_handler(
     Path(tileset_id): Path<String>,
     headers: HeaderMap,
     Query(query): Query<PreviewQuery>,
+    token: Option<Extension<PropagatedAccessToken>>,
 ) -> Result<Response, HttpError> {
-    serve_preview_style(state, tileset_id, headers, query).await
+    serve_preview_style(
+        state,
+        tileset_id,
+        headers,
+        query,
+        token.map(|value| value.0),
+    )
+    .await
 }
 
 /// Serves the generated preview style for a `{namespace}/{tileset_id}` key.
@@ -123,12 +138,14 @@ pub(crate) async fn namespaced_preview_style_handler(
     Path((namespace, tileset_id)): Path<(String, String)>,
     headers: HeaderMap,
     Query(query): Query<PreviewQuery>,
+    token: Option<Extension<PropagatedAccessToken>>,
 ) -> Result<Response, HttpError> {
     serve_preview_style(
         state,
         super::join_tileset_key(&namespace, &tileset_id),
         headers,
         query,
+        token.map(|value| value.0),
     )
     .await
 }
@@ -139,6 +156,7 @@ async fn serve_preview_style(
     tileset_id: String,
     headers: HeaderMap,
     query: PreviewQuery,
+    token: Option<PropagatedAccessToken>,
 ) -> Result<Response, HttpError> {
     let tileset_id = TilesetId::try_from(tileset_id)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
@@ -154,7 +172,7 @@ async fn serve_preview_style(
         .filter(|resolver| resolver.matches(&tileset_id))
         .map(|resolver| resolver.maxzoom());
     let is_mapterhorn = maxzoom_override.is_some();
-    let style = preview_style(
+    let mut style = preview_style(
         &tileset_id,
         &base_url,
         &info,
@@ -162,6 +180,9 @@ async fn serve_preview_style(
         maxzoom_override,
         is_mapterhorn,
     );
+    if let Some(token) = token.as_ref() {
+        propagate_generated_urls(&mut style, &base_url, token);
+    }
     debug!(
         endpoint = "preview_style",
         tileset_id = %tileset_id,
@@ -200,6 +221,7 @@ fn preview_html(
     encoding: Option<&str>,
     tile_type: TileType,
     is_mapterhorn: bool,
+    token: Option<&PropagatedAccessToken>,
 ) -> String {
     let is_vector = !matches!(
         tile_type,
@@ -213,24 +235,56 @@ fn preview_html(
         } else {
             "mvt"
         };
-        let style_url = format!("/tilesets/{tileset_id}/preview.json?encoding={fmt}");
+        let mut style_url = format!("/tilesets/{tileset_id}/preview.json?encoding={fmt}");
+        if let Some(token) = token {
+            style_url = token.append_to(&style_url);
+        }
         return render_preview_html(&title, &style_url, "", true, false);
     }
     if is_mapterhorn {
-        let style_url = format!("/tilesets/{tileset_id}/preview.json");
+        let mut style_url = format!("/tilesets/{tileset_id}/preview.json");
+        if let Some(token) = token {
+            style_url = token.append_to(&style_url);
+        }
         return render_preview_html(&title, &style_url, "", false, true);
     }
     // Raster / raster-dem: `encoding` selects the DEM hillshade scheme, no toggle.
-    let style_url = match encoding {
+    let mut style_url = match encoding {
         Some(enc) => format!("/tilesets/{tileset_id}/preview.json?encoding={enc}"),
         None => format!("/tilesets/{tileset_id}/preview.json"),
     };
+    if let Some(token) = token {
+        style_url = token.append_to(&style_url);
+    }
     let terrain_control = if encoding.and_then(DemEncoding::from_str).is_some() {
         r#"map.addControl(new maplibregl.TerrainControl({ source: "dem", exaggeration: 1.0 }), "top-right");"#
     } else {
         ""
     };
     render_preview_html(&title, &style_url, terrain_control, false, false)
+}
+
+fn propagate_generated_urls(value: &mut Value, base_url: &str, token: &PropagatedAccessToken) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                propagate_generated_urls(value, base_url, token);
+            }
+        }
+        Value::Object(object) => {
+            for value in object.values_mut() {
+                propagate_generated_urls(value, base_url, token);
+            }
+        }
+        Value::String(url)
+            if url
+                .strip_prefix(base_url)
+                .is_some_and(|path| path.starts_with("/tilesets/")) =>
+        {
+            *url = token.append_to(url);
+        }
+        _ => {}
+    }
 }
 
 fn preview_style(
@@ -927,8 +981,8 @@ mod tests {
     #[test]
     fn terrain_controls_are_enabled_only_for_mapterhorn_preview() {
         let tileset_id = TilesetId::try_new("mapterhorn/planet").unwrap();
-        let mapterhorn = preview_html(&tileset_id, None, TileType::Webp, true);
-        let ordinary = preview_html(&tileset_id, None, TileType::Webp, false);
+        let mapterhorn = preview_html(&tileset_id, None, TileType::Webp, true, None);
+        let ordinary = preview_html(&tileset_id, None, TileType::Webp, false, None);
 
         assert!(mapterhorn.contains("const TERRAIN_PRODUCTS = true"));
         assert!(mapterhorn.contains("Vector hillshade"));

@@ -237,6 +237,50 @@ fn singleflight_does_not_mix_different_validators() {
 }
 
 #[test]
+fn credential_bearing_urls_partition_shared_cache_and_singleflight_identity() {
+    let broad = Arc::new(ResourceRequestKey::test_key(
+        "https://ishikari.test/tilesets/base/0/0/0?access_token=public.broad",
+        ResourceKind::Tile,
+    ));
+    let weaker = Arc::new(ResourceRequestKey::test_key(
+        "https://ishikari.test/tilesets/base/0/0/0?access_token=public.style-only",
+        ResourceKind::Tile,
+    ));
+    assert_ne!(
+        broad, weaker,
+        "the complete credential-bearing URL must remain part of resource identity"
+    );
+
+    let cache = cache::ResourceCache::new(4096);
+    assert!(cache.store(
+        broad.clone(),
+        Response::data(b"authorized-for-broad-token".to_vec())
+    ));
+    assert!(cache.lookup_shared(&broad).is_some());
+    assert!(
+        cache.lookup_shared(&weaker).is_none(),
+        "a response fetched with one token must not satisfy another token's request"
+    );
+
+    let broad_flight = FlightKey {
+        resource: broad,
+        persistent: true,
+        priority: "regular",
+        semantics: FlightRequestSemantics::default(),
+    };
+    let weaker_flight = FlightKey {
+        resource: weaker,
+        persistent: true,
+        priority: "regular",
+        semantics: FlightRequestSemantics::default(),
+    };
+    assert_ne!(
+        broad_flight, weaker_flight,
+        "single-flight coalescing must preserve the same credential boundary"
+    );
+}
+
+#[test]
 fn network_only_does_not_consult_the_shared_cache() {
     assert!(uses_shared_cache(
         maplibre_native::file_source::StoragePolicy::Permanent
@@ -994,4 +1038,34 @@ fn maps_http_dates_to_cache_metadata() {
     let response = map_response(200, &headers, b"data", ResourceKind::Image);
     assert_eq!(response.modified, Some(modified));
     assert_eq!(response.expires, Some(expires));
+}
+
+#[test]
+fn credentialed_redirect_chain_cannot_change_origin() {
+    let credentialed =
+        url::Url::parse("https://ishikari.test/style.json?access_token=public.secret").unwrap();
+    let same_origin = url::Url::parse("https://ishikari.test/canonical/style.json").unwrap();
+    let other_origin = url::Url::parse("https://objects.example/style.json").unwrap();
+
+    assert!(credentialed_redirect_stays_on_origin(
+        std::slice::from_ref(&credentialed),
+        &same_origin
+    ));
+    assert!(!credentialed_redirect_stays_on_origin(
+        std::slice::from_ref(&credentialed),
+        &other_origin
+    ));
+
+    let uncredentialed = url::Url::parse("https://public.test/style.json").unwrap();
+    assert!(credentialed_redirect_stays_on_origin(
+        std::slice::from_ref(&uncredentialed),
+        &other_origin
+    ));
+
+    // The original credential-bearing URL remains authoritative after an
+    // intermediate same-origin redirect drops the query string.
+    assert!(!credentialed_redirect_stays_on_origin(
+        &[credentialed, same_origin],
+        &other_origin
+    ));
 }

@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use biei_core::{
     style_catalog::StyleCatalog,
     types::{
-        AddLayerSource, InternalTask, ProfilePreparationError, SourceHash, StyleId, StyleRevision,
+        AddLayerSource, CredentialCachePartition, InternalTask, ProfilePreparationError,
+        RenderAuthorization, SourceHash, StyleId, StyleRevision,
     },
 };
 use mmpf_common::singleflight::{Flight, SingleFlight};
@@ -16,21 +17,40 @@ use tokio::time::Instant;
 use crate::renderer::{PreparedProfile, ProfilePreparer, StyleAvailabilityError};
 
 use super::profile_fetch::{
-    addlayer_source_from_task, addlayer_source_hash_from_task, fetch_style_json,
-    fetch_tileset_json, rewrite_tileset_source_json, source_url_from_addlayer_source,
+    addlayer_source_from_task, addlayer_source_hash_from_task, fetch_style_json_with_auth,
+    fetch_tileset_json_with_auth, rewrite_tileset_source_json, source_url_from_addlayer_source,
 };
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct StyleCacheKey {
+    revision: StyleRevision,
+    credential: Option<CredentialCachePartition>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TilesetCacheKey {
+    url: String,
+    credential: Option<CredentialCachePartition>,
+}
+
+fn credential_partition(
+    authorization: Option<&RenderAuthorization>,
+) -> Option<CredentialCachePartition> {
+    authorization.map(|authorization| authorization.cache_partition)
+}
 
 pub(crate) struct MapLibreProfilePreparer {
     style_catalog: Arc<StyleCatalog>,
     http_client: reqwest::Client,
     url_policy: mmpf_mln_filesource::policy::ResourceUrlPolicy,
+    auth_provider_origin: Option<url::Url>,
     fetch_permits: Arc<tokio::sync::Semaphore>,
-    style_json_cache: Cache<StyleRevision, Arc<str>>,
-    style_error_cache: Cache<StyleRevision, ProfilePreparationError>,
-    tileset_json_cache: Cache<String, Arc<str>>,
-    tileset_error_cache: Cache<String, ProfilePreparationError>,
-    inflight_style_loads: SingleFlight<StyleRevision, ProfileFetchError>,
-    inflight_tileset_loads: SingleFlight<String, ProfileFetchError>,
+    style_json_cache: Cache<StyleCacheKey, Arc<str>>,
+    style_error_cache: Cache<StyleCacheKey, ProfilePreparationError>,
+    tileset_json_cache: Cache<TilesetCacheKey, Arc<str>>,
+    tileset_error_cache: Cache<TilesetCacheKey, ProfilePreparationError>,
+    inflight_style_loads: SingleFlight<StyleCacheKey, ProfileFetchError>,
+    inflight_tileset_loads: SingleFlight<TilesetCacheKey, ProfileFetchError>,
 }
 
 const STYLE_JSON_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -61,10 +81,25 @@ pub(super) fn is_permanent_profile_http_status(status: reqwest::StatusCode) -> b
 }
 
 impl MapLibreProfilePreparer {
+    #[cfg(test)]
     pub(crate) fn new(
         style_catalog: Arc<StyleCatalog>,
         max_concurrent_fetches: usize,
         private_hosts: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_auth_provider_origin(
+            style_catalog,
+            max_concurrent_fetches,
+            private_hosts,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_auth_provider_origin(
+        style_catalog: Arc<StyleCatalog>,
+        max_concurrent_fetches: usize,
+        private_hosts: Vec<String>,
+        auth_provider_origin: Option<url::Url>,
     ) -> anyhow::Result<Self> {
         let url_policy = mmpf_mln_filesource::policy::ResourceUrlPolicy::new(private_hosts);
         Ok(Self {
@@ -74,6 +109,7 @@ impl MapLibreProfilePreparer {
                 crate::renderer::RESOURCE_USER_AGENT,
             )?,
             url_policy,
+            auth_provider_origin,
             fetch_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_fetches.max(1))),
             style_json_cache: style_json_cache(),
             style_error_cache: error_cache(),
@@ -87,9 +123,10 @@ impl MapLibreProfilePreparer {
     async fn resolve_style(
         &self,
         style: &StyleRevision,
+        authorization: Option<&RenderAuthorization>,
         deadline: Instant,
     ) -> Result<PreparedProfile, ProfilePreparationError> {
-        self.resolve_style_fetch(style, deadline)
+        self.resolve_style_fetch(style, authorization, deadline)
             .await
             .map_err(|failure| failure.error)
     }
@@ -160,23 +197,29 @@ impl MapLibreProfilePreparer {
     async fn resolve_style_fetch(
         &self,
         style: &StyleRevision,
+        authorization: Option<&RenderAuthorization>,
         deadline: Instant,
     ) -> Result<PreparedProfile, ProfileFetchError> {
+        let key = StyleCacheKey {
+            revision: style.clone(),
+            credential: credential_partition(authorization),
+        };
         let style_json = self
             .single_flight_load(
-                style.clone(),
+                key.clone(),
                 JsonCaches {
                     json: &self.style_json_cache,
                     error: &self.style_error_cache,
                     inflight: &self.inflight_style_loads,
                 },
                 deadline,
-                || self.lookup_style_cache(style),
-                self.fetch_uncached_style(style, deadline),
+                || self.lookup_style_cache(&key),
+                self.fetch_uncached_style(style, authorization, deadline),
             )
             .await?;
         Ok(PreparedProfile {
             revision: style.clone(),
+            authorization_partition: credential_partition(authorization),
             style_json,
             addlayer_source: None,
         })
@@ -191,7 +234,12 @@ impl MapLibreProfilePreparer {
         };
         let source_hash = addlayer_source_hash_from_task(task).unwrap_or(0);
         let source_json = self
-            .resolve_tileset_source_json(&task.style.id, source, task.deadline)
+            .resolve_tileset_source_json(
+                &task.style.id,
+                source,
+                task.authorization.as_ref(),
+                task.deadline,
+            )
             .await
             .map_err(|err| source_unavailable_from(err, source_hash))?;
         Ok(Some(AddLayerSource {
@@ -204,11 +252,12 @@ impl MapLibreProfilePreparer {
         &self,
         style_id: &StyleId,
         source: &AddLayerSource,
+        authorization: Option<&RenderAuthorization>,
         deadline: Instant,
     ) -> Result<String, ProfilePreparationError> {
         let tileset_url = source_url_from_addlayer_source(style_id, source)?;
         let tilejson = self
-            .resolve_tileset_json(style_id, &tileset_url, deadline)
+            .resolve_tileset_json(style_id, &tileset_url, authorization, deadline)
             .await?;
         rewrite_tileset_source_json(style_id, source, &tileset_url, &tilejson)
     }
@@ -217,18 +266,23 @@ impl MapLibreProfilePreparer {
         &self,
         style_id: &StyleId,
         tileset_url: &str,
+        authorization: Option<&RenderAuthorization>,
         deadline: Instant,
     ) -> Result<Arc<str>, ProfilePreparationError> {
+        let key = TilesetCacheKey {
+            url: tileset_url.to_string(),
+            credential: credential_partition(authorization),
+        };
         self.single_flight_load(
-            tileset_url.to_string(),
+            key.clone(),
             JsonCaches {
                 json: &self.tileset_json_cache,
                 error: &self.tileset_error_cache,
                 inflight: &self.inflight_tileset_loads,
             },
             deadline,
-            || self.lookup_tileset_cache(tileset_url),
-            self.fetch_uncached_tileset(style_id, tileset_url, deadline),
+            || self.lookup_tileset_cache(&key),
+            self.fetch_uncached_tileset(style_id, tileset_url, authorization, deadline),
         )
         .await
         .map_err(|failure| failure.error)
@@ -236,23 +290,23 @@ impl MapLibreProfilePreparer {
 
     fn lookup_style_cache(
         &self,
-        revision: &StyleRevision,
+        key: &StyleCacheKey,
     ) -> Option<Result<Arc<str>, ProfileFetchError>> {
-        if let Some(err) = self.style_error_cache.get(revision) {
+        if let Some(err) = self.style_error_cache.get(key) {
             return Some(Err(ProfileFetchError::permanent(err)));
         }
-        self.style_json_cache.get(revision).map(Ok)
+        self.style_json_cache.get(key).map(Ok)
     }
 
     fn lookup_tileset_cache(
         &self,
-        tileset_url: &str,
+        key: &TilesetCacheKey,
     ) -> Option<Result<Arc<str>, ProfileFetchError>> {
-        if let Some(tilejson) = self.tileset_json_cache.get(tileset_url) {
+        if let Some(tilejson) = self.tileset_json_cache.get(key) {
             return Some(Ok(tilejson));
         }
         self.tileset_error_cache
-            .get(tileset_url)
+            .get(key)
             .map(ProfileFetchError::permanent)
             .map(Err)
     }
@@ -260,6 +314,7 @@ impl MapLibreProfilePreparer {
     async fn fetch_uncached_style(
         &self,
         style: &StyleRevision,
+        authorization: Option<&RenderAuthorization>,
         deadline: Instant,
     ) -> Result<Arc<str>, ProfileFetchError> {
         let _permit = tokio::time::timeout_at(deadline, self.fetch_permits.acquire())
@@ -281,11 +336,13 @@ impl MapLibreProfilePreparer {
                 )))
             })?;
         Ok(Arc::from(
-            fetch_style_json(
+            fetch_style_json_with_auth(
                 &self.http_client,
                 &self.url_policy,
                 &style.id,
                 &definition.style_url,
+                authorization.map(|authorization| &authorization.provider_bearer_token),
+                self.auth_provider_origin.as_ref(),
                 deadline,
             )
             .await?,
@@ -296,6 +353,7 @@ impl MapLibreProfilePreparer {
         &self,
         style_id: &StyleId,
         tileset_url: &str,
+        authorization: Option<&RenderAuthorization>,
         deadline: Instant,
     ) -> Result<Arc<str>, ProfileFetchError> {
         let _permit = tokio::time::timeout_at(deadline, self.fetch_permits.acquire())
@@ -307,11 +365,13 @@ impl MapLibreProfilePreparer {
                 ))
             })?;
         Ok(Arc::from(
-            fetch_tileset_json(
+            fetch_tileset_json_with_auth(
                 &self.http_client,
                 &self.url_policy,
                 style_id,
                 tileset_url,
+                authorization.map(|authorization| &authorization.provider_bearer_token),
+                self.auth_provider_origin.as_ref(),
                 deadline,
             )
             .await?,
@@ -327,23 +387,23 @@ struct JsonCaches<'a, K: Eq + Hash> {
     inflight: &'a SingleFlight<K, ProfileFetchError>,
 }
 
-fn style_json_cache() -> Cache<StyleRevision, Arc<str>> {
+fn style_json_cache() -> Cache<StyleCacheKey, Arc<str>> {
     Cache::builder()
         .max_capacity(STYLE_JSON_CACHE_MAX_BYTES)
         .time_to_idle(STYLE_JSON_CACHE_IDLE_TTL)
         .time_to_live(STYLE_JSON_CACHE_MAX_AGE)
-        .weigher(|_key: &StyleRevision, style_json: &Arc<str>| {
+        .weigher(|_key: &StyleCacheKey, style_json: &Arc<str>| {
             style_json.len().clamp(1, u32::MAX as usize) as u32
         })
         .build()
 }
 
-fn tileset_json_cache() -> Cache<String, Arc<str>> {
+fn tileset_json_cache() -> Cache<TilesetCacheKey, Arc<str>> {
     Cache::builder()
         .max_capacity(TILESET_JSON_CACHE_MAX_BYTES)
         .time_to_idle(TILESET_JSON_CACHE_IDLE_TTL)
         .time_to_live(TILESET_JSON_CACHE_MAX_AGE)
-        .weigher(|_key: &String, tilejson: &Arc<str>| {
+        .weigher(|_key: &TilesetCacheKey, tilejson: &Arc<str>| {
             tilejson.len().clamp(1, u32::MAX as usize) as u32
         })
         .build()
@@ -463,7 +523,9 @@ impl ProfilePreparer for MapLibreProfilePreparer {
         &self,
         task: &InternalTask,
     ) -> Result<Option<PreparedProfile>, ProfilePreparationError> {
-        let mut prepared = self.resolve_style(&task.style, task.deadline).await?;
+        let mut prepared = self
+            .resolve_style(&task.style, task.authorization.as_ref(), task.deadline)
+            .await?;
         prepared.addlayer_source = self.resolve_addlayer_source(task).await?;
         Ok(Some(prepared))
     }
@@ -475,19 +537,27 @@ impl ProfilePreparer for MapLibreProfilePreparer {
     ) -> Result<(), StyleAvailabilityError> {
         // Reuses the cache / single-flight / negative-cache path; the fetched
         // bytes are dropped — we only need to know the provider has the style.
-        self.resolve_style_fetch(revision, deadline)
+        self.resolve_style_fetch(revision, None, deadline)
             .await
             .map(|_| ())
             .map_err(ProfileFetchError::into_availability_error)
     }
 
-    fn mark_style_load_failed(&self, revision: &StyleRevision) {
+    fn mark_style_load_failed(
+        &self,
+        revision: &StyleRevision,
+        authorization: Option<&RenderAuthorization>,
+    ) {
         // A provider may repair invalid style JSON without changing the lazy
         // template revision. Do not keep feeding MLN the rejected positive
         // cache entry after the short negative-cache window expires.
-        self.style_json_cache.invalidate(revision);
+        let key = StyleCacheKey {
+            revision: revision.clone(),
+            credential: credential_partition(authorization),
+        };
+        self.style_json_cache.invalidate(&key);
         self.style_error_cache.insert(
-            revision.clone(),
+            key,
             style_load_failed(&revision.id, "MapLibre rejected the prepared style"),
         );
     }
@@ -503,6 +573,7 @@ impl MapLibreProfilePreparer {
                 "127.0.0.1".to_owned(),
                 "localhost".to_owned(),
             ]),
+            auth_provider_origin: None,
             fetch_permits: Arc::new(tokio::sync::Semaphore::new(16)),
             style_json_cache: style_json_cache(),
             style_error_cache: error_cache(),
@@ -514,7 +585,10 @@ impl MapLibreProfilePreparer {
     }
 
     pub(super) fn has_cached_style(&self, revision: &StyleRevision) -> bool {
-        self.style_json_cache.contains_key(revision)
+        self.style_json_cache.contains_key(&StyleCacheKey {
+            revision: revision.clone(),
+            credential: None,
+        })
     }
 }
 

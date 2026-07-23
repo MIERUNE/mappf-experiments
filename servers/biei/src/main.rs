@@ -1,6 +1,7 @@
 #![deny(unreachable_pub)]
 
 mod app;
+mod auth;
 mod cli;
 mod drain;
 mod http;

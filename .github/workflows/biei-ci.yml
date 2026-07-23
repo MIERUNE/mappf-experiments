@@ -7,6 +7,7 @@ on:
       - "Cargo.lock"
       - ".github/codecov.yml"
       - "crates/biei-core/**"
+      - "crates/mmpf-auth/**"
       - "crates/mmpf-cluster/**"
       - "crates/mmpf-common/**"
       - "crates/mmpf-http/**"
@@ -23,6 +24,7 @@ on:
       - "Cargo.lock"
       - ".github/codecov.yml"
       - "crates/biei-core/**"
+      - "crates/mmpf-auth/**"
       - "crates/mmpf-cluster/**"
       - "crates/mmpf-common/**"
       - "crates/mmpf-http/**"
@@ -121,7 +123,7 @@ jobs:
       - name: Test workspace and collect coverage
         run: >-
           cargo llvm-cov --locked
-          -p mmpf-cluster -p mmpf-common -p mmpf-http -p mmpf-mln-filesource -p biei-core -p biei -p biei-sim
+          -p mmpf-auth -p mmpf-cluster -p mmpf-common -p mmpf-http -p mmpf-mln-filesource -p biei-core -p biei -p biei-sim
           --features biei/gl-opengl --lcov --output-path lcov-biei.info
 
       - name: Upload coverage to Codecov
@@ -136,25 +138,10 @@ jobs:
 
       - name: Lint workspace
         run: >-
-          cargo clippy -p mmpf-cluster -p mmpf-common -p mmpf-http -p mmpf-mln-filesource -p biei-core -p biei -p biei-sim
+          cargo clippy -p mmpf-auth -p mmpf-cluster -p mmpf-common -p mmpf-http -p mmpf-mln-filesource -p biei-core -p biei -p biei-sim
           --all-targets --locked --features biei/gl-opengl --
           -D warnings
           -D clippy::unchecked_time_subtraction
           -D clippy::large_futures
           -D clippy::large_stack_arrays
           -D clippy::unused_async
-
-  container-e2e:
-    name: Production container cluster E2E
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Build production image
-        run: docker build -f demo-deploy/biei/runtime/Dockerfile -t biei-ci:smoke .
-
-      - name: Exercise two-node membership and peer rendering
-        run: BIEI_IMAGE=biei-ci:smoke bash demo-deploy/biei/runtime/cluster-smoke.sh

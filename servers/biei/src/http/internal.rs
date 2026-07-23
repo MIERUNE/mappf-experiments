@@ -560,6 +560,7 @@ mod tests {
             task: WireTask {
                 id: 1,
                 request_id: RequestId::from_string("forward-test"),
+                authorization: None,
                 style: StyleRevision {
                     id: StyleId("carto/voyager".to_string()),
                     version: 1,
@@ -960,6 +961,7 @@ mod tests {
         InternalTask {
             id: 99,
             request_id: RequestId::from_string("internal-test"),
+            authorization: None,
             style: StyleRevision {
                 id: StyleId("carto/voyager".to_string()),
                 version: 1,

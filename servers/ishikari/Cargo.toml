@@ -17,6 +17,7 @@ flate2 = { version = "1.1.9", default-features = false, features = ["rust_backen
 httpdate.workspace = true
 ishikari-core = { workspace = true, features = ["cloud"] }
 mlt-core.workspace = true
+mmpf-auth.workspace = true
 mmpf-cluster.workspace = true
 mmpf-common.workspace = true
 mmpf-http = { workspace = true, features = ["serve"] }

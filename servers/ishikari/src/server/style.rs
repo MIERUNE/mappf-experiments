@@ -1,6 +1,7 @@
 //! MapLibre style JSON provider endpoint.
 
 use axum::{
+    Extension,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{Html, IntoResponse, Response},
@@ -17,8 +18,9 @@ pub(crate) struct StyleQuery {
 
 use crate::provider::{ProviderConfig, path_percent_encode_segments};
 use crate::server::{
-    AppState, HttpError, apply_origin_vary, cache, conditional::Validators, get_origin, sprite,
-    tileset::render_preview_html, upstream::ProviderResource,
+    AppState, HttpError, apply_origin_vary, auth::PropagatedAccessToken, cache,
+    conditional::Validators, get_origin, sprite, tileset::render_preview_html,
+    upstream::ProviderResource,
 };
 use ishikari_core::{interned::TilesetId, storage::ProviderRequest};
 
@@ -29,13 +31,22 @@ pub(crate) async fn style_handler(
     State(state): State<AppState>,
     Path(style_path): Path<String>,
     Query(query): Query<StyleQuery>,
+    token: Option<Extension<PropagatedAccessToken>>,
     headers: HeaderMap,
 ) -> Result<Response, HttpError> {
+    let token = token.as_ref().map(|Extension(token)| token);
     if let Some(style_key) = style_path.strip_suffix("/style.json") {
-        return serve_style(state, style_key.to_string(), headers, query.encoding).await;
+        return serve_style(
+            state,
+            style_key.to_string(),
+            headers,
+            query.encoding,
+            token.cloned(),
+        )
+        .await;
     }
     if let Some(style_key) = style_path.strip_suffix("/preview") {
-        return serve_style_preview(style_key);
+        return serve_style_preview(style_key, token);
     }
     if let Some(request) = sprite::parse_sprite_path(&style_path) {
         return sprite::serve_sprite(state, request, &headers).await;
@@ -68,14 +79,20 @@ pub(crate) async fn internal_style_handler(
 /// Serves an HTML MapLibre preview that loads this style. Same-origin, so it
 /// needs no CORS, and it references the style by a relative URL so it inherits
 /// the page's scheme (no mixed content).
-fn serve_style_preview(style_key: &str) -> Result<Response, HttpError> {
+fn serve_style_preview(
+    style_key: &str,
+    token: Option<&PropagatedAccessToken>,
+) -> Result<Response, HttpError> {
     validate_style_key(style_key)?;
     // Default to MVT; the preview's MVT/MLT toggle switches to on-the-fly MLT.
     // The bare `style.json` (external clients, biei) is MVT regardless.
-    let style_url = format!(
+    let mut style_url = format!(
         "/styles/{}/style.json?encoding=mvt",
         path_percent_encode_segments(style_key)
     );
+    if let Some(token) = token {
+        style_url = token.append_to(&style_url);
+    }
     let html = render_preview_html(&format!("style {style_key}"), &style_url, "", true, false);
     Ok(([(header::CACHE_CONTROL, cache::PREVIEW)], Html(html)).into_response())
 }
@@ -85,6 +102,7 @@ async fn serve_style(
     style_key: String,
     headers: HeaderMap,
     encoding: Option<String>,
+    token: Option<PropagatedAccessToken>,
 ) -> Result<Response, HttpError> {
     validate_style_key(&style_key)?;
     let upstream = resolve_style_url(&state, &style_key)?;
@@ -104,6 +122,7 @@ async fn serve_style(
             &style_key,
             &provider,
             encoding.as_deref(),
+            token.as_ref(),
         )
     })
     .await
@@ -125,6 +144,7 @@ fn transform_style(
     style_key: &str,
     provider: &ProviderConfig,
     encoding: Option<&str>,
+    token: Option<&PropagatedAccessToken>,
 ) -> Result<(Vec<u8>, Validators), HttpError> {
     let decoded = resource.decoded_bytes(MAX_STYLE_BYTES, "style")?;
     let mut style: Value = serde_json::from_slice(&decoded).map_err(|error| {
@@ -133,7 +153,7 @@ fn transform_style(
             format!("style JSON invalid: {error}"),
         )
     })?;
-    rewrite_style(&mut style, origin, style_key, provider, encoding);
+    rewrite_style(&mut style, origin, style_key, provider, encoding, token);
     let body = serde_json::to_vec(&style).map_err(|error| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -186,6 +206,7 @@ fn rewrite_style(
     style_key: &str,
     provider: &ProviderConfig,
     encoding: Option<&str>,
+    token: Option<&PropagatedAccessToken>,
 ) {
     let wants_mlt = encoding == Some("mlt");
     if let Some(object) = style.as_object_mut() {
@@ -193,24 +214,26 @@ fn rewrite_style(
         // configured for them; otherwise keep the upstream style's own values so
         // clients do not hit unconfigured endpoints that 404.
         if provider.has_glyph_provider() {
+            let url = format!("{base_url}/fonts/{{fontstack}}/{{range}}.pbf");
             object.insert(
                 "glyphs".to_string(),
-                Value::String(format!("{base_url}/fonts/{{fontstack}}/{{range}}.pbf")),
+                Value::String(token.map_or(url.clone(), |token| token.append_to(&url))),
             );
         }
         if provider.has_sprite_provider(style_key) {
+            let url = format!(
+                "{base_url}/styles/{}/sprite",
+                path_percent_encode_segments(style_key)
+            );
             object.insert(
                 "sprite".to_string(),
-                Value::String(format!(
-                    "{base_url}/styles/{}/sprite",
-                    path_percent_encode_segments(style_key)
-                )),
+                Value::String(token.map_or(url.clone(), |token| token.append_to(&url))),
             );
         }
 
         if let Some(sources) = object.get_mut("sources").and_then(Value::as_object_mut) {
             for source in sources.values_mut() {
-                rewrite_source_object(source, base_url, wants_mlt);
+                rewrite_source_object(source, base_url, wants_mlt, token);
             }
         }
     }
@@ -220,7 +243,12 @@ fn rewrite_style(
 /// references (`/[<ns>/]<id>`) to this server's endpoints, and tags vector
 /// sources with `encoding: mlt` when MLT was requested and a reference was
 /// actually rewritten. External/absolute references are left untouched.
-fn rewrite_source_object(source: &mut Value, base_url: &str, wants_mlt: bool) {
+fn rewrite_source_object(
+    source: &mut Value,
+    base_url: &str,
+    wants_mlt: bool,
+    token: Option<&PropagatedAccessToken>,
+) {
     let Some(source_object) = source.as_object_mut() else {
         return;
     };
@@ -233,11 +261,14 @@ fn rewrite_source_object(source: &mut Value, base_url: &str, wants_mlt: bool) {
         .and_then(|url| rewrite_tileset_ref_tilejson_url(url, base_url))
     {
         // Defer MLT selection to the TileJSON endpoint via `?encoding=mlt`.
-        let url = if mlt {
+        let mut url = if mlt {
             format!("{rewritten}?encoding=mlt")
         } else {
             rewritten
         };
+        if let Some(token) = token {
+            url = token.append_to(&url);
+        }
         source_object.insert("url".to_string(), Value::String(url));
         rewrote_tileset_ref = true;
     }
@@ -247,11 +278,14 @@ fn rewrite_source_object(source: &mut Value, base_url: &str, wants_mlt: bool) {
                 continue;
             };
             if let Some(rewritten) = rewrite_tileset_ref_tile_url(url, base_url) {
-                let url = if mlt {
+                let mut url = if mlt {
                     format!("{rewritten}.mlt")
                 } else {
                     rewritten
                 };
+                if let Some(token) = token {
+                    url = token.append_to(&url);
+                }
                 *tile_url = Value::String(url);
                 rewrote_tileset_ref = true;
             }
@@ -393,6 +427,7 @@ mod tests {
             "carto/voyager",
             &provider_with_glyph_and_sprite(),
             None,
+            None,
         );
 
         assert_eq!(
@@ -444,6 +479,7 @@ mod tests {
             "mierune/x",
             &provider_with_glyph_and_sprite(),
             Some("mlt"),
+            None,
         );
 
         // Vector source via TileJSON `url`: defer to `?encoding=mlt`, mark source MLT.
@@ -489,6 +525,7 @@ mod tests {
             "https://ishikari.example",
             "carto/voyager",
             &provider,
+            None,
             None,
         );
 

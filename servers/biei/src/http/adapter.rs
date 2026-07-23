@@ -13,7 +13,7 @@ use axum::body::Body;
 use axum::body::to_bytes;
 use axum::extract::{Extension, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
-use axum::http::{HeaderValue, Method, Request, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{any, get, post};
@@ -593,6 +593,7 @@ async fn forwardz(State(state): State<HttpServerState>, request: Request<Body>) 
 async fn public_render(
     State(state): State<HttpServerState>,
     Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
     method: Method,
     uri: Uri,
 ) -> Response {
@@ -613,6 +614,7 @@ async fn public_render(
             .handle_public_path_with_request_id(
                 uri.path(),
                 uri.query(),
+                &headers,
                 Some(request_id),
                 Instant::now(),
             )

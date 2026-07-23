@@ -26,6 +26,7 @@ use super::upstream::ProviderFetcher;
 
 pub(crate) struct ServerRuntimeConfig {
     pub gossip_bootstrap_readiness: BootstrapReadinessGate,
+    pub delivery_auth: Option<mmpf_auth::DeliveryAuth>,
     pub mapterhorn: Option<Arc<MapterhornResolver>>,
     pub cpu_work_concurrency: usize,
     /// Maximum admitted CPU-work units (holding a permit or queued for one)
@@ -98,6 +99,7 @@ pub(crate) struct AppStateInner {
     gossip_bootstrap_readiness: BootstrapReadinessGate,
     pub(super) provider: ProviderConfig,
     pub(super) provider_fetcher: ProviderFetcher,
+    pub(super) delivery_auth: Option<mmpf_auth::DeliveryAuth>,
     /// Per-pod cache of transcoded MLT tiles, keyed by (resource routing key,
     /// tile id). Populated lazily on first `.mlt` request; see
     /// `server::tileset::mlt`.
@@ -145,6 +147,7 @@ impl AppState {
     ) -> Self {
         let ServerRuntimeConfig {
             gossip_bootstrap_readiness,
+            delivery_auth,
             mapterhorn,
             cpu_work_concurrency,
             cpu_work_max_inflight,
@@ -164,6 +167,7 @@ impl AppState {
             gossip_bootstrap_readiness,
             provider,
             provider_fetcher,
+            delivery_auth,
             mapterhorn,
             // Bounded, byte-weighted: first `.mlt` request transcodes, the rest
             // hit this cache. 64 MiB ≈ a few hundred warm MLT tiles per pod.

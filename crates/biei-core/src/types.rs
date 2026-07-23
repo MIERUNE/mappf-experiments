@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -23,6 +24,180 @@ pub enum RouteTier {
 pub type WorkerId = u32;
 pub type SourceHash = u64;
 pub type TaskId = u64;
+
+const MAX_AUTHORIZATION_NAMESPACES: usize = 1024;
+const MAX_AUTHORIZATION_NAMESPACE_BYTES: usize = 256;
+const MAX_PROVIDER_BEARER_TOKEN_BYTES: usize = 4096;
+
+/// Opaque, one-way partition for caches whose bytes may contain a delivery
+/// credential (for example, an Ishikari-rewritten style URL). The verifier
+/// binds it to the policy revision. This is safe to carry on the trusted render
+/// wire; it is not the credential, registry verifier digest, or principal.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CredentialCachePartition([u8; 32]);
+
+impl CredentialCachePartition {
+    pub fn from_digest(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+}
+
+impl std::fmt::Debug for CredentialCachePartition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CredentialCachePartition([redacted])")
+    }
+}
+
+/// The verified caller credential forwarded to the configured delivery
+/// provider for a protected render.
+///
+/// This value is deliberately separate from cache identity and has a redacted
+/// `Debug` implementation. It may cross only Biei's trusted peer transport and
+/// must be attached only to the explicitly configured provider origin.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderBearerToken(String);
+
+impl ProviderBearerToken {
+    pub fn try_new(value: String) -> Result<Self, &'static str> {
+        if value.is_empty()
+            || value.len() > MAX_PROVIDER_BEARER_TOKEN_BYTES
+            || value
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        {
+            return Err(
+                "provider bearer token must be non-empty, bounded, and contain no whitespace",
+            );
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ProviderBearerToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProviderBearerToken([redacted])")
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderBearerToken {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::try_new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A bounded, normalized set of delivery namespaces.
+///
+/// Biei carries this authorization result across its trusted internal render
+/// transport so every node can apply the same output-cache admission rule
+/// without forwarding registry state or re-reading object storage. It contains
+/// no credential or principal identifier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamespaceSet(Arc<[String]>);
+
+impl NamespaceSet {
+    pub fn try_new(mut namespaces: Vec<String>) -> Result<Self, &'static str> {
+        if namespaces.is_empty() || namespaces.len() > MAX_AUTHORIZATION_NAMESPACES {
+            return Err("namespace set must be non-empty and bounded");
+        }
+        if namespaces.iter().any(|namespace| {
+            namespace.is_empty()
+                || namespace.len() > MAX_AUTHORIZATION_NAMESPACE_BYTES
+                || namespace.chars().any(char::is_control)
+        }) {
+            return Err("namespace must be non-empty, bounded, and contain no control characters");
+        }
+        namespaces.sort_unstable();
+        namespaces.dedup();
+        if namespaces
+            .binary_search_by(|value| value.as_str().cmp("*"))
+            .is_ok()
+        {
+            namespaces.clear();
+            namespaces.push("*".to_string());
+        }
+        Ok(Self(namespaces.into()))
+    }
+
+    /// Accepts already normalized shared storage from a verifier boundary.
+    /// Validation is repeated because this type is also part of the internal
+    /// wire contract, but no labels or backing allocation are cloned.
+    pub fn try_from_shared(namespaces: Arc<[String]>) -> Result<Self, &'static str> {
+        if namespaces.is_empty() || namespaces.len() > MAX_AUTHORIZATION_NAMESPACES {
+            return Err("namespace set must be non-empty and bounded");
+        }
+        if namespaces.iter().any(|namespace| {
+            namespace.is_empty()
+                || namespace.len() > MAX_AUTHORIZATION_NAMESPACE_BYTES
+                || namespace.chars().any(char::is_control)
+        }) {
+            return Err("namespace must be non-empty, bounded, and contain no control characters");
+        }
+        if namespaces
+            .windows(2)
+            .any(|pair| pair[0].as_str() >= pair[1].as_str())
+            || (namespaces.iter().any(|namespace| namespace == "*")
+                && !(namespaces.len() == 1 && namespaces[0] == "*"))
+        {
+            return Err("shared namespace set must be sorted, unique, and canonical");
+        }
+        Ok(Self(namespaces))
+    }
+
+    pub fn as_slice(&self) -> &[String] {
+        self.0.as_ref()
+    }
+
+    /// Returns true when this caller grant satisfies every required namespace.
+    pub fn allows(&self, required: &Self) -> bool {
+        if self.0.first().is_some_and(|namespace| namespace == "*") {
+            return true;
+        }
+        required
+            .0
+            .iter()
+            .all(|namespace| namespace != "*" && self.0.binary_search(namespace).is_ok())
+    }
+
+    pub(crate) fn estimated_size_bytes(&self) -> usize {
+        self.0
+            .iter()
+            .map(|namespace| std::mem::size_of::<String>() + namespace.len())
+            .sum()
+    }
+}
+
+impl<'de> Deserialize<'de> for NamespaceSet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let namespaces = Vec::<String>::deserialize(deserializer)?;
+        Self::try_new(namespaces).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for NamespaceSet {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.as_ref().serialize(serializer)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenderAuthorization {
+    pub readable_namespaces: NamespaceSet,
+    pub cache_partition: CredentialCachePartition,
+    pub provider_bearer_token: ProviderBearerToken,
+}
 
 /// Deserialize an optional wire value while still requiring the field itself
 /// to be present. Serde otherwise treats a missing `Option<T>` as `None`, which
@@ -479,6 +654,7 @@ impl TaskSpec {
         InternalTask {
             id: self.id,
             request_id: self.request_id,
+            authorization: None,
             style: self.style,
             source: self.source,
             request: self.request,
@@ -498,6 +674,11 @@ impl TaskSpec {
 pub struct InternalTask {
     pub id: TaskId,
     pub request_id: RequestId,
+    /// Freshly verified caller grants and the redacted provider credential for
+    /// protected delivery, or `None` when delivery auth is explicitly disabled
+    /// for this route. The credential may cross only the trusted render wire;
+    /// it never enters cache identity, gossip, outcomes, or logs.
+    pub authorization: Option<RenderAuthorization>,
     /// Cluster-wide stable style identifier(ID + version). HRW routing and
     /// warm judgment use this together with request mode and scale via
     /// `worker_profile()`.
@@ -1163,6 +1344,62 @@ mod tests {
         );
         // A flat id (no `/`) is its own namespace.
         assert_eq!(StyleId("voyager".to_string()).namespace(), "voyager");
+    }
+
+    #[test]
+    fn namespace_sets_normalize_and_apply_subset_authorization() {
+        let broad = NamespaceSet::try_new(vec![
+            "terrain".to_string(),
+            "basemap".to_string(),
+            "basemap".to_string(),
+        ])
+        .unwrap();
+        let basemap = NamespaceSet::try_new(vec!["basemap".to_string()]).unwrap();
+        let labels = NamespaceSet::try_new(vec!["labels".to_string()]).unwrap();
+        let wildcard = NamespaceSet::try_new(vec!["*".to_string()]).unwrap();
+
+        assert_eq!(
+            broad.as_slice(),
+            &["basemap".to_string(), "terrain".to_string()]
+        );
+        assert!(broad.allows(&basemap));
+        assert!(!basemap.allows(&broad));
+        assert!(!broad.allows(&labels));
+        assert!(wildcard.allows(&broad));
+        assert!(!broad.allows(&wildcard));
+
+        let shared: Arc<[String]> = vec!["basemap".to_string(), "terrain".to_string()].into();
+        let shared_set = NamespaceSet::try_from_shared(Arc::clone(&shared)).unwrap();
+        assert!(Arc::ptr_eq(&shared, &shared_set.0));
+    }
+
+    #[test]
+    fn namespace_set_wire_shape_rejects_missing_empty_and_oversized_values() {
+        assert!(serde_json::from_str::<NamespaceSet>(r#"[]"#).is_err());
+        assert!(serde_json::from_str::<NamespaceSet>(r#"[""]"#).is_err());
+        let too_many = serde_json::to_string(&vec!["a"; MAX_AUTHORIZATION_NAMESPACES + 1]).unwrap();
+        assert!(serde_json::from_str::<NamespaceSet>(&too_many).is_err());
+    }
+
+    #[test]
+    fn credential_cache_partition_debug_is_redacted() {
+        let partition = CredentialCachePartition::from_digest([7; 32]);
+        let debug = format!("{partition:?}");
+        assert_eq!(debug, "CredentialCachePartition([redacted])");
+        assert!(!debug.contains('7'));
+    }
+
+    #[test]
+    fn provider_bearer_token_is_bounded_and_debug_redacted() {
+        let token = ProviderBearerToken::try_new("public.secret-value".to_string()).unwrap();
+        assert_eq!(token.as_str(), "public.secret-value");
+        assert_eq!(format!("{token:?}"), "ProviderBearerToken([redacted])");
+        assert!(ProviderBearerToken::try_new(String::new()).is_err());
+        assert!(ProviderBearerToken::try_new("public.bad token".to_string()).is_err());
+        assert!(
+            ProviderBearerToken::try_new("x".repeat(MAX_PROVIDER_BEARER_TOKEN_BYTES + 1)).is_err()
+        );
+        assert!(serde_json::from_str::<ProviderBearerToken>(r#""public.bad\ntoken""#).is_err());
     }
 
     #[test]

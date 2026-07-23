@@ -40,6 +40,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 COPY Cargo.toml Cargo.lock ./
 COPY crates/biei-core/Cargo.toml crates/biei-core/Cargo.toml
 COPY crates/ishikari-core/Cargo.toml crates/ishikari-core/Cargo.toml
+COPY crates/mmpf-auth/Cargo.toml crates/mmpf-auth/Cargo.toml
 COPY crates/mmpf-cluster/Cargo.toml crates/mmpf-cluster/Cargo.toml
 COPY crates/mmpf-common/Cargo.toml crates/mmpf-common/Cargo.toml
 COPY crates/mmpf-http/Cargo.toml crates/mmpf-http/Cargo.toml
@@ -51,6 +52,7 @@ COPY servers/ishikari/Cargo.toml servers/ishikari/Cargo.toml
 COPY sims/biei-sim/Cargo.toml sims/biei-sim/Cargo.toml
 COPY sims/ishikari-sim/Cargo.toml sims/ishikari-sim/Cargo.toml
 COPY crates/ishikari-core/src crates/ishikari-core/src
+COPY crates/mmpf-auth/src crates/mmpf-auth/src
 COPY crates/mmpf-cluster/src crates/mmpf-cluster/src
 COPY crates/mmpf-common/src crates/mmpf-common/src
 COPY crates/mmpf-http/src crates/mmpf-http/src

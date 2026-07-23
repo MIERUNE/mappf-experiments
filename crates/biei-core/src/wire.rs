@@ -13,15 +13,17 @@ use tokio::time::Instant;
 
 use crate::types::{
     CachePolicy, CompletedInfo, DeadlineStage, FailureKind, ImageFormat, InternalTask,
-    RejectionReason, RenderMode, RenderObservation, RenderOutput, RenderRequest, RequestId,
-    RouteTier, Scale, SourceHash, SourceRef, StyleId, StyleRevision, TaskId, TaskOutcome,
-    TaskResult, WorkerId,
+    RejectionReason, RenderAuthorization, RenderMode, RenderObservation, RenderOutput,
+    RenderRequest, RequestId, RouteTier, Scale, SourceHash, SourceRef, StyleId, StyleRevision,
+    TaskId, TaskOutcome, TaskResult, WorkerId,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WireTask {
     pub id: TaskId,
     pub request_id: RequestId,
+    #[serde(deserialize_with = "crate::types::deserialize_required_option")]
+    pub authorization: Option<RenderAuthorization>,
     pub style: StyleRevision,
     #[serde(deserialize_with = "crate::types::deserialize_required_option")]
     pub source: Option<WireSourceRef>,
@@ -87,6 +89,7 @@ impl InternalTask {
         WireTask {
             id: self.id,
             request_id: self.request_id.clone(),
+            authorization: self.authorization.clone(),
             style: self.style.clone(),
             source: self.source.as_ref().map(WireSourceRef::from),
             request: self.request.clone(),
@@ -120,6 +123,7 @@ impl WireTask {
         InternalTask {
             id: self.id,
             request_id: self.request_id,
+            authorization: self.authorization,
             style: self.style,
             source: self.source.map(SourceRef::from),
             request: self.request,
@@ -529,6 +533,18 @@ mod tests {
         let task = InternalTask {
             id: 42,
             request_id: RequestId::from_string("wire-test"),
+            authorization: Some(crate::types::RenderAuthorization {
+                readable_namespaces: crate::types::NamespaceSet::try_new(vec![
+                    "terrain".to_string(),
+                    "basemap".to_string(),
+                ])
+                .unwrap(),
+                cache_partition: crate::types::CredentialCachePartition::from_digest([7; 32]),
+                provider_bearer_token: crate::types::ProviderBearerToken::try_new(
+                    "public.wire-secret".to_string(),
+                )
+                .unwrap(),
+            }),
             style: style(),
             source: Some(SourceRef {
                 hash: 123,
@@ -551,9 +567,62 @@ mod tests {
         assert_eq!(wire.style, style());
         assert_eq!(wire.scale, Scale::X2);
         assert!(wire.remaining_budget_ms <= 3000);
+        let mut missing_authorization = serde_json::to_value(&wire).unwrap();
+        missing_authorization
+            .as_object_mut()
+            .unwrap()
+            .remove("authorization");
+        assert!(
+            serde_json::from_value::<WireTask>(missing_authorization).is_err(),
+            "the internal contract must not silently treat an old peer as unauthenticated"
+        );
+        let mut missing_partition = serde_json::to_value(&wire).unwrap();
+        missing_partition["authorization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_partition");
+        assert!(
+            serde_json::from_value::<WireTask>(missing_partition).is_err(),
+            "a protected task from a peer must include its cache partition"
+        );
+        let mut missing_provider_token = serde_json::to_value(&wire).unwrap();
+        missing_provider_token["authorization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_bearer_token");
+        assert!(
+            serde_json::from_value::<WireTask>(missing_provider_token).is_err(),
+            "a protected task from a peer must include its provider credential"
+        );
 
         let rebuilt = wire.into_internal(now);
         assert_eq!(rebuilt.id, 42);
+        assert_eq!(
+            rebuilt
+                .authorization
+                .as_ref()
+                .unwrap()
+                .readable_namespaces
+                .as_slice(),
+            &["basemap".to_string(), "terrain".to_string()]
+        );
+        assert_eq!(
+            rebuilt.authorization.as_ref().unwrap().cache_partition,
+            crate::types::CredentialCachePartition::from_digest([7; 32])
+        );
+        assert_eq!(
+            rebuilt
+                .authorization
+                .as_ref()
+                .unwrap()
+                .provider_bearer_token
+                .as_str(),
+            "public.wire-secret"
+        );
+        assert!(
+            !format!("{rebuilt:?}").contains("wire-secret"),
+            "wire credentials must stay redacted from Debug output"
+        );
         assert_eq!(rebuilt.style, style());
         assert_eq!(rebuilt.pixel_ratio.to_scale(), Scale::X2);
         assert_eq!(rebuilt.output_format, ImageFormat::Webp);
@@ -609,6 +678,7 @@ mod tests {
         let task = InternalTask {
             id: 42,
             request_id: RequestId::from_string("wire-hop-test"),
+            authorization: None,
             style: style(),
             source: None,
             request: RenderRequest::Tile {
@@ -644,6 +714,7 @@ mod tests {
         let task = InternalTask {
             id: 7,
             request_id: RequestId::from_string("forward-overshoot"),
+            authorization: None,
             style: style(),
             source: None,
             request: RenderRequest::Tile {

@@ -13,6 +13,8 @@ use biei_core::config::{BlCapacityPolicy, ClusterConfig};
 use biei_core::style_catalog::StyleCatalog;
 use biei_core::types::NodeId;
 
+use crate::auth::RegistryCatalog;
+
 const MAX_QUEUE_CAPACITY_MULTIPLIER: usize = 4;
 const STANDBY_RATIO_NUMERATOR: usize = 5;
 const STANDBY_RATIO_DENOMINATOR: usize = 4;
@@ -23,6 +25,10 @@ pub(crate) type StyleTemplates = ResourceTemplates;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) struct Options {
+    pub auth_registries: RegistryCatalog,
+    /// Exact provider origin allowed to receive a verified delivery token.
+    /// Required when delivery authentication is enabled.
+    pub auth_provider_origin: Option<url::Url>,
     pub style_templates: StyleTemplates,
     pub tileset_url_template: String,
     pub cluster: bool,
@@ -73,6 +79,8 @@ pub(crate) struct Options {
 /// embed the renderer without inheriting Biei's command-line contract.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OptionsInput {
+    pub auth_registries: String,
+    pub auth_provider_origin: Option<String>,
     pub style_templates: String,
     pub tileset_url_template: String,
     pub cluster: bool,
@@ -104,6 +112,17 @@ pub(crate) struct OptionsInput {
 impl Options {
     /// Validate raw entry-point configuration and resolve derived capacities.
     pub(crate) fn resolve(input: OptionsInput) -> anyhow::Result<Self> {
+        let auth_registries = RegistryCatalog::parse(&input.auth_registries)?;
+        let auth_provider_origin =
+            parse_auth_provider_origin(input.auth_provider_origin.as_deref())?;
+        if auth_registries.is_empty() && auth_provider_origin.is_some() {
+            bail!("--auth-provider-origin requires --auth-registries");
+        }
+        if !auth_registries.is_empty() && auth_provider_origin.is_none() {
+            bail!(
+                "--auth-provider-origin (BIEI_AUTH_PROVIDER_ORIGIN) is required when delivery auth is enabled"
+            );
+        }
         let style_templates = parse_style_templates(&input.style_templates)?;
         validate_tileset_url_template(&input.tileset_url_template)?;
         let mln_resource_private_hosts =
@@ -178,6 +197,8 @@ impl Options {
         }
 
         Ok(Self {
+            auth_registries,
+            auth_provider_origin,
             style_templates,
             tileset_url_template: input.tileset_url_template,
             cluster: input.cluster,
@@ -258,6 +279,28 @@ fn execution_permits_for_cores(cores: usize) -> usize {
 /// pure CPU concurrency.
 fn native_render_permits_for_cores(cores: usize) -> usize {
     cores.max(1)
+}
+
+fn parse_auth_provider_origin(raw: Option<&str>) -> anyhow::Result<Option<url::Url>> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(None);
+    };
+    let origin = url::Url::parse(raw).context("parse --auth-provider-origin")?;
+    if !matches!(origin.scheme(), "http" | "https") {
+        bail!("--auth-provider-origin must use http or https");
+    }
+    if origin.cannot_be_a_base()
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+        || origin.path() != "/"
+    {
+        bail!(
+            "--auth-provider-origin must be an exact origin without credentials, path, query, or fragment"
+        );
+    }
+    Ok(Some(origin))
 }
 
 /// Parse `BIEI_STYLE_TEMPLATES` while retaining Biei's HTTP-only, path-scoped
@@ -349,6 +392,8 @@ pub(crate) fn test_options(style_templates: &str, cores: usize) -> Options {
 #[cfg(test)]
 fn test_input(style_templates: &str, cores: usize) -> OptionsInput {
     OptionsInput {
+        auth_registries: String::new(),
+        auth_provider_origin: None,
         style_templates: style_templates.to_string(),
         tileset_url_template: "https://tileset-provider.test/tilesets/{tileset_id}/tileset.json"
             .to_string(),
@@ -398,6 +443,49 @@ mod tests {
             options.cluster_config().bl_capacity,
             BlCapacityPolicy::Fixed(1)
         ));
+    }
+
+    #[test]
+    fn validates_auth_catalog_without_retaining_roots_in_debug_output() {
+        let mut input = test_input("https://styles.test/{style_id}/style.json", 1);
+        input.auth_registries = "public=gs://private-auth-bucket/registries/public/".to_string();
+        input.auth_provider_origin = Some("https://styles.test".to_string());
+        let options = Options::resolve(input).expect("auth registry catalog");
+
+        assert!(!options.auth_registries.is_empty());
+        assert_eq!(
+            options.auth_provider_origin.as_ref().unwrap().as_str(),
+            "https://styles.test/"
+        );
+        let debug = format!("{options:?}");
+        assert!(debug.contains("public"));
+        assert!(!debug.contains("private-auth-bucket"));
+
+        let mut invalid = test_input("https://styles.test/{style_id}/style.json", 1);
+        invalid.auth_registries = "public=gs://bucket/not-a-directory".to_string();
+        assert!(Options::resolve(invalid).is_err());
+    }
+
+    #[test]
+    fn auth_requires_one_explicit_exact_provider_origin() {
+        let mut missing = test_input("https://styles.test/{style_id}/style.json", 1);
+        missing.auth_registries = "public=gs://bucket/auth/".to_string();
+        assert!(Options::resolve(missing).is_err());
+
+        for invalid_origin in [
+            "https://styles.test/path",
+            "https://user@styles.test",
+            "https://styles.test?token=secret",
+            "file:///tmp/provider",
+        ] {
+            let mut invalid = test_input("https://styles.test/{style_id}/style.json", 1);
+            invalid.auth_registries = "public=gs://bucket/auth/".to_string();
+            invalid.auth_provider_origin = Some(invalid_origin.to_string());
+            assert!(
+                Options::resolve(invalid).is_err(),
+                "{invalid_origin} must not be accepted as an exact provider origin"
+            );
+        }
     }
 
     #[test]

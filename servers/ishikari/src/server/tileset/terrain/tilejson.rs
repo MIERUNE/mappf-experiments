@@ -3,6 +3,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::product::DerivedProduct;
+use crate::server::auth::PropagatedAccessToken;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct DerivedTileJsonQuery {
@@ -25,6 +26,7 @@ pub(super) fn derived_tilejson(
     info: &TilesetInfo,
     maxzoom: u8,
     wants_mlt: bool,
+    token: Option<&PropagatedAccessToken>,
 ) -> Value {
     let (suffix, format) = match product {
         DerivedProduct::Contours | DerivedProduct::Hillshade if wants_mlt => (".mlt", "pbf"),
@@ -33,12 +35,16 @@ pub(super) fn derived_tilejson(
         DerivedProduct::HillshadeJpeg => (".jpg", "jpg"),
     };
 
+    let mut tile_url = format!(
+        "{base_url}/tilesets/{tileset_id}/derived/{}/{{z}}/{{x}}/{{y}}{suffix}",
+        product.path(),
+    );
+    if let Some(token) = token {
+        tile_url = token.append_to(&tile_url);
+    }
     let mut document = json!({
         "tilejson": "3.0.0",
-        "tiles": [format!(
-            "{base_url}/tilesets/{tileset_id}/derived/{}/{{z}}/{{x}}/{{y}}{suffix}",
-            product.path(),
-        )],
+        "tiles": [tile_url],
         "attribution": info.metadata.attribution.clone(),
         "bounds": [
             info.header.min_longitude,
@@ -134,6 +140,7 @@ mod tests {
             &info(),
             16,
             true,
+            None,
         );
 
         assert_eq!(document["format"], "pbf");
@@ -160,6 +167,7 @@ mod tests {
                 &info(),
                 16,
                 true,
+                None,
             );
 
             assert_eq!(document["format"], format);

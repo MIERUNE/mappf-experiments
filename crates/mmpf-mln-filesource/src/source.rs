@@ -766,6 +766,8 @@ fn build_filtered_http_client(
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= 10 {
                 attempt.error("too many resource redirects")
+            } else if !credentialed_redirect_stays_on_origin(attempt.previous(), attempt.url()) {
+                attempt.error("credential-bearing resource redirect changes origin")
             } else if redirect_policy.permits_url_without_dns(attempt.url()) {
                 attempt.follow()
             } else {
@@ -773,6 +775,13 @@ fn build_filtered_http_client(
             }
         }))
         .build()?)
+}
+
+fn credentialed_redirect_stays_on_origin(previous: &[url::Url], target: &url::Url) -> bool {
+    previous
+        .iter()
+        .find(|url| url.query_pairs().any(|(key, _)| key == "access_token"))
+        .is_none_or(|credentialed| credentialed.origin() == target.origin())
 }
 
 /// Build the same address- and redirect-filtered client for the profile

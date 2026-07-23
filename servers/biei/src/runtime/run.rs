@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::time::Duration;
 
+use crate::auth::DeliveryAuth;
 use crate::options::Options;
 use crate::runtime::Runtime;
 use mmpf_cluster::{BootstrapReadinessGate, DEFAULT_BOOTSTRAP_GRACE};
@@ -15,7 +16,11 @@ const DRAIN_GRACE: Duration = Duration::from_secs(10);
 const MEMBERSHIP_SHUTDOWN_RESERVE: Duration = Duration::from_secs(2);
 
 /// Run a configured Biei node until the supplied shutdown future resolves.
-pub(crate) async fn run<F>(options: Options, shutdown_requested: F) -> anyhow::Result<()>
+pub(crate) async fn run<F>(
+    options: Options,
+    auth: Option<DeliveryAuth>,
+    shutdown_requested: F,
+) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
@@ -58,7 +63,7 @@ where
         tracing::info!("starting single-node runtime");
         (Runtime::spawn_single_node(&options)?, None)
     };
-    let ingress = runtime.http_ingress(options.sla);
+    let ingress = runtime.http_ingress_with_auth(options.sla, auth);
     let (shutdown, shutdown_task) = install_shutdown_handler(runtime.clone(), shutdown_requested);
     let shutdown_observer = shutdown.clone();
     let serve_result = if options.cluster {

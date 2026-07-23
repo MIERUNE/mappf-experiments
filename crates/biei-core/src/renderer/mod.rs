@@ -6,13 +6,17 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::types::{
-    AddLayerSource, InternalTask, ProfilePreparationError, RenderOutput, RendererError, SourceHash,
-    StyleRevision,
+    AddLayerSource, CredentialCachePartition, InternalTask, ProfilePreparationError, RenderOutput,
+    RendererError, SourceHash, StyleRevision,
 };
 
 #[derive(Clone, Debug)]
 pub struct PreparedProfile {
     pub revision: StyleRevision,
+    /// Credential-derived partition used to fetch these bytes. Keeping this
+    /// beside the prepared JSON prevents a protected task from installing
+    /// profile data prepared for another credential.
+    pub authorization_partition: Option<CredentialCachePartition>,
     pub style_json: Arc<str>,
     /// Request-local addlayer source after resolving its TileJSON into a
     /// concrete style-spec source with `tiles`. Kept here because preparers
@@ -72,7 +76,12 @@ pub trait ProfilePreparer: Send + Sync {
     /// Temporarily suppress a revision that fetched successfully but was
     /// rejected by the renderer's semantic style validation. The default is
     /// a no-op for preparers without a style cache.
-    fn mark_style_load_failed(&self, _revision: &StyleRevision) {}
+    fn mark_style_load_failed(
+        &self,
+        _revision: &StyleRevision,
+        _authorization: Option<&crate::types::RenderAuthorization>,
+    ) {
+    }
 }
 
 #[derive(Default)]

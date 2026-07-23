@@ -12,9 +12,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use axum::http::HeaderMap;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
+use crate::auth::DeliveryAuth;
 use crate::drain::{DrainController, DrainPermit};
 use crate::http::addlayer::parse_addlayer_from_query;
 use crate::http::error::IngressError;
@@ -30,7 +32,10 @@ use crate::http::tile::parse_tile_path;
 
 use biei_core::node::Node;
 use biei_core::style_catalog::StyleCatalog;
-use biei_core::types::{InternalTask, RequestId, StyleId, TaskId};
+use biei_core::types::{
+    CredentialCachePartition, InternalTask, NamespaceSet, ProviderBearerToken, RenderAuthorization,
+    RequestId, StyleId, TaskId,
+};
 
 #[derive(Debug)]
 enum ParsedPublicPath<'a> {
@@ -67,6 +72,21 @@ impl<'a> ParsedPublicPath<'a> {
         }
 
         ParsedRenderPath::from_parts(parts).map(Self::Render)
+    }
+
+    fn static_style_id(&self) -> Option<&StyleId> {
+        match self {
+            Self::Render(ParsedRenderPath {
+                style_id,
+                kind: ParsedRenderKind::Static { .. },
+                ..
+            }) => Some(style_id),
+            Self::Preview { .. }
+            | Self::Render(ParsedRenderPath {
+                kind: ParsedRenderKind::Tile,
+                ..
+            }) => None,
+        }
     }
 }
 
@@ -129,6 +149,7 @@ pub(crate) struct HttpIngress {
     drain: Option<DrainController>,
     concurrency: Option<Arc<Semaphore>>,
     renderer_supervisor: crate::renderer::actor::RendererActorSupervisor,
+    auth: Option<DeliveryAuth>,
 }
 
 impl HttpIngress {
@@ -150,7 +171,13 @@ impl HttpIngress {
             drain: Some(drain),
             concurrency: Some(Arc::new(Semaphore::new(concurrency_limit.max(1)))),
             renderer_supervisor,
+            auth: None,
         }
+    }
+
+    pub(crate) fn with_auth(mut self, auth: Option<DeliveryAuth>) -> Self {
+        self.auth = auth;
+        self
     }
 
     pub(crate) fn drain_controller(&self) -> Option<DrainController> {
@@ -167,7 +194,7 @@ impl HttpIngress {
 
     #[cfg(test)]
     pub(crate) async fn handle_path(&self, path: &str, now: Instant) -> IngressResponse {
-        self.handle_public_path_with_request_id(path, None, None, now)
+        self.handle_public_path_with_request_id(path, None, &HeaderMap::new(), None, now)
             .await
     }
 
@@ -211,6 +238,7 @@ impl HttpIngress {
         &self,
         path: &str,
         query: Option<&str>,
+        headers: &HeaderMap,
         request_id: Option<RequestId>,
         now: Instant,
     ) -> IngressResponse {
@@ -220,9 +248,41 @@ impl HttpIngress {
             Err(err) => return response_from_ingress_error(err).with_request_id(&request_id),
         };
 
-        // Future AuthZ belongs here: the public path has been classified and
-        // carries a validated StyleId, but no concurrency/drain capacity has
-        // been consumed and no InternalTask has been created.
+        let authorization =
+            if let (Some(auth), Some(style_id)) = (&self.auth, parsed.static_style_id()) {
+                match auth
+                    .authorize_static(headers, query, style_id.namespace())
+                    .await
+                {
+                    Ok(authorized) => {
+                        let readable_namespaces =
+                            NamespaceSet::try_from_shared(authorized.shared_readable_namespaces())
+                                .expect("mmpf-auth returns a validated bounded namespace set");
+                        tracing::debug!(
+                            principal_id = authorized.principal_id,
+                            registry_id = authorized.registry_id,
+                            namespace = style_id.namespace(),
+                            "authorized static render"
+                        );
+                        Some(RenderAuthorization {
+                            readable_namespaces,
+                            cache_partition: CredentialCachePartition::from_digest(
+                                authorized.cache_partition(),
+                            ),
+                            provider_bearer_token: ProviderBearerToken::try_new(
+                                authorized.backend_bearer_token().to_string(),
+                            )
+                            .expect("mmpf-auth returns a validated bounded credential"),
+                        })
+                    }
+                    Err(failure) => {
+                        return crate::auth::failure_response(failure).with_request_id(&request_id);
+                    }
+                }
+            } else {
+                None
+            };
+
         let admission = match self.acquire_admission(&request_id) {
             Ok(guards) => guards,
             Err(response) => return response,
@@ -250,7 +310,7 @@ impl HttpIngress {
 
         let response_policy = parsed.response_policy();
         let task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
-        let task = match parse_path_with_request_id(
+        let mut task = match parse_path_with_request_id(
             parsed,
             query,
             &self.catalog,
@@ -263,6 +323,7 @@ impl HttpIngress {
             Ok(task) => task,
             Err(err) => return response_from_ingress_error(err).with_request_id(&request_id),
         };
+        task.authorization = authorization;
         let node = self.node.clone();
         match tokio::spawn(async move {
             // Keep ingress/drain admission attached to the non-cancellable
@@ -513,6 +574,37 @@ mod tests {
         assert!(
             std::str::from_utf8(&response.body)
                 .expect("json body")
+                .contains("service_draining")
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_auth_protects_static_before_admission_but_not_tiles() {
+        let options = crate::options::test_options("https://styles.test/{style_id}/style.json", 1);
+        let runtime = crate::runtime::Runtime::spawn_single_node(&options).expect("runtime");
+        let catalog = crate::auth::RegistryCatalog::parse("public=memory:///auth/public/")
+            .expect("auth catalog");
+        let auth = crate::auth::DeliveryAuth::new(catalog, std::iter::empty::<(String, String)>());
+        let ingress = runtime.http_ingress_with_auth(Duration::from_secs(2), auth);
+        runtime.drain_controller().begin_draining();
+
+        let static_response = ingress
+            .handle_path("/carto/static/none/0,0,1,0,0/320x240.png", Instant::now())
+            .await;
+        assert_eq!(static_response.status, 401);
+        assert!(
+            std::str::from_utf8(&static_response.body)
+                .unwrap()
+                .contains("invalid_token")
+        );
+
+        let tile_response = ingress
+            .handle_path("/carto/0/0/0.png", Instant::now())
+            .await;
+        assert_eq!(tile_response.status, 503);
+        assert!(
+            std::str::from_utf8(&tile_response.body)
+                .unwrap()
                 .contains("service_draining")
         );
     }

@@ -3,7 +3,8 @@
 use tokio::time::Instant;
 
 use biei_core::types::{
-    AddLayerSource, InternalTask, ProfilePreparationError, RenderRequest, SourceHash, StyleId,
+    AddLayerSource, InternalTask, ProfilePreparationError, ProviderBearerToken, RenderRequest,
+    SourceHash, StyleId,
 };
 use mmpf_mln_filesource::http::{
     BodyReadError, read_bounded_body, redacted_url, redacted_url_str, reqwest_error_label,
@@ -60,6 +61,7 @@ pub(super) fn source_url_from_addlayer_source(
     Ok(url.to_string())
 }
 
+#[cfg(test)]
 pub(super) async fn fetch_tileset_json(
     client: &reqwest::Client,
     url_policy: &mmpf_mln_filesource::policy::ResourceUrlPolicy,
@@ -67,8 +69,29 @@ pub(super) async fn fetch_tileset_json(
     tileset_url: &str,
     deadline: Instant,
 ) -> Result<String, ProfileFetchError> {
+    fetch_tileset_json_with_auth(
+        client,
+        url_policy,
+        style_id,
+        tileset_url,
+        None,
+        None,
+        deadline,
+    )
+    .await
+}
+
+pub(super) async fn fetch_tileset_json_with_auth(
+    client: &reqwest::Client,
+    url_policy: &mmpf_mln_filesource::policy::ResourceUrlPolicy,
+    style_id: &StyleId,
+    tileset_url: &str,
+    provider_token: Option<&ProviderBearerToken>,
+    auth_provider_origin: Option<&url::Url>,
+    deadline: Instant,
+) -> Result<String, ProfileFetchError> {
     let safe_input = redacted_url_str(tileset_url);
-    let url = url::Url::parse(tileset_url).map_err(|err| {
+    let mut url = url::Url::parse(tileset_url).map_err(|err| {
         ProfileFetchError::permanent_invalid(
             style_id,
             format!("tileset URL parse failed for {safe_input}: {err}"),
@@ -86,6 +109,13 @@ pub(super) async fn fetch_tileset_json(
             format!("blocked tileset URL destination: {safe_input}"),
         ));
     }
+    attach_provider_token(
+        style_id,
+        &mut url,
+        provider_token,
+        auth_provider_origin,
+        "tileset",
+    )?;
     let safe_url = redacted_url(&url);
     let response = tokio::time::timeout_at(deadline, client.get(url.clone()).send())
         .await
@@ -288,6 +318,7 @@ fn unprotect_tile_template_placeholders(url: &str) -> String {
         .replace(TILE_Y_PLACEHOLDER, "{y}")
 }
 
+#[cfg(test)]
 pub(super) async fn fetch_style_json(
     client: &reqwest::Client,
     url_policy: &mmpf_mln_filesource::policy::ResourceUrlPolicy,
@@ -295,8 +326,30 @@ pub(super) async fn fetch_style_json(
     style_url: &str,
     deadline: Instant,
 ) -> Result<String, ProfileFetchError> {
+    fetch_style_json_with_auth(
+        client, url_policy, style_id, style_url, None, None, deadline,
+    )
+    .await
+}
+
+pub(super) async fn fetch_style_json_with_auth(
+    client: &reqwest::Client,
+    url_policy: &mmpf_mln_filesource::policy::ResourceUrlPolicy,
+    style_id: &StyleId,
+    style_url: &str,
+    provider_token: Option<&ProviderBearerToken>,
+    auth_provider_origin: Option<&url::Url>,
+    deadline: Instant,
+) -> Result<String, ProfileFetchError> {
     let json = match url::Url::parse(style_url) {
-        Ok(url) if url.scheme() == "http" || url.scheme() == "https" => {
+        Ok(mut url) if url.scheme() == "http" || url.scheme() == "https" => {
+            attach_provider_token(
+                style_id,
+                &mut url,
+                provider_token,
+                auth_provider_origin,
+                "style",
+            )?;
             fetch_http_style_json(client, url_policy, style_id, url, deadline).await?
         }
         Ok(url) if url.scheme() == "file" => {
@@ -324,6 +377,33 @@ pub(super) async fn fetch_style_json(
         ProfileFetchError::permanent_invalid(style_id, format!("style JSON parse failed: {err}"))
     })?;
     Ok(json)
+}
+
+fn attach_provider_token(
+    style_id: &StyleId,
+    url: &mut url::Url,
+    provider_token: Option<&ProviderBearerToken>,
+    auth_provider_origin: Option<&url::Url>,
+    resource: &str,
+) -> Result<(), ProfileFetchError> {
+    let (Some(provider_token), Some(auth_provider_origin)) = (provider_token, auth_provider_origin)
+    else {
+        return Ok(());
+    };
+    if url.origin() != auth_provider_origin.origin() {
+        return Ok(());
+    }
+    if url.query_pairs().any(|(key, _)| key == "access_token") {
+        return Err(ProfileFetchError::permanent_invalid(
+            style_id,
+            format!(
+                "{resource} provider URL must not contain access_token when delivery auth forwarding is enabled"
+            ),
+        ));
+    }
+    url.query_pairs_mut()
+        .append_pair("access_token", provider_token.as_str());
+    Ok(())
 }
 
 async fn fetch_http_style_json(
@@ -463,6 +543,7 @@ mod tests {
     use super::*;
     use biei_core::types::StyleId;
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::Instant;
 
     fn temp_style_path(tag: &str) -> std::path::PathBuf {
@@ -471,6 +552,138 @@ mod tests {
             std::process::id(),
             line!()
         ))
+    }
+
+    #[test]
+    fn provider_token_is_attached_only_to_the_exact_configured_origin() {
+        let style_id = StyleId("test/style".to_string());
+        let token = ProviderBearerToken::try_new("public.a+b&c".to_string()).unwrap();
+        let origin = url::Url::parse("https://ishikari.test:8443").unwrap();
+
+        let mut same_origin =
+            url::Url::parse("https://ishikari.test:8443/styles/test/style.json?encoding=mvt")
+                .unwrap();
+        attach_provider_token(
+            &style_id,
+            &mut same_origin,
+            Some(&token),
+            Some(&origin),
+            "style",
+        )
+        .unwrap_or_else(|error| panic!("same-origin token attachment failed: {}", error.error()));
+        assert_eq!(
+            same_origin.as_str(),
+            "https://ishikari.test:8443/styles/test/style.json?encoding=mvt&access_token=public.a%2Bb%26c"
+        );
+
+        let mut other_port =
+            url::Url::parse("https://ishikari.test/styles/test/style.json").unwrap();
+        attach_provider_token(
+            &style_id,
+            &mut other_port,
+            Some(&token),
+            Some(&origin),
+            "style",
+        )
+        .unwrap_or_else(|error| panic!("other-port URL handling failed: {}", error.error()));
+        assert!(
+            other_port.query().is_none(),
+            "host equality alone must not authorize a different origin port"
+        );
+
+        let mut other_host =
+            url::Url::parse("https://styles.example/styles/test/style.json").unwrap();
+        attach_provider_token(
+            &style_id,
+            &mut other_host,
+            Some(&token),
+            Some(&origin),
+            "style",
+        )
+        .unwrap_or_else(|error| panic!("other-host URL handling failed: {}", error.error()));
+        assert!(
+            other_host.query().is_none(),
+            "a configured style template must not automatically become an auth target"
+        );
+    }
+
+    #[test]
+    fn provider_token_rejects_a_preexisting_url_credential() {
+        let style_id = StyleId("test/style".to_string());
+        let token = ProviderBearerToken::try_new("public.new-secret".to_string()).unwrap();
+        let origin = url::Url::parse("https://ishikari.test").unwrap();
+        let mut url =
+            url::Url::parse("https://ishikari.test/style.json?access_token=old-secret").unwrap();
+
+        let error =
+            attach_provider_token(&style_id, &mut url, Some(&token), Some(&origin), "style")
+                .expect_err("ambiguous provider credentials must be rejected");
+        let message = error.error().to_string();
+        assert!(!message.contains("new-secret"));
+        assert!(!message.contains("old-secret"));
+    }
+
+    #[tokio::test]
+    async fn profile_request_sends_provider_token_on_the_wire() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind profile fixture");
+        let address = listener.local_addr().expect("profile fixture address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept profile request");
+            let mut request = vec![0_u8; 4096];
+            let read = stream
+                .read(&mut request)
+                .await
+                .expect("read profile request");
+            let request_line = String::from_utf8_lossy(&request[..read])
+                .lines()
+                .next()
+                .expect("HTTP request line")
+                .to_string();
+
+            let body = r#"{"version":8,"sources":{},"layers":[]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write profile response");
+            request_line
+        });
+
+        let origin = url::Url::parse(&format!("http://{address}/")).expect("fixture origin");
+        let style_url = origin
+            .join("styles/test/style.json?encoding=mvt")
+            .expect("style URL");
+        let policy =
+            mmpf_mln_filesource::policy::ResourceUrlPolicy::new(vec![address.ip().to_string()]);
+        let client = mmpf_mln_filesource::build_profile_http_client(
+            policy.clone(),
+            "biei-profile-auth-test",
+        )
+        .expect("profile HTTP client");
+        let style_id = StyleId("test/style".to_string());
+        let token = ProviderBearerToken::try_new("public.a+b&c".to_string()).unwrap();
+
+        let json = fetch_style_json_with_auth(
+            &client,
+            &policy,
+            &style_id,
+            style_url.as_str(),
+            Some(&token),
+            Some(&origin),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("authenticated style fetch failed: {}", error.error()));
+        assert!(json.contains("\"version\":8"));
+        assert_eq!(
+            server.await.expect("profile fixture task"),
+            "GET /styles/test/style.json?encoding=mvt&access_token=public.a%2Bb%26c HTTP/1.1"
+        );
     }
 
     #[tokio::test]

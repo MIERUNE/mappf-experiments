@@ -8,9 +8,9 @@ use tokio::time::Instant;
 
 use crate::renderer::{BoxRenderer, PreparedProfile};
 use crate::types::{
-    CachePolicy, CompletedInfo, DeadlineStage, InternalTask, NodeId, RejectionReason,
-    RenderObservation, RenderRequest, RendererError, RouteTier, SourceHash, TaskOutcome,
-    TaskResult, WorkerId, WorkerProfile,
+    CachePolicy, CompletedInfo, CredentialCachePartition, DeadlineStage, InternalTask, NodeId,
+    RejectionReason, RenderObservation, RenderRequest, RendererError, RouteTier, SourceHash,
+    TaskOutcome, TaskResult, WorkerId, WorkerProfile,
 };
 use crate::worker_pool::WorkerCompletion;
 
@@ -107,7 +107,10 @@ pub(crate) async fn worker_loop(
 ) {
     // The worker's view of warm state is style revision + render mode + scale.
     // Static/Tile and @1x/@2x intentionally use separate warm workers.
-    let mut current_profile: Option<WorkerProfile> = None;
+    // Credential-sensitive prepared styles stay local to a worker and are not
+    // exposed in gossip warmth. A credential change forces style setup even
+    // when the semantic WorkerProfile is otherwise identical.
+    let mut current_profile: Option<(WorkerProfile, Option<CredentialCachePartition>)> = None;
     let mut cache = SourceCache::new(source_cache_capacity);
 
     let mut repair_tick = tokio::time::interval(RENDERER_REPAIR_INTERVAL);
@@ -201,7 +204,7 @@ fn renderer_error_invalidates_warm_state(err: &RendererError) -> bool {
 
 async fn run_stages(
     renderer: &mut BoxRenderer,
-    current_profile: &mut Option<WorkerProfile>,
+    current_profile: &mut Option<(WorkerProfile, Option<CredentialCachePartition>)>,
     cache: &mut SourceCache,
     render_permits: Arc<Semaphore>,
     native_render_permits: Arc<Semaphore>,
@@ -209,7 +212,13 @@ async fn run_stages(
     prepared_profile: Option<PreparedProfile>,
 ) -> Result<StageSuccess, StageFailure> {
     let task_profile = task.worker_profile();
-    let style_swap = current_profile.as_ref() != Some(&task_profile);
+    let task_authorization_partition = task
+        .authorization
+        .as_ref()
+        .map(|authorization| authorization.cache_partition);
+    let style_swap = current_profile.as_ref().is_none_or(|(profile, partition)| {
+        profile != &task_profile || *partition != task_authorization_partition
+    });
     let cold_start = current_profile.is_none() && style_swap;
     let prepared_addlayer_source = prepared_profile
         .as_ref()
@@ -230,7 +239,7 @@ async fn run_stages(
                 err,
             })?;
         style_setup_duration = Some(Instant::now().duration_since(setup_started_at));
-        *current_profile = Some(task_profile);
+        *current_profile = Some((task_profile, task_authorization_partition));
         cache.clear();
     }
 

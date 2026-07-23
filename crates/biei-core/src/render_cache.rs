@@ -10,9 +10,9 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::types::{
-    CachePolicy, CompletedInfo, GeoJsonOverlay, ImageFormat, InternalTask, LngLat, NodeId,
-    PathOverlay, PinOverlay, PinSize, Positioning, RenderOutput, RenderRequest, RouteTier, Scale,
-    SourceHash, StaticOverlay, TaskOutcome, TaskResult,
+    CachePolicy, CompletedInfo, GeoJsonOverlay, ImageFormat, InternalTask, LngLat, NamespaceSet,
+    NodeId, PathOverlay, PinOverlay, PinSize, Positioning, RenderOutput, RenderRequest, RouteTier,
+    Scale, SourceHash, StaticOverlay, TaskOutcome, TaskResult,
 };
 use mmpf_common::sync::lock_unpoisoned;
 
@@ -30,8 +30,35 @@ pub(crate) struct RenderOutputCache {
 }
 
 struct RenderOutputCacheInner {
-    cache: Cache<Arc<RenderCacheKey>, Arc<RenderOutput>>,
+    cache: Cache<Arc<RenderCacheKey>, Arc<CachedRenderOutput>>,
     in_flight: Box<[RenderFlightMap]>,
+}
+
+#[derive(Clone)]
+struct CachedRenderOutput {
+    output: RenderOutput,
+    /// Conservative namespace requirement for these bytes. The initial
+    /// implementation records the complete caller grant set that produced the
+    /// render; a trusted style-dependency descriptor may narrow it later.
+    required_namespaces: Option<NamespaceSet>,
+}
+
+impl CachedRenderOutput {
+    fn is_authorized_for(&self, readable_namespaces: Option<&NamespaceSet>) -> bool {
+        match (&self.required_namespaces, readable_namespaces) {
+            (None, None) => true,
+            (Some(required), Some(readable)) => readable.allows(required),
+            (None, Some(_)) | (Some(_), None) => false,
+        }
+    }
+
+    fn estimated_size_bytes(&self) -> usize {
+        self.output.bytes.len()
+            + self
+                .required_namespaces
+                .as_ref()
+                .map_or(0, NamespaceSet::estimated_size_bytes)
+    }
 }
 
 impl RenderOutputCacheInner {
@@ -54,6 +81,7 @@ pub(crate) enum RenderCacheLookup {
 pub(crate) struct RenderFlightFollower {
     inner: Arc<RenderOutputCacheInner>,
     key: Arc<RenderCacheKey>,
+    readable_namespaces: Option<NamespaceSet>,
     changed: watch::Receiver<u64>,
 }
 
@@ -62,6 +90,7 @@ pub(crate) struct RenderFlightFollower {
 pub(crate) struct RenderFlightLeader {
     inner: Arc<RenderOutputCacheInner>,
     key: Option<Arc<RenderCacheKey>>,
+    required_namespaces: Option<NamespaceSet>,
 }
 
 impl RenderOutputCache {
@@ -76,11 +105,13 @@ impl RenderOutputCache {
         let cache = Cache::builder()
             .max_capacity(max_capacity_bytes)
             .time_to_live(ttl)
-            .weigher(|key: &Arc<RenderCacheKey>, output: &Arc<RenderOutput>| {
-                key.estimated_size_bytes()
-                    .saturating_add(output.bytes.len())
-                    .clamp(1, u32::MAX as usize) as u32
-            })
+            .weigher(
+                |key: &Arc<RenderCacheKey>, output: &Arc<CachedRenderOutput>| {
+                    key.estimated_size_bytes()
+                        .saturating_add(output.estimated_size_bytes())
+                        .clamp(1, u32::MAX as usize) as u32
+                },
+            )
             .build();
         Self {
             inner: Some(Arc::new(RenderOutputCacheInner {
@@ -109,27 +140,39 @@ impl RenderOutputCache {
         let Some(inner) = &self.inner else {
             return RenderCacheLookup::Disabled;
         };
-        Self::lookup_or_join_key(Arc::clone(inner), Arc::new(RenderCacheKey::from_task(task)))
+        Self::lookup_or_join_key(
+            Arc::clone(inner),
+            Arc::new(RenderCacheKey::from_task(task)),
+            task.authorization
+                .as_ref()
+                .map(|authorization| &authorization.readable_namespaces),
+        )
     }
 
     fn lookup_or_join_key(
         inner: Arc<RenderOutputCacheInner>,
         key: Arc<RenderCacheKey>,
+        readable_namespaces: Option<&NamespaceSet>,
     ) -> RenderCacheLookup {
-        if let Some(output) = inner.cache.get(&key) {
-            return RenderCacheLookup::Hit((*output).clone());
+        if let Some(output) = inner.cache.get(&key)
+            && output.is_authorized_for(readable_namespaces)
+        {
+            return RenderCacheLookup::Hit(output.output.clone());
         }
 
         let mut in_flight = lock_unpoisoned(inner.flight_shard(&key));
         // Close the race with a leader that inserted between the first cache
         // lookup and acquiring the flight lock.
-        if let Some(output) = inner.cache.get(&key) {
-            return RenderCacheLookup::Hit((*output).clone());
+        if let Some(output) = inner.cache.get(&key)
+            && output.is_authorized_for(readable_namespaces)
+        {
+            return RenderCacheLookup::Hit(output.output.clone());
         }
         if let Some((key, changed)) = in_flight.get_key_value(&key) {
             let follower = RenderFlightFollower {
                 inner: Arc::clone(&inner),
                 key: Arc::clone(key),
+                readable_namespaces: readable_namespaces.cloned(),
                 changed: changed.subscribe(),
             };
             drop(in_flight);
@@ -142,6 +185,7 @@ impl RenderOutputCache {
         RenderCacheLookup::Leader(RenderFlightLeader {
             inner,
             key: Some(key),
+            required_namespaces: readable_namespaces.cloned(),
         })
     }
 }
@@ -152,8 +196,13 @@ impl RenderFlightFollower {
     }
 
     pub(crate) fn recheck(self) -> RenderCacheLookup {
-        let Self { inner, key, .. } = self;
-        RenderOutputCache::lookup_or_join_key(inner, key)
+        let Self {
+            inner,
+            key,
+            readable_namespaces,
+            ..
+        } = self;
+        RenderOutputCache::lookup_or_join_key(inner, key, readable_namespaces.as_ref())
     }
 }
 
@@ -165,9 +214,23 @@ impl RenderFlightLeader {
         let Some(key) = &self.key else {
             return false;
         };
-        self.inner
-            .cache
-            .insert(Arc::clone(key), Arc::new(output.clone()));
+        if let Some(existing) = self.inner.cache.get(key)
+            && existing.required_namespaces != self.required_namespaces
+        {
+            // An independently completed render under a weaker or incomparable
+            // grant does not prove that broader-authority profile/FileSource
+            // caches were uninvolved. Do not relax or replace the resident
+            // authorization requirement until that non-interference proof is
+            // available end to end.
+            return false;
+        }
+        self.inner.cache.insert(
+            Arc::clone(key),
+            Arc::new(CachedRenderOutput {
+                output: output.clone(),
+                required_namespaces: self.required_namespaces.clone(),
+            }),
+        );
         true
     }
 }
@@ -514,7 +577,8 @@ mod tests {
     use super::*;
     use crate::types::{
         AddLayer, AddLayerSource, GeoJsonOverlay, LngLat, NodeId, PathOverlay, PinOverlay,
-        PixelRatio, RequestId, SourceRef, StaticOverlay, StyleId, StyleRevision, TaskResult,
+        PixelRatio, RenderAuthorization, RequestId, SourceRef, StaticOverlay, StyleId,
+        StyleRevision, TaskResult,
     };
     use std::hash::BuildHasherDefault;
     use std::time::Duration;
@@ -524,6 +588,7 @@ mod tests {
         InternalTask {
             id: 1,
             request_id: RequestId::from_string("cache-test"),
+            authorization: None,
             style: StyleRevision {
                 id: StyleId("style".to_string()),
                 version: 1,
@@ -541,6 +606,25 @@ mod tests {
             deadline: now + Duration::from_secs(1),
             forwarding_hops: 0,
         }
+    }
+
+    fn protected_task(namespaces: &[&str]) -> InternalTask {
+        let mut task = task(0, None);
+        task.authorization = Some(RenderAuthorization {
+            readable_namespaces: NamespaceSet::try_new(
+                namespaces
+                    .iter()
+                    .map(|namespace| (*namespace).to_string())
+                    .collect(),
+            )
+            .unwrap(),
+            cache_partition: crate::types::CredentialCachePartition::from_digest([1; 32]),
+            provider_bearer_token: crate::types::ProviderBearerToken::try_new(
+                "public.cache-test".to_string(),
+            )
+            .unwrap(),
+        });
+        task
     }
 
     fn rich_static_task(feature_name: &str) -> InternalTask {
@@ -924,6 +1008,88 @@ mod tests {
             RenderCacheLookup::Hit(output) => assert_eq!(output, rendered),
             _ => panic!("inserted output should be a cache hit"),
         }
+    }
+
+    #[test]
+    fn protected_hit_requires_current_caller_to_cover_cached_namespaces() {
+        let cache = RenderOutputCache::new(1024 * 1024);
+        let broad = protected_task(&["terrain", "basemap"]);
+        let weak = protected_task(&["basemap"]);
+        let broader = protected_task(&["labels", "terrain", "basemap"]);
+        let rendered = output(&[1, 2, 3], ImageFormat::Png);
+
+        let leader = match cache.lookup_or_join(&broad) {
+            RenderCacheLookup::Leader(leader) => leader,
+            _ => panic!("first protected request should lead"),
+        };
+        assert!(leader.insert_from_outcome(&completed_outcome(&broad, rendered.clone())));
+        drop(leader);
+
+        assert!(matches!(
+            cache.lookup_or_join(&broader),
+            RenderCacheLookup::Hit(output) if output == rendered
+        ));
+        assert!(matches!(
+            cache.lookup_or_join(&weak),
+            RenderCacheLookup::Leader(_)
+        ));
+    }
+
+    #[test]
+    fn independently_rendered_weaker_grant_does_not_relax_resident_entry() {
+        let cache = RenderOutputCache::new(1024 * 1024);
+        let broad = protected_task(&["basemap", "terrain"]);
+        let weak = protected_task(&["basemap"]);
+        let broad_output = output(&[1], ImageFormat::Png);
+
+        let broad_leader = match cache.lookup_or_join(&broad) {
+            RenderCacheLookup::Leader(leader) => leader,
+            _ => panic!("broad request should lead"),
+        };
+        assert!(broad_leader.insert_from_outcome(&completed_outcome(&broad, broad_output.clone())));
+        drop(broad_leader);
+
+        let weak_leader = match cache.lookup_or_join(&weak) {
+            RenderCacheLookup::Leader(leader) => leader,
+            _ => panic!("weaker caller must miss the broad entry"),
+        };
+        assert!(
+            !weak_leader
+                .insert_from_outcome(&completed_outcome(&weak, output(&[2], ImageFormat::Png),)),
+            "a possibly contaminated weaker render must not relax the entry"
+        );
+        drop(weak_leader);
+
+        assert!(matches!(
+            cache.lookup_or_join(&broad),
+            RenderCacheLookup::Hit(output) if output == broad_output
+        ));
+        assert!(matches!(
+            cache.lookup_or_join(&weak),
+            RenderCacheLookup::Leader(_)
+        ));
+    }
+
+    #[test]
+    fn protected_and_unprotected_entries_never_cross_the_auth_boundary() {
+        let cache = RenderOutputCache::new(1024 * 1024);
+        let public = task(0, None);
+        let protected = protected_task(&["basemap"]);
+
+        let leader = match cache.lookup_or_join(&public) {
+            RenderCacheLookup::Leader(leader) => leader,
+            _ => panic!("public request should lead"),
+        };
+        assert!(
+            leader
+                .insert_from_outcome(&completed_outcome(&public, output(&[1], ImageFormat::Png),))
+        );
+        drop(leader);
+
+        assert!(matches!(
+            cache.lookup_or_join(&protected),
+            RenderCacheLookup::Leader(_)
+        ));
     }
 
     #[test]

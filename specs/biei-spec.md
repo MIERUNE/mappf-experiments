@@ -33,7 +33,9 @@ the document falls behind.
 ### Non-goals
 
 - Multi-region or geography-aware routing.
-- Owning CDN behavior, authentication, authorization, or tenant rate limiting.
+- Owning CDN behavior, a general identity system, fine-grained authorization,
+  or tenant rate limiting. The optional delivery-auth slice is deliberately
+  narrower: cheap attribution and coarse grants for expensive static renders.
 - Provider-specific URL schemes or service APIs.
 - Hiding unbounded native execution behind an unbounded number of replacement
   threads.
@@ -124,6 +126,7 @@ issues/mln-rs-wishlist.md
 servers/biei/src/main.rs
 servers/biei/src/
     |-- app.rs                      # process entry assembly and tracing
+    |-- auth.rs                     # optional delivery credential adapter/cache
     |-- cli.rs                      # CLI/environment parsing
     |-- options.rs                  # validated server configuration
     |-- runtime/                    # dependency assembly and listener lifecycle
@@ -168,6 +171,7 @@ is the node-to-node representation and must never carry a process-local clock.
 | Concern | InternalTask | WireTask |
 |---|---|---|
 | correlation | `RequestId` | same `RequestId` |
+| protected delivery | optional bounded namespace grants, one-way credential-and-policy cache partition, and redacted provider bearer token | same values; token is allowed only on the trusted peer wire and is never cache identity, gossip, outcome, or telemetry |
 | style | `StyleRevision` | `StyleRevision` |
 | request | `RenderRequest` | `RenderRequest` |
 | scale | `PixelRatio` | `Scale` |
@@ -183,6 +187,16 @@ peer transaction — address resolution plus HTTP connect/response/body — agai
 its original deadline; reusing the smaller remote budget here
 would make the origin abandon a response before the remote deadline. These are
 estimates, not synchronized cross-process timestamps.
+
+For an authenticated static render, the normalized namespace grants are also a
+conservative output-cache requirement. Cache identity remains representation-
+only; the current caller is checked against the resident requirement before
+bytes are returned. Until the trusted Ishikari dependency descriptor is wired
+through profile preparation, Biei records the producer's complete grant set and
+refuses to weaken a resident requirement after another render. Separately, the
+one-way credential-and-policy partition isolates credential-bearing profile
+state and changes on registry revision; it is not an output-cache key, gossip
+field, principal, or metric label.
 
 ### 4.2 Style identity and worker profiles
 
@@ -275,6 +289,18 @@ must not be parsed on the tile route.
 
 `StyleId` is the stable path-derived identity, including namespace when the
 configured catalog uses one.
+
+When `BIEI_AUTH_REGISTRIES` is non-empty, Biei requires either a Bearer
+credential or one `access_token` query parameter for static-image routes. Mixed
+or repeated transports are rejected. Authentication runs after the canonical
+route and style ID have been parsed but before concurrency/drain admission,
+provider access, or native work. Tile and preview routes remain unchanged in
+this first slice.
+Unknown registry IDs fail from the trusted local catalog without object-store
+I/O. Registry snapshots use bounded single-flight loading, conditional refresh,
+O(1) digest lookup, and last-known-good retention. The complete experimental
+contract and its remaining deployment gates are in
+[`auth-sketch.md`](auth-sketch.md).
 
 ### 7.2 Static positioning
 
@@ -561,6 +587,13 @@ Preparation provides:
 - Short bounded negative cache for deterministic failures.
 - Single-flight fetch coalescing.
 - Sanitized diagnostics.
+- Credential-partitioned positive, negative, and in-flight entries for
+  protected tasks. Worker-local native style state uses the same partition, so
+  identical style revisions prepared for different credentials cannot remain
+  warm across one another. Cluster warmth remains semantic and does not expose
+  the partition through gossip; protected credential churn can therefore make
+  the dispatcher's warm estimate optimistic until a stable capability model is
+  implemented.
 
 A successful JSON syntax check does not guarantee native semantic acceptance.
 Native style-load failures are briefly remembered and invalidate the rejected
@@ -885,6 +918,14 @@ NetworkPolicy, VPC/firewall rules, or a service mesh. If authenticated peer
 identity is required, use mTLS/SPIFFE or a mesh rather than adding a partial
 application token scheme.
 
+Protected delivery makes the choice explicit because `WireTask` carries the
+caller's reusable provider bearer token. A deployment that accepts its
+cluster-internal network as the trust boundary may keep the simple HTTP
+application protocol. If confidentiality or authenticated workload identity
+is required, provide it at the deployment layer—normally mesh mTLS—for both
+Biei peer forwarding and Biei-to-Ishikari traffic. Do not add a second partial
+application protocol for the same purpose.
+
 This boundary is a hard prerequisite, not an assumption: the internal listener
 is safe only where a NetworkPolicy (enforced by a NetworkPolicy-capable CNI),
 VPC/firewall rule, or mesh actually restricts the internal port to peers. Note
@@ -964,6 +1005,7 @@ optional future export path.
 - internal advertised address and gossip bind address;
 - explicit `--cluster` intent and gossip seeds;
 - style and tileset URL templates/catalog entries;
+- optional static-render auth registry roots (disabled by default);
 - end-to-end SLA budget (five seconds by default);
 - bounded hard queue multiplier over the fixed one-task-per-slot soft limit;
 - core count, which conservatively derives one execution and one native-render

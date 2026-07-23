@@ -18,6 +18,10 @@ use crate::options::{
 /// CLI flags and environment variables for configuring the server.
 #[derive(Parser, Debug)]
 struct Cli {
+    /// Optional delivery-auth registries as `registry_id=auth-root;...`.
+    /// Each root contains a `current.json` registry snapshot.
+    #[arg(long, env = "ISKR_AUTH_REGISTRIES", default_value = "")]
+    auth_registries: String,
     #[arg(
         long = "gossip-seeds",
         env = "ISKR_GOSSIP_SEEDS",
@@ -206,6 +210,7 @@ fn resolve(cli: Cli) -> Result<Options, String> {
         .max(1);
 
     Options::resolve(OptionsInput {
+        auth_registries: cli.auth_registries,
         node_id,
         gossip_seeds: cli.gossip_seeds.unwrap_or_default(),
         gossip_advertise_addr: cli.gossip_advertise_addr,
@@ -262,6 +267,7 @@ mod tests {
 
     fn cli() -> Cli {
         Cli {
+            auth_registries: String::new(),
             gossip_seeds: None,
             node_id: Some("node-a".to_string()),
             gossip_advertise_addr: None,

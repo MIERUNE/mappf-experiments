@@ -9,6 +9,7 @@ on:
       - "Cargo.lock"
       - ".github/codecov.yml"
       - "crates/ishikari-core/**"
+      - "crates/mmpf-auth/**"
       - "crates/mmpf-cluster/**"
       - "crates/mmpf-common/**"
       - "crates/mmpf-http/**"
@@ -24,6 +25,7 @@ on:
       - "Cargo.lock"
       - ".github/codecov.yml"
       - "crates/ishikari-core/**"
+      - "crates/mmpf-auth/**"
       - "crates/mmpf-cluster/**"
       - "crates/mmpf-common/**"
       - "crates/mmpf-http/**"
@@ -74,7 +76,7 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: >-
-          cargo clippy -p mmpf-cluster -p mmpf-common -p mmpf-http -p mmpf-pmtiles -p ishikari-core -p ishikari -p ishikari-sim
+          cargo clippy -p mmpf-auth -p mmpf-cluster -p mmpf-common -p mmpf-http -p mmpf-pmtiles -p ishikari-core -p ishikari -p ishikari-sim
           -p mmpf-terrain --all-targets --locked --
           -D warnings
           -D clippy::unchecked_time_subtraction
@@ -87,7 +89,7 @@ jobs:
         run: |
           cargo llvm-cov clean --workspace
           cargo llvm-cov --no-report \
-            -p mmpf-cluster -p mmpf-common -p mmpf-http -p mmpf-pmtiles \
+            -p mmpf-auth -p mmpf-cluster -p mmpf-common -p mmpf-http -p mmpf-pmtiles \
             -p ishikari-core -p ishikari -p ishikari-sim -p mmpf-terrain \
             --all-targets --locked
           cargo llvm-cov --no-report \

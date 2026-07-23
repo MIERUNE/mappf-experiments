@@ -26,7 +26,11 @@ const MEMBERSHIP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const STATS_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Run a configured Ishikari node until the supplied shutdown future resolves.
-pub(crate) async fn run<F>(options: Options, shutdown_requested: F) -> Result<()>
+pub(crate) async fn run<F>(
+    options: Options,
+    auth: Option<mmpf_auth::DeliveryAuth>,
+    shutdown_requested: F,
+) -> Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
@@ -57,6 +61,7 @@ where
         cache_weight_budget_bytes = cache_capacities.budget_bytes(),
         cache_configured_weight_bytes = cache_capacities.configured_weight_bytes(),
         cpu_work_concurrency = options.cpu_work_concurrency,
+        delivery_auth_enabled = auth.is_some(),
         "starting ishikari"
     );
 
@@ -124,6 +129,7 @@ where
             object_store_registry,
             ServerRuntimeConfig {
                 gossip_bootstrap_readiness,
+                delivery_auth: auth,
                 mapterhorn,
                 cpu_work_concurrency: options.cpu_work_concurrency,
                 cpu_work_max_inflight: options.cpu_work_max_inflight,

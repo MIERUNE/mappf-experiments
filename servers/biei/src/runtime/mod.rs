@@ -15,6 +15,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::time::Instant;
 
+use crate::auth::DeliveryAuth;
 use crate::drain::DrainController;
 use crate::http::ingress::HttpIngress;
 use crate::membership::{Membership, MembershipConfig};
@@ -73,7 +74,16 @@ impl Runtime {
         self.tileset_url_template.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn http_ingress(&self, sla_budget: Duration) -> HttpIngress {
+        self.http_ingress_with_auth(sla_budget, None)
+    }
+
+    pub(crate) fn http_ingress_with_auth(
+        &self,
+        sla_budget: Duration,
+        auth: Option<DeliveryAuth>,
+    ) -> HttpIngress {
         HttpIngress::with_drain_and_limit(
             self.node(),
             self.style_catalog(),
@@ -83,6 +93,7 @@ impl Runtime {
             self.ingress_concurrency_limit,
             self.renderer_supervisor.clone(),
         )
+        .with_auth(auth)
     }
 
     pub(crate) fn drain_controller(&self) -> DrainController {
@@ -229,10 +240,11 @@ fn spawn_node_with_backends(
             Ok(Box::new(renderer) as BoxRenderer)
         })
         .collect::<Result<_, biei_core::types::RendererError>>()?;
-    let profile_preparer = Arc::new(MapLibreProfilePreparer::new(
+    let profile_preparer = Arc::new(MapLibreProfilePreparer::new_with_auth_provider_origin(
         style_catalog.clone(),
         render_permits,
         options.mln_resource_private_hosts.clone(),
+        options.auth_provider_origin.clone(),
     )?);
 
     let node = Node::spawn(NodeSpawn {

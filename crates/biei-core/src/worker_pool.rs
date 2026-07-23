@@ -620,9 +620,10 @@ mod tests {
 
     use crate::renderer::{PreparedProfile, Renderer, RendererOutput};
     use crate::types::{
-        AddLayer, AddLayerSource, ImageFormat, InternalTask, Padding, PixelRatio, Positioning,
-        RenderMode, RenderOutput, RenderRequest, RendererError, Scale, SourceHash, StyleId,
-        StyleRevision, TaskId, TaskResult,
+        AddLayer, AddLayerSource, CredentialCachePartition, ImageFormat, InternalTask,
+        NamespaceSet, Padding, PixelRatio, Positioning, RenderAuthorization, RenderMode,
+        RenderOutput, RenderRequest, RendererError, Scale, SourceHash, StyleId, StyleRevision,
+        TaskId, TaskResult,
     };
 
     use super::*;
@@ -1062,6 +1063,7 @@ mod tests {
         };
         let prepared = PreparedProfile {
             revision: task.style.clone(),
+            authorization_partition: None,
             style_json: Arc::from("{}"),
             addlayer_source: Some(AddLayerSource {
                 tileset_id: "tiles".to_string(),
@@ -1113,6 +1115,7 @@ mod tests {
         InternalTask {
             id,
             request_id: crate::types::RequestId::from_string("worker-pool-test"),
+            authorization: None,
             style: rev(style_index),
             source: None,
             request: RenderRequest::Tile {
@@ -1399,6 +1402,46 @@ mod tests {
         }
 
         assert_eq!(setup_count.load(Ordering::Acquire), 1);
+        pool.shutdown(Instant::now() + Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn credential_change_forces_worker_local_style_setup() {
+        let setup_count = Arc::new(AtomicUsize::new(0));
+        let pool = WorkerPool::spawn(WorkerPoolSpawn {
+            node_id: NodeId::from_index(0),
+            renderers: vec![Box::new(RenderFailingRenderer {
+                setup_count: setup_count.clone(),
+            })],
+            bl_capacity: 1,
+            queue_capacity: 1,
+            render_permits: 1,
+            native_render_permits: 1,
+            source_cache_capacity: 1,
+        });
+
+        for partition in [[1; 32], [1; 32], [2; 32]] {
+            let mut task = make_task(1, 1);
+            task.authorization = Some(RenderAuthorization {
+                readable_namespaces: NamespaceSet::try_new(vec!["carto".to_string()]).unwrap(),
+                cache_partition: CredentialCachePartition::from_digest(partition),
+                provider_bearer_token: crate::types::ProviderBearerToken::try_new(
+                    "public.worker-test".to_string(),
+                )
+                .unwrap(),
+            });
+            let outcome = pool
+                .process(task, None, RouteTier::Tier2HrwBl, Some(0))
+                .await
+                .expect("render failure is reported as TaskOutcome::Failed");
+            assert!(matches!(outcome.result, TaskResult::Failed { .. }));
+        }
+
+        assert_eq!(
+            setup_count.load(Ordering::Acquire),
+            2,
+            "the same credential stays warm; a different credential reloads the style"
+        );
         pool.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 

@@ -10,7 +10,7 @@
 # the target cluster supports Arm nodes. The checked-in GKE demo currently uses
 # linux/amd64 because its asia-northeast1 Autopilot cluster cannot provision Arm
 # workloads.
-FROM rust:1.96-slim-trixie@sha256:31ee7fc65186be7e0e0ccb3f2ca305f14e4739e7642a1ae65753aa5d7b874523 AS chef
+FROM rust:1.97-slim-trixie@sha256:5c6f46a6e4472ab1ca7ba7d494e6677f2f219ebc02f32025d3986f057635ec9c AS chef
 WORKDIR /app
 
 RUN apt-get update \

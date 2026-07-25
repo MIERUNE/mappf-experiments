@@ -60,6 +60,24 @@ pub(crate) struct TileJson {
 }
 
 /// Serves TileJSON for a flat tileset key.
+#[cfg_attr(
+    feature = "unstable-schemas",
+    utoipa::path(
+        get,
+        path = "/tilesets/{tileset_id}",
+        tag = "delivery",
+        params(("tileset_id" = String, Path, description = "Flat tileset key")),
+        responses(
+            (
+                status = 200,
+                description = "TileJSON for the tileset",
+                body = crate::schemas::TileJsonDocument,
+                content_type = "application/json"
+            ),
+            (status = 404, description = "Unknown tileset")
+        )
+    )
+)]
 pub(crate) async fn tilejson_handler(
     State(state): State<AppState>,
     Path(tileset_id): Path<String>,
@@ -78,6 +96,27 @@ pub(crate) async fn tilejson_handler(
 }
 
 /// Serves TileJSON for a `{namespace}/{tileset_id}` key.
+#[cfg_attr(
+    feature = "unstable-schemas",
+    utoipa::path(
+        get,
+        path = "/tilesets/{namespace}/{tileset_id}",
+        tag = "delivery",
+        params(
+            ("namespace" = String, Path, description = "Tileset namespace"),
+            ("tileset_id" = String, Path, description = "Namespace-local tileset id")
+        ),
+        responses(
+            (
+                status = 200,
+                description = "TileJSON for the tileset",
+                body = crate::schemas::TileJsonDocument,
+                content_type = "application/json"
+            ),
+            (status = 404, description = "Unknown tileset")
+        )
+    )
+)]
 pub(crate) async fn namespaced_tilejson_handler(
     State(state): State<AppState>,
     Path((namespace, tileset_id)): Path<(String, String)>,

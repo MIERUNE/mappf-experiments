@@ -23,6 +23,9 @@ use crate::server::{AppState, HttpError, upstream::ProviderResource};
 const MAX_FONTSTACK_LEN: usize = 256;
 const MAX_FONTS_PER_STACK: usize = 8;
 const MAX_GLYPH_BYTES: usize = 1024 * 1024;
+// Glyph ids are Unicode code points stored as uint32 in the glyph PBF. Keep
+// the same full-Unicode ceiling as Martin; supplementary-plane fonts and
+// upstream composers can legitimately serve ranges above the BMP.
 const MAX_UNICODE_CODEPOINT: u32 = 0x10_FFFF;
 const GLYPH_CONTENT_TYPES: &[&str] = &[
     "application/x-protobuf",
@@ -97,6 +100,36 @@ pub(super) fn glyph_composite_cache(max_bytes: u64) -> GlyphCompositeCache {
         .build()
 }
 
+#[cfg_attr(
+    feature = "unstable-schemas",
+    utoipa::path(
+        get,
+        path = "/fonts/{fontstack}/{range}",
+        tag = "delivery",
+        params(
+            (
+                "fontstack" = String,
+                Path,
+                description = "One font name, or a comma-separated stack merged first-font-wins"
+            ),
+            (
+                "range" = String,
+                Path,
+                description = "256-codepoint range as `{start}-{end}`, optionally suffixed `.pbf`"
+            )
+        ),
+        responses(
+            (
+                status = 200,
+                description = "Glyph protobuf for the range",
+                body = crate::schemas::BinaryPayload,
+                content_type = "application/x-protobuf"
+            ),
+            (status = 400, description = "Malformed fontstack or range"),
+            (status = 404, description = "No glyph provider configured")
+        )
+    )
+)]
 pub(crate) async fn glyph_handler(
     State(state): State<AppState>,
     Path((fontstack, range)): Path<(String, String)>,
@@ -432,6 +465,14 @@ mod tests {
         assert_eq!(
             validate_range("65280-65535.pbf").unwrap().as_str(),
             "65280-65535"
+        );
+        assert_eq!(
+            validate_range("65536-65791.pbf").unwrap().as_str(),
+            "65536-65791"
+        );
+        assert_eq!(
+            validate_range("1113856-1114111.pbf").unwrap().as_str(),
+            "1113856-1114111"
         );
         assert!(validate_range("1-256").is_err());
         assert!(validate_range("0-254").is_err());

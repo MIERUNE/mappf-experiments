@@ -22,6 +22,10 @@ const DEFAULT_TILESET_URL_TEMPLATE: &str =
 #[derive(Parser, Debug)]
 #[command(name = "biei", version, about = "Distributed MapLibre renderer")]
 struct Cli {
+    /// Optional TOML configuration document. It supplies only settings that
+    /// have no built-in default, and an explicit flag always takes precedence.
+    #[arg(long, env = "BIEI_CONFIG")]
+    config: Option<std::path::PathBuf>,
     /// Optional delivery-auth registries as `registry_id=auth-root;...`.
     /// Each root contains a `current.json` registry snapshot.
     #[arg(long, env = "BIEI_AUTH_REGISTRIES", default_value = "")]
@@ -129,7 +133,33 @@ struct Cli {
 }
 
 pub(crate) fn load() -> anyhow::Result<Options> {
-    resolve(Cli::parse())
+    let mut cli = Cli::parse();
+    if let Some(path) = cli.config.clone() {
+        let file = crate::config_file::ConfigFile::load(&path)?;
+        apply_config_file(&mut cli, file);
+    }
+    resolve(cli)
+}
+
+/// Fills settings the operator did not pass. Every field corresponds to a flag
+/// with no built-in default, so `None` proves the flag was absent and the
+/// document can never override an explicit choice.
+fn apply_config_file(cli: &mut Cli, file: crate::config_file::ConfigFile) {
+    use crate::config_file::ConfigFile;
+    cli.anonymous_registry =
+        ConfigFile::fill(cli.anonymous_registry.take(), file.anonymous_registry);
+    cli.auth_provider_origin =
+        ConfigFile::fill(cli.auth_provider_origin.take(), file.auth_provider_origin);
+    cli.maplibre_cache_path =
+        ConfigFile::fill(cli.maplibre_cache_path.take(), file.maplibre_cache_path);
+    cli.pin_label_font = ConfigFile::fill(cli.pin_label_font.take(), file.pin_label_font);
+}
+
+/// The clap command, exposed so the configuration-document contract can be
+/// checked against the real flag definitions rather than a transcription.
+#[cfg(all(test, feature = "unstable-schemas"))]
+pub(crate) fn command() -> clap::Command {
+    <Cli as clap::CommandFactory>::command()
 }
 
 fn resolve(cli: Cli) -> anyhow::Result<Options> {

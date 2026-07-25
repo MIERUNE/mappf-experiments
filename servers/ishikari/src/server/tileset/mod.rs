@@ -3,10 +3,12 @@
 mod error;
 pub(crate) mod mapterhorn;
 mod mlt;
-mod preview;
+// Crate-visible so `schemas` can name the OpenAPI companion types utoipa
+// generates beside each handler; those are not covered by the re-exports below.
+pub(crate) mod preview;
 pub(crate) mod terrain;
-mod tile;
-mod tilejson;
+pub(crate) mod tile;
+pub(crate) mod tilejson;
 
 pub(crate) use error::tileset_error_response;
 pub(crate) use preview::{

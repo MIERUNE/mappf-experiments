@@ -42,6 +42,10 @@ use crate::server::{AppState, HttpError};
 use ishikari_core::interned::ResourceRoutingKey;
 use ishikari_core::pmtiles::{MLT_CONTENT_TYPE, TileData, TileType};
 
+/// Earlier MLT clients used the longer subtype; Martin accepts it as an alias
+/// while emitting the current canonical media type.
+const MLT_CONTENT_TYPE_ALIAS: &str = "application/vnd.maplibre-vector-tile";
+
 /// Transcodes one decompressed MVT tile into raw MLT bytes. Concatenates the
 /// per-layer MLT encodings the same way the reference `mlt` CLI does.
 pub(crate) fn mvt_to_mlt(mvt: &[u8]) -> Result<Vec<u8>> {
@@ -174,33 +178,77 @@ pub(crate) enum RequestedTileFormat {
     Mlt,
 }
 
+/// The chosen representation and how it was chosen. Travels as one value so the
+/// response layer cannot emit a `Vary` that disagrees with the selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Representation {
+    pub(crate) format: RequestedTileFormat,
+    /// Whether `Accept` selected the representation. Only then must the response
+    /// `Vary` on it; a suffixed URL is a distinct cache entry that no request
+    /// header can redirect.
+    pub(crate) negotiated_on_accept: bool,
+}
+
+/// A parsed `y` segment plus the representation it selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NegotiatedFormat<'a> {
+    /// The `y` segment with any representation suffix removed.
+    pub(crate) y: &'a str,
+    pub(crate) representation: Representation,
+}
+
 /// Picks the response format and strips any extension off the `y` segment.
-/// Priority: path extension (`.mlt` — the canonical, CDN-safe form) > `Accept:
-/// application/vnd.maplibre-tile` (Martin-compatible). Defaults to the native
-/// tile representation stored in PMTiles.
-pub(crate) fn negotiate_format<'a>(
-    y_raw: &'a str,
-    headers: &HeaderMap,
-) -> (&'a str, RequestedTileFormat) {
-    let y = match y_raw.rsplit_once('.') {
-        Some((y, "mlt")) => return (y, RequestedTileFormat::Mlt),
-        // Raster terrain URLs are served as-stored.
-        Some((y, "mvt" | "pbf" | "webp" | "jpg" | "jpeg")) => y,
-        _ => y_raw,
-    };
+///
+/// **A path suffix is authoritative.** `.mlt` serves MLT and `.mvt`/`.pbf` (and
+/// the raster suffixes) serve the stored representation, in both cases ignoring
+/// `Accept`. This is the canonical, CDN-safe form: the representation is part of
+/// the URL, which is the only cache key a dumb CDN can be relied on to honour
+/// (`specs/auth-sketch.md` §4 warns that many CDNs ignore arbitrary `Vary`).
+/// Making `.mvt` merely strip the suffix while `Accept` could still return MLT
+/// gave the suffix the appearance of authority without the substance.
+///
+/// `Accept: application/vnd.maplibre-tile` (or Martin's accepted
+/// `application/vnd.maplibre-vector-tile` alias) therefore selects only on the
+/// suffix-less URL, which is the one entry where a variant is a real variant.
+pub(crate) fn negotiate_format<'a>(y_raw: &'a str, headers: &HeaderMap) -> NegotiatedFormat<'a> {
+    match y_raw.rsplit_once('.') {
+        Some((y, "mlt")) => {
+            return NegotiatedFormat {
+                y,
+                representation: Representation {
+                    format: RequestedTileFormat::Mlt,
+                    negotiated_on_accept: false,
+                },
+            };
+        }
+        // Vector and raster suffixes both pin the stored representation.
+        Some((y, "mvt" | "pbf" | "webp" | "jpg" | "jpeg")) => {
+            return NegotiatedFormat {
+                y,
+                representation: Representation {
+                    format: RequestedTileFormat::AsStored,
+                    negotiated_on_accept: false,
+                },
+            };
+        }
+        _ => {}
+    }
     let wants_mlt = headers
         .get_all(header::ACCEPT)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .any(accept_value_allows_mlt);
-    (
-        y,
-        if wants_mlt {
-            RequestedTileFormat::Mlt
-        } else {
-            RequestedTileFormat::AsStored
+    NegotiatedFormat {
+        y: y_raw,
+        representation: Representation {
+            format: if wants_mlt {
+                RequestedTileFormat::Mlt
+            } else {
+                RequestedTileFormat::AsStored
+            },
+            negotiated_on_accept: true,
         },
-    )
+    }
 }
 
 fn accept_value_allows_mlt(value: &str) -> bool {
@@ -229,10 +277,11 @@ fn accept_value_allows_mlt(value: &str) -> bool {
 
 fn media_range_allows_mlt(range: &str) -> bool {
     let mut parts = range.split(';');
-    if !parts
-        .next()
-        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case(MLT_CONTENT_TYPE))
-    {
+    if !parts.next().is_some_and(|media_type| {
+        let media_type = media_type.trim();
+        media_type.eq_ignore_ascii_case(MLT_CONTENT_TYPE)
+            || media_type.eq_ignore_ascii_case(MLT_CONTENT_TYPE_ALIAS)
+    }) {
         return false;
     }
 
@@ -600,57 +649,73 @@ mod tests {
     }
 
     #[test]
-    fn extension_selects_format_and_strips_y() {
-        let h = HeaderMap::new();
-        assert_eq!(
-            negotiate_format("6451", &h),
-            ("6451", RequestedTileFormat::AsStored)
-        );
-        assert_eq!(
-            negotiate_format("6451.mvt", &h),
-            ("6451", RequestedTileFormat::AsStored)
-        );
-        assert_eq!(
-            negotiate_format("6451.pbf", &h),
-            ("6451", RequestedTileFormat::AsStored)
-        );
-        // Raster terrain extensions are served as-stored.
-        for suffix in ["webp", "jpg", "jpeg"] {
-            assert_eq!(
-                negotiate_format(&format!("6451.{suffix}"), &h),
-                ("6451", RequestedTileFormat::AsStored)
-            );
+    fn a_suffix_is_authoritative_and_strips_y() {
+        // Every suffix pins its representation, and none of them consults
+        // `Accept`, so a suffixed URL is one immutable cache entry.
+        let empty = HeaderMap::new();
+        let mut mlt_accept = HeaderMap::new();
+        mlt_accept.insert(header::ACCEPT, HeaderValue::from_static(MLT_CONTENT_TYPE));
+        for headers in [&empty, &mlt_accept] {
+            for suffix in ["mvt", "pbf", "webp", "jpg", "jpeg"] {
+                let y_raw = format!("6451.{suffix}");
+                let chosen = negotiate_format(&y_raw, headers);
+                assert_eq!(chosen.y, "6451");
+                assert_eq!(
+                    chosen.representation.format,
+                    RequestedTileFormat::AsStored,
+                    ".{suffix} must pin the stored representation regardless of Accept"
+                );
+                assert!(!chosen.representation.negotiated_on_accept);
+            }
+            let chosen = negotiate_format("6451.mlt", headers);
+            assert_eq!(chosen.y, "6451");
+            assert_eq!(chosen.representation.format, RequestedTileFormat::Mlt);
+            assert!(!chosen.representation.negotiated_on_accept);
         }
-        assert_eq!(
-            negotiate_format("6451.mlt", &h),
-            ("6451", RequestedTileFormat::Mlt)
-        );
 
         let y_raw = String::from("6451.jpeg");
-        let (y, _) = negotiate_format(&y_raw, &h);
-        assert_eq!(y.as_ptr(), y_raw.as_ptr());
+        assert_eq!(
+            negotiate_format(&y_raw, &HeaderMap::new()).y.as_ptr(),
+            y_raw.as_ptr()
+        );
     }
 
     #[test]
-    fn accept_header_selects_mlt_without_extension() {
+    fn accept_selects_only_on_the_suffixless_url() {
         let plain = HeaderMap::new();
-        assert_eq!(
-            negotiate_format("6451", &plain).1,
-            RequestedTileFormat::AsStored
+        let chosen = negotiate_format("6451", &plain);
+        assert_eq!(chosen.y, "6451");
+        assert_eq!(chosen.representation.format, RequestedTileFormat::AsStored);
+        assert!(
+            chosen.representation.negotiated_on_accept,
+            "the suffixless URL is the one entry a request header can redirect"
         );
 
         let mut accept = HeaderMap::new();
         accept.insert(header::ACCEPT, HeaderValue::from_static(MLT_CONTENT_TYPE));
-        assert_eq!(
-            negotiate_format("6451", &accept).1,
-            RequestedTileFormat::Mlt
+        let chosen = negotiate_format("6451", &accept);
+        assert_eq!(chosen.representation.format, RequestedTileFormat::Mlt);
+        assert!(chosen.representation.negotiated_on_accept);
+
+        let mut long_alias = HeaderMap::new();
+        long_alias.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/vnd.maplibre-vector-tile"),
         );
+        let chosen = negotiate_format("6451", &long_alias);
+        assert_eq!(
+            chosen.representation.format,
+            RequestedTileFormat::Mlt,
+            "Martin-compatible MLT aliases should negotiate the same representation"
+        );
+        assert!(chosen.representation.negotiated_on_accept);
     }
 
     #[test]
     fn accept_negotiation_honors_exact_media_ranges_quality_and_all_fields() {
         for value in [
             "application/vnd.maplibre-tile;q=0",
+            "application/vnd.maplibre-vector-tile;q=0",
             "application/vnd.maplibre-tile-extra",
             "text/plain; note=\"application/vnd.maplibre-tile\"",
             "application/vnd.maplibre-tile;q=invalid",
@@ -658,7 +723,7 @@ mod tests {
             let mut headers = HeaderMap::new();
             headers.insert(header::ACCEPT, HeaderValue::from_str(value).unwrap());
             assert_eq!(
-                negotiate_format("6451", &headers).1,
+                negotiate_format("6451", &headers).representation.format,
                 RequestedTileFormat::AsStored,
                 "{value} must not select MLT"
             );
@@ -670,7 +735,7 @@ mod tests {
             HeaderValue::from_static("APPLICATION/VND.MAPLIBRE-TILE;Q=0.5"),
         );
         assert_eq!(
-            negotiate_format("6451", &uppercase).1,
+            negotiate_format("6451", &uppercase).representation.format,
             RequestedTileFormat::Mlt
         );
 
@@ -684,7 +749,7 @@ mod tests {
             HeaderValue::from_static("application/vnd.maplibre-tile;q=0.25"),
         );
         assert_eq!(
-            negotiate_format("6451", &repeated).1,
+            negotiate_format("6451", &repeated).representation.format,
             RequestedTileFormat::Mlt
         );
     }
@@ -698,7 +763,9 @@ mod tests {
             HeaderValue::from_static("application/x-protobuf"),
         );
         assert_eq!(
-            negotiate_format("6451.mlt", &accept_mvt).1,
+            negotiate_format("6451.mlt", &accept_mvt)
+                .representation
+                .format,
             RequestedTileFormat::Mlt
         );
     }

@@ -42,7 +42,7 @@ use self::{
 use super::{
     error::tileset_error_response,
     mlt::{RequestedTileFormat, TranscodeCachePolicy, mlt_response_bytes},
-    tile::tile_data_response,
+    tile::{ensure_content_encoding_acceptable, tile_data_response},
 };
 
 pub(super) fn hillshade_opacity_stops(shadow: bool) -> Vec<(u8, f64)> {
@@ -55,6 +55,27 @@ pub(super) fn hillshade_shade_code_scale() -> f64 {
     hillshade::SHADE_CODE_SCALE
 }
 
+#[cfg_attr(
+    feature = "unstable-schemas",
+    utoipa::path(
+        get,
+        path = "/tilesets/{tileset_id}/derived/{product}",
+        tag = "delivery",
+        params(
+            ("tileset_id" = String, Path, description = "Flat tileset key of the source archive"),
+            ("product" = String, Path, description = "Derived product name")
+        ),
+        responses(
+            (
+                status = 200,
+                description = "TileJSON for the derived product",
+                body = crate::schemas::TileJsonDocument,
+                content_type = "application/json"
+            ),
+            (status = 404, description = "Unknown tileset or product")
+        )
+    )
+)]
 pub(crate) async fn derived_tilejson_handler(
     State(state): State<AppState>,
     Path((tileset_id, product)): Path<(String, String)>,
@@ -73,6 +94,28 @@ pub(crate) async fn derived_tilejson_handler(
     .await
 }
 
+#[cfg_attr(
+    feature = "unstable-schemas",
+    utoipa::path(
+        get,
+        path = "/tilesets/{namespace}/{tileset_id}/derived/{product}",
+        tag = "delivery",
+        params(
+            ("namespace" = String, Path, description = "Tileset namespace"),
+            ("tileset_id" = String, Path, description = "Namespace-local tileset id"),
+            ("product" = String, Path, description = "Derived product name")
+        ),
+        responses(
+            (
+                status = 200,
+                description = "TileJSON for the derived product",
+                body = crate::schemas::TileJsonDocument,
+                content_type = "application/json"
+            ),
+            (status = 404, description = "Unknown tileset or product")
+        )
+    )
+)]
 pub(crate) async fn namespaced_derived_tilejson_handler(
     State(state): State<AppState>,
     Path((namespace, tileset_id, product)): Path<(String, String, String)>,
@@ -131,6 +174,34 @@ async fn serve_tilejson(
     Ok(derived_json_response(body, &headers, cache::TILEJSON))
 }
 
+#[cfg_attr(
+    feature = "unstable-schemas",
+    utoipa::path(
+        get,
+        path = "/tilesets/{tileset_id}/derived/{product}/{z}/{x}/{y}",
+        tag = "delivery",
+        params(
+            ("tileset_id" = String, Path, description = "Flat tileset key of the source archive"),
+            ("product" = String, Path, description = "Derived product name"),
+            ("z" = u8, Path, description = "Zoom level"),
+            ("x" = u32, Path, description = "Tile column"),
+            ("y" = String, Path, description = "Tile row, optionally suffixed with the product's format")
+        ),
+        responses(
+            (
+                status = 200,
+                description = "Derived vector or raster tile payload",
+                content(
+                    (crate::schemas::BinaryPayload = "application/vnd.mapbox-vector-tile"),
+                    (crate::schemas::BinaryPayload = "application/vnd.maplibre-tile"),
+                    (crate::schemas::BinaryPayload = "image/webp"),
+                    (crate::schemas::BinaryPayload = "image/jpeg")
+                )
+            ),
+            (status = 404, description = "Unknown tileset, product, or absent source tile")
+        )
+    )
+)]
 pub(crate) async fn derived_tile_handler(
     State(state): State<AppState>,
     Path((tileset_id, product, z, x, y_raw)): Path<(String, String, u8, u32, String)>,
@@ -139,6 +210,35 @@ pub(crate) async fn derived_tile_handler(
     serve_derived_tile(state, tileset_id, product, z, x, y_raw, headers).await
 }
 
+#[cfg_attr(
+    feature = "unstable-schemas",
+    utoipa::path(
+        get,
+        path = "/tilesets/{namespace}/{tileset_id}/derived/{product}/{z}/{x}/{y}",
+        tag = "delivery",
+        params(
+            ("namespace" = String, Path, description = "Tileset namespace"),
+            ("tileset_id" = String, Path, description = "Namespace-local tileset id"),
+            ("product" = String, Path, description = "Derived product name"),
+            ("z" = u8, Path, description = "Zoom level"),
+            ("x" = u32, Path, description = "Tile column"),
+            ("y" = String, Path, description = "Tile row, optionally suffixed with the product's format")
+        ),
+        responses(
+            (
+                status = 200,
+                description = "Derived vector or raster tile payload",
+                content(
+                    (crate::schemas::BinaryPayload = "application/vnd.mapbox-vector-tile"),
+                    (crate::schemas::BinaryPayload = "application/vnd.maplibre-tile"),
+                    (crate::schemas::BinaryPayload = "image/webp"),
+                    (crate::schemas::BinaryPayload = "image/jpeg")
+                )
+            ),
+            (status = 404, description = "Unknown tileset, product, or absent source tile")
+        )
+    )
+)]
 pub(crate) async fn namespaced_derived_tile_handler(
     State(state): State<AppState>,
     Path((namespace, tileset_id, product, z, x, y_raw)): Path<(
@@ -173,6 +273,17 @@ async fn serve_derived_tile(
     headers: HeaderMap,
 ) -> Result<Response<Body>, HttpError> {
     let request = parse_derived_tile_request(&state, tileset_id, product, z, x, &y_raw, &headers)?;
+    // Every generated vector representation is gzip while raster products are
+    // identity. Reject incompatible clients before peer routing, DEM decode,
+    // generation, or MLT transcoding.
+    ensure_content_encoding_acceptable(
+        &headers,
+        if request.product.is_raster() {
+            None
+        } else {
+            Some("gzip")
+        },
+    )?;
     let routing_key = derived_resource_key(&request.tileset_id, request.product);
     let y_path = match request.format {
         RequestedTileFormat::AsStored => request.y.to_string(),
@@ -226,14 +337,19 @@ async fn serve_derived_tile(
         None => local_derived_output(&state, &request).await?,
     };
 
-    let generated = match outcome {
-        DerivedOutcome::Tile(tile) | DerivedOutcome::Degraded(tile) => tile,
+    let (generated, degraded) = match outcome {
+        DerivedOutcome::Tile(tile) => (tile, false),
+        DerivedOutcome::Degraded(tile) => (tile, true),
         DerivedOutcome::Absent => {
             return Ok(absent_derived_response(state.derived_negative_ttl()));
         }
     };
-    state.metrics.add_egress_bytes(generated.bytes.len() as u64);
-    let response = tile_data_response(generated);
+    let served_bytes = generated.bytes.len();
+    let mut response = tile_data_response(generated, &headers)?;
+    if degraded {
+        apply_degraded_cache_policy(&mut response, state.derived_negative_ttl());
+    }
+    state.metrics.add_egress_bytes(served_bytes as u64);
     debug!(
         endpoint = "derived_tile",
         tileset_id = %request.tileset_id,
@@ -241,6 +357,7 @@ async fn serve_derived_tile(
         z = request.z,
         x = request.x,
         y = request.y,
+        degraded,
         "served generated terrain tile"
     );
     Ok(response)
@@ -321,9 +438,13 @@ async fn local_derived_output(
     }
 }
 
-const DERIVED_WIRE_MAGIC: &[u8; 8] = b"ISKRDRV2";
+// V3 adds a distinct degraded-tile status. The matching gossip cluster epoch
+// prevents a rolling cluster from treating an old peer's degraded V2 tile as a
+// complete tile and publishing it with the long-lived public cache policy.
+const DERIVED_WIRE_MAGIC: &[u8; 8] = b"ISKRDRV3";
 const DERIVED_WIRE_ABSENT: u8 = 0;
 const DERIVED_WIRE_TILE: u8 = 1;
+const DERIVED_WIRE_DEGRADED: u8 = 2;
 const DERIVED_WIRE_CONTENT_MVT: u8 = 1;
 const DERIVED_WIRE_CONTENT_MLT: u8 = 2;
 const DERIVED_WIRE_CONTENT_PNG: u8 = 3;
@@ -341,7 +462,11 @@ fn encode_derived_wire(outcome: &DerivedOutcome) -> Result<Bytes, &'static str> 
         DerivedOutcome::Tile(tile) | DerivedOutcome::Degraded(tile) => {
             let mut wire = Vec::with_capacity(DERIVED_WIRE_MAGIC.len() + 3 + tile.bytes.len());
             wire.extend_from_slice(DERIVED_WIRE_MAGIC);
-            wire.push(DERIVED_WIRE_TILE);
+            wire.push(if matches!(outcome, DerivedOutcome::Degraded(_)) {
+                DERIVED_WIRE_DEGRADED
+            } else {
+                DERIVED_WIRE_TILE
+            });
             wire.push(derived_content_type_code(tile.content_type)?);
             wire.push(derived_content_encoding_code(tile.content_encoding)?);
             wire.extend_from_slice(&tile.bytes);
@@ -369,10 +494,10 @@ fn decode_derived_wire(
     if magic != DERIVED_WIRE_MAGIC {
         return Err("invalid derived wire magic");
     }
-    decode_derived_wire_v2(wire, product, format)
+    decode_derived_wire_v3(wire, product, format)
 }
 
-fn decode_derived_wire_v2(
+fn decode_derived_wire_v3(
     wire: Bytes,
     product: DerivedProduct,
     format: RequestedTileFormat,
@@ -381,15 +506,21 @@ fn decode_derived_wire_v2(
     match wire[status_offset] {
         DERIVED_WIRE_ABSENT if wire.len() == status_offset + 1 => Ok(DerivedOutcome::Absent),
         DERIVED_WIRE_ABSENT => Err("absent derived wire response has a payload"),
-        DERIVED_WIRE_TILE if wire.len() >= status_offset + 3 => {
+        status @ (DERIVED_WIRE_TILE | DERIVED_WIRE_DEGRADED) if wire.len() >= status_offset + 3 => {
             let tile = TileData {
                 bytes: wire.slice(status_offset + 3..),
                 content_type: derived_content_type(wire[status_offset + 1])?,
                 content_encoding: derived_content_encoding(wire[status_offset + 2])?,
             };
-            validate_derived_tile_data(product, format, tile).map(DerivedOutcome::Tile)
+            validate_derived_tile_data(product, format, tile).map(|tile| {
+                if status == DERIVED_WIRE_DEGRADED {
+                    DerivedOutcome::Degraded(tile)
+                } else {
+                    DerivedOutcome::Tile(tile)
+                }
+            })
         }
-        DERIVED_WIRE_TILE => Err("derived tile wire response is truncated"),
+        DERIVED_WIRE_TILE | DERIVED_WIRE_DEGRADED => Err("derived tile wire response is truncated"),
         _ => Err("invalid derived wire status"),
     }
 }
@@ -477,6 +608,18 @@ fn absent_derived_response(negative_ttl: std::time::Duration) -> Response {
     response
 }
 
+/// Keeps a transient edge-fallback tile out of long-lived CDN storage. The
+/// origin's own derived cache expires the same outcome after `negative_ttl`;
+/// public and shared caches must not retain it beyond that recovery attempt.
+fn apply_degraded_cache_policy(response: &mut Response, negative_ttl: std::time::Duration) {
+    if let Ok(value) = header::HeaderValue::from_str(&format!(
+        "public, max-age={0}, s-maxage={0}, must-revalidate",
+        negative_ttl.as_secs()
+    )) {
+        response.headers_mut().insert(header::CACHE_CONTROL, value);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,6 +654,26 @@ mod tests {
             .unwrap(),
             DerivedOutcome::Absent
         ));
+    }
+
+    #[test]
+    fn derived_wire_preserves_transient_degradation() {
+        let source = DerivedOutcome::Degraded(TileData {
+            bytes: Bytes::from_static(b"edge fallback"),
+            content_type: TileType::Mvt.content_type(),
+            content_encoding: Some("gzip"),
+        });
+        let decoded = decode_derived_wire(
+            encode_derived_wire(&source).unwrap(),
+            DerivedProduct::Hillshade,
+            RequestedTileFormat::AsStored,
+        )
+        .unwrap();
+
+        let DerivedOutcome::Degraded(decoded) = decoded else {
+            panic!("expected degraded tile")
+        };
+        assert_eq!(decoded.bytes, Bytes::from_static(b"edge fallback"));
     }
 
     #[test]
@@ -582,6 +745,31 @@ mod tests {
         assert_eq!(
             response.headers().get(header::CACHE_CONTROL).unwrap(),
             "public, max-age=60"
+        );
+    }
+
+    #[test]
+    fn degraded_response_cannot_outlive_origin_recovery() {
+        let mut response = tile_data_response(
+            TileData {
+                bytes: Bytes::from_static(b"edge fallback"),
+                content_type: TileType::Mvt.content_type(),
+                content_encoding: Some("gzip"),
+            },
+            &HeaderMap::new(),
+        )
+        .unwrap();
+        apply_degraded_cache_policy(&mut response, std::time::Duration::from_secs(60));
+
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=60, s-maxage=60, must-revalidate"
+        );
+        assert!(
+            !response.headers()[header::CACHE_CONTROL]
+                .to_str()
+                .unwrap()
+                .contains("stale-while-revalidate")
         );
     }
 }

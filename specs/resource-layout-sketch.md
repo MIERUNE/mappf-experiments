@@ -144,6 +144,21 @@ must use create-only semantics or an equivalent precondition. If a backend
 cannot enforce that safely, the publisher must refuse publication rather than
 fall back to last-write-wins.
 
+The publisher must also set explicit `Cache-Control` object metadata. An
+authenticated object-store transport may synthesize `private, max-age=0` when
+metadata is absent; Ishikari cannot safely distinguish that transport default
+from an intentional private policy and therefore must not override it. The
+current recommended policies are:
+
+```text
+style:        public, max-age=300, s-maxage=3600, stale-while-revalidate=86400
+glyph/sprite: public, max-age=86400, s-maxage=604800, stale-while-revalidate=604800
+```
+
+Once sprite paths are content-addressed as proposed in §5, the publisher may
+use a longer `immutable` policy for the complete bundle. Explicit `no-store`,
+`no-cache`, or `private` metadata remains authoritative.
+
 Multi-object publication order is:
 
 1. Write immutable PMTiles or all immutable sprite members.

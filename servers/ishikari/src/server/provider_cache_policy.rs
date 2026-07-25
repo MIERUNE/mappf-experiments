@@ -7,7 +7,10 @@ use mmpf_http::cache_control::{ParsedCacheControl as CacheControl, parse_values}
 use super::cache;
 
 const STYLE_POSITIVE_TTL: Duration = Duration::from_secs(300);
-const GLYPH_SPRITE_POSITIVE_TTL: Duration = Duration::from_secs(86400);
+const GLYPH_POSITIVE_TTL: Duration = Duration::from_secs(86400);
+/// Shorter than [`GLYPH_POSITIVE_TTL`] for the same reason `cache::SPRITE` is
+/// shorter than `cache::GLYPH`: a sprite path is mutable.
+const SPRITE_POSITIVE_TTL: Duration = Duration::from_secs(3600);
 const PROVIDER_NEGATIVE_TTL: Duration = Duration::from_secs(30);
 /// Upper bound on any upstream-derived freshness or stale window. Ishikari is a
 /// shared cache, so a pathological `max-age` must not pin bytes for months.
@@ -221,14 +224,16 @@ fn normalized_cache_control(resource: &'static str, control: &CacheControl) -> S
 fn default_response_cache_control(resource: &'static str) -> &'static str {
     match resource {
         "style" => cache::STYLE,
-        "glyph" | "sprite" => cache::GLYPH_SPRITE,
+        "glyph" => cache::GLYPH,
+        "sprite" => cache::SPRITE,
         _ => "no-cache",
     }
 }
 
 fn positive_ttl(resource: &'static str) -> Duration {
     match resource {
-        "glyph" | "sprite" => GLYPH_SPRITE_POSITIVE_TTL,
+        "glyph" => GLYPH_POSITIVE_TTL,
+        "sprite" => SPRITE_POSITIVE_TTL,
         _ => STYLE_POSITIVE_TTL,
     }
 }
@@ -245,10 +250,14 @@ mod tests {
     };
 
     #[test]
-    fn provider_cache_uses_longer_ttl_for_heavy_resources() {
+    fn provider_cache_ttl_follows_how_mutable_the_resource_is() {
         assert_eq!(positive_ttl("style"), Duration::from_secs(300));
+        // A glyph range is immutable by construction.
         assert_eq!(positive_ttl("glyph"), Duration::from_secs(86400));
-        assert_eq!(positive_ttl("sprite"), Duration::from_secs(86400));
+        // A sprite path is mutable until sprites are content-addressed, so it
+        // must not inherit the glyph lifetime.
+        assert_eq!(positive_ttl("sprite"), Duration::from_secs(3600));
+        assert!(positive_ttl("sprite") < positive_ttl("glyph"));
     }
 
     #[test]

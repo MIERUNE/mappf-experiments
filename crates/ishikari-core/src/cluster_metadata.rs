@@ -7,7 +7,7 @@ use crate::storage::Peer;
 /// Membership epoch for Ishikari's internal routing contract.
 ///
 /// Different internal-wire epochs intentionally form separate gossip clusters.
-pub const CLUSTER_ID: &str = "ishikari-v2";
+pub const CLUSTER_ID: &str = "ishikari-v3";
 
 /// Membership key containing a node's explicitly advertised internal HTTP address.
 pub const HTTP_ADVERTISE_ADDR_KEY: &str = "http-advertise-addr";

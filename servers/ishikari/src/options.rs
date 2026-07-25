@@ -368,7 +368,14 @@ impl Options {
             non_empty(input.glyph_url_template),
             non_empty(input.sprite_templates),
         )?;
-        let mapterhorn = match non_empty(input.mapterhorn_tileset) {
+        let mapterhorn_tileset = non_empty(input.mapterhorn_tileset);
+        if mapterhorn_tileset.is_none() && input.mapterhorn_maxzoom.is_some() {
+            return Err(
+                "ISKR_MAPTERHORN_TILESET is required when ISKR_MAPTERHORN_MAXZOOM is set"
+                    .to_string(),
+            );
+        }
+        let mapterhorn = match mapterhorn_tileset {
             Some(tileset) => {
                 let maxzoom = input.mapterhorn_maxzoom.ok_or_else(|| {
                     "ISKR_MAPTERHORN_MAXZOOM is required when ISKR_MAPTERHORN_TILESET is set \
@@ -715,6 +722,13 @@ mod tests {
             .err()
             .expect("mapterhorn maxzoom is required");
         assert!(error.contains("ISKR_MAPTERHORN_MAXZOOM is required"));
+
+        let mut orphan_maxzoom = input();
+        orphan_maxzoom.mapterhorn_maxzoom = Some(16);
+        let error = Options::resolve(orphan_maxzoom)
+            .err()
+            .expect("mapterhorn tileset is required");
+        assert!(error.contains("ISKR_MAPTERHORN_TILESET is required"));
 
         let mut invalid_maxzoom = input();
         invalid_maxzoom.mapterhorn_tileset = Some("mapterhorn/planet".to_string());

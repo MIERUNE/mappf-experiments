@@ -2,6 +2,7 @@
 
 use std::{
     net::SocketAddr,
+    path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -10,6 +11,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
+use crate::config_file::ConfigFile;
 use crate::options::{
     DEFAULT_BACKEND_ACTIVE_BODY_BUDGET_BYTES, DEFAULT_CACHE_WEIGHT_BUDGET_BYTES,
     DEFAULT_CHUNK_CACHE_MAX_BYTES, DEFAULT_TILE_CACHE_MAX_BYTES, Options, OptionsInput,
@@ -18,6 +20,10 @@ use crate::options::{
 /// CLI flags and environment variables for configuring the server.
 #[derive(Parser, Debug)]
 struct Cli {
+    /// Optional TOML configuration document. It supplies only settings that
+    /// have no built-in default, and an explicit flag always takes precedence.
+    #[arg(long, env = "ISKR_CONFIG")]
+    config: Option<PathBuf>,
     /// Optional delivery-auth registries as `registry_id=auth-root;...`.
     /// Each root contains a `current.json` registry snapshot.
     #[arg(long, env = "ISKR_AUTH_REGISTRIES", default_value = "")]
@@ -194,9 +200,41 @@ struct Cli {
     cpu_work_max_inflight: Option<usize>,
 }
 
-/// Parse CLI arguments and environment variables into runtime configuration.
+/// Parse CLI arguments and environment variables into runtime configuration,
+/// optionally filling unset settings from a configuration document.
 pub(crate) fn load() -> anyhow::Result<Options> {
-    resolve(Cli::parse()).map_err(anyhow::Error::msg)
+    let mut cli = Cli::parse();
+    if let Some(path) = cli.config.clone() {
+        let file = ConfigFile::load(&path)?;
+        apply_config_file(&mut cli, file);
+    }
+    resolve(cli).map_err(anyhow::Error::msg)
+}
+
+/// The clap command, exposed so the configuration-document contract can be
+/// checked against the real flag definitions rather than a transcription.
+#[cfg(all(test, feature = "unstable-schemas"))]
+pub(crate) fn command() -> clap::Command {
+    <Cli as clap::CommandFactory>::command()
+}
+
+/// Fills settings the operator did not pass. Every field here corresponds to a
+/// flag with no built-in default, so `None` proves the flag was absent and the
+/// document can never override an explicit choice.
+fn apply_config_file(cli: &mut Cli, file: ConfigFile) {
+    cli.anonymous_registry =
+        ConfigFile::fill(cli.anonymous_registry.take(), file.anonymous_registry);
+    cli.backend_fetch_max_inflight = ConfigFile::fill(
+        cli.backend_fetch_max_inflight,
+        file.backend_fetch_max_inflight,
+    );
+    cli.mapterhorn_tileset =
+        ConfigFile::fill(cli.mapterhorn_tileset.take(), file.mapterhorn_tileset);
+    cli.mapterhorn_maxzoom = ConfigFile::fill(cli.mapterhorn_maxzoom, file.mapterhorn_maxzoom);
+    cli.cpu_work_concurrency =
+        ConfigFile::fill(cli.cpu_work_concurrency, file.cpu_work_concurrency);
+    cli.cpu_work_max_inflight =
+        ConfigFile::fill(cli.cpu_work_max_inflight, file.cpu_work_max_inflight);
 }
 
 /// Resolve derived settings and validate parsed CLI input.
@@ -270,8 +308,34 @@ fn default_cpu_work_concurrency() -> usize {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_document_fills_only_settings_the_operator_left_unset() {
+        let mut parsed = cli();
+        parsed.mapterhorn_tileset = Some("from-flag".to_string());
+        parsed.cpu_work_concurrency = None;
+        apply_config_file(
+            &mut parsed,
+            ConfigFile {
+                mapterhorn_tileset: Some("from-file".to_string()),
+                cpu_work_concurrency: Some(3),
+                ..ConfigFile::default()
+            },
+        );
+        assert_eq!(
+            parsed.mapterhorn_tileset.as_deref(),
+            Some("from-flag"),
+            "an explicit flag must win over the document"
+        );
+        assert_eq!(
+            parsed.cpu_work_concurrency,
+            Some(3),
+            "an unset flag must be filled from the document"
+        );
+    }
+
     fn cli() -> Cli {
         Cli {
+            config: None,
             auth_registries: String::new(),
             anonymous_registry: None,
             gossip_seeds: None,

@@ -83,6 +83,14 @@ jobs:
           -D clippy::large_futures
           -D clippy::large_stack_arrays
           -D clippy::unused_async
+      - name: Clippy schema generation
+        run: >-
+          cargo clippy -p ishikari --all-targets --features unstable-schemas --locked --
+          -D warnings
+          -D clippy::unchecked_time_subtraction
+          -D clippy::large_futures
+          -D clippy::large_stack_arrays
+          -D clippy::unused_async
       # Accumulate both feature configurations into one report. --no-report
       # also prevents cargo-llvm-cov from cleaning between the two test runs.
       - name: Test workspace and collect coverage
@@ -94,7 +102,42 @@ jobs:
             --all-targets --locked
           cargo llvm-cov --no-report \
             -p ishikari-core --all-targets --no-default-features --locked
+          # The schema-generation feature carries the guards that keep the
+          # published artifacts honest: that every configuration key maps to a
+          # flag without a default, and that the API description covers the
+          # delivery surface and nothing beyond it. Those tests only compile with
+          # the feature on, so a default-only run would never execute them.
+          cargo llvm-cov --no-report \
+            -p ishikari --all-targets --features unstable-schemas --locked
           cargo llvm-cov report --lcov --output-path lcov-ishikari.info
+      # Generation runs outside the test harness, so a panic or an unserialisable
+      # value would otherwise only surface when someone published an artifact.
+      - name: Generate schema artifacts
+        run: |
+          set -euo pipefail
+          cargo run -q -p ishikari --features unstable-schemas --locked -- \
+            gen-schemas config > config.schema.json
+          cargo run -q -p ishikari --features unstable-schemas --locked -- \
+            gen-schemas openapi > openapi.json
+          python3 - <<'PY'
+          import json
+          config = json.load(open("config.schema.json"))
+          openapi = json.load(open("openapi.json"))
+          assert config["properties"], "configuration schema described no settings"
+          assert openapi["paths"], "API description covered no routes"
+          print(
+              f"config settings: {len(config['properties'])}, "
+              f"described routes: {len(openapi['paths'])}"
+          )
+          PY
+      - name: Upload schema artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ishikari-schemas
+          path: |
+            config.schema.json
+            openapi.json
+          if-no-files-found: error
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:

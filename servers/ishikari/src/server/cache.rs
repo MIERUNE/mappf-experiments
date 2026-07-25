@@ -19,6 +19,14 @@ pub(crate) const STYLE: &str = "public, max-age=300, s-maxage=3600, stale-while-
 /// Development-facing preview HTML and generated preview style JSON.
 pub(crate) const PREVIEW: &str = "public, max-age=300";
 
-/// Glyphs and sprites. Safe to bump for versioned font/sprite assets.
-pub(crate) const GLYPH_SPRITE: &str =
+/// Glyphs. A range is immutable by construction — `(fontstack, start-end)` fully
+/// determines the bytes — so a long shared lifetime is safe.
+pub(crate) const GLYPH: &str =
     "public, max-age=86400, s-maxage=604800, stale-while-revalidate=604800";
+
+/// Sprites. Deliberately shorter than [`GLYPH`]: a sprite lives at a mutable
+/// provider path, so republishing one under the same key would otherwise stay
+/// stale in shared caches for a week. Raise this to the glyph lifetime only once
+/// sprites are addressed by content hash (`specs/resource-layout-sketch.md` still
+/// lists that as proposed).
+pub(crate) const SPRITE: &str = "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400";

@@ -161,7 +161,10 @@ unavailable.
 
 PMTiles containing native MLT tiles are served as stored. Stored MVT tiles can
 also be transcoded on demand by using the `.mlt` path suffix or
-`Accept: application/vnd.maplibre-tile`; ordinary requests remain as stored.
+`Accept: application/vnd.maplibre-tile`. The earlier
+`application/vnd.maplibre-vector-tile` spelling is accepted as a compatibility
+alias; responses use the canonical shorter media type. Ordinary requests remain
+as stored.
 Transcodes are single-flighted into a bounded per-pod cache and run on the
 blocking pool behind the shared `ISKR_CPU_WORK_CONCURRENCY` budget. Transcoded
 outputs are not forwarded between peers.

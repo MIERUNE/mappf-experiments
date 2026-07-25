@@ -136,6 +136,7 @@ cd "$ROOT_DIR"
 for index in $(seq 0 15); do
   cp .github/fixtures/biei/empty-style.json "$WORK_DIR/style-${index}.json"
 done
+cp .github/fixtures/biei/visual-style.json "$WORK_DIR/visual.json"
 python3 -m http.server "$FIXTURE_PORT" --bind 0.0.0.0 \
   --directory "$WORK_DIR" >"$WORK_DIR/fixture-server.log" 2>&1 &
 FIXTURE_PID=$!
@@ -189,5 +190,70 @@ curl -g -fsS --show-error --max-time 30 \
   --output "$WORK_DIR/render.webp"
 test "$(od -An -tx1 -N4 "$WORK_DIR/render.webp" | tr -d ' \n')" = 52494646
 test "$(dd if="$WORK_DIR/render.webp" bs=1 skip=8 count=4 status=none | od -An -tx1 | tr -d ' \n')" = 57454250
+
+# Lock down a small but meaningful visible contract with no external resources:
+# the style background, GeoJSON fill/stroke, camera bearing/pitch, and @2x
+# scaling must all affect real pixels in the production image.
+VISUAL_OVERLAY='geojson(%7B%22type%22%3A%22Feature%22%2C%22properties%22%3A%7B%22fill%22%3A%22%231a75ff%22%2C%22fill-opacity%22%3A1%2C%22stroke%22%3A%22%23ff3344%22%2C%22stroke-width%22%3A4%7D%2C%22geometry%22%3A%7B%22type%22%3A%22Polygon%22%2C%22coordinates%22%3A%5B%5B%5B-10%2C-10%5D%2C%5B10%2C-10%5D%2C%5B10%2C10%5D%2C%5B-10%2C10%5D%2C%5B-10%2C-10%5D%5D%5D%7D%7D)'
+VISUAL_BASE="http://127.0.0.1:${NODE0_PUBLIC_PORT}/smoke/visual/static"
+
+curl -g -fsS --show-error --max-time 30 \
+  "${VISUAL_BASE}/0,0,2/128x128.png" \
+  --output "$WORK_DIR/visual-base.png"
+python3 demo-deploy/biei/runtime/assert-png.py \
+  "$WORK_DIR/visual-base.png" \
+  --size 128x128 \
+  --sample 0,0,203040ff \
+  --sample 64,64,203040ff \
+  --min-color 203040ff,16384
+
+curl -g -fsS --show-error --max-time 30 \
+  "${VISUAL_BASE}/${VISUAL_OVERLAY}/0,0,2,0,0/128x128.png" \
+  --output "$WORK_DIR/visual-overlay.png"
+python3 demo-deploy/biei/runtime/assert-png.py \
+  "$WORK_DIR/visual-overlay.png" \
+  --size 128x128 \
+  --sample 0,0,203040ff \
+  --sample 64,64,1a75ffff \
+  --min-color 1a75ffff,1500 \
+  --min-color ff3344ff,100 \
+  --different-from "$WORK_DIR/visual-base.png" \
+  --min-different 2000
+
+curl -g -fsS --show-error --max-time 30 \
+  "${VISUAL_BASE}/${VISUAL_OVERLAY}/0,0,2,45,0/128x128.png" \
+  --output "$WORK_DIR/visual-bearing.png"
+python3 demo-deploy/biei/runtime/assert-png.py \
+  "$WORK_DIR/visual-bearing.png" \
+  --size 128x128 \
+  --sample 64,64,1a75ffff \
+  --different-from "$WORK_DIR/visual-overlay.png" \
+  --min-different 500
+
+curl -g -fsS --show-error --max-time 30 \
+  "${VISUAL_BASE}/${VISUAL_OVERLAY}/0,0,2,0,45/128x128.png" \
+  --output "$WORK_DIR/visual-pitch.png"
+python3 demo-deploy/biei/runtime/assert-png.py \
+  "$WORK_DIR/visual-pitch.png" \
+  --size 128x128 \
+  --sample 64,64,1a75ffff \
+  --different-from "$WORK_DIR/visual-overlay.png" \
+  --min-different 500
+
+curl -g -fsS --show-error --max-time 30 \
+  "${VISUAL_BASE}/${VISUAL_OVERLAY}/0,0,2,0,0/64x64@2x.png" \
+  --output "$WORK_DIR/visual-2x.png"
+python3 demo-deploy/biei/runtime/assert-png.py \
+  "$WORK_DIR/visual-2x.png" \
+  --size 128x128 \
+  --sample 64,64,1a75ffff \
+  --min-color 1a75ffff,1500
+
+if [[ -n "${BIEI_PERF_OUTPUT:-}" ]]; then
+  python3 demo-deploy/biei/runtime/render-perf.py run \
+    --base-url "$VISUAL_BASE" \
+    --output "$BIEI_PERF_OUTPUT" \
+    --requests "${BIEI_PERF_REQUESTS:-12}"
+fi
 
 printf 'PASS: two-node membership converged and peer rendering completed via %s\n' "$FORWARDED_STYLE"

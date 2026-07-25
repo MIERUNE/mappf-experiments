@@ -20,7 +20,9 @@ use ishikari_core::{
 
 use super::error::tileset_error_response;
 use super::mapterhorn::Resolved;
-use super::mlt::{RequestedTileFormat, mlt_response_bytes, negotiate_format};
+use super::mlt::{
+    Representation, RequestedTileFormat, is_mlt_tile, mlt_response_bytes, negotiate_format,
+};
 
 /// Parses the numeric tile `y` (after extension stripping).
 fn parse_y(y: &str) -> Result<u32, HttpError> {
@@ -29,29 +31,110 @@ fn parse_y(y: &str) -> Result<u32, HttpError> {
 }
 
 /// Serves the external z/x/y tile endpoint for a flat tileset key.
+#[cfg_attr(
+    feature = "unstable-schemas",
+    utoipa::path(
+        get,
+        path = "/tilesets/{tileset_id}/{z}/{x}/{y}",
+        tag = "delivery",
+        params(
+            ("tileset_id" = String, Path, description = "Flat tileset key"),
+            ("z" = u8, Path, description = "Zoom level"),
+            ("x" = u32, Path, description = "Tile column"),
+            (
+                "y" = String,
+                Path,
+                description = "Tile row, optionally suffixed to select a representation (`.mlt`, `.mvt`, `.pbf`)"
+            )
+        ),
+        responses(
+            (
+                status = 200,
+                description = "Stored or negotiated tile payload",
+                content(
+                    (crate::schemas::BinaryPayload = "application/vnd.mapbox-vector-tile"),
+                    (crate::schemas::BinaryPayload = "application/vnd.maplibre-tile"),
+                    (crate::schemas::BinaryPayload = "image/png"),
+                    (crate::schemas::BinaryPayload = "image/jpeg"),
+                    (crate::schemas::BinaryPayload = "image/webp"),
+                    (crate::schemas::BinaryPayload = "image/avif"),
+                    (crate::schemas::BinaryPayload = "application/octet-stream")
+                )
+            ),
+            (status = 404, description = "Unknown tileset or absent tile"),
+            (status = 406, description = "Stored content encoding is not acceptable")
+        )
+    )
+)]
 pub(crate) async fn tile_handler(
     State(state): State<AppState>,
     Path((tileset_id, z, x, y_raw)): Path<(String, u8, u32, String)>,
     headers: HeaderMap,
 ) -> Result<Response<Body>, HttpError> {
-    let (y, format) = negotiate_format(&y_raw, &headers);
-    serve_tile(state, tileset_id, z, x, parse_y(y)?, format).await
+    let chosen = negotiate_format(&y_raw, &headers);
+    serve_tile(
+        state,
+        tileset_id,
+        z,
+        x,
+        parse_y(chosen.y)?,
+        chosen.representation,
+        &headers,
+    )
+    .await
 }
 
 /// Serves the external z/x/y tile endpoint for a `{namespace}/{tileset_id}` key.
+#[cfg_attr(
+    feature = "unstable-schemas",
+    utoipa::path(
+        get,
+        path = "/tilesets/{namespace}/{tileset_id}/{z}/{x}/{y}",
+        tag = "delivery",
+        params(
+            ("namespace" = String, Path, description = "Tileset namespace"),
+            ("tileset_id" = String, Path, description = "Namespace-local tileset id"),
+            ("z" = u8, Path, description = "Zoom level"),
+            ("x" = u32, Path, description = "Tile column"),
+            (
+                "y" = String,
+                Path,
+                description = "Tile row, optionally suffixed to select a representation (`.mlt`, `.mvt`, `.pbf`)"
+            )
+        ),
+        responses(
+            (
+                status = 200,
+                description = "Stored or negotiated tile payload",
+                content(
+                    (crate::schemas::BinaryPayload = "application/vnd.mapbox-vector-tile"),
+                    (crate::schemas::BinaryPayload = "application/vnd.maplibre-tile"),
+                    (crate::schemas::BinaryPayload = "image/png"),
+                    (crate::schemas::BinaryPayload = "image/jpeg"),
+                    (crate::schemas::BinaryPayload = "image/webp"),
+                    (crate::schemas::BinaryPayload = "image/avif"),
+                    (crate::schemas::BinaryPayload = "application/octet-stream")
+                )
+            ),
+            (status = 404, description = "Unknown tileset or absent tile"),
+            (status = 406, description = "Stored content encoding is not acceptable")
+        )
+    )
+)]
 pub(crate) async fn namespaced_tile_handler(
     State(state): State<AppState>,
     Path((namespace, tileset_id, z, x, y_raw)): Path<(String, String, u8, u32, String)>,
     headers: HeaderMap,
 ) -> Result<Response<Body>, HttpError> {
-    let (y, format) = negotiate_format(&y_raw, &headers);
+    let chosen = negotiate_format(&y_raw, &headers);
     serve_tile(
         state,
         super::join_tileset_key(&namespace, &tileset_id),
         z,
         x,
-        parse_y(y)?,
-        format,
+        parse_y(chosen.y)?,
+        chosen.representation,
+        &headers,
     )
     .await
 }
@@ -64,7 +147,8 @@ async fn serve_tile(
     z: u8,
     x: u32,
     y: u32,
-    format: RequestedTileFormat,
+    representation: Representation,
+    headers: &HeaderMap,
 ) -> Result<Response<Body>, HttpError> {
     let tileset_id = TilesetId::try_from(tileset_id)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
@@ -82,15 +166,23 @@ async fn serve_tile(
         .route_tile(tileset_id.clone(), tile_id)
         .await
         .map_err(|e| tileset_error_response(&e))?;
-    state.metrics.record_tile_served(source.report_label());
+    // Cache outcomes describe the resolution that just happened, so they are
+    // recorded whatever the response turns out to be. `tiles_served` counts
+    // delivered tiles, so it waits until a response actually exists: an absent
+    // tile, an unacceptable encoding, or a failed transcode is not a serve.
     for outcome in state.resource_resolver.cache_outcomes(source) {
         state.metrics.record_tile_cache(outcome);
     }
     let Some(tile) = tile else {
         return Err((StatusCode::NOT_FOUND, "not found".to_string()));
     };
+    let Representation {
+        format,
+        negotiated_on_accept,
+    } = representation;
     let response = match format {
         RequestedTileFormat::AsStored => {
+            ensure_content_encoding_acceptable(headers, tile.content_encoding)?;
             state.metrics.add_egress_bytes(tile.bytes.len() as u64);
             debug!(
                 endpoint = "tile",
@@ -102,9 +194,19 @@ async fn serve_tile(
             );
             TilesetResponse::from(tile)
                 .with_cache_control(cache::TILE)
+                .negotiated_on_accept(negotiated_on_accept)
                 .into_response()
         }
         RequestedTileFormat::Mlt => {
+            // Transcoded MLT is always gzip. Reject an incompatible request
+            // before entering the CPU-work queue; native MLT retains its
+            // archive encoding.
+            let expected_encoding = if is_mlt_tile(&tile) {
+                tile.content_encoding
+            } else {
+                Some("gzip")
+            };
+            ensure_content_encoding_acceptable(headers, expected_encoding)?;
             let routing_key = ResourceRoutingKey::from(&tileset_id);
             let (bytes, content_encoding, served_format) = mlt_response_bytes(
                 &state,
@@ -114,6 +216,7 @@ async fn serve_tile(
                 super::mlt::TranscodeCachePolicy::Retain,
             )
             .await?;
+            debug_assert_eq!(content_encoding, expected_encoding);
             state.metrics.add_egress_bytes(bytes.len() as u64);
             debug!(
                 endpoint = "tile",
@@ -127,10 +230,12 @@ async fn serve_tile(
                 content_type: MLT_CONTENT_TYPE,
                 content_encoding,
                 cache_control: Some(cache::TILE),
+                negotiated_on_accept,
             }
             .into_response()
         }
     };
+    state.metrics.record_tile_served(source.report_label());
     Ok(response)
 }
 
@@ -184,12 +289,16 @@ pub(super) async fn resolve_archive(
     }
 }
 
-/// Builds the standard tile payload response, including transport encoding and
-/// the public tile cache policy. Shared by stored and generated tile products.
-pub(super) fn tile_data_response(tile: TileData) -> Response {
-    TilesetResponse::from(tile)
+/// Builds the standard public tile payload response, including transport
+/// encoding and cache policy. Shared by stored and generated tile products.
+pub(super) fn tile_data_response(
+    tile: TileData,
+    headers: &HeaderMap,
+) -> Result<Response, HttpError> {
+    ensure_content_encoding_acceptable(headers, tile.content_encoding)?;
+    Ok(TilesetResponse::from(tile)
         .with_cache_control(cache::TILE)
-        .into_response()
+        .into_response())
 }
 
 /// Serves the internal tile endpoint used for node-to-node forwarding.
@@ -231,6 +340,10 @@ struct TilesetResponse {
     content_type: &'static str,
     content_encoding: Option<&'static str>,
     cache_control: Option<&'static str>,
+    /// Set only when `Accept` chose the media type, so `Vary` lists it only
+    /// where it can change the response. Defaults to false: a suffixed URL, a
+    /// raster product, and an internal forward are all fixed representations.
+    negotiated_on_accept: bool,
 }
 
 impl From<TileData> for TilesetResponse {
@@ -244,6 +357,7 @@ impl From<TileData> for TilesetResponse {
             content_type: tile.content_type,
             content_encoding: tile.content_encoding,
             cache_control: None,
+            negotiated_on_accept: false,
         }
     }
 }
@@ -252,6 +366,12 @@ impl TilesetResponse {
     /// Attaches a public `Cache-Control` value to the response.
     fn with_cache_control(mut self, value: &'static str) -> Self {
         self.cache_control = Some(value);
+        self
+    }
+
+    /// Records that `Accept` chose this representation, so `Vary` must list it.
+    fn negotiated_on_accept(mut self, negotiated: bool) -> Self {
+        self.negotiated_on_accept = negotiated;
         self
     }
 }
@@ -276,15 +396,102 @@ impl IntoResponse for TilesetResponse {
                 header::CACHE_CONTROL,
                 HeaderValue::from_static(cache_control),
             );
-            // Public tile paths can negotiate MLT from `Accept` when the
-            // canonical `.mlt` suffix is absent. Prevent a shared cache from
-            // serving that representation to an MVT client (or vice versa).
+            // `Accept-Encoding` always participates: the stored transport
+            // representation is chosen from it, and every CDN normalizes and keys
+            // on that header natively.
+            //
+            // `Accept` is listed only where it actually selects the media type,
+            // which is the suffix-less URL. Advertising it on a suffixed or raster
+            // URL would invite a cache to key on a header that cannot change the
+            // response, letting arbitrary `Accept` values multiply variants of one
+            // immutable tile.
+            let vary = if self.negotiated_on_accept {
+                "Accept, Accept-Encoding"
+            } else {
+                "Accept-Encoding"
+            };
             response
                 .headers_mut()
-                .insert(header::VARY, HeaderValue::from_static("Accept"));
+                .insert(header::VARY, HeaderValue::from_static(vary));
         }
         response
     }
+}
+
+/// Checks whether the representation Ishikari already has can be sent without
+/// changing its transport encoding.
+///
+/// The common path remains zero-copy: a missing `Accept-Encoding` accepts any
+/// coding, and a matching coding is served as stored. Ishikari deliberately
+/// does not decompress or cross-compress tiles on this path; when the client
+/// excludes the only available representation, it returns `406`.
+pub(super) fn ensure_content_encoding_acceptable(
+    headers: &HeaderMap,
+    content_encoding: Option<&str>,
+) -> Result<(), HttpError> {
+    if content_encoding_is_acceptable(headers, content_encoding) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::NOT_ACCEPTABLE,
+            "no acceptable tile content encoding is available".to_string(),
+        ))
+    }
+}
+
+fn content_encoding_is_acceptable(headers: &HeaderMap, content_encoding: Option<&str>) -> bool {
+    if !headers.contains_key(header::ACCEPT_ENCODING) {
+        return true;
+    }
+
+    let requested = content_encoding.unwrap_or("identity");
+    let mut exact_quality: Option<f32> = None;
+    let mut wildcard_quality: Option<f32> = None;
+
+    for value in headers.get_all(header::ACCEPT_ENCODING) {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for item in value.split(',') {
+            let mut parts = item.split(';');
+            let Some(coding) = parts
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let mut quality = 1.0_f32;
+            for parameter in parts {
+                let Some((name, value)) = parameter.split_once('=') else {
+                    continue;
+                };
+                if name.trim().eq_ignore_ascii_case("q") {
+                    quality = match value.trim().parse::<f32>() {
+                        Ok(value) if value.is_finite() && (0.0..=1.0).contains(&value) => value,
+                        _ => 0.0,
+                    };
+                }
+            }
+
+            if coding.eq_ignore_ascii_case(requested) {
+                exact_quality = Some(exact_quality.map_or(quality, |current| current.max(quality)));
+            } else if coding == "*" {
+                wildcard_quality =
+                    Some(wildcard_quality.map_or(quality, |current| current.max(quality)));
+            }
+        }
+    }
+
+    if let Some(quality) = exact_quality {
+        return quality > 0.0;
+    }
+    if requested.eq_ignore_ascii_case("identity") {
+        // Identity is acceptable by default. It is excluded only by an
+        // explicit identity entry above, or by `*;q=0` when identity is absent.
+        return wildcard_quality != Some(0.0);
+    }
+    wildcard_quality.is_some_and(|quality| quality > 0.0)
 }
 
 #[cfg(test)]
@@ -300,10 +507,22 @@ mod tests {
     }
 
     #[test]
-    fn public_tile_responses_vary_on_accept() {
-        let response = tile_data_response(tile());
+    fn a_fixed_representation_varies_only_on_accept_encoding() {
+        // Derived products and suffixed URLs pin their representation, so
+        // advertising `Accept` would let a cache key on a header that cannot
+        // change the response.
+        let response = tile_data_response(tile(), &HeaderMap::new()).unwrap();
         assert_eq!(response.headers()[header::CACHE_CONTROL], cache::TILE);
-        assert_eq!(response.headers()[header::VARY], "Accept");
+        assert_eq!(response.headers()[header::VARY], "Accept-Encoding");
+    }
+
+    #[test]
+    fn an_accept_negotiated_representation_also_varies_on_accept() {
+        let response = TilesetResponse::from(tile())
+            .with_cache_control(cache::TILE)
+            .negotiated_on_accept(true)
+            .into_response();
+        assert_eq!(response.headers()[header::VARY], "Accept, Accept-Encoding");
     }
 
     #[test]
@@ -311,5 +530,85 @@ mod tests {
         let response = TilesetResponse::from(tile()).into_response();
         assert!(response.headers().get(header::CACHE_CONTROL).is_none());
         assert!(response.headers().get(header::VARY).is_none());
+    }
+
+    fn accept_encoding(value: &'static str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static(value));
+        headers
+    }
+
+    #[test]
+    fn absent_accept_encoding_accepts_stored_codings() {
+        let headers = HeaderMap::new();
+        assert!(content_encoding_is_acceptable(&headers, Some("gzip")));
+        assert!(content_encoding_is_acceptable(&headers, None));
+    }
+
+    #[test]
+    fn exact_or_wildcard_coding_accepts_the_stored_representation() {
+        assert!(content_encoding_is_acceptable(
+            &accept_encoding("br, gzip;q=0.5"),
+            Some("gzip")
+        ));
+        assert!(content_encoding_is_acceptable(
+            &accept_encoding("*;q=0.5"),
+            Some("zstd")
+        ));
+    }
+
+    #[test]
+    fn repeated_accept_encoding_fields_are_combined() {
+        let mut headers = accept_encoding("br;q=1");
+        headers.append(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip;q=0.5"),
+        );
+        assert!(content_encoding_is_acceptable(&headers, Some("gzip")));
+    }
+
+    #[test]
+    fn exact_exclusion_overrides_a_permissive_wildcard() {
+        assert!(!content_encoding_is_acceptable(
+            &accept_encoding("gzip;q=0, *;q=1"),
+            Some("gzip")
+        ));
+    }
+
+    #[test]
+    fn identity_is_acceptable_by_default_but_can_be_excluded() {
+        assert!(content_encoding_is_acceptable(
+            &accept_encoding("gzip"),
+            None
+        ));
+        assert!(!content_encoding_is_acceptable(
+            &accept_encoding("identity;q=0"),
+            None
+        ));
+        assert!(!content_encoding_is_acceptable(
+            &accept_encoding("*;q=0"),
+            None
+        ));
+        assert!(content_encoding_is_acceptable(
+            &accept_encoding("*;q=0, identity;q=1"),
+            None
+        ));
+    }
+
+    #[test]
+    fn empty_accept_encoding_requests_identity_only() {
+        let headers = accept_encoding("");
+        assert!(content_encoding_is_acceptable(&headers, None));
+        assert!(!content_encoding_is_acceptable(&headers, Some("gzip")));
+    }
+
+    #[test]
+    fn rejected_stored_encoding_returns_not_acceptable() {
+        let error = ensure_content_encoding_acceptable(
+            &accept_encoding("br;q=1, gzip;q=0, identity;q=0"),
+            Some("gzip"),
+        )
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::NOT_ACCEPTABLE);
     }
 }

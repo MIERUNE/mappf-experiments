@@ -1084,8 +1084,17 @@ live in their focused `mmpf-*` crates.
 The Biei CI job builds, tests, and lints Biei plus its shared dependencies; the
 repository-wide workspace remains covered by the product-specific jobs. CI also
 runs a two-node production-container E2E rather than relying on a standalone
-MapLibre example. Production container builds must use the MapLibre
-Native-compatible Linux runtime and reproducible dependency versions.
+MapLibre example. That E2E checks deterministic pixels for a resource-free
+background, GeoJSON fill/stroke, bearing, pitch, and pixel ratio; a valid image
+header alone is not a rendering contract. Production container builds must use
+the MapLibre Native-compatible Linux runtime and reproducible dependency
+versions.
+
+The manually dispatched performance workflow compares PR base and head on one
+runner with a warm resource-free style and unique output-cache-miss renders. It
+is an informational gross-regression check, not a merge gate. Because it omits
+provider I/O, concurrency, and production hardware, its results must not justify
+capacity, SLA, FileSource, or oversubscription defaults.
 Precompiled native artifacts currently require the tested Ubuntu ABI baseline;
 changing the runtime distribution requires an actual render smoke test, not
 only a successful link.

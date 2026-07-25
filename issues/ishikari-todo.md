@@ -21,6 +21,13 @@ No Ishikari-specific implementation item is active. Current production defaults 
 - **Current decision:** retain the configurable 10 ms default.
 - **Reopen when:** a named tuning effort compares the 0 ms baseline and current default across end-user latency, backend operations and bytes, waiter fan-in, and the measured Pareto frontier.
 
+## Tile representation selection
+
+- **Current decision: a path suffix is authoritative.** `.mlt` serves MLT; `.mvt`, `.pbf`, and the raster suffixes serve the stored representation. `Accept` is consulted only on the suffixless URL, and `Vary` lists `Accept` only there. Both `application/vnd.maplibre-tile` and the earlier `application/vnd.maplibre-vector-tile` spelling select MLT, while responses use the canonical shorter type. `Accept-Encoding` continues to participate everywhere.
+- **Why:** [`../specs/auth-sketch.md`](../specs/auth-sketch.md) §4 states that the CDN cache key is the full URL and that arbitrary `Vary` values cannot be relied on. A representation chosen by a request header is therefore either served wrongly from a shared cache or keyed on an attacker-controlled header that multiplies variants of one immutable tile. Putting the representation in the URL avoids both. Martin resolves the same ambiguity in the opposite direction — extensionless canonical URL, `Accept` only, `.{ext}` answered with a 301 — which suits a server that makes no CDN assumptions but costs a redirect per tile and leaves it emitting no `Vary` at all.
+- **Migration note:** this changed observable behavior. A request combining a suffix with a conflicting `Accept` (for example `.mvt` with `Accept: application/vnd.maplibre-tile`) previously returned MLT and now returns the stored representation. Such a request was self-contradictory, so no supported client is expected to depend on it.
+- **Reopen when:** a client needs a representation that cannot be expressed as a suffix, or measurement shows the suffixless URL carries enough traffic that its `Vary: Accept` fragmentation matters.
+
 ## Derived terrain decisions
 
 The contract and evaluation dimensions live in [`../specs/isoline-and-hillshade-spec.md`](../specs/isoline-and-hillshade-spec.md).

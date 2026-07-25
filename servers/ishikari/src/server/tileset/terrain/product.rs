@@ -79,7 +79,10 @@ pub(super) fn parse_derived_tile_request(
 ) -> Result<DerivedTileRequest, HttpError> {
     let tileset_id = validated_mapterhorn(state, tileset_id)?;
     let product = DerivedProduct::parse(&product)?;
-    let (y, format) = negotiate_format(y_raw, headers);
+    // A derived product fixes its own representation; only the `y` suffix needs
+    // stripping here, so `Accept` participation is irrelevant on this path.
+    let chosen = negotiate_format(y_raw, headers);
+    let (y, format) = (chosen.y, chosen.representation.format);
     let y = y
         .parse::<u32>()
         .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid tile y: {y}")))?;

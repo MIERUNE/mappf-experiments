@@ -55,6 +55,19 @@ impl DemEncoding {
 }
 
 /// Serves the HTML preview shell for a flat tileset key.
+#[cfg_attr(
+    feature = "unstable-schemas",
+    utoipa::path(
+        get,
+        path = "/tilesets/{tileset_id}/preview",
+        tag = "delivery",
+        params(("tileset_id" = String, Path, description = "Flat tileset key")),
+        responses(
+            (status = 200, description = "Preview page", body = String, content_type = "text/html"),
+            (status = 404, description = "Unknown tileset")
+        )
+    )
+)]
 pub(crate) async fn preview_handler(
     State(state): State<AppState>,
     Path(tileset_id): Path<String>,
@@ -65,6 +78,22 @@ pub(crate) async fn preview_handler(
 }
 
 /// Serves the HTML preview shell for a `{namespace}/{tileset_id}` key.
+#[cfg_attr(
+    feature = "unstable-schemas",
+    utoipa::path(
+        get,
+        path = "/tilesets/{namespace}/{tileset_id}/preview",
+        tag = "delivery",
+        params(
+            ("namespace" = String, Path, description = "Tileset namespace"),
+            ("tileset_id" = String, Path, description = "Namespace-local tileset id")
+        ),
+        responses(
+            (status = 200, description = "Preview page", body = String, content_type = "text/html"),
+            (status = 404, description = "Unknown tileset")
+        )
+    )
+)]
 pub(crate) async fn namespaced_preview_handler(
     State(state): State<AppState>,
     Path((namespace, tileset_id)): Path<(String, String)>,
@@ -115,6 +144,24 @@ async fn serve_preview(
 }
 
 /// Serves the generated preview style for a flat tileset key.
+#[cfg_attr(
+    feature = "unstable-schemas",
+    utoipa::path(
+        get,
+        path = "/tilesets/{tileset_id}/preview.json",
+        tag = "delivery",
+        params(("tileset_id" = String, Path, description = "Flat tileset key")),
+        responses(
+            (
+                status = 200,
+                description = "Preview style document",
+                body = serde_json::Value,
+                content_type = "application/json"
+            ),
+            (status = 404, description = "Unknown tileset")
+        )
+    )
+)]
 pub(crate) async fn preview_style_handler(
     State(state): State<AppState>,
     Path(tileset_id): Path<String>,
@@ -133,6 +180,27 @@ pub(crate) async fn preview_style_handler(
 }
 
 /// Serves the generated preview style for a `{namespace}/{tileset_id}` key.
+#[cfg_attr(
+    feature = "unstable-schemas",
+    utoipa::path(
+        get,
+        path = "/tilesets/{namespace}/{tileset_id}/preview.json",
+        tag = "delivery",
+        params(
+            ("namespace" = String, Path, description = "Tileset namespace"),
+            ("tileset_id" = String, Path, description = "Namespace-local tileset id")
+        ),
+        responses(
+            (
+                status = 200,
+                description = "Preview style document",
+                body = serde_json::Value,
+                content_type = "application/json"
+            ),
+            (status = 404, description = "Unknown tileset")
+        )
+    )
+)]
 pub(crate) async fn namespaced_preview_style_handler(
     State(state): State<AppState>,
     Path((namespace, tileset_id)): Path<(String, String)>,

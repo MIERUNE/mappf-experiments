@@ -1,0 +1,138 @@
+name: Performance comparison
+
+on:
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Pull request number to compare with its base
+        required: true
+        type: string
+      requests:
+        description: Measured warm renders per revision
+        required: true
+        default: "12"
+        type: choice
+        options:
+          - "8"
+          - "12"
+          - "20"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-${{ inputs.pull_request }}
+  cancel-in-progress: true
+
+jobs:
+  biei:
+    name: Biei base vs head
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Resolve pull request revisions
+        id: revisions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pull_request }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::pull_request must be a positive integer"
+            exit 1
+          }
+          repository="/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}"
+          {
+            echo "base=$(gh api "$repository" --jq .base.sha)"
+            echo "head=$(gh api "$repository" --jq .head.sha)"
+            echo "harness=$(gh api "/repos/${GITHUB_REPOSITORY}/commits/${DEFAULT_BRANCH}" --jq .sha)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      # Keep the benchmark itself fixed while only the image under test changes.
+      # Otherwise a PR that edits cluster-smoke or render-perf would compare two
+      # different workloads and produce a meaningless delta.
+      - name: Check out benchmark harness
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ steps.revisions.outputs.harness }}
+          path: harness
+          persist-credentials: false
+
+      - name: Check out base
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ steps.revisions.outputs.base }}
+          path: base
+          persist-credentials: false
+
+      - name: Build base image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ./base
+          file: ./base/demo-deploy/biei/runtime/Dockerfile
+          load: true
+          tags: biei-perf:base
+          cache-from: type=gha,scope=performance-biei
+
+      - name: Benchmark base
+        env:
+          BIEI_IMAGE: biei-perf:base
+          BIEI_PERF_OUTPUT: /tmp/biei-perf-base.json
+          BIEI_PERF_REQUESTS: ${{ inputs.requests }}
+        run: bash harness/demo-deploy/biei/runtime/cluster-smoke.sh
+
+      - name: Check out head
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ steps.revisions.outputs.head }}
+          path: head
+          persist-credentials: false
+
+      - name: Build head image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ./head
+          file: ./head/demo-deploy/biei/runtime/Dockerfile
+          load: true
+          tags: biei-perf:head
+          cache-from: type=gha,scope=performance-biei
+          cache-to: type=gha,mode=max,scope=performance-biei
+
+      - name: Benchmark head
+        env:
+          BIEI_IMAGE: biei-perf:head
+          BIEI_PERF_OUTPUT: /tmp/biei-perf-head.json
+          BIEI_PERF_REQUESTS: ${{ inputs.requests }}
+        run: bash harness/demo-deploy/biei/runtime/cluster-smoke.sh
+
+      # Measure base again, now that head has run. Base-then-head alone gives head
+      # a warmer host and page cache, so every comparison leans head's way. The
+      # two base runs bracket head, and their spread is this workload's actual
+      # run-to-run noise — without it a drift-sized delta reads as a real win.
+      # The base image is already built, so this costs one benchmark, not a build.
+      - name: Benchmark base again
+        env:
+          BIEI_IMAGE: biei-perf:base
+          BIEI_PERF_OUTPUT: /tmp/biei-perf-base-repeat.json
+          BIEI_PERF_REQUESTS: ${{ inputs.requests }}
+        run: bash harness/demo-deploy/biei/runtime/cluster-smoke.sh
+
+      - name: Report comparison
+        env:
+          BASE_SHA: ${{ steps.revisions.outputs.base }}
+          HEAD_SHA: ${{ steps.revisions.outputs.head }}
+          HARNESS_SHA: ${{ steps.revisions.outputs.harness }}
+        run: |
+          python3 harness/demo-deploy/biei/runtime/render-perf.py compare \
+            --base /tmp/biei-perf-base.json \
+            --head /tmp/biei-perf-head.json \
+            --base-repeat /tmp/biei-perf-base-repeat.json \
+            --base-label "$BASE_SHA" \
+            --head-label "$HEAD_SHA" \
+            --harness-label "$HARNESS_SHA" \
+            --summary "$GITHUB_STEP_SUMMARY"

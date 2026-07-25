@@ -49,11 +49,33 @@ check_type() { # name expected-code expected-content-type-prefix url
   fi
 }
 
+check_type_with_accept() { # name expected-code expected-content-type-prefix accept url
+  local tmp code content_type
+  tmp="$(mktemp)"
+  code=$(curl -g -s -D "$tmp" -o /dev/null -w '%{http_code}' \
+    --max-time "$TIMEOUT" -H "Accept: $4" "$5" 2>/dev/null)
+  content_type=$(awk 'BEGIN{IGNORECASE=1} /^content-type:/ {sub(/\r$/, "", $0); print $2; exit}' "$tmp")
+  rm -f "$tmp"
+  if [ "$code" = "$2" ] && [[ "$content_type" == "$3"* ]]; then
+    printf 'OK   %-34s %s %s\n' "$1" "$code" "$content_type"
+  else
+    printf 'FAIL %-34s got %s %s want %s %s  (%s)\n' \
+      "$1" "$code" "${content_type:-<none>}" "$2" "$3" "$5"
+    fail=$((fail + 1))
+  fi
+}
+
 echo "== ishikari smoke: ${base} =="
 # Public provider routes (catch-all -> :8080).
 check_type "tilejson"        200 "application/json" "${base}/tilesets/${TILESET}"
 check_type "style.json"      200 "application/json" "${base}/styles/${STYLE}/style.json"
 check_type "tile"            200 "application/vnd.mapbox-vector-tile" "${base}/tilesets/${TILESET}/${TILE}"
+check_type_with_accept \
+  "MLT canonical Accept" 200 "application/vnd.maplibre-tile" \
+  "application/vnd.maplibre-tile" "${base}/tilesets/${TILESET}/${TILE}"
+check_type_with_accept \
+  "MLT compatibility Accept" 200 "application/vnd.maplibre-tile" \
+  "application/vnd.maplibre-vector-tile" "${base}/tilesets/${TILESET}/${TILE}"
 check_type "glyph"           200 "application/x-protobuf" "${base}/fonts/${GLYPH_FONT}/${GLYPH_RANGE}.pbf"
 check_type "sprite.json"     200 "application/json" "${base}/styles/${STYLE}/sprite.json"
 check_type "sprite.png"      200 "image/png" "${base}/styles/${STYLE}/sprite.png"

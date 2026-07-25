@@ -55,67 +55,73 @@ fn with_public_layers(delivery_routes: Router<AppState>, state: AppState) -> Rou
     with_common_layers(router, state)
 }
 
-/// Public map-resource routes. Authentication and browser CORS are applied to
-/// this subrouter without exposing operational endpoints to either policy.
-fn public_delivery_routes() -> Router<AppState> {
-    Router::new()
-        .route(
-            "/tilesets/{tileset_id}",
-            get(server::tileset::tilejson_handler),
-        )
-        .route(
-            "/tilesets/{tileset_id}/preview",
-            get(server::tileset::preview_handler),
-        )
-        .route(
-            "/tilesets/{tileset_id}/preview.json",
-            get(server::tileset::preview_style_handler),
-        )
-        .route(
-            "/tilesets/{tileset_id}/{z}/{x}/{y}",
-            get(server::tileset::tile_handler),
-        )
-        .route(
-            "/tilesets/{tileset_id}/derived/{product}",
-            get(server::tileset::derived_tilejson_handler),
-        )
-        .route(
-            "/tilesets/{tileset_id}/derived/{product}/{z}/{x}/{y}",
-            get(server::tileset::derived_tile_handler),
-        )
-        // Namespaced tileset keys ({namespace}/{tileset_id}). Static `preview`
-        // / `preview.json` second segments take priority over the namespaced
-        // TileJSON route, so they stay reachable as flat-tileset previews.
-        .route(
-            "/tilesets/{namespace}/{tileset_id}",
-            get(server::tileset::namespaced_tilejson_handler),
-        )
-        .route(
-            "/tilesets/{namespace}/{tileset_id}/preview",
-            get(server::tileset::namespaced_preview_handler),
-        )
-        .route(
-            "/tilesets/{namespace}/{tileset_id}/preview.json",
-            get(server::tileset::namespaced_preview_style_handler),
-        )
-        .route(
-            "/tilesets/{namespace}/{tileset_id}/{z}/{x}/{y}",
-            get(server::tileset::namespaced_tile_handler),
-        )
-        .route(
-            "/tilesets/{namespace}/{tileset_id}/derived/{product}",
-            get(server::tileset::namespaced_derived_tilejson_handler),
-        )
-        .route(
-            "/tilesets/{namespace}/{tileset_id}/derived/{product}/{z}/{x}/{y}",
-            get(server::tileset::namespaced_derived_tile_handler),
-        )
-        .route("/styles/{*style_path}", get(server::style::style_handler))
-        .route(
-            "/fonts/{fontstack}/{range}",
-            get(server::glyph::glyph_handler),
-        )
+/// Defines the public router and its route manifest from one list. Schema tests
+/// consume the manifest, so adding a route can no longer leave both the OpenAPI
+/// path list and its coverage fixture stale while the real router changes.
+macro_rules! define_public_delivery_routes {
+    ($(($path:literal, $handler:path)),+ $(,)?) => {
+        #[cfg(all(test, feature = "unstable-schemas"))]
+        pub(crate) const PUBLIC_DELIVERY_ROUTE_PATHS: &[&str] = &[$($path),+];
+
+        /// Public map-resource routes. Authentication and browser CORS are
+        /// applied to this subrouter without exposing operational endpoints.
+        fn public_delivery_routes() -> Router<AppState> {
+            Router::new()$(.route($path, get($handler)))+
+        }
+    };
 }
+
+// Static `preview` / `preview.json` second segments take priority over the
+// namespaced TileJSON route, so flat-tileset previews remain reachable.
+define_public_delivery_routes!(
+    ("/tilesets/{tileset_id}", server::tileset::tilejson_handler),
+    (
+        "/tilesets/{tileset_id}/preview",
+        server::tileset::preview_handler
+    ),
+    (
+        "/tilesets/{tileset_id}/preview.json",
+        server::tileset::preview_style_handler
+    ),
+    (
+        "/tilesets/{tileset_id}/{z}/{x}/{y}",
+        server::tileset::tile_handler
+    ),
+    (
+        "/tilesets/{tileset_id}/derived/{product}",
+        server::tileset::derived_tilejson_handler
+    ),
+    (
+        "/tilesets/{tileset_id}/derived/{product}/{z}/{x}/{y}",
+        server::tileset::derived_tile_handler
+    ),
+    (
+        "/tilesets/{namespace}/{tileset_id}",
+        server::tileset::namespaced_tilejson_handler
+    ),
+    (
+        "/tilesets/{namespace}/{tileset_id}/preview",
+        server::tileset::namespaced_preview_handler
+    ),
+    (
+        "/tilesets/{namespace}/{tileset_id}/preview.json",
+        server::tileset::namespaced_preview_style_handler
+    ),
+    (
+        "/tilesets/{namespace}/{tileset_id}/{z}/{x}/{y}",
+        server::tileset::namespaced_tile_handler
+    ),
+    (
+        "/tilesets/{namespace}/{tileset_id}/derived/{product}",
+        server::tileset::namespaced_derived_tilejson_handler
+    ),
+    (
+        "/tilesets/{namespace}/{tileset_id}/derived/{product}/{z}/{x}/{y}",
+        server::tileset::namespaced_derived_tile_handler
+    ),
+    ("/styles/{*style_path}", server::style::style_handler),
+    ("/fonts/{fontstack}/{range}", server::glyph::glyph_handler),
+);
 
 fn public_operational_routes() -> Router<AppState> {
     Router::new()
@@ -364,6 +370,8 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 mod auth;
+#[cfg(feature = "unstable-schemas")]
+pub(crate) use auth::DeliveryError;
 pub(crate) mod cache;
 pub(crate) mod conditional;
 #[cfg(test)]

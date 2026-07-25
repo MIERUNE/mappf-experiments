@@ -145,3 +145,33 @@ jobs:
           -D clippy::large_futures
           -D clippy::large_stack_arrays
           -D clippy::unused_async
+
+      # The schema feature carries the guard that keeps the published
+      # configuration document honest: every key must map to a flag without a
+      # built-in default, or the document value would silently never apply. That
+      # test only compiles with the feature on, so a default-only run would never
+      # execute it.
+      - name: Test and lint schema generation
+        run: |
+          set -euo pipefail
+          cargo test -p biei --locked \
+            --features biei/gl-opengl,biei/unstable-schemas
+          cargo clippy -p biei --all-targets --locked \
+            --features biei/gl-opengl,biei/unstable-schemas -- \
+            -D warnings -D clippy::unused_async
+          cargo run -q -p biei --locked \
+            --features biei/gl-opengl,biei/unstable-schemas -- \
+            gen-schemas config > config.schema.json
+          python3 -c "
+          import json
+          schema = json.load(open('config.schema.json'))
+          assert schema['properties'], 'configuration schema described no settings'
+          print(f\"config settings: {len(schema['properties'])}\")
+          "
+
+      - name: Upload schema artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: biei-schemas
+          path: config.schema.json
+          if-no-files-found: error

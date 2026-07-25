@@ -1365,13 +1365,15 @@ async fn public_provider_responses_carry_cache_policy_and_age() {
     );
     assert!(headers.contains_key(header::AGE));
 
-    // Glyphs and sprites have no upstream policy: the asset default applies.
-    // Glyph bytes are verbatim, so upstream validators pass through unchanged.
+    // Glyphs and sprites have no upstream policy, so each asset default applies.
+    // A glyph range is immutable and gets the long lifetime; a sprite lives at a
+    // mutable path and gets the shorter one. Glyph bytes are verbatim, so
+    // upstream validators pass through unchanged.
     let (status, headers, body) = harness
         .get(&harness.public, "/fonts/TestFont/0-255.pbf")
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(headers[header::CACHE_CONTROL], cache::GLYPH_SPRITE);
+    assert_eq!(headers[header::CACHE_CONTROL], cache::GLYPH);
     assert_eq!(headers[header::AGE], "0");
     assert_eq!(headers[header::ETAG], GLYPH_UPSTREAM_ETAG);
     assert_eq!(headers[header::LAST_MODIFIED], GLYPH_UPSTREAM_LAST_MODIFIED);
@@ -1381,14 +1383,14 @@ async fn public_provider_responses_carry_cache_policy_and_age() {
         .get(&harness.public, "/styles/base/sprite.json")
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(headers[header::CACHE_CONTROL], cache::GLYPH_SPRITE);
+    assert_eq!(headers[header::CACHE_CONTROL], cache::SPRITE);
     assert_eq!(headers[header::CONTENT_TYPE], "application/json");
 
     let (status, headers, _) = harness
         .get(&harness.public, "/styles/base/sprite.png")
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(headers[header::CACHE_CONTROL], cache::GLYPH_SPRITE);
+    assert_eq!(headers[header::CACHE_CONTROL], cache::SPRITE);
     assert_eq!(headers[header::CONTENT_TYPE], "image/png");
 
     harness.cleanup().await;
@@ -1519,7 +1521,7 @@ async fn internal_provider_responses_carry_typed_metadata_not_public_headers() {
         )
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(headers[PROVIDER_CACHE_CONTROL_HEADER], cache::GLYPH_SPRITE);
+    assert_eq!(headers[PROVIDER_CACHE_CONTROL_HEADER], cache::GLYPH);
     assert!(headers.contains_key(PROVIDER_AGE_HEADER));
     assert_eq!(headers[PROVIDER_ETAG_HEADER], GLYPH_UPSTREAM_ETAG);
     assert_eq!(
@@ -1547,7 +1549,7 @@ async fn conditional_requests_return_304_with_cache_metadata() {
         .await;
     assert_eq!(status, StatusCode::NOT_MODIFIED);
     assert!(body.is_empty());
-    assert_eq!(headers[header::CACHE_CONTROL], cache::GLYPH_SPRITE);
+    assert_eq!(headers[header::CACHE_CONTROL], cache::GLYPH);
     assert!(headers.contains_key(header::AGE));
     assert_eq!(headers[header::ETAG], GLYPH_UPSTREAM_ETAG);
 
@@ -1679,6 +1681,38 @@ async fn namespaced_style_uses_the_matching_upstream_template() {
     harness.cleanup().await;
 }
 
+/// A representation suffix is authoritative: `Accept` cannot redirect it. This
+/// keeps the representation in the URL, which is the only cache key a dumb CDN
+/// is relied on to honour, and prevents arbitrary `Accept` values from
+/// multiplying variants of one immutable tile.
+#[tokio::test]
+async fn a_representation_suffix_overrides_a_conflicting_accept_header() {
+    let harness = harness("tile-suffix-authority").await;
+    let mlt = vec![(header::ACCEPT, "application/vnd.maplibre-tile")];
+
+    for path in ["/tilesets/fixture/0/0/0.mvt", "/tilesets/fixture/0/0/0.pbf"] {
+        let (status, headers, _) = harness.get_with(&harness.public, path, &mlt).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(
+            headers[header::CONTENT_TYPE],
+            "application/vnd.mapbox-vector-tile",
+            "{path} must serve the stored representation despite Accept"
+        );
+        assert_eq!(headers[header::VARY], "Accept-Encoding", "{path}");
+    }
+
+    let mvt = vec![(header::ACCEPT, "application/vnd.mapbox-vector-tile")];
+    let (status, headers, _) = harness
+        .get_with(&harness.public, "/tilesets/fixture/0/0/0.mlt", &mvt)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers[header::CONTENT_TYPE],
+        "application/vnd.maplibre-tile",
+        ".mlt must serve MLT despite an MVT-only Accept"
+    );
+}
+
 #[tokio::test]
 async fn tile_routes_serve_stored_mvt_and_negotiate_mlt() {
     let harness = harness("tile-negotiation").await;
@@ -1697,18 +1731,26 @@ async fn tile_routes_serve_stored_mvt_and_negotiate_mlt() {
     );
     assert_eq!(headers[header::CONTENT_ENCODING], "gzip");
     assert_eq!(headers[header::CACHE_CONTROL], cache::TILE);
-    assert_eq!(headers[header::VARY], "Accept");
+    assert_eq!(headers[header::VARY], "Accept, Accept-Encoding");
     let mut decoded = Vec::new();
     flate2::read::GzDecoder::new(stored.as_ref())
         .read_to_end(&mut decoded)
         .expect("decode stored MVT");
     assert!(decoded.is_empty());
 
-    for (path, request_headers) in [
-        ("/tilesets/fixture/0/0/0.mlt", Vec::new()),
+    // A `.mlt` suffix is authoritative, so it needs no `Accept` and must not
+    // advertise varying on it; the suffixless URL is where `Accept` selects.
+    for (path, request_headers, expected_vary) in [
+        ("/tilesets/fixture/0/0/0.mlt", Vec::new(), "Accept-Encoding"),
         (
             path,
             vec![(header::ACCEPT, "application/vnd.maplibre-tile")],
+            "Accept, Accept-Encoding",
+        ),
+        (
+            path,
+            vec![(header::ACCEPT, "application/vnd.maplibre-vector-tile")],
+            "Accept, Accept-Encoding",
         ),
     ] {
         let (status, headers, mlt) = harness
@@ -1721,13 +1763,27 @@ async fn tile_routes_serve_stored_mvt_and_negotiate_mlt() {
         );
         assert_eq!(headers[header::CONTENT_ENCODING], "gzip");
         assert_eq!(headers[header::CACHE_CONTROL], cache::TILE);
-        assert_eq!(headers[header::VARY], "Accept");
+        assert_eq!(headers[header::VARY], expected_vary);
         let mut decoded = Vec::new();
         flate2::read::GzDecoder::new(mlt.as_ref())
             .read_to_end(&mut decoded)
             .expect("decode negotiated MLT");
         assert!(decoded.is_empty());
     }
+
+    let (status, _, body) = harness
+        .get_with(
+            &harness.public,
+            path,
+            &[(header::ACCEPT_ENCODING, "identity")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_ACCEPTABLE);
+    assert!(
+        String::from_utf8_lossy(&body).contains("no acceptable tile content encoding"),
+        "body: {}",
+        String::from_utf8_lossy(&body)
+    );
 
     harness.cleanup().await;
 }

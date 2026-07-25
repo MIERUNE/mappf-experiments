@@ -72,11 +72,17 @@ existing contract merely because it wins one benchmark.
   publishing workflow—not eventual cache convergence—must prevent or detect
   overwrite of a live id.
 - TileJSON is derived from the PMTiles header and metadata. Ordinary tile
-  requests serve the archive's stored format and `Content-Encoding`. Explicit
-  `.mlt` requests, or `Accept: application/vnd.maplibre-tile` where supported,
-  may transcode stored MVT under the bounded CPU-work budget. Responses on a
-  path that negotiates by `Accept` must emit `Vary: Accept`; the `.mlt` suffix
-  remains the canonical cache-stable form.
+  requests serve the archive's stored format and `Content-Encoding` when that
+  coding is acceptable to the request. A missing `Accept-Encoding` accepts the
+  stored coding. Ishikari does not spend CPU decompressing or cross-compressing
+  a tile solely for content-coding negotiation; if the only stored/generated
+  representation is excluded, the public route returns `406 Not Acceptable`.
+  Explicit `.mlt` requests, or `Accept: application/vnd.maplibre-tile` where
+  supported, may transcode stored MVT under the bounded CPU-work budget. The
+  earlier `application/vnd.maplibre-vector-tile` spelling is accepted as an
+  input alias; responses use the canonical shorter media type. Public
+  tile responses emit `Vary: Accept, Accept-Encoding`; the `.mlt` suffix remains
+  the canonical cache-stable media-type form.
 - Public tile responses use `public, max-age=3600, s-maxage=86400,
   stale-while-revalidate=604800`. TileJSON uses `public, max-age=300,
   s-maxage=3600, stale-while-revalidate=86400`. These policies describe the

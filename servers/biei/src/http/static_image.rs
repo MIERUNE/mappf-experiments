@@ -12,8 +12,8 @@ use biei_core::types::{
     StaticOverlay, StyleId, TaskId, TaskSpec,
 };
 
-const MAX_STATIC_WIDTH: u16 = 1920;
-const MAX_STATIC_HEIGHT: u16 = 1280;
+pub(crate) const MAX_STATIC_WIDTH: u16 = 1920;
+pub(crate) const MAX_STATIC_HEIGHT: u16 = 1280;
 const MAX_STATIC_RGBA_BYTES: u64 = MAX_STATIC_WIDTH as u64 * MAX_STATIC_HEIGHT as u64 * 2 * 2 * 4;
 
 #[allow(clippy::too_many_arguments)]

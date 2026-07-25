@@ -26,6 +26,7 @@ pub(crate) type StyleTemplates = ResourceTemplates;
 #[non_exhaustive]
 pub(crate) struct Options {
     pub auth_registries: RegistryCatalog,
+    pub anonymous_registry: Option<String>,
     /// Exact provider origin allowed to receive a verified delivery token.
     /// Required when delivery authentication is enabled.
     pub auth_provider_origin: Option<url::Url>,
@@ -80,6 +81,7 @@ pub(crate) struct Options {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OptionsInput {
     pub auth_registries: String,
+    pub anonymous_registry: Option<String>,
     pub auth_provider_origin: Option<String>,
     pub style_templates: String,
     pub tileset_url_template: String,
@@ -198,6 +200,7 @@ impl Options {
 
         Ok(Self {
             auth_registries,
+            anonymous_registry: input.anonymous_registry,
             auth_provider_origin,
             style_templates,
             tileset_url_template: input.tileset_url_template,
@@ -393,6 +396,7 @@ pub(crate) fn test_options(style_templates: &str, cores: usize) -> Options {
 fn test_input(style_templates: &str, cores: usize) -> OptionsInput {
     OptionsInput {
         auth_registries: String::new(),
+        anonymous_registry: None,
         auth_provider_origin: None,
         style_templates: style_templates.to_string(),
         tileset_url_template: "https://tileset-provider.test/tilesets/{tileset_id}/tileset.json"

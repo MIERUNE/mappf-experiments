@@ -126,6 +126,12 @@ bare entry) is the catch-all and receives the whole id:
 Without a `default`, an unregistered namespace returns `unknown_style` (404),
 which keeps the catalog scoped to providers you list.
 
+Static-render responses allow browser use from any origin with
+`Access-Control-Allow-Origin: *`. Preflight accepts the delivery
+`Authorization` header and common cache/range request headers. This applies
+only to render content; health, metrics, and internal peer routes do not inherit
+the CORS policy. Cookie credentials are intentionally unsupported.
+
 ### Experimental static-render authentication
 
 Authentication is disabled by default. Setting `BIEI_AUTH_REGISTRIES` to a
@@ -135,6 +141,7 @@ behavior. For example:
 
 ```sh
 BIEI_AUTH_REGISTRIES='public=gs://example-auth/registries/public/' \
+BIEI_ANONYMOUS_REGISTRY='public' \
 BIEI_AUTH_PROVIDER_ORIGIN='https://ishikari.example.internal'
 ```
 
@@ -152,6 +159,13 @@ restrictive `Referrer-Policy`. The current v1 snapshot shape is:
   "schema_version": 1,
   "registry_id": "public",
   "revision": 1,
+  "anonymous": {
+    "enabled": true,
+    "namespaces": ["mierune", "carto", "mapterhorn"],
+    "actions": ["read", "render.static"],
+    "allowed_origins": [],
+    "allow_missing_origin": true
+  },
   "credentials": [{
     "credential_sha256": "<64 lowercase hex characters>",
     "principal_id": "demo-browser",
@@ -163,6 +177,12 @@ restrictive `Referrer-Policy`. The current v1 snapshot shape is:
   }]
 }
 ```
+
+`BIEI_ANONYMOUS_REGISTRY` is optional. When set, a request with no credential
+uses only that registry's explicit `anonymous` grant. A malformed, mixed,
+unknown, disabled, or otherwise invalid credential is rejected and never falls
+back to anonymous access. Without this setting, missing credentials retain the
+existing `401` behavior.
 
 For this object-store adapter, `credential_sha256` is SHA-256 over the fixed
 bytes `mmpf-object-store-auth-v1\0`, followed by the registry ID's 64-bit
@@ -182,9 +202,12 @@ profile cache partition, which prevents style/TileJSON cache, single-flight,
 and loaded native style reuse across different credentials or policy revisions
 without putting the raw credential in a cache key. Biei carries the bounded,
 redacted verified token across its trusted render wire and appends it as
-`access_token` only when fetching from `BIEI_AUTH_PROVIDER_ORIGIN`. Ishikari's
-same-origin rewrites then propagate it to generated tile, glyph, and sprite
-URLs; retained external provider URLs never receive it.
+`access_token` only when fetching from `BIEI_AUTH_PROVIDER_ORIGIN`. An
+authorized anonymous render carries the same bounded grants and cache partition
+but no provider token; Ishikari must independently allow the requested
+namespace through its matching anonymous policy. Ishikari's same-origin
+rewrites propagate verified query credentials to generated tile, glyph, and
+sprite URLs; retained external provider URLs never receive them.
 
 Because this is the original reusable bearer token, deployments must decide
 whether their internal network is an accepted trust boundary. If node-to-node

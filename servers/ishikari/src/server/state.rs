@@ -99,6 +99,7 @@ pub(crate) struct AppStateInner {
     gossip_bootstrap_readiness: BootstrapReadinessGate,
     pub(super) provider: ProviderConfig,
     pub(super) provider_fetcher: ProviderFetcher,
+    pub(super) glyph_composite_cache: super::glyph::GlyphCompositeCache,
     pub(super) delivery_auth: Option<mmpf_auth::DeliveryAuth>,
     /// Per-pod cache of transcoded MLT tiles, keyed by (resource routing key,
     /// tile id). Populated lazily on first `.mlt` request; see
@@ -167,6 +168,9 @@ impl AppState {
             gossip_bootstrap_readiness,
             provider,
             provider_fetcher,
+            glyph_composite_cache: super::glyph::glyph_composite_cache(
+                cache_capacities.glyph_composite_bytes(),
+            ),
             delivery_auth,
             mapterhorn,
             // Bounded, byte-weighted: first `.mlt` request transcodes, the rest
@@ -225,6 +229,10 @@ impl AppState {
     ) -> &moka::future::Cache<(ishikari_core::interned::ResourceRoutingKey, u64), bytes::Bytes>
     {
         &self.mlt_cache
+    }
+
+    pub(super) fn glyph_composite_cache(&self) -> &super::glyph::GlyphCompositeCache {
+        &self.glyph_composite_cache
     }
 
     /// The configured Mapterhorn composite resolver, if any.

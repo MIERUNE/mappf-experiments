@@ -196,7 +196,10 @@ impl Serialize for NamespaceSet {
 pub struct RenderAuthorization {
     pub readable_namespaces: NamespaceSet,
     pub cache_partition: CredentialCachePartition,
-    pub provider_bearer_token: ProviderBearerToken,
+    /// Verified caller credential forwarded only to the configured provider.
+    /// Explicitly authorized anonymous requests have no bearer credential.
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub provider_bearer_token: Option<ProviderBearerToken>,
 }
 
 /// Deserialize an optional wire value while still requiring the field itself

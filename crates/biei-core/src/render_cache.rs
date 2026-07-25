@@ -619,10 +619,10 @@ mod tests {
             )
             .unwrap(),
             cache_partition: crate::types::CredentialCachePartition::from_digest([1; 32]),
-            provider_bearer_token: crate::types::ProviderBearerToken::try_new(
-                "public.cache-test".to_string(),
-            )
-            .unwrap(),
+            provider_bearer_token: Some(
+                crate::types::ProviderBearerToken::try_new("public.cache-test".to_string())
+                    .unwrap(),
+            ),
         });
         task
     }

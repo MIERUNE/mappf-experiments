@@ -62,6 +62,7 @@ where
         cache_configured_weight_bytes = cache_capacities.configured_weight_bytes(),
         cpu_work_concurrency = options.cpu_work_concurrency,
         delivery_auth_enabled = auth.is_some(),
+        anonymous_access_enabled = options.anonymous_registry.is_some(),
         "starting ishikari"
     );
 

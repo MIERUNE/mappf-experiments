@@ -540,10 +540,10 @@ mod tests {
                 ])
                 .unwrap(),
                 cache_partition: crate::types::CredentialCachePartition::from_digest([7; 32]),
-                provider_bearer_token: crate::types::ProviderBearerToken::try_new(
-                    "public.wire-secret".to_string(),
-                )
-                .unwrap(),
+                provider_bearer_token: Some(
+                    crate::types::ProviderBearerToken::try_new("public.wire-secret".to_string())
+                        .unwrap(),
+                ),
             }),
             style: style(),
             source: Some(SourceRef {
@@ -592,7 +592,19 @@ mod tests {
             .remove("provider_bearer_token");
         assert!(
             serde_json::from_value::<WireTask>(missing_provider_token).is_err(),
-            "a protected task from a peer must include its provider credential"
+            "an authorized task from a peer must explicitly include its optional provider credential"
+        );
+        let mut anonymous_authorization = serde_json::to_value(&wire).unwrap();
+        anonymous_authorization["authorization"]["provider_bearer_token"] = serde_json::Value::Null;
+        let anonymous_wire: WireTask = serde_json::from_value(anonymous_authorization)
+            .expect("authorized anonymous tasks carry grants without a provider credential");
+        assert!(
+            anonymous_wire
+                .authorization
+                .as_ref()
+                .unwrap()
+                .provider_bearer_token
+                .is_none()
         );
 
         let rebuilt = wire.into_internal(now);
@@ -616,6 +628,8 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .provider_bearer_token
+                .as_ref()
+                .unwrap()
                 .as_str(),
             "public.wire-secret"
         );

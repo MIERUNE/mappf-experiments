@@ -291,11 +291,15 @@ must not be parsed on the tile route.
 configured catalog uses one.
 
 When `BIEI_AUTH_REGISTRIES` is non-empty, Biei requires either a Bearer
-credential or one `access_token` query parameter for static-image routes. Mixed
-or repeated transports are rejected. Authentication runs after the canonical
-route and style ID have been parsed but before concurrency/drain admission,
-provider access, or native work. Tile and preview routes remain unchanged in
-this first slice.
+credential or one `access_token` query parameter for static-image routes unless
+`BIEI_ANONYMOUS_REGISTRY` selects a configured registry whose snapshot has an
+enabled anonymous grant for the requested namespace and `render.static`.
+Malformed, mixed, repeated, unknown, or invalid credentials never fall back to
+anonymous access. Authentication runs after the canonical route and style ID
+have been parsed but before concurrency/drain admission, provider access, or
+native work. An authorized anonymous task carries its namespace grants and
+revision-derived cache partition across the peer wire, but has no provider
+bearer token. Tile and preview routes remain unchanged in this first slice.
 Unknown registry IDs fail from the trusted local catalog without object-store
 I/O. Registry snapshots use bounded single-flight loading, conditional refresh,
 O(1) digest lookup, and last-known-good retention. The complete experimental

@@ -29,6 +29,8 @@ where
         require_gossip_bootstrap = options.require_gossip_bootstrap,
         http_bind = %options.http_bind,
         node_id = %options.node_id,
+        delivery_auth_enabled = auth.is_some(),
+        anonymous_access_enabled = options.anonymous_registry.is_some(),
         "starting biei"
     );
     // Must precede Runtime::spawn_*: the registration is process-global and

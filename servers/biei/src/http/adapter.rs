@@ -18,6 +18,7 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{any, get, post};
 use mmpf_cluster::BootstrapReadinessGate;
+use mmpf_http::cors::public_distribution;
 use mmpf_http::operational::{
     INTERNAL_LIVENESS_PATH, INTERNAL_METRICS_PATH, INTERNAL_READINESS_PATH, PUBLIC_LIVENESS_PATH,
     PUBLIC_READINESS_PATH,
@@ -431,7 +432,7 @@ fn combined_router_with_public_content(
     public_content: Router<HttpServerState>,
 ) -> Router {
     finish_public_router(
-        standalone_operational_routes().merge(public_content),
+        standalone_operational_routes().merge(public_content.layer(public_distribution())),
         state,
         ListenerScope::Standalone,
     )
@@ -461,7 +462,7 @@ fn public_router_with_public_content(
     public_content: Router<HttpServerState>,
 ) -> Router {
     finish_public_router(
-        cluster_public_operational_routes().merge(public_content),
+        cluster_public_operational_routes().merge(public_content.layer(public_distribution())),
         state,
         ListenerScope::Public,
     )
@@ -1078,6 +1079,93 @@ mod tests {
                 "public content layer reached operational path {path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn distribution_cors_covers_content_and_excludes_operational_routes() {
+        let origin = "https://map-client.example";
+        let public_content: Router<HttpServerState> =
+            Router::new().fallback(completed_tile_response);
+        let router = public_router_with_public_content(empty_state(), public_content);
+
+        let content = route_through(
+            router.clone(),
+            Method::GET,
+            "/carto/voyager/0/0/0.png".parse().unwrap(),
+            Request::builder()
+                .header(axum::http::header::ORIGIN, origin)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(content.status(), StatusCode::OK);
+        assert_eq!(
+            content
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "*"
+        );
+
+        let preflight = route_through(
+            router.clone(),
+            Method::OPTIONS,
+            "/carto/voyager/0/0/0.png".parse().unwrap(),
+            Request::builder()
+                .header(axum::http::header::ORIGIN, origin)
+                .header(axum::http::header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .header(
+                    axum::http::header::ACCESS_CONTROL_REQUEST_HEADERS,
+                    "authorization,range",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(preflight.status(), StatusCode::OK);
+        assert_eq!(
+            preflight
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "*"
+        );
+
+        let operational = route_through(
+            router,
+            Method::GET,
+            PUBLIC_READINESS_PATH.parse().unwrap(),
+            Request::builder()
+                .header(axum::http::header::ORIGIN, origin)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(operational.status(), StatusCode::OK);
+        assert!(
+            operational
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
+
+        let internal = handle_internal(
+            State(empty_state()),
+            Method::GET,
+            INTERNAL_LIVENESS_PATH.parse().unwrap(),
+            Request::builder()
+                .header(axum::http::header::ORIGIN, origin)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(internal.status(), StatusCode::OK);
+        assert!(
+            internal
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
     }
 
     #[tokio::test]

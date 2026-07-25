@@ -269,10 +269,10 @@ impl HttpIngress {
                             cache_partition: CredentialCachePartition::from_digest(
                                 authorized.cache_partition(),
                             ),
-                            provider_bearer_token: ProviderBearerToken::try_new(
-                                authorized.backend_bearer_token().to_string(),
-                            )
-                            .expect("mmpf-auth returns a validated bounded credential"),
+                            provider_bearer_token: authorized.backend_bearer_token().map(|token| {
+                                ProviderBearerToken::try_new(token.to_string())
+                                    .expect("mmpf-auth returns a validated bounded credential")
+                            }),
                         })
                     }
                     Err(failure) => {
@@ -607,6 +607,84 @@ mod tests {
                 .unwrap()
                 .contains("service_draining")
         );
+    }
+
+    #[tokio::test]
+    async fn anonymous_static_policy_is_explicit_and_invalid_tokens_do_not_fall_back() {
+        let options = crate::options::test_options("https://styles.test/{style_id}/style.json", 1);
+        let runtime = crate::runtime::Runtime::spawn_single_node(&options).expect("runtime");
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let auth_root = std::env::temp_dir().join(format!(
+            "biei-anonymous-auth-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&auth_root).expect("auth root");
+        std::fs::write(
+            auth_root.join("current.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "registry_id": "public",
+                "revision": 1,
+                "anonymous": {
+                    "enabled": true,
+                    "namespaces": ["carto"],
+                    "actions": ["render.static"],
+                    "allowed_origins": [],
+                    "allow_missing_origin": true
+                },
+                "credentials": []
+            }))
+            .expect("snapshot JSON"),
+        )
+        .expect("snapshot");
+        let root_url = url::Url::from_directory_path(&auth_root)
+            .expect("auth root URL")
+            .to_string();
+        let catalog =
+            crate::auth::RegistryCatalog::parse(&format!("public={root_url}")).expect("catalog");
+        let auth = crate::auth::DeliveryAuth::new_with_anonymous_registry(
+            catalog,
+            Some("public".to_string()),
+            std::iter::empty::<(String, String)>(),
+        )
+        .expect("anonymous registry selection")
+        .expect("enabled auth");
+        let ingress = runtime.http_ingress_with_auth(Duration::from_secs(2), Some(auth));
+        runtime.drain_controller().begin_draining();
+
+        let anonymous = ingress
+            .handle_path("/carto/static/none/0,0,1,0,0/320x240.png", Instant::now())
+            .await;
+        assert_eq!(
+            anonymous.status, 503,
+            "the anonymous carto grant must pass auth and reach drain admission"
+        );
+
+        let private = ingress
+            .handle_path("/private/static/none/0,0,1,0,0/320x240.png", Instant::now())
+            .await;
+        assert_eq!(private.status, 403);
+
+        let invalid = ingress
+            .handle_public_path_with_request_id(
+                "/carto/static/none/0,0,1,0,0/320x240.png",
+                Some("access_token=public.wrong"),
+                &HeaderMap::new(),
+                None,
+                Instant::now(),
+            )
+            .await;
+        assert_eq!(invalid.status, 401);
+        assert!(
+            std::str::from_utf8(&invalid.body)
+                .unwrap()
+                .contains("invalid_token")
+        );
+
+        let _ = std::fs::remove_dir_all(auth_root);
     }
 
     #[tokio::test]

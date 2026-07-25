@@ -174,6 +174,15 @@ than treating either coalescing or non-coalescing as a resource-wide rule.
 - Distinct provider URLs are protected by a process-wide fetch concurrency and
   admission bound in addition to per-key single-flight. A slow or hung upstream
   must not pin request tasks or body memory without a bound.
+- A comma-separated glyph stack is split into at most eight distinct font
+  names. Each single-font 256-codepoint PBF is fetched through the ordinary
+  provider cache, then the ordered first-font-wins composite is protobuf-decoded,
+  bounded, generated under CPU-work admission, and stored in a separate
+  byte-weighted cache. The original 64 MiB provider budget is partitioned into
+  48 MiB for upstream representations and 16 MiB for glyph composites, so this
+  feature does not silently raise the process cache ceiling. HRW placement
+  remains keyed by the complete ordered stack, concentrating composite entries
+  on the same owner and preserving peer failover.
 - The direct HTTP provider fetch does not follow redirects. Upstreams answer
   directly; chasing a redirect would let a compromised or open-redirecting
   upstream steer the fetch at cluster-internal or link-local addresses that the
@@ -182,17 +191,17 @@ than treating either coalescing or non-coalescing as a resource-wide rule.
   glyph/sprite responses and peer hops. Compressed style JSON is decoded with a
   bounded output before validation and rewriting; invalid JSON never enters the
   provider cache.
-- Validators pass through only for byte-identical bodies: glyphs and sprites
-  emit the upstream `ETag`/`Last-Modified` and answer `If-None-Match`
+- Validators pass through only for byte-identical bodies: single-font glyphs
+  and sprites emit the upstream `ETag`/`Last-Modified` and answer `If-None-Match`
   (weak comparison, precedence over `If-Modified-Since`) and second-granular
   `If-Modified-Since` with `304 Not Modified`. The `304` carries the same cache
   metadata (`Cache-Control`, `Age`, validators) as the `200` but omits
   representation metadata such as `Content-Encoding` (RFC 9110 §15.4.5).
   `If-None-Match: *` matches any existing representation even
-  when no `ETag` is available. Derived representations — rewritten style JSON,
-  TileJSON, and derived-product TileJSON — instead emit an Ishikari-computed
-  strong `ETag` over the exact bytes served and no `Last-Modified`, and answer
-  `If-None-Match` with a `304`. Ishikari never emits a validator that the
+  when no `ETag` is available. Derived representations — composite glyphs,
+  rewritten style JSON, TileJSON, and derived-product TileJSON — instead emit
+  an Ishikari-computed strong `ETag` over the exact bytes served and no
+  `Last-Modified`, and answer `If-None-Match` with a `304`. Ishikari never emits a validator that the
   upstream did not supply for a byte-identical body, and validators survive the
   internal peer hop alongside the cache policy.
 - TileJSON, rewritten style JSON, and generated preview/derived documents embed

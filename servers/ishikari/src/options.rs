@@ -20,7 +20,10 @@ pub(crate) const DEFAULT_BACKEND_ACTIVE_BODY_BUDGET_BYTES: u64 = 128 * MIB;
 const RESOURCE_CACHE_MAX_BYTES: u64 = 64 * MIB;
 const ARCHIVE_CACHE_MAX_BYTES: u64 = 64 * MIB;
 const LEAF_CACHE_MAX_BYTES: u64 = 64 * MIB;
-const PROVIDER_CACHE_MAX_BYTES: u64 = 64 * MIB;
+// Keep origin provider objects and derived composite glyphs under the original
+// 64 MiB provider budget rather than quietly raising the process cache ceiling.
+const PROVIDER_CACHE_MAX_BYTES: u64 = 48 * MIB;
+const GLYPH_COMPOSITE_CACHE_MAX_BYTES: u64 = 16 * MIB;
 const MLT_CACHE_MAX_BYTES: u64 = 64 * MIB;
 const DERIVED_TILE_CACHE_MAX_BYTES: u64 = 128 * MIB;
 const DEM_TILE_CACHE_MAX_BYTES: u64 = 64 * MIB;
@@ -40,6 +43,7 @@ pub(crate) struct CacheCapacities {
     archive_bytes: u64,
     leaf_bytes: u64,
     provider_bytes: u64,
+    glyph_composite_bytes: u64,
     mlt_bytes: u64,
     derived_tile_bytes: u64,
     dem_tile_bytes: u64,
@@ -54,6 +58,7 @@ impl CacheCapacities {
             ARCHIVE_CACHE_MAX_BYTES,
             LEAF_CACHE_MAX_BYTES,
             PROVIDER_CACHE_MAX_BYTES,
+            GLYPH_COMPOSITE_CACHE_MAX_BYTES,
             MLT_CACHE_MAX_BYTES,
             DERIVED_TILE_CACHE_MAX_BYTES,
             DEM_TILE_CACHE_MAX_BYTES,
@@ -81,6 +86,7 @@ impl CacheCapacities {
             archive_bytes: ARCHIVE_CACHE_MAX_BYTES,
             leaf_bytes: LEAF_CACHE_MAX_BYTES,
             provider_bytes: PROVIDER_CACHE_MAX_BYTES,
+            glyph_composite_bytes: GLYPH_COMPOSITE_CACHE_MAX_BYTES,
             mlt_bytes: MLT_CACHE_MAX_BYTES,
             derived_tile_bytes: DERIVED_TILE_CACHE_MAX_BYTES,
             dem_tile_bytes: DEM_TILE_CACHE_MAX_BYTES,
@@ -119,6 +125,10 @@ impl CacheCapacities {
         self.provider_bytes
     }
 
+    pub(crate) fn glyph_composite_bytes(self) -> u64 {
+        self.glyph_composite_bytes
+    }
+
     pub(crate) fn mlt_bytes(self) -> u64 {
         self.mlt_bytes
     }
@@ -152,6 +162,7 @@ impl Default for CacheCapacities {
 #[non_exhaustive]
 pub(crate) struct Options {
     pub(crate) auth_registries: RegistryCatalog,
+    pub(crate) anonymous_registry: Option<String>,
     pub(crate) http_listen_addr: SocketAddr,
     /// Cluster-internal listener (metrics and peer forwarding).
     pub(crate) internal_listen_addr: SocketAddr,
@@ -248,6 +259,7 @@ fn backend_kind(source: &str) -> &'static str {
 /// choosing process-local defaults.
 pub(crate) struct OptionsInput {
     pub(crate) auth_registries: String,
+    pub(crate) anonymous_registry: Option<String>,
     pub(crate) node_id: String,
     pub(crate) gossip_seeds: Vec<String>,
     pub(crate) gossip_advertise_addr: Option<SocketAddr>,
@@ -374,6 +386,7 @@ impl Options {
         let cpu_work_concurrency = input.cpu_work_concurrency.max(1);
         Ok(Self {
             auth_registries,
+            anonymous_registry: input.anonymous_registry,
             http_listen_addr,
             internal_listen_addr,
             membership: MembershipConfig {
@@ -446,6 +459,7 @@ mod tests {
     fn input() -> OptionsInput {
         OptionsInput {
             auth_registries: String::new(),
+            anonymous_registry: None,
             node_id: "node-a".to_string(),
             gossip_seeds: Vec::new(),
             gossip_advertise_addr: None,
@@ -578,7 +592,8 @@ mod tests {
         assert_eq!(caches.resource_bytes(), 64 * MIB);
         assert_eq!(caches.archive_bytes(), 64 * MIB);
         assert_eq!(caches.leaf_bytes(), 64 * MIB);
-        assert_eq!(caches.provider_bytes(), 64 * MIB);
+        assert_eq!(caches.provider_bytes(), 48 * MIB);
+        assert_eq!(caches.glyph_composite_bytes(), 16 * MIB);
         assert_eq!(caches.mlt_bytes(), 64 * MIB);
         assert_eq!(caches.derived_tile_bytes(), 128 * MIB);
         assert_eq!(caches.dem_tile_bytes(), 64 * MIB);

@@ -36,6 +36,7 @@ maplibre_native = { version = "0.8.7", default-features = false, features = ["js
 mlt-core = { version = "0.12", default-features = false }
 moka = { version = "0.12", features = ["sync", "future"] }
 object_store = { version = "0.14" }
+pbf_font_tools = "3.1.1"
 prometheus = "0.14"
 rand = "0.10.2"
 rand_distr = "0.6"
@@ -47,6 +48,7 @@ sha2 = "0.10"
 thiserror = "2"
 tiny-skia = "0.12"
 tokio = "1"
+tower-http = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 twox-hash = "2"

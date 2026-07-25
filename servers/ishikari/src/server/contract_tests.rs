@@ -22,16 +22,18 @@ use std::{
 use axum::{
     Router,
     body::Body,
-    http::{HeaderMap, Request, StatusCode, header},
+    http::{HeaderMap, Method, Request, StatusCode, header},
     response::IntoResponse,
     routing::get,
 };
 use bytes::Bytes;
+use futures_util::future::join_all;
+use pbf_font_tools::{Fontstack, Glyph, Glyphs, prost::Message};
 use tower::util::ServiceExt;
 
 use super::{
-    AppState, ServerRuntimeConfig, cache, internal_router, public_router, with_common_layers,
-    with_public_layers,
+    AppState, ServerRuntimeConfig, cache, internal_router, public_delivery_routes,
+    with_common_layers, with_public_layers,
 };
 use crate::provider::ProviderConfig;
 use crate::{
@@ -59,6 +61,28 @@ const GLYPH_UPSTREAM_LAST_MODIFIED: &str = "Sat, 01 Feb 2025 10:00:00 GMT";
 const PMTILES_HEADER_SIZE: usize = 127;
 const PMTILES_FIXTURE_SIZE: usize = 16 * 1024;
 const PMTILES_LEAF_BYTES: &[u8] = b"leaf";
+
+fn glyph_pbf(font: &str, glyphs: &[(u32, u8)]) -> Vec<u8> {
+    Glyphs {
+        stacks: vec![Fontstack {
+            name: font.to_string(),
+            range: "0-255".to_string(),
+            glyphs: glyphs
+                .iter()
+                .map(|&(id, marker)| Glyph {
+                    id,
+                    bitmap: Some(vec![marker]),
+                    width: 1,
+                    height: 1,
+                    left: 0,
+                    top: 0,
+                    advance: 1,
+                })
+                .collect(),
+        }],
+    }
+    .encode_to_vec()
+}
 
 /// Writes a minimal PMTiles v3 archive containing one gzip-compressed empty MVT
 /// at z0/0/0. Building it in the harness keeps the router contract test
@@ -123,12 +147,14 @@ async fn spawn_upstream() -> (
     Arc<AtomicUsize>,
     Arc<AtomicUsize>,
     Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
 ) {
     let uncached_requests = Arc::new(AtomicUsize::new(0));
     let invalid_requests = Arc::new(AtomicUsize::new(0));
     let aged_requests = Arc::new(AtomicUsize::new(0));
     let revalidated_requests = Arc::new(AtomicUsize::new(0));
     let fallback_requests = Arc::new(AtomicUsize::new(0));
+    let glyph_component_requests = Arc::new(AtomicUsize::new(0));
     let router = Router::new()
         .route(
             "/styles/base/style.json",
@@ -324,6 +350,47 @@ async fn spawn_upstream() -> (
                     &b"glyph-bytes"[..],
                 )
             }),
+        )
+        .route(
+            "/fonts/Primary/0-255.pbf",
+            get({
+                let requests = Arc::clone(&glyph_component_requests);
+                move || {
+                    let requests = Arc::clone(&requests);
+                    async move {
+                        requests.fetch_add(1, Ordering::Relaxed);
+                        (
+                            [(header::CONTENT_TYPE, "application/x-protobuf")],
+                            glyph_pbf("Primary", &[(1, 1), (3, 3)]),
+                        )
+                    }
+                }
+            }),
+        )
+        .route(
+            "/fonts/Fallback/0-255.pbf",
+            get({
+                let requests = Arc::clone(&glyph_component_requests);
+                move || {
+                    let requests = Arc::clone(&requests);
+                    async move {
+                        requests.fetch_add(1, Ordering::Relaxed);
+                        (
+                            [(header::CONTENT_TYPE, "application/x-protobuf")],
+                            glyph_pbf("Fallback", &[(2, 2), (3, 9)]),
+                        )
+                    }
+                }
+            }),
+        )
+        .route(
+            "/fonts/Precomposed,Fallback/0-255.pbf",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "application/x-protobuf")],
+                    glyph_pbf("Precomposed, Fallback", &[(7, 7)]),
+                )
+            }),
         );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -337,6 +404,7 @@ async fn spawn_upstream() -> (
         aged_requests,
         revalidated_requests,
         fallback_requests,
+        glyph_component_requests,
     )
 }
 
@@ -350,6 +418,7 @@ struct Harness {
     aged_upstream_requests: Arc<AtomicUsize>,
     revalidated_upstream_requests: Arc<AtomicUsize>,
     fallback_upstream_requests: Arc<AtomicUsize>,
+    glyph_component_requests: Arc<AtomicUsize>,
 }
 
 impl Harness {
@@ -363,7 +432,18 @@ impl Harness {
         path: &str,
         request_headers: &[(header::HeaderName, &str)],
     ) -> (StatusCode, HeaderMap, Bytes) {
-        let mut request = Request::builder().uri(path);
+        self.request_with(router, Method::GET, path, request_headers)
+            .await
+    }
+
+    async fn request_with(
+        &self,
+        router: &Router,
+        method: Method,
+        path: &str,
+        request_headers: &[(header::HeaderName, &str)],
+    ) -> (StatusCode, HeaderMap, Bytes) {
+        let mut request = Request::builder().method(method).uri(path);
         for (name, value) in request_headers {
             request = request.header(name, *value);
         }
@@ -484,21 +564,26 @@ async fn spawn_provider_peer() -> SocketAddr {
 }
 
 async fn harness(label: &str) -> Harness {
-    harness_config(label, None, false).await
+    harness_config(label, None, false, false).await
 }
 
 async fn harness_with_provider_peer(label: &str, provider_peer: Option<SocketAddr>) -> Harness {
-    harness_config(label, provider_peer, false).await
+    harness_config(label, provider_peer, false, false).await
 }
 
 async fn harness_with_auth(label: &str) -> Harness {
-    harness_config(label, None, true).await
+    harness_config(label, None, true, false).await
+}
+
+async fn harness_with_anonymous_auth(label: &str) -> Harness {
+    harness_config(label, None, true, true).await
 }
 
 async fn harness_config(
     label: &str,
     provider_peer: Option<SocketAddr>,
     auth_enabled: bool,
+    anonymous_enabled: bool,
 ) -> Harness {
     let (
         upstream,
@@ -507,6 +592,7 @@ async fn harness_config(
         aged_upstream_requests,
         revalidated_upstream_requests,
         fallback_upstream_requests,
+        glyph_component_requests,
     ) = spawn_upstream().await;
 
     let suffix = std::time::SystemTime::now()
@@ -522,7 +608,7 @@ async fn harness_config(
     let delivery_auth = if auth_enabled {
         let auth_root = tiles_dir.join("auth");
         std::fs::create_dir_all(&auth_root).expect("auth root");
-        let snapshot = serde_json::json!({
+        let mut snapshot = serde_json::json!({
             "schema_version": 1,
             "registry_id": "public",
             "revision": 1,
@@ -553,6 +639,15 @@ async fn harness_config(
                 }
             ]
         });
+        if anonymous_enabled {
+            snapshot["anonymous"] = serde_json::json!({
+                "enabled": true,
+                "namespaces": ["base", "fixture"],
+                "actions": ["read"],
+                "allowed_origins": [],
+                "allow_missing_origin": true
+            });
+        }
         std::fs::write(
             auth_root.join("current.json"),
             serde_json::to_vec(&snapshot).expect("auth snapshot JSON"),
@@ -563,7 +658,12 @@ async fn harness_config(
             .to_string();
         let catalog =
             mmpf_auth::RegistryCatalog::parse(&format!("public={root_url}")).expect("auth catalog");
-        mmpf_auth::DeliveryAuth::new(catalog, std::iter::empty::<(String, String)>())
+        mmpf_auth::DeliveryAuth::new_with_anonymous_registry(
+            catalog,
+            anonymous_enabled.then(|| "public".to_string()),
+            std::iter::empty::<(String, String)>(),
+        )
+        .expect("anonymous registry selection")
     } else {
         None
     };
@@ -656,7 +756,7 @@ async fn harness_config(
     );
 
     Harness {
-        public: with_public_layers(public_router(), state.clone()),
+        public: with_public_layers(public_delivery_routes(), state.clone()),
         internal: with_common_layers(internal_router(), state),
         membership_owner,
         tiles_dir,
@@ -665,6 +765,7 @@ async fn harness_config(
         aged_upstream_requests,
         revalidated_upstream_requests,
         fallback_upstream_requests,
+        glyph_component_requests,
     }
 }
 
@@ -775,6 +876,124 @@ async fn delivery_auth_is_optional_and_covers_only_public_content_routes() {
         )
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "namespace grants are exact");
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn distribution_cors_precedes_auth_and_excludes_operational_routes() {
+    let harness = harness_with_auth("distribution-cors").await;
+    let origin = (header::ORIGIN, "https://map-client.example");
+
+    let (status, headers, _) = harness
+        .get_with(
+            &harness.public,
+            "/styles/base/style.json",
+            std::slice::from_ref(&origin),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+
+    let (status, headers, _) = harness
+        .get_with(
+            &harness.public,
+            "/styles/base/style.json?access_token=public.secret",
+            std::slice::from_ref(&origin),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+
+    let (status, headers, body) = harness
+        .request_with(
+            &harness.public,
+            Method::OPTIONS,
+            "/styles/base/style.json",
+            &[
+                origin.clone(),
+                (header::ACCESS_CONTROL_REQUEST_METHOD, "GET"),
+                (
+                    header::ACCESS_CONTROL_REQUEST_HEADERS,
+                    "authorization,range",
+                ),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_empty());
+    assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+    let allowed_headers = headers[header::ACCESS_CONTROL_ALLOW_HEADERS]
+        .to_str()
+        .unwrap();
+    assert!(allowed_headers.contains("authorization"));
+    assert!(allowed_headers.contains("range"));
+
+    let (status, headers, _) = harness
+        .get_with(&harness.public, "/readyz", std::slice::from_ref(&origin))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+        "operational routes must not inherit distribution CORS"
+    );
+
+    let (status, headers, _) = harness
+        .get_with(
+            &harness.internal,
+            "/_internal/provider/styles/base/style.json",
+            &[origin],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+        "internal provider routes must not inherit distribution CORS"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn anonymous_delivery_policy_is_scoped_and_never_masks_invalid_tokens() {
+    let harness = harness_with_anonymous_auth("delivery-auth-anonymous").await;
+
+    let (status, _, style_body) = harness
+        .get(&harness.public, "/styles/base/style.json")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !String::from_utf8_lossy(&style_body).contains("access_token"),
+        "anonymous generated URLs must remain credential-free"
+    );
+    assert_eq!(
+        harness
+            .get(&harness.public, "/tilesets/fixture/0/0/0")
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        harness
+            .get(&harness.public, "/styles/regional/base/style.json")
+            .await
+            .0,
+        StatusCode::FORBIDDEN,
+        "anonymous namespace grants are exact"
+    );
+
+    let (status, headers, _) = harness
+        .get(
+            &harness.public,
+            "/styles/base/style.json?access_token=public.wrong",
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "an invalid credential must never fall back to anonymous access"
+    );
+    assert_eq!(headers[header::CACHE_CONTROL], "private, no-store");
 
     harness.cleanup().await;
 }
@@ -1176,6 +1395,102 @@ async fn public_provider_responses_carry_cache_policy_and_age() {
 }
 
 #[tokio::test]
+async fn composite_glyphs_reuse_component_fetches_and_preserve_font_precedence() {
+    let harness = harness("composite-glyphs").await;
+
+    let mut concurrent =
+        join_all((0..8).map(|_| harness.get(&harness.public, "/fonts/Primary,Fallback/0-255.pbf")))
+            .await;
+    assert!(
+        concurrent
+            .iter()
+            .all(|(status, _, _)| *status == StatusCode::OK)
+    );
+    let (_, first_headers, first_body) = concurrent.swap_remove(0);
+    assert!(
+        concurrent.iter().all(|(_, _, body)| body == &first_body),
+        "composite single-flight followers must receive the same bytes"
+    );
+    assert_eq!(
+        harness.glyph_component_requests.load(Ordering::Relaxed),
+        2,
+        "concurrent composite misses must fetch each component only once"
+    );
+    assert_eq!(
+        first_headers[header::CACHE_CONTROL],
+        "public, max-age=86400, s-maxage=604800"
+    );
+    assert!(first_headers.contains_key(header::ETAG));
+    assert!(
+        first_headers.get(header::LAST_MODIFIED).is_none(),
+        "a derived composite must not retain one component's validator"
+    );
+    let first = Glyphs::decode(first_body.clone()).expect("merged glyph PBF");
+    assert_eq!(
+        first.stacks[0]
+            .glyphs
+            .iter()
+            .map(|glyph| (glyph.id, glyph.bitmap.as_deref().unwrap()[0]))
+            .collect::<Vec<_>>(),
+        [(1, 1), (2, 2), (3, 3)]
+    );
+
+    // A different composite key reuses both single-font provider entries while
+    // reversing precedence for the overlapping glyph.
+    let (status, _, reversed_body) = harness
+        .get(&harness.public, "/fonts/Fallback,Primary/0-255.pbf")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        harness.glyph_component_requests.load(Ordering::Relaxed),
+        2,
+        "individual font ranges should come from the provider cache"
+    );
+    let reversed = Glyphs::decode(reversed_body).expect("reversed merged glyph PBF");
+    assert_eq!(
+        reversed.stacks[0]
+            .glyphs
+            .iter()
+            .find(|glyph| glyph.id == 3)
+            .and_then(|glyph| glyph.bitmap.as_deref())
+            .map(|bitmap| bitmap[0]),
+        Some(9)
+    );
+
+    let (status, repeated_headers, repeated_body) = harness
+        .get(&harness.public, "/fonts/Primary,Fallback/0-255.pbf")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(repeated_body, first_body);
+    assert_eq!(repeated_headers[header::ETAG], first_headers[header::ETAG]);
+    assert_eq!(harness.glyph_component_requests.load(Ordering::Relaxed), 2);
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn precomposed_glyph_stack_is_served_without_requiring_component_fonts() {
+    let harness = harness("precomposed-glyphs").await;
+
+    let (status, _, body) = harness
+        .get(&harness.public, "/fonts/Precomposed,Fallback/0-255.pbf")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let decoded = Glyphs::decode(body).expect("precomposed glyph PBF");
+    assert_eq!(decoded.stacks[0].name, "Precomposed, Fallback");
+    assert_eq!(
+        decoded.stacks[0]
+            .glyphs
+            .iter()
+            .map(|glyph| glyph.id)
+            .collect::<Vec<_>>(),
+        [7]
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
 async fn internal_provider_responses_carry_typed_metadata_not_public_headers() {
     let harness = harness("internal").await;
 
@@ -1514,7 +1829,16 @@ async fn internal_metrics_expose_every_material_cache() {
     assert_eq!(status, StatusCode::OK);
     let body = String::from_utf8_lossy(&body);
     for cache in [
-        "tile", "chunk", "resource", "archive", "leaf", "provider", "mlt", "derived", "dem",
+        "tile",
+        "chunk",
+        "resource",
+        "archive",
+        "leaf",
+        "provider",
+        "glyph_composite",
+        "mlt",
+        "derived",
+        "dem",
     ] {
         assert!(
             body.contains(&format!("ishikari_cache_bytes{{cache=\"{cache}\"}}")),

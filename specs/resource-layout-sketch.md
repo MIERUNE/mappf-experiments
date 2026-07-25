@@ -36,7 +36,7 @@ The logical tileset identifier is either `tileset_id` or
 tilesets/{namespace}/{tileset_id}.pmtiles
 styles/{style_id}/style.json
 styles/{style_id}/sprites/{sprite_id}{@2x}.{json,png}
-fonts/{fontstack}/{range}.pbf
+fonts/{font_name}/{range}.pbf
 ```
 
 For a flat tileset id, the optional namespace path segment is omitted. There is
@@ -47,6 +47,16 @@ through the source templates below.
 TileJSON remains derived from the PMTiles header and metadata. Storing a second
 TileJSON object would create another source of truth without adding useful
 information.
+
+Glyph objects contain one font and one 256-codepoint range. Ishikari treats a
+comma-separated public `{fontstack}` as an ordered composition request: it
+fetches and caches each `{font_name}/{range}.pbf` independently, keeps the first
+font's glyph when IDs overlap, and byte-bounded-caches the merged
+representation. The composite is a runtime cache entry, not another object the
+publisher must materialize. Single-font responses remain byte-identical
+passthrough. The source template is deployment-configurable, but one request is
+bounded to eight distinct component fonts so a public path cannot create
+unbounded object-store fan-out.
 
 ## 3. PMTiles source templates (adopted)
 

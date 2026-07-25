@@ -131,6 +131,16 @@ implemented by both servers, but a deployment must first configure URL-log redac
 referrer policy, and CDN cache-key behavior. Clients must not silently switch
 transports, and a request carrying both is rejected.
 
+The distribution transport itself is cross-origin: Biei static renders and
+Ishikari public map resources return `Access-Control-Allow-Origin: *`.
+Credential-free `OPTIONS` preflight is handled before delivery authentication
+and permits the Bearer header plus common cache/range request headers. Actual
+authorization failures retain CORS headers so browser clients can observe the
+status. This wildcard policy deliberately excludes cookies and is not an
+authorization decision; optional token-level `Origin` policy remains the
+anti-hotlink control. Operational and cluster-internal routes do not inherit
+distribution CORS.
+
 ### 4.2 Registry entry
 
 A request parses the token's `registry_id`, resolves it through trusted local
@@ -616,6 +626,13 @@ parameter. Mixed or repeated transports are rejected. Query transport exists
 for browser/map clients that cannot set headers and requires URL-log redaction,
 restrictive referrer policy, and deliberate CDN cache-key handling.
 
+Each service may additionally select one configured registry with
+`BIEI_ANONYMOUS_REGISTRY` or `ISKR_ANONYMOUS_REGISTRY`. Only a truly missing
+credential may use that snapshot's explicit anonymous grant. Invalid
+credentials never downgrade to anonymous access. The initial public policy
+allows the `mierune`, `carto`, and `mapterhorn` namespaces; absence of the
+selector or of an enabled matching grant preserves token-required behavior.
+
 Ishikari propagates a verified query token only into same-origin URLs produced
 by its own style, TileJSON, derived TileJSON, and preview transformations. It
 does not attach the token to external URLs retained from provider style JSON,
@@ -653,14 +670,15 @@ The initial object-store shape is one self-contained object per registry:
 {auth_root}/current.json
 ```
 
-The current v1 shared schema contains `schema_version`, `registry_id`, a monotonic
-`revision`, and a bounded `credentials` array. Each credential entry contains a
-one-way `credential_sha256`, bounded `principal_id`, enabled state, namespace
-and exact `render.static` or `read` grants, exact allowed origins, and an explicit
-`allow_missing_origin` policy. It never contains raw API keys, recoverable
-secrets, private signing keys, or arbitrary secret-manager payloads. Rate tiers,
-validity windows, additional actions, and external verifier descriptions remain
-future schema work rather than ignored fields.
+The current v1 shared schema contains `schema_version`, `registry_id`, a
+monotonic `revision`, an optional bounded `anonymous` grant, and a bounded
+`credentials` array. The anonymous grant has enabled state, namespace and exact
+`render.static` or `read` grants, exact allowed origins, and an explicit
+`allow_missing_origin` policy. Each credential entry adds a one-way
+`credential_sha256` and bounded `principal_id`. The object never contains raw
+API keys, recoverable secrets, private signing keys, or arbitrary secret-manager
+payloads. Rate tiers, validity windows, additional actions, and external
+verifier descriptions remain future schema work rather than ignored fields.
 
 The object is conditionally replaced as a whole. Readers use its strong object
 validator or generation for conditional refresh and never list a prefix or
@@ -796,10 +814,11 @@ configuration and reusable service code:
 - service core crates consume typed verifier/configuration objects;
 - domain routers own route-level authorization decisions;
 - cache keys describe representations, not credentials;
-- gossip never carries raw external credentials; Biei's render wire may carry
-  the bounded redacted ordinary provider token only under the selected
-  trusted service boundary, alongside namespace grants and a one-way
-  credential-and-policy cache partition;
+- gossip never carries raw external credentials; Biei's render wire carries
+  namespace grants and a one-way authorization-and-policy cache partition, and
+  may carry the bounded redacted ordinary provider token only for an
+  authenticated caller under the selected trusted service boundary. Authorized
+  anonymous tasks explicitly carry no provider token;
 - simulators model authentication cost only when a measured question requires
   it.
 

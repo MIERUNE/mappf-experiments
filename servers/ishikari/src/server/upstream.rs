@@ -195,6 +195,32 @@ impl ProviderResource {
         &self.bytes
     }
 
+    pub(crate) fn cache_control(&self) -> &str {
+        &self.cache_control
+    }
+
+    pub(crate) fn age_seconds(&self) -> u64 {
+        self.age_seconds
+    }
+
+    /// Builds a locally derived provider representation. Its validators apply
+    /// to the transformed bytes, not to any one upstream component.
+    pub(crate) fn derived(bytes: Bytes, cache_control: Arc<str>) -> Self {
+        let validators = Validators::for_derived_body(&bytes);
+        Self {
+            bytes,
+            cache_control,
+            age_seconds: 0,
+            validators,
+            content_encoding: None,
+        }
+    }
+
+    pub(crate) fn with_additional_age(mut self, elapsed: Duration) -> Self {
+        self.age_seconds = self.age_seconds.saturating_add(elapsed.as_secs());
+        self
+    }
+
     /// Returns the decoded representation for server-side transformation.
     /// Byte-identical glyph/sprite responses keep their original encoding;
     /// styles must be decoded before JSON parsing and rewriting.

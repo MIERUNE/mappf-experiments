@@ -3,6 +3,8 @@
 //! The public token envelope deliberately owns only registry selection. The
 //! suffix is opaque here: each registry adapter decides whether it represents
 //! a random secret, a JWT, or another credential format.
+//! A service may also select one configured registry whose explicit anonymous
+//! grant applies only when the request contains no credential at all.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -39,6 +41,7 @@ const REFRESH_FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
 const OBJECT_STORE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const DIGEST_DOMAIN: &[u8] = b"mmpf-object-store-auth-v1\0";
 const CACHE_PARTITION_DOMAIN: &[u8] = b"mmpf-delivery-cache-partition-v1\0";
+const ANONYMOUS_CACHE_PARTITION_DOMAIN: &[u8] = b"mmpf-delivery-anonymous-cache-partition-v1\0";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct RegistryCatalog {
@@ -150,6 +153,7 @@ pub struct DeliveryAuth {
 
 struct DeliveryAuthInner {
     catalog: RegistryCatalog,
+    anonymous_registry_id: Option<String>,
     stores: ObjectStores,
     cache: Cache<String, CachedRegistry>,
     cold_retry_after: Mutex<HashMap<String, Instant>>,
@@ -179,9 +183,39 @@ impl DeliveryAuth {
         K: Into<String>,
         V: Into<String>,
     {
-        (!catalog.is_empty()).then(|| Self {
+        Self::new_with_anonymous_registry(catalog, None, object_store_options)
+            .expect("no anonymous registry selection is always valid")
+    }
+
+    /// Builds delivery authentication with an optional registry whose
+    /// explicitly configured anonymous grant applies when no credential is
+    /// presented.
+    ///
+    /// Missing credentials may use this policy. Malformed, mixed, unknown, or
+    /// otherwise invalid credentials never fall back to anonymous access.
+    pub fn new_with_anonymous_registry<I, K, V>(
+        catalog: RegistryCatalog,
+        anonymous_registry_id: Option<String>,
+        object_store_options: I,
+    ) -> anyhow::Result<Option<Self>>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        if let Some(registry_id) = anonymous_registry_id.as_deref() {
+            validate_registry_id(registry_id)?;
+            if catalog.get(registry_id).is_none() {
+                bail!("anonymous auth registry {registry_id:?} is not configured");
+            }
+        }
+        if catalog.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
             inner: Arc::new(DeliveryAuthInner {
                 catalog,
+                anonymous_registry_id,
                 stores: ObjectStores::new(object_store_options),
                 cache: Cache::builder()
                     .max_capacity(AUTH_CACHE_CAPACITY_BYTES)
@@ -192,7 +226,7 @@ impl DeliveryAuth {
                 refreshes: SingleFlight::default(),
                 refresh_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_REGISTRY_LOADS)),
             }),
-        })
+        }))
     }
 
     pub async fn authorize_static(
@@ -222,7 +256,9 @@ impl DeliveryAuth {
         namespace: Option<&str>,
         action: DeliveryAction,
     ) -> Result<AuthorizedDelivery, AuthFailure> {
-        let presented = delivery_token(headers, query)?;
+        let Some(presented) = delivery_token(headers, query)? else {
+            return self.authorize_anonymous(headers, namespace, action).await;
+        };
         let propagate_access_token = presented.from_query;
         let (registry_id, credential) = parse_token_envelope(presented.value.as_ref())?;
         let Some(config) = self.inner.catalog.get(registry_id) else {
@@ -235,32 +271,52 @@ impl DeliveryAuth {
             .await
             .map_err(|_| AuthFailure::Unavailable)?;
         let digest = credential_digest(registry_id, credential);
-        let Some(grant) = snapshot
-            .credentials
-            .get(&digest)
-            .filter(|grant| grant.enabled && constant_time_eq(&grant.credential_sha256, &digest))
-        else {
+        let Some(grant) = snapshot.credentials.get(&digest).filter(|grant| {
+            grant.authorization.enabled && constant_time_eq(&grant.credential_sha256, &digest)
+        }) else {
             return Err(AuthFailure::InvalidCredential);
         };
 
-        if namespace.is_some_and(|namespace| {
-            grant.namespaces.first().is_none_or(|first| first != "*")
-                && grant
-                    .namespaces
-                    .binary_search_by(|allowed| allowed.as_str().cmp(namespace))
-                    .is_err()
-        }) || !grant.actions.contains(&action)
-        {
-            return Err(AuthFailure::Forbidden);
-        }
-        authorize_origin(headers, grant)?;
+        authorize_grant(headers, &grant.authorization, namespace, action)?;
+        Ok(AuthorizedDelivery {
+            principal_id: grant.authorization.principal_id.clone(),
+            registry_id: registry_id.to_string(),
+            readable_namespaces: Arc::clone(&grant.authorization.namespaces),
+            cache_partition: credential_cache_partition(registry_id, credential, snapshot.revision),
+            presented_token: Some(Arc::from(presented.value.as_ref())),
+            propagate_access_token,
+        })
+    }
+
+    async fn authorize_anonymous(
+        &self,
+        headers: &HeaderMap,
+        namespace: Option<&str>,
+        action: DeliveryAction,
+    ) -> Result<AuthorizedDelivery, AuthFailure> {
+        let Some(registry_id) = self.inner.anonymous_registry_id.as_deref() else {
+            return Err(AuthFailure::InvalidCredential);
+        };
+        let config = self
+            .inner
+            .catalog
+            .get(registry_id)
+            .expect("anonymous registry selection is validated at construction");
+        let snapshot = self
+            .snapshot(registry_id, config)
+            .await
+            .map_err(|_| AuthFailure::Unavailable)?;
+        let Some(grant) = snapshot.anonymous.as_ref().filter(|grant| grant.enabled) else {
+            return Err(AuthFailure::InvalidCredential);
+        };
+        authorize_grant(headers, grant, namespace, action)?;
         Ok(AuthorizedDelivery {
             principal_id: grant.principal_id.clone(),
             registry_id: registry_id.to_string(),
             readable_namespaces: Arc::clone(&grant.namespaces),
-            cache_partition: credential_cache_partition(registry_id, credential, snapshot.revision),
-            presented_token: Arc::from(presented.value.as_ref()),
-            propagate_access_token,
+            cache_partition: anonymous_cache_partition(registry_id, snapshot.revision),
+            presented_token: None,
+            propagate_access_token: false,
         })
     }
 
@@ -430,7 +486,7 @@ pub struct AuthorizedDelivery {
     pub registry_id: String,
     readable_namespaces: Arc<[String]>,
     cache_partition: [u8; 32],
-    presented_token: Arc<str>,
+    presented_token: Option<Arc<str>>,
     propagate_access_token: bool,
 }
 
@@ -457,22 +513,24 @@ impl AuthorizedDelivery {
     /// Returns the verified credential exactly as presented at the delivery
     /// boundary. A backend may forward it only to an explicitly configured
     /// trusted provider; it must never be logged or used as a cache key.
-    pub fn backend_bearer_token(&self) -> &str {
-        &self.presented_token
+    pub fn backend_bearer_token(&self) -> Option<&str> {
+        self.presented_token.as_deref()
     }
 
     /// Returns the verified query credential when the caller used
     /// `access_token`. Header credentials are never copied into generated URLs.
     pub fn propagated_access_token(&self) -> Option<&str> {
         self.propagate_access_token
-            .then_some(self.presented_token.as_ref())
+            .then_some(self.presented_token.as_deref())
+            .flatten()
     }
 
     /// Shares the verified query credential without copying its secret bytes.
     /// Header credentials are never converted into a URL credential.
     pub fn shared_propagated_access_token(&self) -> Option<Arc<str>> {
         self.propagate_access_token
-            .then(|| Arc::clone(&self.presented_token))
+            .then_some(self.presented_token.as_ref().map(Arc::clone))
+            .flatten()
     }
 }
 
@@ -489,20 +547,20 @@ pub enum AuthFailure {
 fn delivery_token<'a>(
     headers: &'a HeaderMap,
     query: Option<&'a str>,
-) -> Result<PresentedCredential<'a>, AuthFailure> {
+) -> Result<Option<PresentedCredential<'a>>, AuthFailure> {
     let bearer = bearer_token(headers)?;
     let query = access_token_from_query(query)?;
     match (bearer, query) {
         (Some(_), Some(_)) => Err(AuthFailure::InvalidCredential),
-        (Some(token), None) => Ok(PresentedCredential {
+        (Some(token), None) => Ok(Some(PresentedCredential {
             value: Cow::Borrowed(token),
             from_query: false,
-        }),
-        (None, Some(token)) => Ok(PresentedCredential {
+        })),
+        (None, Some(token)) => Ok(Some(PresentedCredential {
             value: token,
             from_query: true,
-        }),
-        (None, None) => Err(AuthFailure::InvalidCredential),
+        })),
+        (None, None) => Ok(None),
     }
 }
 
@@ -578,7 +636,20 @@ struct RegistrySnapshotWire {
     schema_version: u32,
     registry_id: String,
     revision: u64,
+    #[serde(default)]
+    anonymous: Option<AnonymousGrantWire>,
     credentials: Vec<CredentialGrantWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnonymousGrantWire {
+    enabled: bool,
+    namespaces: Vec<String>,
+    actions: Vec<DeliveryAction>,
+    #[serde(default)]
+    allowed_origins: Vec<String>,
+    allow_missing_origin: bool,
 }
 
 #[derive(Deserialize)]
@@ -596,11 +667,16 @@ struct CredentialGrantWire {
 
 struct RegistrySnapshot {
     revision: u64,
+    anonymous: Option<AuthorizationGrant>,
     credentials: HashMap<[u8; 32], CredentialGrant>,
 }
 
 struct CredentialGrant {
     credential_sha256: [u8; 32],
+    authorization: AuthorizationGrant,
+}
+
+struct AuthorizationGrant {
     principal_id: String,
     enabled: bool,
     namespaces: Arc<[String]>,
@@ -622,62 +698,112 @@ impl RegistrySnapshot {
         if wire.credentials.len() > MAX_CREDENTIALS_PER_REGISTRY {
             bail!("auth registry has too many credentials");
         }
+        let anonymous = wire
+            .anonymous
+            .map(|grant| {
+                normalize_grant(
+                    "anonymous".to_string(),
+                    grant.enabled,
+                    grant.namespaces,
+                    grant.actions,
+                    grant.allowed_origins,
+                    grant.allow_missing_origin,
+                )
+            })
+            .transpose()?;
         let mut credentials = HashMap::with_capacity(wire.credentials.len());
-        for mut grant in wire.credentials {
+        for grant in wire.credentials {
             let digest = decode_sha256(&grant.credential_sha256)?;
             if credentials.contains_key(&digest) {
                 bail!("auth registry contains a duplicate credential digest");
             }
-            validate_bounded_label("principal_id", &grant.principal_id, MAX_PRINCIPAL_ID_BYTES)?;
-            if grant.namespaces.is_empty() || grant.namespaces.len() > MAX_NAMESPACES_PER_CREDENTIAL
-            {
-                bail!("credential namespaces must be non-empty and bounded");
-            }
-            for namespace in &grant.namespaces {
-                if namespace != "*" {
-                    validate_bounded_label("namespace", namespace, 256)?;
-                }
-            }
-            grant.namespaces.sort_unstable();
-            grant.namespaces.dedup();
-            if grant
-                .namespaces
-                .binary_search_by(|value| value.as_str().cmp("*"))
-                .is_ok()
-            {
-                grant.namespaces.clear();
-                grant.namespaces.push("*".to_string());
-            }
-            let actions: HashSet<_> = grant.actions.into_iter().collect();
-            if actions.is_empty() {
-                bail!("credential actions must not be empty");
-            }
-            if grant.allowed_origins.len() > MAX_ORIGINS_PER_CREDENTIAL {
-                bail!("credential has too many allowed origins");
-            }
-            let allowed_origins = grant
-                .allowed_origins
-                .iter()
-                .map(|origin| normalize_declared_origin(origin))
-                .collect::<anyhow::Result<Vec<_>>>()?;
             credentials.insert(
                 digest,
                 CredentialGrant {
                     credential_sha256: digest,
-                    principal_id: grant.principal_id,
-                    enabled: grant.enabled,
-                    namespaces: grant.namespaces.into(),
-                    actions,
-                    allowed_origins,
-                    allow_missing_origin: grant.allow_missing_origin,
+                    authorization: normalize_grant(
+                        grant.principal_id,
+                        grant.enabled,
+                        grant.namespaces,
+                        grant.actions,
+                        grant.allowed_origins,
+                        grant.allow_missing_origin,
+                    )?,
                 },
             );
         }
         Ok(Self {
             revision: wire.revision,
+            anonymous,
             credentials,
         })
     }
+}
+
+fn normalize_grant(
+    principal_id: String,
+    enabled: bool,
+    mut namespaces: Vec<String>,
+    actions: Vec<DeliveryAction>,
+    allowed_origins: Vec<String>,
+    allow_missing_origin: bool,
+) -> anyhow::Result<AuthorizationGrant> {
+    validate_bounded_label("principal_id", &principal_id, MAX_PRINCIPAL_ID_BYTES)?;
+    if namespaces.is_empty() || namespaces.len() > MAX_NAMESPACES_PER_CREDENTIAL {
+        bail!("credential namespaces must be non-empty and bounded");
+    }
+    for namespace in &namespaces {
+        if namespace != "*" {
+            validate_bounded_label("namespace", namespace, 256)?;
+        }
+    }
+    namespaces.sort_unstable();
+    namespaces.dedup();
+    if namespaces
+        .binary_search_by(|value| value.as_str().cmp("*"))
+        .is_ok()
+    {
+        namespaces.clear();
+        namespaces.push("*".to_string());
+    }
+    let actions: HashSet<_> = actions.into_iter().collect();
+    if actions.is_empty() {
+        bail!("credential actions must not be empty");
+    }
+    if allowed_origins.len() > MAX_ORIGINS_PER_CREDENTIAL {
+        bail!("credential has too many allowed origins");
+    }
+    let allowed_origins = allowed_origins
+        .iter()
+        .map(|origin| normalize_declared_origin(origin))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(AuthorizationGrant {
+        principal_id,
+        enabled,
+        namespaces: namespaces.into(),
+        actions,
+        allowed_origins,
+        allow_missing_origin,
+    })
+}
+
+fn authorize_grant(
+    headers: &HeaderMap,
+    grant: &AuthorizationGrant,
+    namespace: Option<&str>,
+    action: DeliveryAction,
+) -> Result<(), AuthFailure> {
+    if namespace.is_some_and(|namespace| {
+        grant.namespaces.first().is_none_or(|first| first != "*")
+            && grant
+                .namespaces
+                .binary_search_by(|allowed| allowed.as_str().cmp(namespace))
+                .is_err()
+    }) || !grant.actions.contains(&action)
+    {
+        return Err(AuthFailure::Forbidden);
+    }
+    authorize_origin(headers, grant)
 }
 
 fn validate_bounded_label(name: &str, value: &str, max_bytes: usize) -> anyhow::Result<()> {
@@ -687,7 +813,7 @@ fn validate_bounded_label(name: &str, value: &str, max_bytes: usize) -> anyhow::
     Ok(())
 }
 
-fn authorize_origin(headers: &HeaderMap, grant: &CredentialGrant) -> Result<(), AuthFailure> {
+fn authorize_origin(headers: &HeaderMap, grant: &AuthorizationGrant) -> Result<(), AuthFailure> {
     if grant.allowed_origins.is_empty() {
         return Ok(());
     }
@@ -781,6 +907,15 @@ fn credential_cache_partition(
     hasher.update(registry_id.as_bytes());
     hasher.update((credential.len() as u64).to_be_bytes());
     hasher.update(credential.as_bytes());
+    hasher.finalize().into()
+}
+
+fn anonymous_cache_partition(registry_id: &str, registry_revision: u64) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(ANONYMOUS_CACHE_PARTITION_DOMAIN);
+    hasher.update(registry_revision.to_be_bytes());
+    hasher.update((registry_id.len() as u64).to_be_bytes());
+    hasher.update(registry_id.as_bytes());
     hasher.finalize().into()
 }
 
@@ -938,6 +1073,42 @@ mod tests {
         auth
     }
 
+    async fn configured_anonymous_auth(revision: u64) -> DeliveryAuth {
+        let catalog = RegistryCatalog::parse("public=memory:///auth/public/").unwrap();
+        let auth = DeliveryAuth::new_with_anonymous_registry(
+            catalog,
+            Some("public".to_string()),
+            std::iter::empty::<(String, String)>(),
+        )
+        .unwrap()
+        .unwrap();
+        let snapshot = serde_json::json!({
+            "schema_version": 1,
+            "registry_id": "public",
+            "revision": revision,
+            "anonymous": {
+                "enabled": true,
+                "namespaces": ["mierune", "carto", "mapterhorn"],
+                "actions": ["read", "render.static"],
+                "allowed_origins": [],
+                "allow_missing_origin": true
+            },
+            "credentials": [{
+                "credential_sha256": encode_sha256(credential_digest("public", "private")),
+                "principal_id": "private-user",
+                "enabled": true,
+                "namespaces": ["private"],
+                "actions": ["read", "render.static"],
+                "allowed_origins": [],
+                "allow_missing_origin": true
+            }]
+        })
+        .to_string()
+        .into_bytes();
+        put_snapshot(&auth, "public", snapshot).await;
+        auth
+    }
+
     async fn put_snapshot(auth: &DeliveryAuth, registry_id: &str, body: Vec<u8>) {
         let config = auth.inner.catalog.get(registry_id).unwrap();
         let (store, path) = auth.inner.stores.resolve(&config.current_url).unwrap();
@@ -959,6 +1130,105 @@ mod tests {
         assert!(RegistryCatalog::parse("a=gs://bucket/a/;a=gs://bucket/b/").is_err());
     }
 
+    #[test]
+    fn anonymous_registry_selection_must_name_a_configured_registry() {
+        let catalog = RegistryCatalog::parse("public=memory:///auth/public/").unwrap();
+        assert!(
+            DeliveryAuth::new_with_anonymous_registry(
+                catalog,
+                Some("missing".to_string()),
+                std::iter::empty::<(String, String)>(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn anonymous_cache_partition_is_revision_scoped_and_domain_separated() {
+        assert_ne!(
+            anonymous_cache_partition("public", 1),
+            anonymous_cache_partition("public", 2)
+        );
+        assert_ne!(
+            anonymous_cache_partition("public", 1),
+            credential_cache_partition("public", "anonymous", 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_credentials_use_only_the_explicit_anonymous_grant() {
+        let auth = configured_anonymous_auth(7).await;
+        let no_headers = HeaderMap::new();
+
+        let authorized = auth
+            .authorize_static(&no_headers, None, "mierune")
+            .await
+            .expect("configured public namespace");
+        assert_eq!(authorized.principal_id, "anonymous");
+        assert_eq!(authorized.registry_id, "public");
+        assert_eq!(
+            authorized.readable_namespaces(),
+            &[
+                "carto".to_string(),
+                "mapterhorn".to_string(),
+                "mierune".to_string()
+            ]
+        );
+        assert_eq!(authorized.backend_bearer_token(), None);
+        assert_eq!(authorized.propagated_access_token(), None);
+
+        auth.authorize(&no_headers, None, Some("carto"), DeliveryAction::Read)
+            .await
+            .expect("anonymous read grant");
+        assert!(matches!(
+            auth.authorize_static(&no_headers, None, "private").await,
+            Err(AuthFailure::Forbidden)
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_credentials_never_fall_back_to_anonymous_access() {
+        let auth = configured_anonymous_auth(1).await;
+
+        assert!(matches!(
+            auth.authorize_static(&headers("public.wrong"), None, "mierune")
+                .await,
+            Err(AuthFailure::InvalidCredential)
+        ));
+        assert!(matches!(
+            auth.authorize_static(&HeaderMap::new(), Some("access_token=malformed"), "mierune")
+                .await,
+            Err(AuthFailure::InvalidCredential)
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_credentials_still_fail_without_an_anonymous_selection() {
+        let auth = configured_auth("public", "secret").await;
+        assert!(matches!(
+            auth.authorize_static(&HeaderMap::new(), None, "demo").await,
+            Err(AuthFailure::InvalidCredential)
+        ));
+    }
+
+    #[tokio::test]
+    async fn anonymous_selection_does_not_imply_access_without_a_snapshot_grant() {
+        let catalog = RegistryCatalog::parse("public=memory:///auth/public/").unwrap();
+        let auth = DeliveryAuth::new_with_anonymous_registry(
+            catalog,
+            Some("public".to_string()),
+            std::iter::empty::<(String, String)>(),
+        )
+        .unwrap()
+        .unwrap();
+        put_snapshot(&auth, "public", snapshot_json("public", "secret")).await;
+
+        assert!(matches!(
+            auth.authorize_static(&HeaderMap::new(), None, "demo").await,
+            Err(AuthFailure::InvalidCredential)
+        ));
+    }
+
     #[tokio::test]
     async fn object_store_registry_authorizes_opaque_credentials() {
         let auth = configured_auth("public", "eyJhbGciOi.fake.jwt").await;
@@ -975,7 +1245,7 @@ mod tests {
         assert_eq!(authorized.readable_namespaces(), &["demo".to_string()]);
         assert_eq!(
             authorized.backend_bearer_token(),
-            "public.eyJhbGciOi.fake.jwt"
+            Some("public.eyJhbGciOi.fake.jwt")
         );
         assert_eq!(authorized.propagated_access_token(), None);
         let header_cache_partition = authorized.cache_partition();
@@ -1001,7 +1271,7 @@ mod tests {
         assert_eq!(authorized.principal_id, "demo-browser");
         assert_eq!(
             authorized.backend_bearer_token(),
-            "public.eyJhbGciOi.fake.jwt"
+            Some("public.eyJhbGciOi.fake.jwt")
         );
         assert_eq!(
             authorized.propagated_access_token(),

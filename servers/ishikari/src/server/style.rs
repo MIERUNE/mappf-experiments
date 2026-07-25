@@ -76,9 +76,9 @@ pub(crate) async fn internal_style_handler(
     Err((StatusCode::NOT_FOUND, "not found".to_string()))
 }
 
-/// Serves an HTML MapLibre preview that loads this style. Same-origin, so it
-/// needs no CORS, and it references the style by a relative URL so it inherits
-/// the page's scheme (no mixed content).
+/// Serves an HTML MapLibre preview that loads this style. Its relative style
+/// URL inherits the page's origin and scheme; external map clients can also use
+/// the same delivery endpoint through the public CORS policy.
 fn serve_style_preview(
     style_key: &str,
     token: Option<&PropagatedAccessToken>,

@@ -31,7 +31,7 @@ cleanup() {
   trap - EXIT
   if (( status != 0 )); then
     printf '\nAuthenticated provider E2E failed; container logs follow.\n' >&2
-    for container in "${CONTAINERS[@]}"; do
+    for container in ${CONTAINERS[@]+"${CONTAINERS[@]}"}; do
       printf '\n%s:\n' "$container" >&2
       docker logs "$container" >&2 || true
     done
@@ -40,8 +40,8 @@ cleanup() {
       sed -n '1,200p' "$WORK_DIR/fixture-server.log" >&2 || true
     fi
   fi
-  if (( ${#CONTAINERS[@]} > 0 )); then
-    docker rm -f "${CONTAINERS[@]}" >/dev/null 2>&1 || true
+  if [[ -n "${CONTAINERS[*]-}" ]]; then
+    docker rm -f ${CONTAINERS[@]+"${CONTAINERS[@]}"} >/dev/null 2>&1 || true
   fi
   if [[ -n "$FIXTURE_PID" ]]; then
     kill "$FIXTURE_PID" >/dev/null 2>&1 || true
@@ -209,6 +209,13 @@ snapshot = {
     "schema_version": 1,
     "registry_id": "public",
     "revision": 1,
+    "anonymous": {
+        "enabled": True,
+        "namespaces": ["mierune", "carto", "mapterhorn"],
+        "actions": ["read", "render.static"],
+        "allowed_origins": [],
+        "allow_missing_origin": True,
+    },
     "credentials": [
         {
             "credential_sha256": credential_sha256("public", "broad"),
@@ -254,8 +261,9 @@ docker run -d \
   -e ISKR_HTTP_PORT=8080 \
   -e ISKR_INTERNAL_HTTP_PORT=9090 \
   -e ISKR_AUTH_REGISTRIES=public=file:///fixtures/auth/ \
+  -e ISKR_ANONYMOUS_REGISTRY=public \
   -e ISKR_TILESET_SOURCES=/fixtures/tilesets \
-  -e "ISKR_STYLE_TEMPLATES=smoke=http://${HOST_ALIAS}:${FIXTURE_PORT}/{style_id}.json" \
+  -e "ISKR_STYLE_TEMPLATES=smoke=http://${HOST_ALIAS}:${FIXTURE_PORT}/{style_id}.json;carto=http://${HOST_ALIAS}:${FIXTURE_PORT}/{style_id}.json" \
   "$ISHIKARI_IMAGE" >/dev/null
 
 wait_for_status "http://127.0.0.1:${ISHIKARI_PUBLIC_PORT}/readyz" 200
@@ -274,6 +282,7 @@ docker run -d \
   -e BIEI_HTTP_BIND=0.0.0.0:8080 \
   -e BIEI_CORES=1 \
   -e BIEI_AUTH_REGISTRIES=public=file:///fixtures/auth/ \
+  -e BIEI_ANONYMOUS_REGISTRY=public \
   -e BIEI_AUTH_PROVIDER_ORIGIN=http://ishikari:8080 \
   -e 'BIEI_STYLE_TEMPLATES=http://ishikari:8080/styles/{style_id}/style.json' \
   -e BIEI_MLN_RESOURCE_PRIVATE_HOSTS=ishikari \
@@ -288,8 +297,14 @@ ISHIKARI_BASE="http://127.0.0.1:${ISHIKARI_PUBLIC_PORT}"
 BROAD_QUERY="access_token=public.broad"
 WEAK_QUERY="access_token=public.style-only"
 
-expect_status "unauthenticated Biei render" \
-  "${BIEI_BASE}/auth-style/static/0,0,0/256x256.png" 401
+expect_status "anonymous public Biei render" \
+  "http://127.0.0.1:${BIEI_PUBLIC_PORT}/carto/blank-style/static/0,0,0/256x256.png" 200
+expect_status "anonymous protected Biei render" \
+  "${BIEI_BASE}/auth-style/static/0,0,0/256x256.png" 403
+expect_status "invalid token never falls back to anonymous" \
+  "http://127.0.0.1:${BIEI_PUBLIC_PORT}/carto/blank-style/static/0,0,0/256x256.png?access_token=public.wrong" 401
+expect_status "anonymous public Ishikari style" \
+  "${ISHIKARI_BASE}/styles/carto/blank-style/style.json" 200
 expect_status "weaker token style access" \
   "${ISHIKARI_BASE}/styles/smoke/auth-style/style.json?${WEAK_QUERY}" 200
 

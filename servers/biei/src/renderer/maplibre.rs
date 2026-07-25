@@ -463,10 +463,9 @@ mod tests {
         first.authorization = Some(RenderAuthorization {
             readable_namespaces: NamespaceSet::try_new(vec!["carto".to_string()]).unwrap(),
             cache_partition: CredentialCachePartition::from_digest([1; 32]),
-            provider_bearer_token: biei_core::types::ProviderBearerToken::try_new(
-                "public.first".to_string(),
-            )
-            .unwrap(),
+            provider_bearer_token: Some(
+                biei_core::types::ProviderBearerToken::try_new("public.first".to_string()).unwrap(),
+            ),
         });
         let prepared = preparer
             .prepare_profile(&first)
@@ -476,10 +475,10 @@ mod tests {
         second.authorization = Some(RenderAuthorization {
             readable_namespaces: NamespaceSet::try_new(vec!["carto".to_string()]).unwrap(),
             cache_partition: CredentialCachePartition::from_digest([2; 32]),
-            provider_bearer_token: biei_core::types::ProviderBearerToken::try_new(
-                "public.second".to_string(),
-            )
-            .unwrap(),
+            provider_bearer_token: Some(
+                biei_core::types::ProviderBearerToken::try_new("public.second".to_string())
+                    .unwrap(),
+            ),
         });
         let mut renderer = MapLibreRenderer::from_actor(actor);
 
@@ -588,19 +587,18 @@ mod tests {
         first_credential.authorization = Some(RenderAuthorization {
             readable_namespaces: NamespaceSet::try_new(vec!["carto".to_string()]).unwrap(),
             cache_partition: CredentialCachePartition::from_digest([1; 32]),
-            provider_bearer_token: biei_core::types::ProviderBearerToken::try_new(
-                "public.first".to_string(),
-            )
-            .unwrap(),
+            provider_bearer_token: Some(
+                biei_core::types::ProviderBearerToken::try_new("public.first".to_string()).unwrap(),
+            ),
         });
         let mut second_credential = first_credential.clone();
         second_credential.authorization = Some(RenderAuthorization {
             readable_namespaces: NamespaceSet::try_new(vec!["carto".to_string()]).unwrap(),
             cache_partition: CredentialCachePartition::from_digest([2; 32]),
-            provider_bearer_token: biei_core::types::ProviderBearerToken::try_new(
-                "public.second".to_string(),
-            )
-            .unwrap(),
+            provider_bearer_token: Some(
+                biei_core::types::ProviderBearerToken::try_new("public.second".to_string())
+                    .unwrap(),
+            ),
         });
 
         let first = preparer

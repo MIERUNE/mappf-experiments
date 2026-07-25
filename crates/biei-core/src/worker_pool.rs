@@ -1425,10 +1425,10 @@ mod tests {
             task.authorization = Some(RenderAuthorization {
                 readable_namespaces: NamespaceSet::try_new(vec!["carto".to_string()]).unwrap(),
                 cache_partition: CredentialCachePartition::from_digest(partition),
-                provider_bearer_token: crate::types::ProviderBearerToken::try_new(
-                    "public.worker-test".to_string(),
-                )
-                .unwrap(),
+                provider_bearer_token: Some(
+                    crate::types::ProviderBearerToken::try_new("public.worker-test".to_string())
+                        .unwrap(),
+                ),
             });
             let outcome = pool
                 .process(task, None, RouteTier::Tier2HrwBl, Some(0))

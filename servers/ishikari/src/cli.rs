@@ -22,6 +22,10 @@ struct Cli {
     /// Each root contains a `current.json` registry snapshot.
     #[arg(long, env = "ISKR_AUTH_REGISTRIES", default_value = "")]
     auth_registries: String,
+    /// Registry whose explicit anonymous policy applies when a request has no
+    /// credential. Invalid credentials never fall back to this registry.
+    #[arg(long, env = "ISKR_ANONYMOUS_REGISTRY")]
+    anonymous_registry: Option<String>,
     #[arg(
         long = "gossip-seeds",
         env = "ISKR_GOSSIP_SEEDS",
@@ -211,6 +215,7 @@ fn resolve(cli: Cli) -> Result<Options, String> {
 
     Options::resolve(OptionsInput {
         auth_registries: cli.auth_registries,
+        anonymous_registry: cli.anonymous_registry,
         node_id,
         gossip_seeds: cli.gossip_seeds.unwrap_or_default(),
         gossip_advertise_addr: cli.gossip_advertise_addr,
@@ -268,6 +273,7 @@ mod tests {
     fn cli() -> Cli {
         Cli {
             auth_registries: String::new(),
+            anonymous_registry: None,
             gossip_seeds: None,
             node_id: Some("node-a".to_string()),
             gossip_advertise_addr: None,

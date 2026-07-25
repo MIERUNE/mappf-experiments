@@ -2138,6 +2138,7 @@ dependencies = [
  "bytes",
  "clap",
  "flate2",
+ "futures-util",
  "httpdate",
  "ishikari-core",
  "mlt-core",
@@ -2148,6 +2149,7 @@ dependencies = [
  "mmpf-terrain",
  "moka",
  "object_store",
+ "pbf_font_tools",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
@@ -2571,6 +2573,7 @@ dependencies = [
  "rand 0.10.2",
  "serde",
  "tokio",
+ "tower-http",
  "tracing",
 ]
 
@@ -2946,6 +2949,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
 
 [[package]]
+name = "pbf_font_tools"
+version = "3.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "568e834fc9c115ccc1bcd7d79248a1c795d334e166ad4b657c86932df0246c43"
+dependencies = [
+ "futures",
+ "prost",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "pdqselect"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3069,6 +3084,29 @@ dependencies = [
  "parking_lot",
  "protobuf",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "prost"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
+dependencies = [
+ "anyhow",
+ "itertools 0.14.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

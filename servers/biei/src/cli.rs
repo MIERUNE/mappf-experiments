@@ -26,6 +26,10 @@ struct Cli {
     /// Each root contains a `current.json` registry snapshot.
     #[arg(long, env = "BIEI_AUTH_REGISTRIES", default_value = "")]
     auth_registries: String,
+    /// Registry whose explicit anonymous policy applies when a request has no
+    /// credential. Invalid credentials never fall back to this registry.
+    #[arg(long, env = "BIEI_ANONYMOUS_REGISTRY")]
+    anonymous_registry: Option<String>,
     /// Exact Ishikari/provider origin allowed to receive verified delivery
     /// credentials, for example `http://ishikari:8080`.
     #[arg(long, env = "BIEI_AUTH_PROVIDER_ORIGIN")]
@@ -131,6 +135,7 @@ pub(crate) fn load() -> anyhow::Result<Options> {
 fn resolve(cli: Cli) -> anyhow::Result<Options> {
     Options::resolve(OptionsInput {
         auth_registries: cli.auth_registries,
+        anonymous_registry: cli.anonymous_registry,
         auth_provider_origin: cli.auth_provider_origin,
         style_templates: cli.style_templates,
         tileset_url_template: cli.tileset_url_template,

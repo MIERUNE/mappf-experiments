@@ -64,6 +64,22 @@ single-flight coordination to absorb cold concurrent renders. Stale provider
 entries revalidate conditionally, so an unchanged HTTP or object-store origin
 can refresh freshness without sending the body again.
 
+For a comma-separated glyph request such as
+`/fonts/Primary,Fallback/0-255.pbf`, Ishikari resolves and caches
+`Primary/0-255.pbf` and `Fallback/0-255.pbf` independently, then caches the
+merged PBF under the ordered composite key. The first font wins when both
+components contain the same glyph ID. Single-font requests remain
+byte-for-byte passthrough. A stack is limited to eight distinct fonts to bound
+provider fan-out; `ISKR_GLYPH_URL_TEMPLATE` must therefore resolve individual
+font names rather than require a pre-composed object.
+
+All public styles, sprites, glyphs, TileJSON, tiles, derived products, and
+previews allow browser use from any origin with
+`Access-Control-Allow-Origin: *`. Preflight accepts the delivery
+`Authorization` header and common cache/range request headers. Health, metrics,
+and cluster-internal peer routes do not inherit this policy. Cookie credentials
+are intentionally unsupported.
+
 ## Optional delivery authentication
 
 Authentication is disabled by default. Set `ISKR_AUTH_REGISTRIES` to a
@@ -73,6 +89,7 @@ root must end in `/` and contain a complete `current.json` snapshot:
 
 ```bash
 ISKR_AUTH_REGISTRIES='public=gs://example-auth/registries/public/'
+ISKR_ANONYMOUS_REGISTRY='public'
 ```
 
 The shared MMPF verifier accepts exactly one `Authorization: Bearer ...` header
@@ -81,6 +98,14 @@ against the first segment of a style or tileset key; a flat key uses its own ID
 as that segment. Glyph ranges are shared globally and therefore require the
 action but no fabricated namespace. Health, metrics, and cluster-internal peer
 routes are outside this delivery-auth boundary.
+
+`ISKR_ANONYMOUS_REGISTRY` is optional. A credential-free request then uses only
+that registry snapshot's explicit `anonymous` namespace/action grant. For the
+demo's intended public catalog, the grant may allow `mierune`, `carto`, and
+`mapterhorn`. Invalid credentials never fall back to anonymous access; they
+remain `401`, while a valid anonymous principal outside its namespace set is
+`403`. Without this setting, missing credentials retain the existing
+token-required behavior.
 
 When a verified request uses `access_token`, Ishikari copies it only into
 same-origin style, sprite, glyph, TileJSON, tile, derived-tile, and preview URLs

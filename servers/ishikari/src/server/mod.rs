@@ -14,6 +14,7 @@ use axum::{
     routing::get,
 };
 use ishikari_core::metrics::NodeMetrics;
+use mmpf_http::cors::public_distribution;
 use mmpf_http::operational::{
     INTERNAL_LIVENESS_PATH, INTERNAL_METRICS_PATH, INTERNAL_READINESS_PATH, PUBLIC_LIVENESS_PATH,
     PUBLIC_READINESS_PATH,
@@ -40,25 +41,24 @@ fn with_common_layers(router: Router<AppState>, state: AppState) -> Router {
         .with_state(state)
 }
 
-fn with_public_layers(router: Router<AppState>, state: AppState) -> Router {
-    let router = router.route_layer(middleware::from_fn_with_state(
-        state.clone(),
-        auth::authorize_delivery,
-    ));
+fn with_public_layers(delivery_routes: Router<AppState>, state: AppState) -> Router {
+    // CORS is outside authentication so credential-free preflights succeed and
+    // auth failures remain readable to browsers. Operational routes are merged
+    // separately and never inherit the browser-facing policy.
+    let delivery_routes = delivery_routes
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::authorize_delivery,
+        ))
+        .layer(public_distribution());
+    let router = public_operational_routes().merge(delivery_routes);
     with_common_layers(router, state)
 }
 
-/// Public-facing routes (served on the Gateway-fronted port): content plus the
-/// top-level `/livez` `/readyz` health endpoints (k8s convention, matching the
-/// sibling `biei` service). Metrics, `/_internal/*` and peer-to-peer forwarding
-/// live only on the internal router so they are never reachable on the public
-/// port.
-fn public_router() -> Router<AppState> {
+/// Public map-resource routes. Authentication and browser CORS are applied to
+/// this subrouter without exposing operational endpoints to either policy.
+fn public_delivery_routes() -> Router<AppState> {
     Router::new()
-        // Top-level health, mirrored as `/_internal/{healthz,readyz}` on the
-        // internal port. Liveness is `/livez`, readiness is `/readyz`.
-        .route(PUBLIC_LIVENESS_PATH, get(healthz))
-        .route(PUBLIC_READINESS_PATH, get(readyz))
         .route(
             "/tilesets/{tileset_id}",
             get(server::tileset::tilejson_handler),
@@ -117,6 +117,14 @@ fn public_router() -> Router<AppState> {
         )
 }
 
+fn public_operational_routes() -> Router<AppState> {
+    Router::new()
+        // Top-level health, mirrored as `/_internal/{healthz,readyz}` on the
+        // internal port. Liveness is `/livez`, readiness is `/readyz`.
+        .route(PUBLIC_LIVENESS_PATH, get(healthz))
+        .route(PUBLIC_READINESS_PATH, get(readyz))
+}
+
 /// Cluster-internal routes (served on a separate port that is NOT exposed
 /// through the Gateway): operational endpoints and peer-to-peer forwarding.
 /// All operational endpoints are namespaced under `/_internal/`
@@ -167,7 +175,7 @@ pub(crate) async fn run_http_server(
     internal_addr: SocketAddr,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
-    let public = with_public_layers(public_router(), state.clone());
+    let public = with_public_layers(public_delivery_routes(), state.clone());
     let internal = with_common_layers(internal_router(), state);
 
     let public_listener = TcpListener::bind(public_addr)
@@ -300,6 +308,7 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     // concurrent scrapes and run the independent caches in parallel.
     if let Some(_guard) = state.try_start_cache_maintenance() {
         tokio::join!(
+            state.glyph_composite_cache.run_pending_tasks(),
             state.mlt_cache.run_pending_tasks(),
             state.derived_tile_cache.run_pending_tasks(),
             state.dem_tile_cache.run_pending_tasks(),
@@ -335,6 +344,10 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     state
         .metrics
         .set_cache_bytes("provider", state.provider_fetcher.weighted_size());
+    state.metrics.set_cache_bytes(
+        "glyph_composite",
+        state.glyph_composite_cache.weighted_size(),
+    );
     state
         .metrics
         .set_cache_bytes("mlt", state.mlt_cache.weighted_size());

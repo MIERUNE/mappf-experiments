@@ -341,7 +341,8 @@ impl MapLibreProfilePreparer {
                 &self.url_policy,
                 &style.id,
                 &definition.style_url,
-                authorization.map(|authorization| &authorization.provider_bearer_token),
+                authorization
+                    .and_then(|authorization| authorization.provider_bearer_token.as_ref()),
                 self.auth_provider_origin.as_ref(),
                 deadline,
             )
@@ -370,7 +371,8 @@ impl MapLibreProfilePreparer {
                 &self.url_policy,
                 style_id,
                 tileset_url,
-                authorization.map(|authorization| &authorization.provider_bearer_token),
+                authorization
+                    .and_then(|authorization| authorization.provider_bearer_token.as_ref()),
                 self.auth_provider_origin.as_ref(),
                 deadline,
             )

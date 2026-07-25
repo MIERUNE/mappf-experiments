@@ -1,5 +1,9 @@
 # Map Platform Experiments
 
+[![Ishikari CI](https://github.com/MIERUNE/mappf-experiments/actions/workflows/ishikari-ci.yml/badge.svg)](https://github.com/MIERUNE/mappf-experiments/actions/workflows/ishikari-ci.yml)
+[![Biei CI](https://github.com/MIERUNE/mappf-experiments/actions/workflows/biei-ci.yml/badge.svg)](https://github.com/MIERUNE/mappf-experiments/actions/workflows/biei-ci.yml)
+[![Runtime E2E](https://github.com/MIERUNE/mappf-experiments/actions/workflows/runtime-e2e.yml/badge.svg)](https://github.com/MIERUNE/mappf-experiments/actions/workflows/runtime-e2e.yml)
+
 This repository explores how to build a scalable map platform for serving, caching and rendering web maps.
 
 > [!WARNING]

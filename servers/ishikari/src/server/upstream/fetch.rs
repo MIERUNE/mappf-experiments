@@ -8,7 +8,6 @@ use std::{
 use axum::http::{HeaderMap, StatusCode, header};
 use bytes::BytesMut;
 use ishikari_core::storage::ObjectStoreRegistry;
-use mmpf_common::singleflight::Flight;
 use object_store::{Attribute, Error as ObjectStoreError, GetOptions};
 use reqwest::Client;
 use url::Url;
@@ -23,104 +22,11 @@ use crate::server::{
     },
 };
 
+use super::cache::{CachedProviderFetch, ProviderFetchCacheKey, ProviderFetcher};
 use super::{
-    CachedProviderFetch, CachedProviderRepresentation, FetchedProviderNegative,
-    FetchedProviderResource, Freshness, PROVIDER_FETCH_TIMEOUT, ProviderFetchCacheKey,
-    ProviderFetcher, ProviderFlightOutcome, ProviderOriginOutcome, ProviderResource,
-    record_cached_provider_fetch, spawn_stale_revalidation, store_leader_result,
+    CachedProviderRepresentation, FetchedProviderNegative, FetchedProviderResource,
+    PROVIDER_FETCH_TIMEOUT, ProviderOriginOutcome,
 };
-
-pub(super) async fn fetch_limited_bytes_with_validation(
-    fetcher: &ProviderFetcher,
-    url: String,
-    max_bytes: usize,
-    resource: &'static str,
-    accepted_content_types: &'static [&'static str],
-    body_validation: BodyValidation,
-) -> Result<ProviderResource, HttpError> {
-    let url: Arc<str> = Arc::from(url);
-    let key = ProviderFetchCacheKey::new(
-        resource,
-        Arc::clone(&url),
-        accepted_content_types,
-        body_validation,
-    );
-    let mut recorded_miss = false;
-    let mut joined_singleflight = false;
-    loop {
-        if let Some((entry, freshness)) = fetcher.cache.get(&key) {
-            // A follower already recorded the request as a miss plus a join.
-            // Reading the leader's freshly inserted value is not an independent
-            // cache hit and must not inflate cache-hit-ratio dashboards.
-            record_cached_provider_fetch(
-                &fetcher.metrics,
-                resource,
-                &entry,
-                freshness,
-                joined_singleflight,
-            );
-            if freshness == Freshness::Stale {
-                spawn_stale_revalidation(
-                    fetcher,
-                    key.clone(),
-                    Arc::clone(&url),
-                    max_bytes,
-                    resource,
-                    accepted_content_types,
-                    body_validation,
-                );
-            }
-            return entry.into_result();
-        }
-        if !recorded_miss {
-            fetcher
-                .metrics
-                .record_provider_resource_cache(resource, "miss");
-            recorded_miss = true;
-        }
-
-        match fetcher.cache.begin_fetch(key.clone()) {
-            Flight::Leader(guard) => {
-                // Another leader may have installed a replacement after our
-                // initial miss but before this election. Re-check under flight
-                // ownership so an expired observation cannot trigger a serial
-                // duplicate origin fetch.
-                if fetcher.cache.get(&key).is_some() {
-                    drop(guard);
-                    continue;
-                }
-                let result = fetch_limited_bytes_uncached(
-                    fetcher,
-                    &url,
-                    max_bytes,
-                    resource,
-                    accepted_content_types,
-                    body_validation,
-                    None,
-                )
-                .await;
-                return store_leader_result(fetcher, &key, resource, result, guard);
-            }
-            Flight::Follower(follower) => {
-                // Request-scoped: an uncacheable success stores nothing, so a
-                // follower can wake, miss, and follow the next leader. Those
-                // internal wait cycles are one joined request, not several.
-                if !joined_singleflight {
-                    fetcher
-                        .metrics
-                        .record_provider_resource_cache(resource, "singleflight_join");
-                    joined_singleflight = true;
-                }
-                if let Some(outcome) = follower.wait().await {
-                    return match outcome {
-                        ProviderFlightOutcome::Error(error) => Err(error),
-                        ProviderFlightOutcome::Resource(resource) => Ok(resource),
-                    };
-                }
-            }
-        }
-    }
-}
 
 pub(super) async fn fetch_limited_bytes_uncached(
     fetcher: &ProviderFetcher,

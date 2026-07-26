@@ -61,6 +61,10 @@ fn parse_y(y: &str) -> Result<u32, HttpError> {
                     (crate::schemas::BinaryPayload = "application/octet-stream")
                 )
             ),
+            (
+                status = 204,
+                description = "The archive holds a zero-byte entry for this tile"
+            ),
             (status = 404, description = "Unknown tileset or absent tile"),
             (status = 406, description = "Stored content encoding is not acceptable")
         )
@@ -115,6 +119,10 @@ pub(crate) async fn tile_handler(
                     (crate::schemas::BinaryPayload = "image/avif"),
                     (crate::schemas::BinaryPayload = "application/octet-stream")
                 )
+            ),
+            (
+                status = 204,
+                description = "The archive holds a zero-byte entry for this tile"
             ),
             (status = 404, description = "Unknown tileset or absent tile"),
             (status = 406, description = "Stored content encoding is not acceptable")
@@ -176,6 +184,21 @@ async fn serve_tile(
     let Some(tile) = tile else {
         return Err((StatusCode::NOT_FOUND, "not found".to_string()));
     };
+    // A stored entry with no bytes cannot be served as a representation: the
+    // archive's compression applies to every entry, so it would go out as an
+    // empty body labelled `Content-Encoding: gzip`, which no client can decode.
+    // Answer `204` instead — the archive positively says this tile is empty, so
+    // there is nothing to encode, transcode, or validate.
+    //
+    // Deliberately narrow. A conventionally empty tile is a *compressed* empty
+    // payload, so its bytes are non-empty and it is served normally; detecting
+    // that would mean decompressing every tile. An *absent* tile keeps its
+    // `404`, because `204` is cacheable and would pin "no tile here" in shared
+    // caches far past the deliberately short negative TTL.
+    if tile.bytes.is_empty() {
+        state.metrics.record_tile_served(source.report_label());
+        return Ok(empty_tile_response());
+    }
     let Representation {
         format,
         negotiated_on_accept,
@@ -237,6 +260,21 @@ async fn serve_tile(
     };
     state.metrics.record_tile_served(source.report_label());
     Ok(response)
+}
+
+/// Builds the `204` served for a zero-byte stored entry.
+///
+/// It carries the ordinary tile cache policy because an immutable archive's
+/// empty entry is a stable positive fact, and no `Vary`, `Content-Type`, or
+/// `Content-Encoding`, because a `204` has no representation for a request
+/// header to select or a client to decode.
+fn empty_tile_response() -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NO_CONTENT;
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static(cache::TILE));
+    response
 }
 
 /// Resolves the physical PMTiles archive to read for a request, applying
@@ -504,6 +542,20 @@ mod tests {
             content_type: "application/x-protobuf",
             content_encoding: None,
         }
+    }
+
+    #[test]
+    fn a_zero_byte_stored_entry_is_answered_with_204() {
+        let response = super::empty_tile_response();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        // An empty body must not claim an encoding or a media type: labelling it
+        // `Content-Encoding: gzip` is exactly the defect this replaces.
+        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+        assert!(response.headers().get(header::CONTENT_TYPE).is_none());
+        // Nothing varies when there is no representation to select.
+        assert!(response.headers().get(header::VARY).is_none());
+        // The archive is immutable, so an empty entry is ordinarily cacheable.
+        assert_eq!(response.headers()[header::CACHE_CONTROL], cache::TILE);
     }
 
     #[test]

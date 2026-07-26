@@ -28,6 +28,14 @@ No Ishikari-specific implementation item is active. Current production defaults 
 - **Migration note:** this changed observable behavior. A request combining a suffix with a conflicting `Accept` (for example `.mvt` with `Accept: application/vnd.maplibre-tile`) previously returned MLT and now returns the stored representation. Such a request was self-contradictory, so no supported client is expected to depend on it.
 - **Reopen when:** a client needs a representation that cannot be expressed as a suffix, or measurement shows the suffixless URL carries enough traffic that its `Vary: Accept` fragmentation matters.
 
+## Empty and absent tile status
+
+- **Current decision:** a zero-byte stored entry is answered `204`; an *absent* tile keeps `404`; a conventionally empty tile is served normally as `200`.
+- **Why `204` for a zero-byte entry:** the archive's compression flag applies to every entry, so such a tile would otherwise go out as an empty body labelled `Content-Encoding: gzip`, which no client can decode. `204` states the positive fact that the archive holds nothing there, and needs no encoding, transcode, or validator.
+- **Why `404` stays for an absent tile:** `204` is cacheable, so adopting it here would pin "no tile here" in shared caches for the full tile `s-maxage`, defeating the deliberately short `--tile-negative-ttl`, whose stated purpose is that a republished archive's newly added tiles surface quickly and that lookups of not-yet-existing tiles cannot delay their rollout. Martin can answer both cases identically because it sets no cache headers at all.
+- **Why this does not extend to conventionally empty tiles:** Martin checks `tile.data.is_empty()` because it holds decoded tile data. Ishikari holds stored compressed bytes, and a compressed empty payload is ~20 non-zero bytes, so the equivalent check would require decompressing every tile — far more cost than the empty case could ever save. An earlier claim that `204` would avoid a wasted MLT transcode was wrong for the same reason: compressed empty tiles never reach that branch as empty.
+- **Reopen when:** a measured archive shows enough conventionally empty tiles that transcoding them is material, and a cheap way to identify them without decompressing exists.
+
 ## Derived terrain decisions
 
 The contract and evaluation dimensions live in [`../specs/isoline-and-hillshade-spec.md`](../specs/isoline-and-hillshade-spec.md).

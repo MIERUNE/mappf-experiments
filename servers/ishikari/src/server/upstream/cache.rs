@@ -1,411 +1,40 @@
-//! Shared bounded upstream fetch helpers for provider resources.
+//! Provider representation cache: freshness evaluation, single-flight, and
+//! background stale revalidation.
+//!
+//! Holds the decision of *whether to go to origin*; `fetch` performs the
+//! transport and `resource` owns the value that results.
 
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, atomic::AtomicUsize},
     time::{Duration, Instant},
 };
 
 use axum::http::StatusCode;
-use axum::http::{HeaderMap, HeaderValue, header};
 use bytes::Bytes;
 use moka::sync::Cache;
-use reqwest::{Client, redirect};
-use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore},
-    time::Instant as TokioInstant,
-};
+use reqwest::Client;
+use tokio::{sync::Semaphore, time::Instant as TokioInstant};
 
-use crate::http_client::representation_preserving_builder;
-use crate::server::{
-    HttpError, bytes_response,
-    conditional::Validators,
-    provider_body::{BodyValidation, decode_provider_body},
-    provider_cache_policy::{CachePolicy, NegativeCachePolicy},
+use super::fetch::{fetch_limited_bytes_uncached, provider_fetch_cache_weight};
+use super::{
+    CachedProviderRepresentation, FetchedProviderNegative, FetchedProviderResource,
+    PROVIDER_FETCH_CONCURRENCY, PROVIDER_FETCH_MAX_INFLIGHT,
+    PROVIDER_STALE_REVALIDATION_FAILURE_COOLDOWN, PROVIDER_STALE_REVALIDATION_FAILURE_MAX_KEYS,
+    ProviderFetchPermit, ProviderFetchSlot, ProviderFlightOutcome, ProviderOriginOutcome,
+    ProviderResource, provider_http_client, provider_negative_error,
 };
-use ishikari_core::{
-    metrics::NodeMetrics,
-    storage::{
-        InternalFetchResponse, ObjectStoreRegistry, PROVIDER_AGE_HEADER,
-        PROVIDER_CACHE_CONTROL_HEADER, PROVIDER_ETAG_HEADER, PROVIDER_LAST_MODIFIED_HEADER,
-    },
-};
+use crate::server::provider_body::BodyValidation;
+use crate::server::{HttpError, conditional::Validators};
+use ishikari_core::metrics::NodeMetrics;
+use ishikari_core::storage::ObjectStoreRegistry;
 use mmpf_common::singleflight::{Flight, LeaderGuard, SingleFlight};
 
-mod fetch;
-
-#[cfg(test)]
-use fetch::{
-    corrected_initial_age, require_complete_provider_status, revalidated_provider_resource,
-};
-use fetch::{
-    fetch_limited_bytes_uncached, fetch_limited_bytes_with_validation, provider_fetch_cache_weight,
-};
-
-/// Provider resources are much larger than PMTiles index reads. Bound active
-/// bodies process-wide so many distinct URLs cannot bypass per-key
-/// single-flight and consume unbounded memory.
-const PROVIDER_FETCH_CONCURRENCY: usize = 16;
-const PROVIDER_FETCH_MAX_INFLIGHT: usize = 128;
-/// Bounded so a slow or hung upstream cannot pin request tasks indefinitely
-/// (mirrors the tile backend fetch timeout).
-const PROVIDER_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
-/// Failed stale revalidations carry only `HttpError` (`StatusCode` plus a
-/// message), so origin `Retry-After` metadata is not available here without a
-/// broader transport error redesign. Use a small fixed delay to prevent hot
-/// stale keys from retrying at request rate.
-const PROVIDER_STALE_REVALIDATION_FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
-/// Failure state is auxiliary to the byte-bounded representation cache. Bound
-/// it independently so cache eviction cannot leave an unbounded key set.
-const PROVIDER_STALE_REVALIDATION_FAILURE_MAX_KEYS: u64 = 4_096;
-
 #[derive(Clone)]
-enum ProviderFlightOutcome {
-    Error(HttpError),
-    /// The leader's completed representation. Current followers reuse this
-    /// directly; cache retention and eviction are independent concerns.
-    Resource(ProviderResource),
-}
-
-struct FetchedProviderResource {
-    bytes: Bytes,
-    policy: CachePolicy,
-    validators: Validators,
-    content_encoding: Option<Arc<str>>,
-    initial_age: Duration,
-}
-
-struct FetchedProviderNegative {
-    status: StatusCode,
-    policy: NegativeCachePolicy,
-    initial_age: Duration,
-}
-
-/// Result of an origin request. A conditional hit carries a rebuilt cache entry
-/// around the previously validated body, so it follows the same insertion path
-/// without downloading or re-validating the representation bytes.
-enum ProviderOriginOutcome {
-    Modified(FetchedProviderResource),
-    NotModified(FetchedProviderResource),
-    Negative(FetchedProviderNegative),
-}
-
-#[derive(Clone)]
-struct CachedProviderRepresentation {
-    bytes: Bytes,
-    cache_control: Arc<str>,
-    validators: Validators,
-    content_encoding: Option<Arc<str>>,
-}
-
-struct ProviderFetchSlot {
-    inflight: Arc<AtomicUsize>,
-}
-
-impl ProviderFetchSlot {
-    fn try_reserve(inflight: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
-        let previous = inflight.fetch_add(1, Ordering::Relaxed);
-        if previous >= max {
-            inflight.fetch_sub(1, Ordering::Relaxed);
-            None
-        } else {
-            Some(Self {
-                inflight: Arc::clone(inflight),
-            })
-        }
-    }
-}
-
-impl Drop for ProviderFetchSlot {
-    fn drop(&mut self) {
-        self.inflight.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-struct ProviderFetchPermit {
-    _permit: OwnedSemaphorePermit,
-    _slot: ProviderFetchSlot,
-}
-
-/// HTTP client for direct provider fetches. Redirects are disabled: provider
-/// upstreams answer directly, and following a redirect would let a compromised
-/// or open-redirecting upstream steer the fetch at cluster-internal or
-/// link-local addresses (e.g. cloud metadata) that the internal-listener
-/// isolation otherwise fences off. The per-request deadline still bounds the
-/// whole fetch, but a connect timeout fails a black-hole host faster.
-///
-/// `Content-Encoding` is preserved as representation metadata and decoded
-/// explicitly, so transparent transfer decompression must stay off. Disable it
-/// on the client rather than relying on Cargo feature isolation: workspace-wide
-/// builds also compile Biei, which intentionally enables some of these features.
-fn provider_http_client() -> Client {
-    representation_preserving_builder()
-        .redirect(redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(5))
-        .build()
-        .expect("provider HTTP client builds")
-}
-
-/// Provider bytes plus the cache metadata that must survive peer forwarding.
-#[derive(Clone)]
-pub(crate) struct ProviderResource {
-    bytes: Bytes,
-    cache_control: Arc<str>,
-    age_seconds: u64,
-    validators: Validators,
-    content_encoding: Option<Arc<str>>,
-}
-
-impl ProviderResource {
-    fn fetched(fetched: &FetchedProviderResource) -> Self {
-        Self {
-            bytes: fetched.bytes.clone(),
-            cache_control: Arc::clone(&fetched.policy.response_cache_control),
-            age_seconds: fetched.initial_age.as_secs(),
-            validators: fetched.validators.clone(),
-            content_encoding: fetched.content_encoding.clone(),
-        }
-    }
-
-    pub(crate) fn from_peer(response: InternalFetchResponse) -> Result<Self, &'static str> {
-        let cache_control = response
-            .provider_cache_control
-            .ok_or("peer provider response is missing cache policy")?;
-        let age_seconds = response
-            .provider_age_seconds
-            .ok_or("peer provider response is missing age")?;
-        Ok(Self {
-            bytes: response.bytes,
-            cache_control: Arc::from(cache_control),
-            age_seconds,
-            validators: Validators::new(
-                response.provider_etag.map(Arc::from),
-                response
-                    .provider_last_modified
-                    .as_deref()
-                    .and_then(|value| httpdate::parse_http_date(value).ok()),
-            ),
-            content_encoding: response.content_encoding.map(Arc::from),
-        })
-    }
-
-    pub(crate) fn bytes(&self) -> &Bytes {
-        &self.bytes
-    }
-
-    pub(crate) fn cache_control(&self) -> &str {
-        &self.cache_control
-    }
-
-    pub(crate) fn age_seconds(&self) -> u64 {
-        self.age_seconds
-    }
-
-    /// Builds a locally derived provider representation. Its validators apply
-    /// to the transformed bytes, not to any one upstream component.
-    pub(crate) fn derived(bytes: Bytes, cache_control: Arc<str>) -> Self {
-        let validators = Validators::for_derived_body(&bytes);
-        Self {
-            bytes,
-            cache_control,
-            age_seconds: 0,
-            validators,
-            content_encoding: None,
-        }
-    }
-
-    pub(crate) fn with_additional_age(mut self, elapsed: Duration) -> Self {
-        self.age_seconds = self.age_seconds.saturating_add(elapsed.as_secs());
-        self
-    }
-
-    /// Returns the decoded representation for server-side transformation.
-    /// Byte-identical glyph/sprite responses keep their original encoding;
-    /// styles must be decoded before JSON parsing and rewriting.
-    pub(crate) fn decoded_bytes(
-        &self,
-        max_bytes: usize,
-        resource: &'static str,
-    ) -> Result<Bytes, HttpError> {
-        decode_provider_body(
-            &self.bytes,
-            self.content_encoding.as_deref(),
-            max_bytes,
-            resource,
-        )
-    }
-
-    /// Replaces the upstream validators for a derived representation whose
-    /// bytes differ from the upstream body (e.g. rewritten style JSON).
-    pub(crate) fn with_derived_validators(mut self, validators: Validators) -> Self {
-        self.validators = validators;
-        // The derived style body is serialized as an identity representation.
-        self.content_encoding = None;
-        self
-    }
-
-    /// Builds the public representation response, including conditional request
-    /// handling and the provider's public cache and representation metadata.
-    pub(crate) fn public_response(
-        &self,
-        request: &HeaderMap,
-        body: impl Into<axum::body::Body>,
-        content_type: &'static str,
-    ) -> axum::response::Response {
-        if self.not_modified(request) {
-            return self.not_modified_response();
-        }
-        let mut response = bytes_response(body, content_type, None);
-        self.apply_public_headers(response.headers_mut());
-        response
-    }
-
-    /// Builds the cluster-internal representation response with typed provider
-    /// forwarding metadata rather than downstream cache headers.
-    pub(crate) fn internal_response(&self, content_type: &'static str) -> axum::response::Response {
-        let mut response = bytes_response(self.bytes.clone(), content_type, None);
-        self.apply_internal_headers(response.headers_mut());
-        response
-    }
-
-    /// Whether a conditional request matches this representation (serve `304`).
-    fn not_modified(&self, request: &HeaderMap) -> bool {
-        self.validators.not_modified(request)
-    }
-
-    /// `304 Not Modified` for a matched conditional request: no body, and no
-    /// representation metadata (`Content-Encoding`). It carries the cache
-    /// metadata and validators that a `200` would (RFC 9110 §15.4.5).
-    fn not_modified_response(&self) -> axum::response::Response {
-        let mut response = axum::response::Response::new(axum::body::Body::empty());
-        *response.status_mut() = StatusCode::NOT_MODIFIED;
-        self.apply_cache_metadata(response.headers_mut());
-        response
-    }
-
-    fn apply_public_headers(&self, headers: &mut HeaderMap) {
-        self.apply_cache_metadata(headers);
-        self.apply_content_encoding(headers);
-    }
-
-    /// `Cache-Control`, `Age`, and validators — the metadata shared by a `200`
-    /// body response and its `304`. Excludes representation headers.
-    fn apply_cache_metadata(&self, headers: &mut HeaderMap) {
-        headers.insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_bytes(self.cache_control.as_bytes())
-                .expect("cache policy originated from a valid HTTP header"),
-        );
-        headers.insert(
-            header::AGE,
-            HeaderValue::from_str(&self.age_seconds.to_string()).expect("age is numeric"),
-        );
-        self.validators.apply(headers);
-    }
-
-    fn apply_internal_headers(&self, headers: &mut HeaderMap) {
-        headers.insert(
-            PROVIDER_CACHE_CONTROL_HEADER,
-            HeaderValue::from_bytes(self.cache_control.as_bytes())
-                .expect("cache policy originated from a valid HTTP header"),
-        );
-        headers.insert(
-            PROVIDER_AGE_HEADER,
-            HeaderValue::from_str(&self.age_seconds.to_string()).expect("age is numeric"),
-        );
-        if let Some(etag) = self.validators.etag()
-            && let Ok(value) = HeaderValue::from_str(etag)
-        {
-            headers.insert(PROVIDER_ETAG_HEADER, value);
-        }
-        if let Some(http_date) = self.validators.last_modified_http_date()
-            && let Ok(value) = HeaderValue::from_str(&http_date)
-        {
-            headers.insert(PROVIDER_LAST_MODIFIED_HEADER, value);
-        }
-        self.apply_content_encoding(headers);
-    }
-
-    fn apply_content_encoding(&self, headers: &mut HeaderMap) {
-        if let Some(encoding) = &self.content_encoding
-            && let Ok(value) = HeaderValue::from_str(encoding)
-        {
-            headers.insert(header::CONTENT_ENCODING, value);
-        }
-    }
-}
-
-/// Owns Ishikari's local provider-fetch capability: cache and single-flight
-/// state, admission, provider metrics, and shared object-store clients.
-#[derive(Clone)]
-pub(crate) struct ProviderFetcher {
-    cache: ProviderFetchCache,
-    metrics: NodeMetrics,
-    object_store_registry: Arc<ObjectStoreRegistry>,
-}
-
-impl ProviderFetcher {
-    pub(crate) fn new(
-        metrics: NodeMetrics,
-        object_store_registry: Arc<ObjectStoreRegistry>,
-        cache_max_bytes: u64,
-    ) -> Self {
-        Self {
-            cache: ProviderFetchCache::new(cache_max_bytes),
-            metrics,
-            object_store_registry,
-        }
-    }
-
-    pub(crate) async fn fetch_bytes(
-        &self,
-        url: String,
-        max_bytes: usize,
-        resource: &'static str,
-        accepted_content_types: &'static [&'static str],
-    ) -> Result<ProviderResource, HttpError> {
-        fetch_limited_bytes_with_validation(
-            self,
-            url,
-            max_bytes,
-            resource,
-            accepted_content_types,
-            BodyValidation::Bytes,
-        )
-        .await
-    }
-
-    pub(crate) async fn fetch_json(
-        &self,
-        url: String,
-        max_bytes: usize,
-        resource: &'static str,
-        accepted_content_types: &'static [&'static str],
-    ) -> Result<ProviderResource, HttpError> {
-        fetch_limited_bytes_with_validation(
-            self,
-            url,
-            max_bytes,
-            resource,
-            accepted_content_types,
-            BodyValidation::Json,
-        )
-        .await
-    }
-
-    pub(crate) fn weighted_size(&self) -> u64 {
-        self.cache.weighted_size()
-    }
-}
-
-#[derive(Clone)]
-struct ProviderFetchCache {
+pub(super) struct ProviderFetchCache {
     entries: Cache<ProviderFetchCacheKey, CachedProviderFetch>,
     failed_revalidations: Cache<ProviderFetchCacheKey, TokioInstant>,
     inflight: SingleFlight<ProviderFetchCacheKey, ProviderFlightOutcome>,
-    http_client: Client,
+    pub(super) http_client: Client,
     fetch_semaphore: Arc<Semaphore>,
     fetch_inflight: Arc<AtomicUsize>,
 }
@@ -549,7 +178,10 @@ impl ProviderFetchCache {
         self.failed_revalidations.invalidate(key);
     }
 
-    async fn admit_fetch(&self, resource: &'static str) -> Result<ProviderFetchPermit, HttpError> {
+    pub(super) async fn admit_fetch(
+        &self,
+        resource: &'static str,
+    ) -> Result<ProviderFetchPermit, HttpError> {
         let slot =
             ProviderFetchSlot::try_reserve(&self.fetch_inflight, PROVIDER_FETCH_MAX_INFLIGHT)
                 .ok_or_else(|| {
@@ -580,11 +212,11 @@ impl ProviderFetchCache {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-struct ProviderFetchCacheKey {
+pub(super) struct ProviderFetchCacheKey {
     resource: &'static str,
     accepted_content_types: &'static [&'static str],
     body_validation: BodyValidation,
-    url: Arc<str>,
+    pub(super) url: Arc<str>,
 }
 
 impl ProviderFetchCacheKey {
@@ -605,7 +237,7 @@ impl ProviderFetchCacheKey {
 
 /// Freshness of a cached entry relative to its window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Freshness {
+pub(super) enum Freshness {
     /// Serve directly.
     Fresh,
     /// Past `fresh_until` but within the SWR window: serve, revalidate in the
@@ -616,7 +248,7 @@ enum Freshness {
 }
 
 #[derive(Clone)]
-enum CachedProviderFetch {
+pub(super) enum CachedProviderFetch {
     Found {
         bytes: Bytes,
         cache_control: Arc<str>,
@@ -668,16 +300,16 @@ impl CachedProviderFetch {
                 age_at_insert,
                 stored_at,
                 ..
-            } => Ok(ProviderResource {
+            } => Ok(ProviderResource::from_cached(
                 bytes,
                 cache_control,
-                age_seconds: Instant::now()
+                validators,
+                content_encoding,
+                Instant::now()
                     .saturating_duration_since(stored_at)
                     .saturating_add(age_at_insert)
                     .as_secs(),
-                validators,
-                content_encoding,
-            }),
+            )),
             Self::Negative { status, .. } => Err(provider_negative_error(status)),
         }
     }
@@ -828,38 +460,177 @@ fn store_leader_result(
     }
 }
 
-fn provider_negative_error(status: StatusCode) -> HttpError {
-    (
-        status,
-        if status == StatusCode::GONE {
-            "gone"
-        } else {
-            "not found"
-        }
-        .to_string(),
-    )
+/// Owns Ishikari's local provider-fetch capability: cache and single-flight
+/// state, admission, provider metrics, and shared object-store clients.
+#[derive(Clone)]
+pub(crate) struct ProviderFetcher {
+    pub(super) cache: ProviderFetchCache,
+    metrics: NodeMetrics,
+    pub(super) object_store_registry: Arc<ObjectStoreRegistry>,
 }
 
-// Origin transport and body validation live in the fetch module; this module
-// owns cache, freshness, admission, and single-flight policy.
+impl ProviderFetcher {
+    pub(crate) fn new(
+        metrics: NodeMetrics,
+        object_store_registry: Arc<ObjectStoreRegistry>,
+        cache_max_bytes: u64,
+    ) -> Self {
+        Self {
+            cache: ProviderFetchCache::new(cache_max_bytes),
+            metrics,
+            object_store_registry,
+        }
+    }
+
+    pub(crate) async fn fetch_bytes(
+        &self,
+        url: String,
+        max_bytes: usize,
+        resource: &'static str,
+        accepted_content_types: &'static [&'static str],
+    ) -> Result<ProviderResource, HttpError> {
+        fetch_limited_bytes_with_validation(
+            self,
+            url,
+            max_bytes,
+            resource,
+            accepted_content_types,
+            BodyValidation::Bytes,
+        )
+        .await
+    }
+
+    pub(crate) async fn fetch_json(
+        &self,
+        url: String,
+        max_bytes: usize,
+        resource: &'static str,
+        accepted_content_types: &'static [&'static str],
+    ) -> Result<ProviderResource, HttpError> {
+        fetch_limited_bytes_with_validation(
+            self,
+            url,
+            max_bytes,
+            resource,
+            accepted_content_types,
+            BodyValidation::Json,
+        )
+        .await
+    }
+
+    pub(crate) fn weighted_size(&self) -> u64 {
+        self.cache.weighted_size()
+    }
+}
+
+async fn fetch_limited_bytes_with_validation(
+    fetcher: &ProviderFetcher,
+    url: String,
+    max_bytes: usize,
+    resource: &'static str,
+    accepted_content_types: &'static [&'static str],
+    body_validation: BodyValidation,
+) -> Result<ProviderResource, HttpError> {
+    let url: Arc<str> = Arc::from(url);
+    let key = ProviderFetchCacheKey::new(
+        resource,
+        Arc::clone(&url),
+        accepted_content_types,
+        body_validation,
+    );
+    let mut recorded_miss = false;
+    let mut joined_singleflight = false;
+    loop {
+        if let Some((entry, freshness)) = fetcher.cache.get(&key) {
+            // A follower already recorded the request as a miss plus a join.
+            // Reading the leader's freshly inserted value is not an independent
+            // cache hit and must not inflate cache-hit-ratio dashboards.
+            record_cached_provider_fetch(
+                &fetcher.metrics,
+                resource,
+                &entry,
+                freshness,
+                joined_singleflight,
+            );
+            if freshness == Freshness::Stale {
+                spawn_stale_revalidation(
+                    fetcher,
+                    key.clone(),
+                    Arc::clone(&url),
+                    max_bytes,
+                    resource,
+                    accepted_content_types,
+                    body_validation,
+                );
+            }
+            return entry.into_result();
+        }
+        if !recorded_miss {
+            fetcher
+                .metrics
+                .record_provider_resource_cache(resource, "miss");
+            recorded_miss = true;
+        }
+
+        match fetcher.cache.begin_fetch(key.clone()) {
+            Flight::Leader(guard) => {
+                // Another leader may have installed a replacement after our
+                // initial miss but before this election. Re-check under flight
+                // ownership so an expired observation cannot trigger a serial
+                // duplicate origin fetch.
+                if fetcher.cache.get(&key).is_some() {
+                    drop(guard);
+                    continue;
+                }
+                let result = fetch_limited_bytes_uncached(
+                    fetcher,
+                    &url,
+                    max_bytes,
+                    resource,
+                    accepted_content_types,
+                    body_validation,
+                    None,
+                )
+                .await;
+                return store_leader_result(fetcher, &key, resource, result, guard);
+            }
+            Flight::Follower(follower) => {
+                // Request-scoped: an uncacheable success stores nothing, so a
+                // follower can wake, miss, and follow the next leader. Those
+                // internal wait cycles are one joined request, not several.
+                if !joined_singleflight {
+                    fetcher
+                        .metrics
+                        .record_provider_resource_cache(resource, "singleflight_join");
+                    joined_singleflight = true;
+                }
+                if let Some(outcome) = follower.wait().await {
+                    return match outcome {
+                        ProviderFlightOutcome::Error(error) => Err(error),
+                        ProviderFlightOutcome::Resource(resource) => Ok(resource),
+                    };
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::fetch::{
+        corrected_initial_age, require_complete_provider_status, revalidated_provider_resource,
+    };
     use super::{
         BodyValidation, CachedProviderFetch, FetchedProviderNegative, FetchedProviderResource,
         Freshness, PROVIDER_STALE_REVALIDATION_FAILURE_COOLDOWN, ProviderFetchCache,
         ProviderFetchCacheKey, ProviderFetchSlot, ProviderFetcher, ProviderFlightOutcome,
-        ProviderOriginOutcome, ProviderResource, Validators, corrected_initial_age,
-        record_cached_provider_fetch, require_complete_provider_status,
-        revalidated_provider_resource, store_leader_result,
+        ProviderOriginOutcome, Validators, record_cached_provider_fetch, store_leader_result,
     };
     use crate::server::provider_cache_policy::{NegativeCachePolicy, cache_policy};
     use axum::http::{HeaderMap, StatusCode, header};
     use bytes::Bytes;
     use ishikari_core::metrics::NodeMetrics;
-    use ishikari_core::storage::{
-        InternalFetchResponse, ObjectStoreRegistry, PROVIDER_AGE_HEADER,
-        PROVIDER_CACHE_CONTROL_HEADER, PROVIDER_ETAG_HEADER, PROVIDER_LAST_MODIFIED_HEADER,
-    };
+    use ishikari_core::storage::ObjectStoreRegistry;
     use mmpf_common::singleflight::Flight;
     use std::{
         sync::{
@@ -1018,107 +789,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_cache_metadata_survives_internal_and_public_headers() {
-        let last_modified = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let resource = ProviderResource {
-            bytes: Bytes::from_static(b"glyph"),
-            cache_control: "public, max-age=30, s-maxage=60".into(),
-            age_seconds: 12,
-            validators: Validators::new(Some("\"v1\"".into()), Some(last_modified)),
-            content_encoding: Some("gzip".into()),
-        };
-        let mut internal = HeaderMap::new();
-        resource.apply_internal_headers(&mut internal);
-        assert_eq!(
-            internal[PROVIDER_CACHE_CONTROL_HEADER],
-            "public, max-age=30, s-maxage=60"
-        );
-        assert_eq!(internal[PROVIDER_AGE_HEADER], "12");
-        assert_eq!(internal[PROVIDER_ETAG_HEADER], "\"v1\"");
-        let http_date = httpdate::fmt_http_date(last_modified);
-        assert_eq!(
-            internal[PROVIDER_LAST_MODIFIED_HEADER].to_str().unwrap(),
-            http_date
-        );
-
-        let header_string = |name: &str| {
-            internal
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned)
-        };
-        let peer_resource = ProviderResource::from_peer(InternalFetchResponse {
-            bytes: resource.bytes().clone(),
-            tile_source: None,
-            provider_cache_control: header_string(PROVIDER_CACHE_CONTROL_HEADER),
-            provider_age_seconds: header_string(PROVIDER_AGE_HEADER)
-                .and_then(|value| value.parse().ok()),
-            provider_etag: header_string(PROVIDER_ETAG_HEADER),
-            provider_last_modified: header_string(PROVIDER_LAST_MODIFIED_HEADER),
-            content_encoding: header_string(header::CONTENT_ENCODING.as_str()),
-        })
-        .expect("complete peer metadata");
-        let mut public = HeaderMap::new();
-        peer_resource.apply_public_headers(&mut public);
-        assert_eq!(
-            public[header::CACHE_CONTROL],
-            "public, max-age=30, s-maxage=60"
-        );
-        assert_eq!(public[header::AGE], "12");
-        assert_eq!(public[header::ETAG], "\"v1\"");
-        assert_eq!(public[header::LAST_MODIFIED].to_str().unwrap(), http_date);
-        assert_eq!(public[header::CONTENT_ENCODING], "gzip");
-
-        // The forwarded validators still answer conditional requests.
-        let mut conditional = HeaderMap::new();
-        conditional.insert(header::IF_NONE_MATCH, "\"v1\"".parse().unwrap());
-        assert!(peer_resource.not_modified(&conditional));
-    }
-
-    #[test]
-    fn not_modified_response_omits_representation_metadata() {
-        let resource = ProviderResource {
-            bytes: Bytes::from_static(b"gzipped"),
-            cache_control: "public, max-age=30".into(),
-            age_seconds: 7,
-            validators: Validators::new(Some("\"v1\"".into()), None),
-            content_encoding: Some("gzip".into()),
-        };
-
-        // The 200 carries the representation's Content-Encoding.
-        let mut ok = HeaderMap::new();
-        resource.apply_public_headers(&mut ok);
-        assert_eq!(ok[header::CONTENT_ENCODING], "gzip");
-
-        // The 304 carries cache metadata and validators, but not the
-        // representation's Content-Encoding (RFC 9110 §15.4.5).
-        let response = resource.not_modified_response();
-        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
-        let headers = response.headers();
-        assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=30");
-        assert_eq!(headers[header::AGE], "7");
-        assert_eq!(headers[header::ETAG], "\"v1\"");
-        assert!(headers.get(header::CONTENT_ENCODING).is_none());
-    }
-
-    #[test]
-    fn peer_without_provider_metadata_is_rejected() {
-        let result = ProviderResource::from_peer(InternalFetchResponse {
-            bytes: Bytes::from_static(b"missing metadata"),
-            tile_source: None,
-            provider_cache_control: None,
-            provider_age_seconds: None,
-            provider_etag: None,
-            provider_last_modified: None,
-            content_encoding: None,
-        });
-        let Err(error) = result else {
-            panic!("missing peer metadata must fail closed");
-        };
-        assert_eq!(error, "peer provider response is missing cache policy");
-    }
-
-    #[test]
     fn uncacheable_refresh_invalidates_an_existing_stale_body() {
         let cache = ProviderFetchCache::new(TEST_PROVIDER_CACHE_MAX_BYTES);
         let key = ProviderFetchCacheKey::new(
@@ -1205,7 +875,7 @@ mod tests {
         let (entry, freshness) = cache.get(&key).expect("aged entry");
         assert_eq!(freshness, Freshness::Fresh);
         let resource = entry.into_result().expect("resource");
-        assert!(resource.age_seconds >= 45);
+        assert!(resource.age_seconds() >= 45);
 
         let already_expired = FetchedProviderResource {
             initial_age: Duration::from_secs(60),

@@ -8,7 +8,11 @@ Status: **an experimental shared Biei/Ishikari slice is implemented but not enab
 - If dynamic delivery credentials are adopted, use one conditionally replaced, self-contained `current.json` per configured registry under its trusted auth root. It contains the complete token verifier set and namespace/action grants for that registry; runtime readers never list a prefix, infer latest state from object names, or fetch one object per token.
 - Prefer a dedicated registry bucket/container and workload identity per environment. A prefix is organization, not a portable authorization boundary; do not reuse Ishikari's content-reader identity.
 - Store metadata, public verification material, high-entropy API-key verifier digests, and secret references—not raw API keys, HMAC masters, cap subkeys, or private signing keys.
-- Prefer a conditional-write admin CLI/object writer before considering a public management API. Management uses cloud/workload identity; application credentials never authorize registry mutation.
+- The planned management and publishing backend is the separate **Abashiri
+  API**, not a route added to Biei or Ishikari. Its user-facing web client is
+  branded **MMPF Console**; any future CLI should call the same API rather than
+  establish a second mutation path. Abashiri uses human OIDC or workload
+  identity, and delivery credentials never authorize registry mutation.
 - Authentication does not replace edge tenant/IP request limits. Origin-local limits cannot govern CDN cache-hit egress.
 - Public distribution uses credential-free wildcard CORS in both services, including Bearer preflight and CORS-readable authorization failures. It excludes cookies, health, metrics, and cluster-internal routes; token `Origin` policy remains a separate anti-hotlink signal rather than browser access control.
 - Carry a bounded public `registry_id` in the opaque delivery key and resolve it only through a trusted local `registry_id -> auth_root` catalog. Unknown IDs cause no storage I/O. The token entry owns namespace/action grants; there is initially no namespace-to-registry allowlist or registry-level namespace ceiling because registry writing remains centrally trusted. For built-in credentials, authentication and all registry-derived policy use one captured registry revision; external AuthN may use separate immutable verifier state, but AuthZ still uses one policy snapshot.

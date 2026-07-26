@@ -453,6 +453,18 @@ out of scope for the ordinary delivery tier.
 
 ## 7. Human management and automated publishing
 
+The planned management-plane backend is the **Abashiri API**, implemented as a
+separate server application from Biei and Ishikari. **MMPF Console** is the
+user-facing web application built on Abashiri; the API itself remains named
+Abashiri. A future CLI may also be an Abashiri client.
+
+Abashiri owns management and publishing coordination, conditional durable
+mutations, and audit records. It does not serve delivery resources, render
+maps, join either service's gossip cluster, or mutate Biei or Ishikari runtime
+state. Biei and Ishikari remain read-only delivery-plane applications that
+observe content and registry state through their existing durable-store
+contracts, with any explicit refresh call remaining only an acceleration hint.
+
 ### 7.1 Human administration
 
 The management surface should integrate with a corporate identity provider

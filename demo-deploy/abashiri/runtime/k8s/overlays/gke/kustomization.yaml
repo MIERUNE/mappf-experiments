@@ -7,7 +7,7 @@ resources:
 images:
   - name: abashiri
     newName: asia-northeast1-docker.pkg.dev/mappf-experiment/abashiri/abashiri
-    digest: sha256:68cee6db1513bb82a7b1b838f238b1c06e849d9690a2a3cd6e918889ebade281
+    digest: sha256:55ef7b519cab42ec4db42a7f3e8e580a99041bb471e9c7c7c87d55fe1f455bcf
 patches:
   - path: patch-serviceaccount.yaml
   - path: patch-deployment.yaml

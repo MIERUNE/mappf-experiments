@@ -6,6 +6,7 @@
 //! [`ArchiveBackend`] while retaining their own peer and cache policy.
 
 mod format;
+mod layout;
 mod metadata;
 mod reader;
 
@@ -13,6 +14,7 @@ pub use format::{
     Compression, Directory, DirectoryEntry, HEADER_SIZE, Header, MLT_CONTENT_TYPE, TileCoord,
     TileData, TileId, TileType, decompress_bytes_with_limit,
 };
+pub use layout::{HeaderLayout, LayoutReport, LayoutVerifier};
 pub use metadata::{
     Metadata, MetadataJson, Tilestats, TilestatsAttribute, TilestatsLayer, VectorLayer,
 };

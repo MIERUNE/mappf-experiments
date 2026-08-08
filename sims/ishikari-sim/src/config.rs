@@ -79,6 +79,7 @@ impl ClusterConfig {
             // Mirrors the production default. Simulator runs never republish an
             // archive mid-run, so negative entries do not expire during a run.
             tile_negative_ttl: Duration::from_secs(60),
+            archive_revalidation_interval: Duration::from_secs(300),
         }
         .resolve()?)
     }

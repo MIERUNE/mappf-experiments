@@ -1051,9 +1051,13 @@ pub enum ProfileContent {
 
 /// Failure while fetching or validating data before a task enters a renderer
 /// slot. This remains local to the preparation boundary and is converted to the
-/// existing wire-stable `FailureKind` or deadline rejection by `Node`.
+/// existing wire-stable failure or rejection taxonomy by `Node`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfilePreparationError {
+    StyleNotFound {
+        style_id: StyleId,
+        source: String,
+    },
     StyleUnavailable {
         style_id: StyleId,
         source: String,
@@ -1073,6 +1077,13 @@ pub enum ProfilePreparationError {
 }
 
 impl ProfilePreparationError {
+    pub fn style_not_found(style_id: &StyleId, source: impl Into<String>) -> Self {
+        Self::StyleNotFound {
+            style_id: style_id.clone(),
+            source: source.into(),
+        }
+    }
+
     pub fn style_unavailable(style_id: &StyleId, source: impl Into<String>) -> Self {
         Self::StyleUnavailable {
             style_id: style_id.clone(),
@@ -1098,7 +1109,9 @@ impl ProfilePreparationError {
     /// failures unchanged.
     pub fn into_source(self, hash: SourceHash) -> Self {
         match self {
-            Self::StyleUnavailable { source, .. } => Self::SourceUnavailable { hash, source },
+            Self::StyleNotFound { source, .. } | Self::StyleUnavailable { source, .. } => {
+                Self::SourceUnavailable { hash, source }
+            }
             Self::InvalidPreparedContent { source, .. } => Self::InvalidPreparedContent {
                 content: ProfileContent::Source(hash),
                 source,
@@ -1107,8 +1120,9 @@ impl ProfilePreparationError {
         }
     }
 
-    pub fn failure_kind(&self) -> FailureKind {
-        match self {
+    pub fn failure_kind(&self) -> Option<FailureKind> {
+        Some(match self {
+            Self::StyleNotFound { .. } => return None,
             Self::StyleUnavailable { .. } => FailureKind::StyleUnavailable,
             Self::SourceUnavailable { .. } => FailureKind::SourceUnavailable,
             Self::CallerDeadlineExceeded => FailureKind::PreparationTimeout,
@@ -1117,14 +1131,15 @@ impl ProfilePreparationError {
                 ProfileContent::Style(_) => FailureKind::StyleUnavailable,
                 ProfileContent::Source(_) => FailureKind::SourceUnavailable,
             },
-        }
+        })
     }
 }
 
 impl std::fmt::Display for ProfilePreparationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::StyleUnavailable { style_id, source }
+            Self::StyleNotFound { style_id, source }
+            | Self::StyleUnavailable { style_id, source }
             | Self::InvalidPreparedContent {
                 content: ProfileContent::Style(style_id),
                 source,
@@ -1410,21 +1425,25 @@ mod tests {
         let style_id = StyleId("style".to_string());
         assert_eq!(
             ProfilePreparationError::CallerDeadlineExceeded.failure_kind(),
-            FailureKind::PreparationTimeout,
+            Some(FailureKind::PreparationTimeout),
+        );
+        assert_eq!(
+            ProfilePreparationError::style_not_found(&style_id, "provider 404").failure_kind(),
+            None,
         );
         assert_eq!(
             ProfilePreparationError::style_unavailable(&style_id, "provider 503").failure_kind(),
-            FailureKind::StyleUnavailable,
+            Some(FailureKind::StyleUnavailable),
         );
         assert_eq!(
             ProfilePreparationError::invalid_style(&style_id, "invalid JSON")
                 .into_source(1)
                 .failure_kind(),
-            FailureKind::SourceUnavailable,
+            Some(FailureKind::SourceUnavailable),
         );
         assert_eq!(
             ProfilePreparationError::infrastructure("semaphore closed").failure_kind(),
-            FailureKind::Other,
+            Some(FailureKind::Other),
         );
         assert_eq!(
             FailureKind::from_renderer_error(&RendererError::Timeout),

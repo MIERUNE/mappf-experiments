@@ -7,13 +7,14 @@ use crate::{membership::ClusterView, request_id, server};
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::{MatchedPath, Request, State},
+    extract::{DefaultBodyLimit, MatchedPath, Request, State},
     http::{HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use ishikari_core::metrics::NodeMetrics;
+use mmpf_cluster::MAX_STYLE_REFRESH_HINT_BYTES;
 use mmpf_http::cors::public_distribution;
 use mmpf_http::operational::{
     INTERNAL_LIVENESS_PATH, INTERNAL_METRICS_PATH, INTERNAL_READINESS_PATH, PUBLIC_LIVENESS_PATH,
@@ -50,9 +51,21 @@ fn with_public_layers(delivery_routes: Router<AppState>, state: AppState) -> Rou
             state.clone(),
             auth::authorize_delivery,
         ))
+        .layer(middleware::from_fn(enforce_public_response_cache_policy))
         .layer(public_distribution());
     let router = public_operational_routes().merge(delivery_routes);
     with_common_layers(router, state)
+}
+
+async fn enforce_public_response_cache_policy(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    if response.status().is_client_error() || response.status().is_server_error() {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static(server::cache::ERROR),
+        );
+    }
+    response
 }
 
 /// Defines the public router and its route manifest from one list. Schema tests
@@ -164,6 +177,11 @@ fn internal_router() -> Router<AppState> {
         .route(
             "/_internal/provider/fonts/{fontstack}/{range}",
             get(server::glyph::internal_glyph_handler),
+        )
+        .route(
+            "/_internal/refresh/style",
+            post(server::refresh::style_refresh_handler)
+                .route_layer(DefaultBodyLimit::max(MAX_STYLE_REFRESH_HINT_BYTES)),
         )
 }
 
@@ -382,6 +400,7 @@ pub(crate) mod internal;
 pub(crate) mod provider;
 mod provider_body;
 mod provider_cache_policy;
+mod refresh;
 mod response;
 pub(crate) use response::{apply_origin_vary, bytes_response, derived_json_response, get_origin};
 mod state;

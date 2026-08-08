@@ -15,9 +15,13 @@ use ishikari_core::{
     },
     metrics::NodeMetricsSnapshot,
     pmtiles::{
-        BootstrapTransfer, Reader as PmtilesReader, Storage as PmtilesStorage, StorageError,
+        BootstrapTransfer, ObservedRange, Reader as PmtilesReader, Storage as PmtilesStorage,
+        StorageError,
     },
-    storage::{HrwRouter, Peer, ResolverTuning, TileSource, TilesetId, plan_chunk_fetch_ranges},
+    storage::{
+        ArchiveGeneration, ArchiveKey, HrwRouter, Peer, ResolverTuning, TileSource, TilesetId,
+        plan_chunk_fetch_ranges,
+    },
 };
 use mmpf_pmtiles::{TileCoord, TileId, TileLookupTrace as TileAccessPlan};
 use moka::{policy::EvictionPolicy, sync::Cache};
@@ -134,12 +138,52 @@ impl LocalCatalogStorage {
 }
 
 impl PmtilesStorage for LocalCatalogStorage {
-    async fn read_range(
+    async fn observe_range(
         &self,
         tileset_id: &TilesetId,
         start: u64,
         length: usize,
-        _archive_len: Option<u64>,
+    ) -> Result<ObservedRange, StorageError> {
+        Ok(ObservedRange {
+            bytes: self.read_file_range(tileset_id, start, length)?,
+            generation: ArchiveGeneration::from_wire("v:simulator-static").unwrap(),
+        })
+    }
+
+    async fn read_range(
+        &self,
+        archive: &ArchiveKey,
+        start: u64,
+        length: usize,
+        _archive_len: u64,
+    ) -> Result<Bytes, StorageError> {
+        self.read_file_range(archive.tileset_id(), start, length)
+    }
+
+    fn fetch_bootstrap_bytes<'a>(
+        &'a self,
+        _tileset_id: &'a TilesetId,
+        _include_metadata: bool,
+    ) -> impl Future<Output = Result<Option<BootstrapTransfer>>> + Send + 'a {
+        std::future::ready(Ok(None))
+    }
+
+    fn fetch_leaf_bytes<'a>(
+        &'a self,
+        _archive: &'a ArchiveKey,
+        _offset: u64,
+        _length: usize,
+    ) -> impl Future<Output = Result<Option<Bytes>>> + Send + 'a {
+        std::future::ready(Ok(None))
+    }
+}
+
+impl LocalCatalogStorage {
+    fn read_file_range(
+        &self,
+        tileset_id: &TilesetId,
+        start: u64,
+        length: usize,
     ) -> Result<Bytes, StorageError> {
         let path = self.archive_path(tileset_id);
         let mut file = match File::open(&path) {
@@ -166,23 +210,6 @@ impl PmtilesStorage for LocalCatalogStorage {
             ))
         })?;
         Ok(Bytes::from(bytes))
-    }
-
-    fn fetch_bootstrap_bytes<'a>(
-        &'a self,
-        _tileset_id: &'a TilesetId,
-        _include_metadata: bool,
-    ) -> impl Future<Output = Result<Option<BootstrapTransfer>>> + Send + 'a {
-        std::future::ready(Ok(None))
-    }
-
-    fn fetch_leaf_bytes<'a>(
-        &'a self,
-        _tileset_id: &'a TilesetId,
-        _offset: u64,
-        _length: usize,
-    ) -> impl Future<Output = Result<Option<Bytes>>> + Send + 'a {
-        std::future::ready(Ok(None))
     }
 }
 

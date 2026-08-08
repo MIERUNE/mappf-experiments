@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use tokio::time::Instant;
 use crate::types::{
     CachePolicy, CompletedInfo, GeoJsonOverlay, ImageFormat, InternalTask, LngLat, NamespaceSet,
     NodeId, PathOverlay, PinOverlay, PinSize, Positioning, RenderOutput, RenderRequest, RouteTier,
-    Scale, SourceHash, StaticOverlay, TaskOutcome, TaskResult,
+    Scale, SourceHash, StaticOverlay, StyleId, TaskOutcome, TaskResult,
 };
 use mmpf_common::sync::lock_unpoisoned;
 
@@ -32,6 +33,8 @@ pub(crate) struct RenderOutputCache {
 struct RenderOutputCacheInner {
     cache: Cache<Arc<RenderCacheKey>, Arc<CachedRenderOutput>>,
     in_flight: Box<[RenderFlightMap]>,
+    invalidation_epoch: AtomicU64,
+    mutation_gate: Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -91,6 +94,7 @@ pub(crate) struct RenderFlightLeader {
     inner: Arc<RenderOutputCacheInner>,
     key: Option<Arc<RenderCacheKey>>,
     required_namespaces: Option<NamespaceSet>,
+    invalidation_epoch: u64,
 }
 
 impl RenderOutputCache {
@@ -105,6 +109,7 @@ impl RenderOutputCache {
         let cache = Cache::builder()
             .max_capacity(max_capacity_bytes)
             .time_to_live(ttl)
+            .support_invalidation_closures()
             .weigher(
                 |key: &Arc<RenderCacheKey>, output: &Arc<CachedRenderOutput>| {
                     key.estimated_size_bytes()
@@ -119,8 +124,26 @@ impl RenderOutputCache {
                 in_flight: (0..RENDER_FLIGHT_SHARDS)
                     .map(|_| Mutex::new(HashMap::new()))
                     .collect(),
+                invalidation_epoch: AtomicU64::new(0),
+                mutation_gate: Mutex::new(()),
             })),
         }
+    }
+
+    /// Removes completed renders for one style and fences renders that began
+    /// before the invalidation. Refresh hints use this before they return so an
+    /// output-cache hit cannot hide a provider revalidation indefinitely.
+    pub(crate) fn invalidate_style(&self, style_id: &StyleId) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let _mutation = lock_unpoisoned(&inner.mutation_gate);
+        inner.invalidation_epoch.fetch_add(1, Ordering::AcqRel);
+        let style_id = style_id.as_str().to_owned();
+        inner
+            .cache
+            .invalidate_entries_if(move |key, _| key.style_id == style_id)
+            .expect("render cache enables invalidation closures");
     }
 
     pub(crate) fn is_enabled_for(&self, task: &InternalTask) -> bool {
@@ -183,6 +206,7 @@ impl RenderOutputCache {
         in_flight.insert(Arc::clone(&key), changed);
         drop(in_flight);
         RenderCacheLookup::Leader(RenderFlightLeader {
+            invalidation_epoch: inner.invalidation_epoch.load(Ordering::Acquire),
             inner,
             key: Some(key),
             required_namespaces: readable_namespaces.cloned(),
@@ -214,6 +238,10 @@ impl RenderFlightLeader {
         let Some(key) = &self.key else {
             return false;
         };
+        let _mutation = lock_unpoisoned(&self.inner.mutation_gate);
+        if self.invalidation_epoch != self.inner.invalidation_epoch.load(Ordering::Acquire) {
+            return false;
+        }
         if let Some(existing) = self.inner.cache.get(key)
             && existing.required_namespaces != self.required_namespaces
         {
@@ -745,6 +773,43 @@ mod tests {
         let b = RenderCacheKey::from_task(&task(1, None));
 
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn style_invalidation_removes_entries_and_fences_in_flight_insertions() {
+        let cache = RenderOutputCache::new(1_024 * 1_024);
+        let task = task(0, None);
+        let stale_leader = match cache.lookup_or_join(&task) {
+            RenderCacheLookup::Leader(leader) => leader,
+            _ => panic!("first lookup must lead"),
+        };
+
+        cache.invalidate_style(&task.style.id);
+        assert!(!stale_leader.insert_from_outcome(&completed_outcome(
+            &task,
+            output(b"stale", task.output_format),
+        )));
+        drop(stale_leader);
+
+        let current_leader = match cache.lookup_or_join(&task) {
+            RenderCacheLookup::Leader(leader) => leader,
+            _ => panic!("post-invalidation lookup must lead"),
+        };
+        assert!(current_leader.insert_from_outcome(&completed_outcome(
+            &task,
+            output(b"current", task.output_format),
+        )));
+        drop(current_leader);
+        assert!(matches!(
+            cache.lookup_or_join(&task),
+            RenderCacheLookup::Hit(_)
+        ));
+
+        cache.invalidate_style(&task.style.id);
+        assert!(matches!(
+            cache.lookup_or_join(&task),
+            RenderCacheLookup::Leader(_)
+        ));
     }
 
     #[test]

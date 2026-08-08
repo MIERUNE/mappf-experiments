@@ -195,7 +195,7 @@ impl Renderer for MapLibreRenderer {
 mod tests {
     use super::*;
     use crate::renderer::{ProfilePreparer, StyleAvailabilityError, actor::BlockingRenderBackend};
-    use biei_core::style_catalog::{StyleCatalog, StyleDefinition};
+    use biei_core::style_catalog::{StyleCatalog, StyleDefinition, style_content_version};
     use biei_core::types::{
         AddLayer, AddLayerSource, CredentialCachePartition, ImageFormat, NamespaceSet, PixelRatio,
         Positioning, ProfileContent, ProfilePreparationError, RenderAuthorization, RenderRequest,
@@ -203,7 +203,7 @@ mod tests {
     };
     use std::{
         sync::{
-            Arc,
+            Arc, RwLock,
             atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
@@ -370,6 +370,33 @@ mod tests {
                         tokio::time::sleep(delay).await;
                     }
                     (status, body)
+                }
+            });
+            axum::serve(listener, app).await.expect("test server runs");
+        });
+        (format!("http://{addr}/style.json"), count, server)
+    }
+
+    async fn spawn_mutable_style_server(
+        body: Arc<RwLock<String>>,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let count = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server binds");
+        let addr = listener.local_addr().expect("test server has local addr");
+        let server_count = Arc::clone(&count);
+        let server = tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move || {
+                let body = Arc::clone(&body);
+                let server_count = Arc::clone(&server_count);
+                async move {
+                    server_count.fetch_add(1, Ordering::SeqCst);
+                    let body = body
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    ([(axum::http::header::CACHE_CONTROL, "max-age=0")], body)
                 }
             });
             axum::serve(listener, app).await.expect("test server runs");
@@ -561,6 +588,98 @@ mod tests {
         server.abort();
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         assert!(Arc::ptr_eq(&first.style_json, &second.style_json));
+    }
+
+    #[tokio::test]
+    async fn profile_preparer_activates_content_revision_without_a_duplicate_fetch() {
+        let first_body = r#"{"version":8,"name":"first","sources":{},"layers":[]}"#;
+        let second_body = r#"{"version":8,"name":"second","sources":{},"layers":[]}"#;
+        let body = Arc::new(RwLock::new(first_body.to_string()));
+        let (style_url, request_count, server) =
+            spawn_mutable_style_server(Arc::clone(&body)).await;
+        let bootstrap = revision();
+        let catalog = Arc::new(StyleCatalog::with_minimum_revalidation_interval_for_tests(
+            Duration::from_millis(10),
+        ));
+        catalog.upsert_definition(
+            bootstrap.id.clone(),
+            StyleDefinition::new(style_url, bootstrap.version),
+        );
+        let preparer = MapLibreProfilePreparer::for_tests(Arc::clone(&catalog));
+
+        let initial = preparer
+            .prepare_profile(&internal_task(bootstrap.clone()))
+            .await
+            .expect("bootstrap profile prepares")
+            .expect("prepared profile");
+        assert_eq!(initial.style_json.as_ref(), first_body);
+
+        let first_revision = StyleRevision {
+            id: bootstrap.id.clone(),
+            version: style_content_version(first_body),
+        };
+        assert_eq!(
+            catalog.resolve_latest(&bootstrap.id),
+            Some(first_revision.version)
+        );
+        assert!(
+            preparer.has_cached_style(&first_revision),
+            "the first fetch is installed under its content revision"
+        );
+
+        let current = preparer
+            .prepare_profile(&internal_task(first_revision.clone()))
+            .await
+            .expect("content revision resolves from the first fetch")
+            .expect("prepared profile");
+        assert_eq!(current.style_json.as_ref(), first_body);
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            1,
+            "switching from the bootstrap identity must not fetch twice"
+        );
+
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        *body
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = second_body.to_string();
+        assert!(
+            catalog
+                .request_revalidation(&bootstrap.id)
+                .applied_to_observed_style()
+        );
+        let admitted_old = preparer
+            .prepare_profile(&internal_task(first_revision.clone()))
+            .await
+            .expect("old admitted revision remains servable during refresh")
+            .expect("prepared profile");
+        assert_eq!(
+            admitted_old.style_json.as_ref(),
+            first_body,
+            "new bytes must not be mislabeled with the admitted old revision"
+        );
+
+        let second_revision = StyleRevision {
+            id: bootstrap.id.clone(),
+            version: style_content_version(second_body),
+        };
+        assert_eq!(
+            catalog.resolve_latest(&bootstrap.id),
+            Some(second_revision.version)
+        );
+        let activated = preparer
+            .prepare_profile(&internal_task(second_revision))
+            .await
+            .expect("new revision is immediately available")
+            .expect("prepared profile");
+
+        server.abort();
+        assert_eq!(activated.style_json.as_ref(), second_body);
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            2,
+            "revision activation reuses the refresh response"
+        );
     }
 
     #[tokio::test]
@@ -1104,15 +1223,15 @@ mod tests {
         server.abort();
         assert!(matches!(
             first,
-            Err(ProfilePreparationError::StyleUnavailable { .. })
+            Err(ProfilePreparationError::StyleNotFound { .. })
         ));
         assert!(matches!(
             second,
-            Err(ProfilePreparationError::StyleUnavailable { .. })
+            Err(ProfilePreparationError::StyleNotFound { .. })
         ));
         assert!(matches!(
             third,
-            Err(ProfilePreparationError::StyleUnavailable { .. })
+            Err(ProfilePreparationError::StyleNotFound { .. })
         ));
         assert_eq!(
             request_count.load(Ordering::SeqCst),
@@ -1149,7 +1268,7 @@ mod tests {
         server.abort();
         assert!(matches!(
             err.error(),
-            ProfilePreparationError::StyleUnavailable { .. }
+            ProfilePreparationError::StyleNotFound { .. }
         ));
         assert!(
             err.is_negative_cacheable(),

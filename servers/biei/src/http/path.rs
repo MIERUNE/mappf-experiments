@@ -9,6 +9,13 @@ pub(crate) struct ResolvedStyle {
 }
 
 pub(crate) fn resolve_style_id(components: &[&str]) -> Result<StyleId, IngressError> {
+    // An empty slice used to join to an empty id and pass every remaining check,
+    // because the per-component loop it would have failed never ran. Nothing
+    // wants a style with no name: the caller that could produce it was a render
+    // path with too few segments to hold both a style id and a coordinate.
+    if components.is_empty() {
+        return Err(invalid("style_id must not be empty"));
+    }
     for component in components {
         validate_path_component(component, "style_id")?;
     }
@@ -19,6 +26,15 @@ pub(crate) fn resolve_style_id(components: &[&str]) -> Result<StyleId, IngressEr
         )));
     }
     Ok(StyleId(style_id))
+}
+
+/// Validates an already-joined style id under the same rules as a request path.
+///
+/// Advisory refresh hints arrive over a transport envelope that deliberately
+/// accepts the union of every service's identifier shape, so the id still has to
+/// clear Biei's own rules before it is used to resolve a provider URL.
+pub(crate) fn resolve_style_id_str(style_id: &str) -> Result<StyleId, IngressError> {
+    resolve_style_id(&style_id.split('/').collect::<Vec<_>>())
 }
 
 pub(crate) fn resolve_style(

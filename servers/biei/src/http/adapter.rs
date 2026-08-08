@@ -5,19 +5,24 @@
 //! HTTP response.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::body::to_bytes;
-use axum::extract::{Extension, State};
+use axum::extract::{DefaultBodyLimit, Extension, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{any, get, post};
-use mmpf_cluster::BootstrapReadinessGate;
+use mmpf_cluster::{
+    BootstrapReadinessGate, HintAdmission, MAX_STYLE_REFRESH_HINT_BYTES, RefreshHintDedup,
+    StyleRefreshHint,
+};
 use mmpf_http::cors::public_distribution;
 use mmpf_http::operational::{
     INTERNAL_LIVENESS_PATH, INTERNAL_METRICS_PATH, INTERNAL_READINESS_PATH, PUBLIC_LIVENESS_PATH,
@@ -32,6 +37,7 @@ use crate::http::ingress::HttpIngress;
 use crate::http::metrics::{HttpMetrics, RequestEndpoint};
 use crate::http::request_id_from_headers;
 use crate::http::response::{IngressResponse, PRIVATE_NO_STORE_CACHE_CONTROL};
+use biei_core::style_catalog::RevalidationRequest;
 use biei_core::types::RequestId;
 
 const MAX_INTERNAL_FORWARD_BODY_BYTES: usize = 10 * 1024 * 1024;
@@ -95,6 +101,10 @@ struct HttpServerState {
     internal_forward: Option<crate::http::internal::InternalForwardEndpoint>,
     metrics: Option<HttpMetrics>,
     renderer_supervisor: Option<crate::renderer::actor::RendererActorSupervisor>,
+    /// Suppression window for repeated refresh hints. Not an `Option`: the route
+    /// is mounted in every mode, so a mode without one would apply every retry.
+    /// Clustered runs share `Membership`'s instance; standalone owns its own.
+    refresh_dedup: Arc<RefreshHintDedup>,
 }
 
 #[derive(Clone)]
@@ -138,6 +148,7 @@ pub(crate) async fn serve_with_shutdown(
             internal_forward: None,
             metrics,
             renderer_supervisor: Some(renderer_supervisor),
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
         },
         bind,
         None,
@@ -167,6 +178,9 @@ pub(crate) async fn serve_with_shutdown_and_membership_and_internal_forward(
         drain.clone(),
         renderer_supervisor.clone(),
     ));
+    // Shared with the gossip receiver, so a hint that arrives over both
+    // transports is applied once.
+    let refresh_dedup = membership.refresh_dedup();
     let membership = MembershipReadiness {
         membership,
         bootstrap: gossip_bootstrap_readiness,
@@ -179,6 +193,7 @@ pub(crate) async fn serve_with_shutdown_and_membership_and_internal_forward(
             internal_forward,
             metrics,
             renderer_supervisor: Some(renderer_supervisor),
+            refresh_dedup,
         },
         public_bind,
         Some(internal_bind),
@@ -334,6 +349,8 @@ fn classify_path(scope: ListenerScope, path: &str) -> EndpointClassification {
                 fixed(RequestEndpoint::Metrics)
             } else if path == "/_internal/forward" {
                 fixed(RequestEndpoint::InternalForward)
+            } else if path == "/_internal/refresh/style" {
+                fixed(RequestEndpoint::StyleRefresh)
             } else {
                 fixed(RequestEndpoint::NotFound)
             }
@@ -347,6 +364,8 @@ fn classify_path(scope: ListenerScope, path: &str) -> EndpointClassification {
                 fixed(RequestEndpoint::Metrics)
             } else if path == "/_internal/forward" {
                 fixed(RequestEndpoint::InternalForward)
+            } else if path == "/_internal/refresh/style" {
+                fixed(RequestEndpoint::StyleRefresh)
             } else if path == "/metrics" || path == "/_internal" || path.starts_with("/_internal/")
             {
                 fixed(RequestEndpoint::NotFound)
@@ -378,11 +397,27 @@ fn standalone_operational_routes() -> Router<HttpServerState> {
         .route(INTERNAL_READINESS_PATH, get(readyz))
         .route(INTERNAL_METRICS_PATH, get(metricsz))
         .route("/_internal/forward", post(forwardz))
+        .route(
+            "/_internal/refresh/style",
+            post(refresh_style).route_layer(DefaultBodyLimit::max(MAX_STYLE_REFRESH_HINT_BYTES)),
+        )
 }
 
+/// Force `no-store` onto public failures so a shared cache cannot retain them.
+///
+/// The condition is "is a failure", not "is not a success". `is_success()` covers
+/// only `2xx`, so negating it also captures `3xx` — and a `304` is a successful
+/// validation whose whole purpose is to refresh a downstream entry. Telling a
+/// cache not to store that response instructs it to drop the entry it was
+/// revalidating, so every conditional request would fall back to a full body and
+/// the validator would cost more than it saves. Biei emits no `304` today, which
+/// is the only reason the looser predicate was harmless; conditional
+/// revalidation is queued work, so the predicate is narrowed before it lands
+/// rather than after it regresses.
 async fn enforce_public_response_cache_policy(request: Request<Body>, next: Next) -> Response {
     let mut response = next.run(request).await;
-    if !response.status().is_success() {
+    let status = response.status();
+    if status.is_client_error() || status.is_server_error() {
         response.headers_mut().insert(
             CACHE_CONTROL,
             HeaderValue::from_static(PRIVATE_NO_STORE_CACHE_CONTROL),
@@ -482,6 +517,10 @@ fn internal_router(state: HttpServerState) -> Router {
         .route(INTERNAL_READINESS_PATH, get(readyz))
         .route(INTERNAL_METRICS_PATH, get(metricsz))
         .route("/_internal/forward", post(forwardz))
+        .route(
+            "/_internal/refresh/style",
+            post(refresh_style).route_layer(DefaultBodyLimit::max(MAX_STYLE_REFRESH_HINT_BYTES)),
+        )
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(
@@ -565,6 +604,78 @@ async fn metricsz(State(state): State<HttpServerState>) -> Response {
         })
 }
 
+async fn refresh_style(
+    State(state): State<HttpServerState>,
+    Json(hint): Json<StyleRefreshHint>,
+) -> Response {
+    let record = |outcome: &'static str| {
+        if let Some(metrics) = state.metrics.as_ref() {
+            metrics.record_style_refresh_hint(outcome);
+        }
+    };
+    if hint.validate().is_err() {
+        record("rejected");
+        return simple_response(StatusCode::BAD_REQUEST, "invalid refresh hint");
+    }
+    let Some(ingress) = state.ingress.as_ref() else {
+        record("disabled");
+        return simple_response(StatusCode::NOT_FOUND, "style refresh disabled");
+    };
+    // A `hint_id` names one publisher mutation, so a repeat is a retry. Answer as
+    // the first delivery did without pulling the check forward or advancing the
+    // fence again.
+    if state.refresh_dedup.admit(&hint) == HintAdmission::Duplicate {
+        // Counted, not merely logged: the response is an indistinguishable `202`,
+        // so without this the retry amplification this guard exists to bound
+        // would be invisible in production.
+        record("suppressed");
+        tracing::debug!(
+            hint_id = %hint.hint_id,
+            style_id = %hint.style_id,
+            "ignored duplicate advisory style refresh"
+        );
+        return simple_response(StatusCode::ACCEPTED, "refresh accepted");
+    }
+    // The transport envelope accepts the union of every service's identifier
+    // shape, so Biei's own rules still have to run before the id resolves a
+    // provider URL.
+    let Ok(style_id) = crate::http::path::resolve_style_id_str(&hint.style_id) else {
+        record("rejected_style_id");
+        return simple_response(StatusCode::BAD_REQUEST, "invalid refresh style id");
+    };
+    let catalog = ingress.style_catalog();
+    if catalog.resolve_latest(&style_id).is_none() {
+        record("unknown_style");
+        return simple_response(StatusCode::NOT_FOUND, "style not configured");
+    }
+    // A hint that cannot reserve fence capacity is still applied — the process-wide
+    // request count keeps an in-flight fetch due — but the exhaustion must not be
+    // silent, because it costs an extra revalidation per affected fetch.
+    if catalog.request_revalidation_for_hint(&style_id, &hint.hint_id)
+        == RevalidationRequest::AcceptedWithoutFence
+    {
+        tracing::warn!(
+            style_id = %hint.style_id,
+            "style refresh fence capacity exhausted; hint applied without a per-style fence"
+        );
+    }
+    ingress.node().invalidate_render_output_cache(&style_id);
+    if let Some(membership) = state.membership.as_ref()
+        && let Err(error) = membership.membership.publish_style_refresh(&hint).await
+    {
+        record("publish_failed");
+        tracing::warn!(%error, "failed to publish style refresh hint");
+        return simple_response(StatusCode::INTERNAL_SERVER_ERROR, "refresh publish failed");
+    }
+    record("accepted");
+    tracing::info!(
+        hint_id = %hint.hint_id,
+        style_id = %hint.style_id,
+        "accepted advisory style refresh"
+    );
+    simple_response(StatusCode::ACCEPTED, "refresh accepted")
+}
+
 async fn forwardz(State(state): State<HttpServerState>, request: Request<Body>) -> Response {
     let Some(internal_forward) = state.internal_forward.as_ref() else {
         return simple_response(StatusCode::NOT_FOUND, "internal forward disabled");
@@ -598,7 +709,14 @@ async fn public_render(
     method: Method,
     uri: Uri,
 ) -> Response {
-    if method != Method::GET {
+    // RFC 9110 requires `HEAD` wherever `GET` is served, and health checkers and
+    // CDNs rely on it. Run the identical pipeline and drop only the body, so
+    // every header — content type and length, cache policy, request id —
+    // describes the `GET` it stands in for. This is what Axum's own `get()`
+    // routes do, which is why the operational endpoints here and every Ishikari
+    // route already answer both.
+    let headers_only = method == Method::HEAD;
+    if method != Method::GET && !headers_only {
         return public_error_response(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
     }
     if uri
@@ -610,7 +728,7 @@ async fn public_render(
     let Some(ingress) = state.ingress else {
         return public_error_response(StatusCode::NOT_FOUND, "not_found");
     };
-    into_axum_response(
+    let mut response = into_axum_response(
         ingress
             .handle_public_path_with_request_id(
                 uri.path(),
@@ -620,7 +738,11 @@ async fn public_render(
                 Instant::now(),
             )
             .await,
-    )
+    );
+    if headers_only {
+        *response.body_mut() = Body::empty();
+    }
+    response
 }
 
 fn public_error_response(status: StatusCode, code: &'static str) -> Response {
@@ -715,6 +837,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
             renderer_supervisor: None,
         }
     }
@@ -795,6 +918,56 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn style_refresh_route_is_internal_and_validates_before_runtime_lookup() {
+        let state = empty_state();
+        let valid = r#"{"schema_version":1,"hint_id":"mutation-42","style_id":"base"}"#;
+        let request = Request::builder()
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(valid))
+            .unwrap();
+        let internal = handle_internal(
+            State(state.clone()),
+            Method::POST,
+            "/_internal/refresh/style".parse().unwrap(),
+            request,
+        )
+        .await;
+        assert_eq!(
+            internal.status(),
+            StatusCode::NOT_FOUND,
+            "valid request reaches the disabled-runtime guard"
+        );
+
+        let request = Request::builder()
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(valid))
+            .unwrap();
+        let public = handle_public(
+            State(state.clone()),
+            Method::POST,
+            "/_internal/refresh/style".parse().unwrap(),
+            request,
+        )
+        .await;
+        assert_eq!(public.status(), StatusCode::NOT_FOUND);
+
+        let request = Request::builder()
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"schema_version":1,"hint_id":"x","style_id":"../secret"}"#,
+            ))
+            .unwrap();
+        let invalid = handle_internal(
+            State(state),
+            Method::POST,
+            "/_internal/refresh/style".parse().unwrap(),
+            request,
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[test]
     fn classify_endpoint_is_listener_aware_and_bounded() {
         use ListenerScope::{Internal, Public, Standalone};
@@ -841,6 +1014,12 @@ mod tests {
             ),
             (
                 Internal,
+                "/_internal/refresh/style",
+                StatusCode::ACCEPTED,
+                StyleRefresh,
+            ),
+            (
+                Internal,
                 PUBLIC_LIVENESS_PATH,
                 StatusCode::NOT_FOUND,
                 NotFound,
@@ -853,6 +1032,12 @@ mod tests {
                 "/_internal/forward",
                 StatusCode::NOT_FOUND,
                 InternalForward,
+            ),
+            (
+                Standalone,
+                "/_internal/refresh/style",
+                StatusCode::ACCEPTED,
+                StyleRefresh,
             ),
             (
                 Standalone,
@@ -883,6 +1068,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
             renderer_supervisor: None,
         };
         let request = Request::builder().body(Body::empty()).unwrap();
@@ -916,6 +1102,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
             renderer_supervisor: None,
         };
 
@@ -953,6 +1140,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
             renderer_supervisor: Some(supervisor.clone()),
         };
 
@@ -998,6 +1186,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
             renderer_supervisor: Some(supervisor.clone()),
         };
 
@@ -1044,6 +1233,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
             renderer_supervisor: None,
         };
         let public_content =
@@ -1190,6 +1380,7 @@ mod tests {
             )),
             metrics,
             renderer_supervisor: Some(runtime.renderer_supervisor()),
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
         };
 
         let public = handle(
@@ -1233,6 +1424,7 @@ mod tests {
                 runtime.renderer_supervisor(),
             )),
             renderer_supervisor: Some(runtime.renderer_supervisor()),
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
         };
 
         let response = handle(
@@ -1273,6 +1465,7 @@ mod tests {
             internal_forward: None,
             metrics: Some(metrics),
             renderer_supervisor: Some(runtime.renderer_supervisor()),
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
         };
 
         // A liveness probe never creates a core task, yet must be tallied.
@@ -1303,6 +1496,181 @@ mod tests {
         assert!(
             !body.contains(r#"endpoint="metrics""#),
             "scrape counted itself"
+        );
+    }
+
+    /// The two hint outcomes that matter share one status code, so the counter is
+    /// the only thing that separates them. `membership: None` is the case that
+    /// used to skip deduplication entirely: the route is mounted regardless, so a
+    /// single-node process applied every retry.
+    /// The `no-store` override must key on failure, not on "not 2xx". A `304` is
+    /// a successful validation, so overriding it would tell the cache to discard
+    /// the entry it was refreshing and defeat conditional requests entirely.
+    #[test]
+    fn the_no_store_override_targets_failures_and_spares_revalidation() {
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::NOT_FOUND,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(
+                status.is_client_error() || status.is_server_error(),
+                "{status} must receive the no-store override"
+            );
+        }
+        for status in [
+            StatusCode::OK,
+            StatusCode::NO_CONTENT,
+            StatusCode::NOT_MODIFIED,
+        ] {
+            assert!(
+                !(status.is_client_error() || status.is_server_error()),
+                "{status} must keep its own cache policy"
+            );
+        }
+        // The distinction the old predicate missed.
+        assert!(!StatusCode::NOT_MODIFIED.is_success());
+    }
+
+    /// RFC 9110 requires `HEAD` wherever `GET` is served. The render route used to
+    /// answer `405` while `/livez` and every Ishikari route answered both, so
+    /// health checkers and CDNs probing a render URL saw a method error.
+    #[tokio::test]
+    async fn head_mirrors_get_headers_on_the_public_render_route() {
+        let options =
+            crate::options::test_options("http://style-api.test/styles/{style_id}/style.json", 1);
+        let runtime = crate::runtime::Runtime::spawn_single_node(&options).expect("runtime");
+        let state = HttpServerState {
+            drain: None,
+            ingress: Some(runtime.http_ingress(Duration::from_secs(2))),
+            membership: None,
+            internal_forward: None,
+            metrics: None,
+            renderer_supervisor: Some(runtime.renderer_supervisor()),
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
+        };
+        // A refusal, so the assertion is about method handling rather than about
+        // reaching a renderer: the two responses must agree on everything but the
+        // body.
+        let path = "/carto/voyager/static/139.7,35.6,11,0,0/64x64.png";
+        let mut responses = Vec::new();
+        for method in [Method::GET, Method::HEAD] {
+            responses.push(
+                handle(
+                    State(state.clone()),
+                    method,
+                    path.parse().unwrap(),
+                    Request::builder().body(Body::empty()).unwrap(),
+                )
+                .await,
+            );
+        }
+        let head = responses.pop().expect("head");
+        let get = responses.pop().expect("get");
+        assert_ne!(
+            get.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "premise: GET is served here"
+        );
+        assert_eq!(head.status(), get.status());
+        assert_eq!(
+            head.headers().get(CONTENT_TYPE),
+            get.headers().get(CONTENT_TYPE)
+        );
+        assert_eq!(
+            head.headers().get(CACHE_CONTROL),
+            get.headers().get(CACHE_CONTROL)
+        );
+        let get_body = to_bytes(get.into_body(), 1024 * 1024).await.unwrap();
+        let head_body = to_bytes(head.into_body(), 1024 * 1024).await.unwrap();
+        assert!(!get_body.is_empty(), "premise: GET carries a body");
+        assert!(head_body.is_empty(), "HEAD must not carry a body");
+
+        // Methods that are genuinely unsupported still refuse.
+        for method in [Method::POST, Method::PUT, Method::DELETE] {
+            let response = handle(
+                State(state.clone()),
+                method.clone(),
+                path.parse().unwrap(),
+                Request::builder().body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_hint_outcomes_are_counted_because_the_status_cannot_distinguish_them() {
+        let options =
+            crate::options::test_options("http://style-api.test/styles/{style_id}/style.json", 1);
+        let runtime = crate::runtime::Runtime::spawn_single_node(&options).expect("runtime");
+        let metrics = HttpMetrics::new(runtime.node(), None, None, runtime.renderer_supervisor());
+        let state = HttpServerState {
+            drain: None,
+            ingress: Some(runtime.http_ingress(Duration::from_secs(2))),
+            membership: None,
+            internal_forward: None,
+            metrics: Some(metrics),
+            renderer_supervisor: Some(runtime.renderer_supervisor()),
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
+        };
+        let hint = |hint_id: &str, style_id: &str| {
+            Request::builder()
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"schema_version":1,"hint_id":"{hint_id}","style_id":"{style_id}"}}"#
+                )))
+                .unwrap()
+        };
+        let post = async |state: HttpServerState, request| {
+            handle_internal(
+                State(state),
+                Method::POST,
+                "/_internal/refresh/style".parse().unwrap(),
+                request,
+            )
+            .await
+            .status()
+        };
+
+        let first = post(state.clone(), hint("mutation-1", "base")).await;
+        let retry = post(state.clone(), hint("mutation-1", "base")).await;
+        assert_eq!(first, StatusCode::ACCEPTED);
+        assert_eq!(
+            retry, first,
+            "a suppressed retry is indistinguishable by status"
+        );
+        assert_eq!(
+            post(state.clone(), hint("mutation-2", "../escape")).await,
+            StatusCode::BAD_REQUEST
+        );
+
+        let scrape = handle_internal(
+            State(state),
+            Method::GET,
+            "/_internal/metrics".parse().unwrap(),
+            Request::builder().body(Body::empty()).unwrap(),
+        )
+        .await;
+        let body = to_bytes(scrape.into_body(), 1024 * 1024).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        for expected in [
+            r#"biei_style_refresh_hints_total{outcome="accepted"} 1"#,
+            r#"biei_style_refresh_hints_total{outcome="suppressed"} 1"#,
+            r#"biei_style_refresh_hints_total{outcome="rejected"} 1"#,
+        ] {
+            assert!(body.contains(expected), "missing {expected} in:\n{body}");
+        }
+        // The style id never reaches a label — the vocabulary is fixed.
+        assert!(
+            !body.contains("style_id="),
+            "hint metrics leaked a style id"
         );
     }
 
@@ -1508,6 +1876,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
             renderer_supervisor: Some(runtime.renderer_supervisor()),
         };
 
@@ -1546,6 +1915,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
             renderer_supervisor: Some(runtime.renderer_supervisor()),
         };
 
@@ -1619,6 +1989,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
             renderer_supervisor: Some(runtime.renderer_supervisor()),
         };
         let oversized_uri = format!("/{}", "x".repeat(MAX_PUBLIC_PATH_BYTES + 1))
@@ -1696,6 +2067,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
             renderer_supervisor: None,
         };
         let long_path = format!("/{}", "x".repeat(MAX_PUBLIC_PATH_BYTES + 1));
@@ -1719,6 +2091,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
             renderer_supervisor: None,
         };
         let exact_path = format!("/{}", "x".repeat(MAX_PUBLIC_PATH_BYTES - 1));
@@ -1742,6 +2115,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
             renderer_supervisor: None,
         };
         let uri: Uri = format!("/style/static/none/0,0,1/1x1?addlayer={}", "x".repeat(8192))
@@ -1798,6 +2172,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
             renderer_supervisor: None,
         };
 
@@ -1835,6 +2210,7 @@ mod tests {
             membership: None,
             internal_forward: None,
             metrics: None,
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
             renderer_supervisor: None,
         };
 

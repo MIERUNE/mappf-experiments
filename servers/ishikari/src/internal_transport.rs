@@ -11,10 +11,11 @@ use bytes::{Bytes, BytesMut};
 use reqwest::{Client, Response, StatusCode, header};
 
 use ishikari_core::storage::{
-    FetchFuture, InternalFetchResponse, InternalProviderNegative, InternalTileSource,
-    InternalTransport, PROVIDER_AGE_HEADER, PROVIDER_CACHE_CONTROL_HEADER, PROVIDER_ETAG_HEADER,
-    PROVIDER_LAST_MODIFIED_HEADER, PROVIDER_NEGATIVE_HEADER, Peer, PeerFetchError,
-    TILE_SOURCE_HEADER, internal_peer_request_timeout, internal_response_body_limit,
+    ARCHIVE_GENERATION_HEADER, ArchiveGeneration, FetchFuture, InternalFetchResponse,
+    InternalProviderNegative, InternalTileSource, InternalTransport, PROVIDER_AGE_HEADER,
+    PROVIDER_CACHE_CONTROL_HEADER, PROVIDER_ETAG_HEADER, PROVIDER_LAST_MODIFIED_HEADER,
+    PROVIDER_NEGATIVE_HEADER, Peer, PeerFetchError, TILE_SOURCE_HEADER,
+    internal_peer_request_timeout, internal_response_body_limit,
 };
 
 use crate::{http_client::representation_preserving_builder, request_id};
@@ -88,6 +89,10 @@ impl InternalTransport for HttpInternalTransport {
             let str_header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
             let owned_header = |name: &str| str_header(name).map(str::to_owned);
             let tile_source = str_header(TILE_SOURCE_HEADER).and_then(InternalTileSource::parse);
+            let archive_generation = str_header(ARCHIVE_GENERATION_HEADER)
+                .map(ArchiveGeneration::from_wire)
+                .transpose()
+                .map_err(|error| PeerFetchError::Fatal(error.to_string()))?;
             let provider_cache_control = owned_header(PROVIDER_CACHE_CONTROL_HEADER);
             let provider_age_seconds =
                 str_header(PROVIDER_AGE_HEADER).and_then(|value| value.parse().ok());
@@ -98,6 +103,7 @@ impl InternalTransport for HttpInternalTransport {
                 read_bounded_body(&mut response, internal_response_body_limit(path)).await?;
             Ok(InternalFetchResponse {
                 bytes,
+                archive_generation,
                 tile_source,
                 provider_cache_control,
                 provider_age_seconds,

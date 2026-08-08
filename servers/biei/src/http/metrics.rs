@@ -46,6 +46,12 @@ pub(crate) struct HttpMetrics {
     /// rejections that never reach core. `IntCounterVec` is `Arc`-backed, so
     /// cloning `HttpMetrics` into the routers and the scrape shares one tally.
     http_requests: IntCounterVec,
+    /// Advisory style-refresh outcomes. Separate from `http_requests` because the
+    /// status code does not identify the outcome: a suppressed duplicate answers
+    /// `202` exactly as the first delivery does, so the deduplication that bounds
+    /// retry amplification would otherwise be invisible in production — where the
+    /// `debug!` line that distinguishes them is below the configured log level.
+    style_refresh_hints: IntCounterVec,
 }
 
 impl HttpMetrics {
@@ -65,6 +71,11 @@ impl HttpMetrics {
                 "HTTP responses by bounded endpoint and status code.",
                 &["endpoint", "status"],
             ),
+            style_refresh_hints: counter_vec(
+                "biei_style_refresh_hints_total",
+                "Advisory style refresh hints received over HTTP by outcome.",
+                &["outcome"],
+            ),
         }
     }
 
@@ -76,6 +87,22 @@ impl HttpMetrics {
         self.http_requests
             .with_label_values(&[endpoint.as_label(), status_label(status)])
             .inc();
+    }
+
+    /// Record the terminal outcome of one advisory style-refresh hint.
+    ///
+    /// The vocabulary is fixed and mutually exclusive — exactly one call per
+    /// request, so the labels sum to the hints received: `rejected` (envelope
+    /// validation), `disabled` (no ingress), `suppressed` (duplicate inside the
+    /// dedup window), `rejected_style_id` (accepted by the shared envelope but
+    /// refused by Biei's stricter id rules), `unknown_style`, `publish_failed`
+    /// (applied locally, gossip publish failed), `accepted`.
+    ///
+    /// Fence-capacity exhaustion is deliberately not a label here: it is a
+    /// degradation of an `accepted` hint rather than an outcome of its own, and
+    /// it already emits `warn!`, which production logging retains.
+    pub(crate) fn record_style_refresh_hint(&self, outcome: &'static str) {
+        self.style_refresh_hints.with_label_values(&[outcome]).inc();
     }
 
     pub(crate) async fn render_prometheus(&self) -> String {
@@ -125,13 +152,14 @@ impl HttpMetrics {
         // `Collector::collect` (unlike `Registry::gather`) yields the family even
         // with no series; the text encoder rejects an empty family and would
         // blank the whole scrape, so drop it until at least one request lands.
-        let request_families: Vec<MetricFamily> = self
+        let server_families: Vec<MetricFamily> = self
             .http_requests
             .collect()
             .into_iter()
+            .chain(self.style_refresh_hints.collect())
             .filter(|family| !family.get_metric().is_empty())
             .collect();
-        render_prometheus_with_runtime(&self.node.metrics(), &runtime, request_families)
+        render_prometheus_with_runtime(&self.node.metrics(), &runtime, server_families)
     }
 }
 
@@ -143,6 +171,7 @@ pub(crate) enum RequestEndpoint {
     Ready,
     Metrics,
     InternalForward,
+    StyleRefresh,
     Render,
     NotFound,
 }
@@ -154,6 +183,7 @@ impl RequestEndpoint {
             RequestEndpoint::Ready => "ready",
             RequestEndpoint::Metrics => "metrics",
             RequestEndpoint::InternalForward => "internal_forward",
+            RequestEndpoint::StyleRefresh => "style_refresh",
             RequestEndpoint::Render => "render",
             RequestEndpoint::NotFound => "not_found",
         }
@@ -168,6 +198,7 @@ impl RequestEndpoint {
 fn status_label(status: u16) -> &'static str {
     match status {
         200 => "200",
+        202 => "202",
         400 => "400",
         404 => "404",
         405 => "405",

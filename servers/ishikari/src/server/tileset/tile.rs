@@ -2,7 +2,7 @@
 
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{self},
@@ -15,9 +15,13 @@ use crate::server::{AppState, HttpError, cache};
 use ishikari_core::{
     interned::{ResourceRoutingKey, TilesetId},
     pmtiles::{MLT_CONTENT_TYPE, TileCoord, TileData, TileId},
-    storage::{ArchivePresence, InternalTileSource, TILE_SOURCE_HEADER, TileSource},
+    storage::{
+        ARCHIVE_GENERATION_HEADER, ArchivePresence, InternalTileSource, TILE_SOURCE_HEADER,
+        TileSource,
+    },
 };
 
+use super::TileRepresentationQuery;
 use super::error::tileset_error_response;
 use super::mapterhorn::Resolved;
 use super::mlt::{
@@ -26,8 +30,7 @@ use super::mlt::{
 
 /// Parses the numeric tile `y` (after extension stripping).
 fn parse_y(y: &str) -> Result<u32, HttpError> {
-    y.parse()
-        .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid tile y: {y}")))
+    super::parse_tile_coordinate("y", y)
 }
 
 /// Serves the external z/x/y tile endpoint for a flat tileset key.
@@ -72,15 +75,17 @@ fn parse_y(y: &str) -> Result<u32, HttpError> {
 )]
 pub(crate) async fn tile_handler(
     State(state): State<AppState>,
-    Path((tileset_id, z, x, y_raw)): Path<(String, u8, u32, String)>,
+    Path((tileset_id, z_raw, x_raw, y_raw)): Path<(String, String, String, String)>,
+    Query(query): Query<TileRepresentationQuery>,
     headers: HeaderMap,
 ) -> Result<Response<Body>, HttpError> {
+    query.reject_encoding()?;
     let chosen = negotiate_format(&y_raw, &headers);
     serve_tile(
         state,
         tileset_id,
-        z,
-        x,
+        super::parse_tile_coordinate("z", &z_raw)?,
+        super::parse_tile_coordinate("x", &x_raw)?,
         parse_y(chosen.y)?,
         chosen.representation,
         &headers,
@@ -131,15 +136,23 @@ pub(crate) async fn tile_handler(
 )]
 pub(crate) async fn namespaced_tile_handler(
     State(state): State<AppState>,
-    Path((namespace, tileset_id, z, x, y_raw)): Path<(String, String, u8, u32, String)>,
+    Path((namespace, tileset_id, z_raw, x_raw, y_raw)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+    Query(query): Query<TileRepresentationQuery>,
     headers: HeaderMap,
 ) -> Result<Response<Body>, HttpError> {
+    query.reject_encoding()?;
     let chosen = negotiate_format(&y_raw, &headers);
     serve_tile(
         state,
         super::join_tileset_key(&namespace, &tileset_id),
-        z,
-        x,
+        super::parse_tile_coordinate("z", &z_raw)?,
+        super::parse_tile_coordinate("x", &x_raw)?,
         parse_y(chosen.y)?,
         chosen.representation,
         &headers,
@@ -184,6 +197,8 @@ async fn serve_tile(
     let Some(tile) = tile else {
         return Err((StatusCode::NOT_FOUND, "not found".to_string()));
     };
+    let generation = tile.generation;
+    let tile = tile.data;
     // A stored entry with no bytes cannot be served as a representation: the
     // archive's compression applies to every entry, so it would go out as an
     // empty body labelled `Content-Encoding: gzip`, which no client can decode.
@@ -234,6 +249,7 @@ async fn serve_tile(
             let (bytes, content_encoding, served_format) = mlt_response_bytes(
                 &state,
                 &routing_key,
+                &generation,
                 tile_id,
                 tile,
                 super::mlt::TranscodeCachePolicy::Retain,
@@ -264,7 +280,7 @@ async fn serve_tile(
 
 /// Builds the `204` served for a zero-byte stored entry.
 ///
-/// It carries the ordinary tile cache policy because an immutable archive's
+/// It carries the ordinary tile cache policy because an archive generation's
 /// empty entry is a stable positive fact, and no `Vary`, `Content-Type`, or
 /// `Content-Encoding`, because a `204` has no representation for a request
 /// header to select or a client to decode.
@@ -357,16 +373,23 @@ pub(crate) async fn internal_tile_handler(
         _ => return Err((StatusCode::NOT_FOUND, "not found".to_string())),
     };
     tile.map(|tile| {
-        state.metrics.add_internal_bytes(tile.bytes.len() as u64);
+        let generation = tile.generation.to_wire();
+        state
+            .metrics
+            .add_internal_bytes(tile.data.bytes.len() as u64);
         debug!(
             endpoint = "internal_tile",
-            served_bytes = tile.bytes.len(),
+            served_bytes = tile.data.bytes.len(),
             "served internal response"
         );
-        let mut response = TilesetResponse::from(tile).into_response();
+        let mut response = TilesetResponse::from(tile.data).into_response();
         response.headers_mut().insert(
             TILE_SOURCE_HEADER,
             HeaderValue::from_static(source.as_str()),
+        );
+        response.headers_mut().insert(
+            ARCHIVE_GENERATION_HEADER,
+            HeaderValue::from_str(&generation).expect("archive generation is a valid header value"),
         );
         response
     })

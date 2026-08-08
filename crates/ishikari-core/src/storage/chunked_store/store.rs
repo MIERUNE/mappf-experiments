@@ -12,12 +12,12 @@ use thiserror::Error;
 
 use crate::interned::TilesetId;
 use crate::metrics::NodeMetrics;
-use crate::storage::ObjectStoreRegistry;
+use crate::storage::{ObjectStoreRegistry, generation::ArchiveKey};
 
 use super::{
     cache::{ChunkCache, ChunkCacheKey},
     coordinator::ChunkFetchCoordinator,
-    fetcher::{BackendLatencyModel, ChunkFetchError, ChunkFetcher},
+    fetcher::{BackendLatencyModel, ChunkFetchError, ChunkFetcher, ObservedBytes},
 };
 
 /// Chunked byte-range reader backed by an object store.
@@ -114,15 +114,23 @@ impl ChunkedStore {
         self.coordinator.received_bytes()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn observe_archive(
+        &self,
+        tileset_id: &TilesetId,
+    ) -> std::result::Result<(ArchiveKey, u64), ChunkFetchError> {
+        self.coordinator.observe_archive(tileset_id).await
+    }
+
     /// Reads a tileset byte range through the shared chunk cache and inflight fetcher.
     pub(crate) async fn read_bytes(
         &self,
-        tileset_id: &TilesetId,
+        archive: &ArchiveKey,
         start: u64,
         length: usize,
-        archive_len: Option<u64>,
+        archive_len: u64,
     ) -> std::result::Result<ChunkRead, ChunkFetchError> {
-        let end = validate_byte_range(start, length, archive_len)
+        let end = validate_byte_range(start, length, Some(archive_len))
             .map_err(|error| ChunkFetchError::Message(error.to_string()))?;
         if length == 0 {
             return Ok(ChunkRead {
@@ -130,29 +138,18 @@ impl ChunkedStore {
                 source: ChunkReadSource::Cache,
             });
         }
-        let Some(archive_len) = archive_len else {
-            let bytes = self
-                .coordinator
-                .fetch_exact_range(tileset_id, start..end)
-                .await?;
-            return Ok(ChunkRead {
-                bytes,
-                source: ChunkReadSource::Backend,
-            });
-        };
-
         let chunk_range = byte_range_to_chunk_range(start, end, self.chunk_size());
         let first_chunk = *chunk_range.start();
         if first_chunk == *chunk_range.end() {
             return self
-                .read_single_chunk(tileset_id, first_chunk, start, length, archive_len)
+                .read_single_chunk(archive, first_chunk, start, length, archive_len)
                 .await;
         }
 
         let mut missing_chunks = Vec::new();
         let mut resolved_chunks = HashMap::new();
         for chunk_index in chunk_range.clone() {
-            if let Some(chunk) = self.chunk_cache_get(tileset_id, chunk_index) {
+            if let Some(chunk) = self.chunk_cache_get(archive, chunk_index) {
                 self.coordinator.metrics().record_chunk_cache("hit");
                 resolved_chunks.insert(chunk_index, chunk);
             } else {
@@ -164,7 +161,7 @@ impl ChunkedStore {
         if !missing_chunks.is_empty() {
             let fetched = self
                 .coordinator
-                .fetch_chunks(self.clone(), tileset_id, &missing_chunks, archive_len)
+                .fetch_chunks(self.clone(), archive, &missing_chunks, archive_len)
                 .await?;
             resolved_chunks.extend(fetched);
         }
@@ -180,22 +177,41 @@ impl ChunkedStore {
         Ok(ChunkRead { bytes, source })
     }
 
-    async fn read_single_chunk(
+    /// Reads an uncached range and captures the strong object generation from
+    /// the same response. Used only to establish a new archive snapshot.
+    pub(crate) async fn observe_bytes(
         &self,
         tileset_id: &TilesetId,
+        start: u64,
+        length: usize,
+    ) -> std::result::Result<ObservedBytes, ChunkFetchError> {
+        let length_u64 = u64::try_from(length).map_err(|_| {
+            ChunkFetchError::Message("observed range length does not fit u64".to_string())
+        })?;
+        let end = start.checked_add(length_u64).ok_or_else(|| {
+            ChunkFetchError::Message("observed range arithmetic overflow".to_string())
+        })?;
+        self.coordinator
+            .fetch_exact_range(tileset_id, start..end)
+            .await
+    }
+
+    async fn read_single_chunk(
+        &self,
+        archive: &ArchiveKey,
         chunk_index: u64,
         start: u64,
         length: usize,
         archive_len: u64,
     ) -> std::result::Result<ChunkRead, ChunkFetchError> {
-        let (chunk, source) = if let Some(chunk) = self.chunk_cache_get(tileset_id, chunk_index) {
+        let (chunk, source) = if let Some(chunk) = self.chunk_cache_get(archive, chunk_index) {
             self.coordinator.metrics().record_chunk_cache("hit");
             (chunk, ChunkReadSource::Cache)
         } else {
             self.coordinator.metrics().record_chunk_cache("miss");
             let mut fetched = self
                 .coordinator
-                .fetch_chunks(self.clone(), tileset_id, &[chunk_index], archive_len)
+                .fetch_chunks(self.clone(), archive, &[chunk_index], archive_len)
                 .await?;
             let chunk = fetched.remove(&chunk_index).ok_or_else(|| {
                 ChunkFetchError::Message("resolved chunk missing after fetch".to_string())
@@ -213,12 +229,8 @@ impl ChunkedStore {
         self.cache.weighted_size()
     }
 
-    pub(crate) fn chunk_cache_get(
-        &self,
-        tileset_id: &TilesetId,
-        chunk_index: u64,
-    ) -> Option<Bytes> {
-        self.cache.get(&ChunkCacheKey::new(tileset_id, chunk_index))
+    pub(crate) fn chunk_cache_get(&self, archive: &ArchiveKey, chunk_index: u64) -> Option<Bytes> {
+        self.cache.get(&ChunkCacheKey::new(archive, chunk_index))
     }
 
     fn read_resolved_bytes(
@@ -304,7 +316,7 @@ impl ChunkedStore {
 
     pub(super) fn cache_chunk_group(
         &self,
-        tileset_id: &TilesetId,
+        archive: &ArchiveKey,
         chunk_range: Range<u64>,
         archive_len: u64,
         bytes: Bytes,
@@ -315,7 +327,7 @@ impl ChunkedStore {
         for (chunk_index, slice) in slices {
             let chunk = bytes.slice(slice);
             self.cache
-                .put(ChunkCacheKey::new(tileset_id, chunk_index), chunk.clone());
+                .put(ChunkCacheKey::new(archive, chunk_index), chunk.clone());
             chunks.insert(chunk_index, chunk);
         }
 
@@ -450,6 +462,16 @@ mod tests {
         }
     }
 
+    impl StoreFixture {
+        async fn archive(&self) -> ArchiveKey {
+            self.store
+                .observe_archive(&self.tileset_id)
+                .await
+                .expect("fixture metadata")
+                .0
+        }
+    }
+
     fn store_fixture(test_name: &str, data: &[u8], chunk_size: u64) -> StoreFixture {
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -544,15 +566,16 @@ mod tests {
     #[tokio::test]
     async fn single_chunk_cache_hit_returns_a_zero_copy_slice() {
         let fixture = store_fixture("single-chunk-hit", b"abcdefghijklmnop", 8);
+        let archive = fixture.archive().await;
         let cached = Bytes::from_static(b"abcdefgh");
         fixture
             .store
             .cache
-            .put(ChunkCacheKey::new(&fixture.tileset_id, 0), cached.clone());
+            .put(ChunkCacheKey::new(&archive, 0), cached.clone());
 
         let read = fixture
             .store
-            .read_bytes(&fixture.tileset_id, 2, 4, Some(16))
+            .read_bytes(&archive, 2, 4, 16)
             .await
             .expect("cached single-chunk read");
 
@@ -572,15 +595,16 @@ mod tests {
     #[tokio::test]
     async fn single_chunk_cache_miss_fetches_and_returns_a_zero_copy_slice() {
         let fixture = store_fixture("single-chunk-miss", b"abcdefghijklmnop", 8);
+        let archive = fixture.archive().await;
 
         let read = fixture
             .store
-            .read_bytes(&fixture.tileset_id, 2, 4, Some(16))
+            .read_bytes(&archive, 2, 4, 16)
             .await
             .expect("single-chunk backend read");
         let cached = fixture
             .store
-            .chunk_cache_get(&fixture.tileset_id, 0)
+            .chunk_cache_get(&archive, 0)
             .expect("fetched chunk must be cached");
 
         assert_eq!(read.bytes.as_ref(), b"cdef");
@@ -600,42 +624,34 @@ mod tests {
     #[tokio::test]
     async fn single_chunk_read_ending_at_chunk_boundary_does_not_fetch_the_next_chunk() {
         let fixture = store_fixture("single-chunk-boundary", b"abcdefghijklmnop", 8);
+        let archive = fixture.archive().await;
 
         let read = fixture
             .store
-            .read_bytes(&fixture.tileset_id, 4, 4, Some(16))
+            .read_bytes(&archive, 4, 4, 16)
             .await
             .expect("range ending exactly at chunk boundary");
 
         assert_eq!(read.bytes.as_ref(), b"efgh");
         assert_eq!(read.source, ChunkReadSource::Backend);
         assert_eq!(fixture.store.received_bytes(), 8);
-        assert!(
-            fixture
-                .store
-                .chunk_cache_get(&fixture.tileset_id, 0)
-                .is_some()
-        );
-        assert!(
-            fixture
-                .store
-                .chunk_cache_get(&fixture.tileset_id, 1)
-                .is_none()
-        );
+        assert!(fixture.store.chunk_cache_get(&archive, 0).is_some());
+        assert!(fixture.store.chunk_cache_get(&archive, 1).is_none());
     }
 
     #[tokio::test]
     async fn single_chunk_read_handles_a_short_final_chunk() {
         let fixture = store_fixture("single-chunk-final", b"abcdefghijk", 8);
+        let archive = fixture.archive().await;
 
         let read = fixture
             .store
-            .read_bytes(&fixture.tileset_id, 9, 2, Some(11))
+            .read_bytes(&archive, 9, 2, 11)
             .await
             .expect("range within short final chunk");
         let cached = fixture
             .store
-            .chunk_cache_get(&fixture.tileset_id, 1)
+            .chunk_cache_get(&archive, 1)
             .expect("short final chunk must be cached");
 
         assert_eq!(read.bytes.as_ref(), b"jk");
@@ -646,6 +662,37 @@ mod tests {
             cached.slice(1..3).as_ptr()
         ));
         assert_eq!(fixture.store.received_bytes(), 3);
+    }
+
+    #[tokio::test]
+    async fn replacement_cannot_mix_cached_and_new_chunks() {
+        let fixture = store_fixture("generation-change", b"aaaaaaaabbbbbbbb", 8);
+        let first = fixture.archive().await;
+
+        let cached = fixture
+            .store
+            .read_bytes(&first, 0, 8, 16)
+            .await
+            .expect("cache first-generation chunk");
+        assert_eq!(cached.bytes.as_ref(), b"aaaaaaaa");
+
+        let replacement = fixture.directory.join("replacement.pmtiles");
+        std::fs::write(&replacement, b"ccccccccdddddddd").unwrap();
+        std::fs::rename(replacement, fixture.directory.join("fixture.pmtiles")).unwrap();
+
+        assert!(matches!(
+            fixture.store.read_bytes(&first, 8, 8, 16).await,
+            Err(ChunkFetchError::GenerationChanged)
+        ));
+
+        let second = fixture.archive().await;
+        assert_ne!(first, second);
+        let refreshed = fixture
+            .store
+            .read_bytes(&second, 0, 8, 16)
+            .await
+            .expect("read replacement generation");
+        assert_eq!(refreshed.bytes.as_ref(), b"cccccccc");
     }
 
     #[tokio::test]
@@ -679,24 +726,24 @@ mod tests {
         let tileset_id = TilesetId::try_new("fixture").unwrap();
 
         let initial = store
-            .read_bytes(&tileset_id, 0, 16_384, None)
+            .observe_bytes(&tileset_id, 0, 16_384)
             .await
             .expect("unknown-length range is capped to the object");
         assert_eq!(initial.bytes.as_ref(), b"abcdefgh");
-        assert_eq!(initial.source, ChunkReadSource::Backend);
         assert_eq!(store.received_bytes(), 8);
-        assert!(store.chunk_cache_get(&tileset_id, 0).is_none());
+        let archive = ArchiveKey::new(&tileset_id, initial.generation);
+        assert!(store.chunk_cache_get(&archive, 0).is_none());
 
         let bounded = store
-            .read_bytes(&tileset_id, 0, 8, Some(8))
+            .read_bytes(&archive, 0, 8, 8)
             .await
             .expect("archive-bounded chunk range");
         assert_eq!(bounded.bytes.as_ref(), b"abcdefgh");
-        assert!(store.chunk_cache_get(&tileset_id, 0).is_some());
+        assert!(store.chunk_cache_get(&archive, 0).is_some());
 
         let missing = TilesetId::try_new("missing").unwrap();
         assert!(matches!(
-            store.read_bytes(&missing, 0, 16_384, None).await,
+            store.observe_bytes(&missing, 0, 16_384).await,
             Err(ChunkFetchError::NotFound)
         ));
 
@@ -732,18 +779,19 @@ mod tests {
             NodeMetrics::new(),
         )
         .unwrap();
+        let first_id = TilesetId::try_new("first").unwrap();
+        let second_id = TilesetId::try_new("second").unwrap();
+        let (first_archive, first_len) = store.observe_archive(&first_id).await.unwrap();
+        let (second_archive, second_len) = store.observe_archive(&second_id).await.unwrap();
         let first_store = store.clone();
         let first = tokio::spawn(async move {
             first_store
-                .read_bytes(&TilesetId::try_new("first").unwrap(), 0, 4, None)
+                .read_bytes(&first_archive, 0, 4, first_len)
                 .await
         });
         tokio::task::yield_now().await;
 
-        let error = match store
-            .read_bytes(&TilesetId::try_new("second").unwrap(), 0, 4, None)
-            .await
-        {
+        let error = match store.read_bytes(&second_archive, 0, 4, second_len).await {
             Ok(_) => panic!("second distinct group must be shed"),
             Err(error) => error,
         };
@@ -753,7 +801,7 @@ mod tests {
         assert_eq!(first.await.unwrap().unwrap().bytes.as_ref(), b"abcd");
         assert_eq!(
             store
-                .read_bytes(&TilesetId::try_new("second").unwrap(), 0, 4, None)
+                .read_bytes(&second_archive, 0, 4, second_len)
                 .await
                 .expect("group permit must be released")
                 .bytes

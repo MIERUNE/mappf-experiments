@@ -21,10 +21,14 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 use crate::interned::TilesetId;
+use crate::storage::generation::{ArchiveGeneration, ArchiveKey};
 
-use super::cache::{ArchiveCache, LeafCacheKey};
+use super::cache::{ArchiveCache, LeafCacheKey, VersionedArchive};
 #[cfg(any(test, feature = "simulator-support"))]
-use super::cache::{DEFAULT_ARCHIVE_CACHE_MAX_BYTES, DEFAULT_LEAF_CACHE_MAX_BYTES};
+use super::cache::{
+    DEFAULT_ARCHIVE_CACHE_MAX_BYTES, DEFAULT_ARCHIVE_REVALIDATION_INTERVAL,
+    DEFAULT_LEAF_CACHE_MAX_BYTES,
+};
 
 /// Errors returned by PMTiles storage reads.
 #[derive(Clone, Debug, Error)]
@@ -43,6 +47,10 @@ pub enum StorageError {
     /// authoritative absence.
     #[error("{0}")]
     Backend(String),
+    /// The backing object no longer matches the generation admitted for this
+    /// lookup. The complete PMTiles traversal must restart from its bootstrap.
+    #[error("archive generation changed while reading")]
+    GenerationChanged,
     #[error("{0}")]
     Message(String),
 }
@@ -108,19 +116,41 @@ struct InvalidLeafRange;
 
 /// Bootstrap bytes transferred from a peer, optionally including metadata.
 pub struct BootstrapTransfer {
+    pub generation: ArchiveGeneration,
     pub bootstrap: Bytes,
     pub metadata: Option<Bytes>,
 }
 
+/// Bytes from the response that established the current object generation.
+pub struct ObservedRange {
+    pub bytes: Bytes,
+    pub generation: ArchiveGeneration,
+}
+
+/// Archive-derived value together with the generation that produced it.
+#[derive(Debug)]
+pub struct ArchiveResource<T> {
+    pub value: T,
+    pub generation: ArchiveGeneration,
+}
+
 /// Storage capabilities required by the PMTiles reader.
 pub trait Storage: Send + Sync {
-    /// Reads a range of bytes for the given PMTiles archive.
-    fn read_range<'a>(
+    /// Reads the first uncached range and captures its object generation.
+    fn observe_range<'a>(
         &'a self,
         tileset_id: &'a TilesetId,
         start: u64,
         length: usize,
-        archive_len: Option<u64>,
+    ) -> impl Future<Output = Result<ObservedRange, StorageError>> + Send + 'a;
+
+    /// Reads a range of bytes for the given PMTiles archive.
+    fn read_range<'a>(
+        &'a self,
+        archive: &'a ArchiveKey,
+        start: u64,
+        length: usize,
+        archive_len: u64,
     ) -> impl Future<Output = Result<Bytes, StorageError>> + Send + 'a;
 
     /// Fetches archive bootstrap bytes from a peer, optionally including metadata.
@@ -133,7 +163,7 @@ pub trait Storage: Send + Sync {
     /// Fetches leaf bytes.
     fn fetch_leaf_bytes<'a>(
         &'a self,
-        tileset_id: &'a TilesetId,
+        archive: &'a ArchiveKey,
         offset: u64,
         length: usize,
     ) -> impl Future<Output = Result<Option<Bytes>>> + Send + 'a;
@@ -144,7 +174,7 @@ pub struct Reader<R> {
     archive_cache: ArchiveCache,
     storage: R,
     bootstrap_inflight: SingleFlight<TilesetId, ReaderFlightError>,
-    metadata_inflight: SingleFlight<TilesetId, ReaderFlightError>,
+    metadata_inflight: SingleFlight<ArchiveKey, ReaderFlightError>,
     leaf_inflight: SingleFlight<LeafCacheKey, ReaderFlightError>,
 }
 
@@ -155,11 +185,10 @@ pub struct Reader<R> {
 /// caches, cancellation-safe single-flight, and backend attribution.
 struct DistributedArchiveBackend<'a, S> {
     reader: &'a Arc<Reader<S>>,
-    tileset_id: &'a TilesetId,
+    archive: VersionedArchive,
 }
 
 enum DistributedReaderError {
-    ArchiveAbsent,
     Other(anyhow::Error),
 }
 
@@ -221,6 +250,15 @@ async fn wait_reader_flight(follower: Follower<ReaderFlightError>) -> Result<()>
     Ok(())
 }
 
+fn is_generation_changed(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<StorageError>(),
+            Some(StorageError::GenerationChanged)
+        )
+    })
+}
+
 impl<S> ArchiveBackend for DistributedArchiveBackend<'_, S>
 where
     S: Storage,
@@ -228,19 +266,14 @@ where
     type Error = DistributedReaderError;
 
     async fn load_bootstrap(&self) -> Result<ArchiveBootstrap, Self::Error> {
-        self.reader
-            .load_bootstrap(self.tileset_id)
-            .await
-            .map_err(DistributedReaderError::Other)?
-            .ok_or(DistributedReaderError::ArchiveAbsent)
+        Ok(self.archive.archive.clone())
     }
 
     async fn load_metadata(&self) -> Result<Arc<Metadata>, Self::Error> {
         self.reader
-            .load_metadata(self.tileset_id)
+            .load_metadata_for(&self.archive)
             .await
-            .map_err(DistributedReaderError::Other)?
-            .ok_or(DistributedReaderError::ArchiveAbsent)
+            .map_err(DistributedReaderError::Other)
     }
 
     async fn load_leaf(
@@ -249,7 +282,7 @@ where
     ) -> Result<Arc<Directory>, Self::Error> {
         self.reader
             .load_leaf_directory(
-                self.tileset_id,
+                &self.archive.key,
                 request.offset,
                 request.length as usize,
                 request.compression,
@@ -264,10 +297,12 @@ where
             .reader
             .storage
             .read_range(
-                self.tileset_id,
+                &self.archive.key,
                 request.offset,
                 request.length,
-                request.archive_len,
+                request
+                    .archive_len
+                    .unwrap_or_else(|| self.archive.archive.archive_len()),
             )
             .await
             .with_context(|| match request.kind {
@@ -280,7 +315,8 @@ where
 
         if request.kind == ReadKind::Tile {
             tracing::debug!(
-                tileset_id = %self.tileset_id,
+                tileset_id = %self.archive.key.tileset_id,
+                archive_generation = %self.archive.key.generation.to_wire(),
                 tile_offset = request.offset,
                 tile_length = request.length,
                 "resolved tile bytes"
@@ -308,6 +344,7 @@ where
             storage,
             DEFAULT_ARCHIVE_CACHE_MAX_BYTES,
             DEFAULT_LEAF_CACHE_MAX_BYTES,
+            DEFAULT_ARCHIVE_REVALIDATION_INTERVAL,
         )
     }
 
@@ -317,9 +354,14 @@ where
         storage: S,
         archive_cache_max_bytes: u64,
         leaf_cache_max_bytes: u64,
+        archive_revalidation_interval: std::time::Duration,
     ) -> Result<Self> {
         Ok(Self {
-            archive_cache: ArchiveCache::new(archive_cache_max_bytes, leaf_cache_max_bytes),
+            archive_cache: ArchiveCache::new(
+                archive_cache_max_bytes,
+                leaf_cache_max_bytes,
+                archive_revalidation_interval,
+            ),
             storage,
             bootstrap_inflight: SingleFlight::default(),
             metadata_inflight: SingleFlight::default(),
@@ -337,14 +379,25 @@ where
         self.archive_cache.weighted_sizes()
     }
 
+    /// Returns the currently observed strong identity for a logical archive.
+    pub(crate) async fn archive_key(
+        self: &Arc<Self>,
+        tileset_id: &TilesetId,
+    ) -> Result<Option<ArchiveKey>> {
+        Ok(self
+            .load_bootstrap(tileset_id)
+            .await?
+            .map(|archive| archive.key))
+    }
+
     fn archive_reader<'a>(
         self: &'a Arc<Self>,
-        tileset_id: &'a TilesetId,
+        archive: VersionedArchive,
     ) -> CoreArchiveReader<DistributedArchiveBackend<'a, S>> {
         CoreArchiveReader::with_backend(
             DistributedArchiveBackend {
                 reader: self,
-                tileset_id,
+                archive,
             },
             ReaderLimits::default(),
         )
@@ -356,12 +409,30 @@ where
         self: &Arc<Self>,
         tileset_id: &TilesetId,
         tile_id: u64,
-    ) -> Result<Option<TileData>> {
-        match self.archive_reader(tileset_id).get_tile(tile_id).await {
-            Ok(tile) => Ok(tile),
-            Err(DistributedReaderError::ArchiveAbsent) => Ok(None),
-            Err(DistributedReaderError::Other(error)) => Err(error),
+    ) -> Result<Option<ArchiveResource<Option<TileData>>>> {
+        for attempt in 0..2 {
+            let Some(archive) = self.load_bootstrap(tileset_id).await? else {
+                return Ok(None);
+            };
+            let generation = archive.key.generation.clone();
+            let archive_key = archive.key.clone();
+            match self.archive_reader(archive).get_tile(tile_id).await {
+                Ok(tile) => {
+                    return Ok(Some(ArchiveResource {
+                        value: tile,
+                        generation,
+                    }));
+                }
+                Err(DistributedReaderError::Other(error))
+                    if attempt == 0 && is_generation_changed(&error) =>
+                {
+                    self.archive_cache.invalidate_generation(&archive_key);
+                    self.load_bootstrap_local(tileset_id).await?;
+                }
+                Err(DistributedReaderError::Other(error)) => return Err(error),
+            }
         }
+        unreachable!("generation retry loop returns on its second attempt")
     }
 
     /// Returns the logical archive reads needed by the modeled simulator.
@@ -371,54 +442,72 @@ where
         tileset_id: &TilesetId,
         tile_id: u64,
     ) -> Result<Option<TileAccessPlan>> {
-        match self
-            .archive_reader(tileset_id)
+        let Some(archive) = self.load_bootstrap(tileset_id).await? else {
+            return Ok(None);
+        };
+        self.archive_reader(archive)
             .lookup_with_trace(tile_id)
             .await
-        {
-            Ok(plan) => Ok(Some(plan)),
-            Err(DistributedReaderError::ArchiveAbsent) => Ok(None),
-            Err(DistributedReaderError::Other(error)) => Err(error),
-        }
+            .map(Some)
+            .map_err(|error| match error {
+                DistributedReaderError::Other(error) => error,
+            })
     }
 
     /// Returns the parsed PMTiles header for a tileset.
-    pub(crate) async fn header(self: &Arc<Self>, tileset_id: &TilesetId) -> Result<Option<Header>> {
-        match self.archive_reader(tileset_id).header().await {
-            Ok(header) => Ok(Some(header)),
-            Err(DistributedReaderError::ArchiveAbsent) => Ok(None),
-            Err(DistributedReaderError::Other(error)) => Err(error),
-        }
-    }
-
-    /// Returns archive metadata if present.
-    pub(crate) async fn metadata(
+    pub(crate) async fn header(
         self: &Arc<Self>,
         tileset_id: &TilesetId,
-    ) -> Result<Option<Arc<Metadata>>> {
-        match self.archive_reader(tileset_id).metadata().await {
-            Ok(metadata) => Ok(Some(metadata)),
-            Err(DistributedReaderError::ArchiveAbsent) => Ok(None),
-            Err(DistributedReaderError::Other(error)) => Err(error),
-        }
+    ) -> Result<Option<ArchiveResource<Header>>> {
+        Ok(self
+            .load_bootstrap(tileset_id)
+            .await?
+            .map(|archive| ArchiveResource {
+                value: archive.archive.header,
+                generation: archive.key.generation,
+            }))
     }
 
-    async fn load_metadata(
+    /// Returns header and metadata from the same pinned archive generation.
+    pub(crate) async fn info(
         self: &Arc<Self>,
         tileset_id: &TilesetId,
-    ) -> Result<Option<Arc<Metadata>>> {
-        loop {
-            if let Some(archive) = self.archive_cache.get(tileset_id)
-                && let Some(metadata) = archive.metadata
-            {
-                return Ok(Some(metadata));
-            }
-            if self.archive_cache.is_known_absent(tileset_id) {
+    ) -> Result<Option<ArchiveResource<(Header, Arc<Metadata>)>>> {
+        for attempt in 0..2 {
+            let Some(archive) = self.load_bootstrap_with_metadata(tileset_id, true).await? else {
                 return Ok(None);
+            };
+            match self.load_metadata_for(&archive).await {
+                Ok(metadata) => {
+                    return Ok(Some(ArchiveResource {
+                        value: (archive.archive.header, metadata),
+                        generation: archive.key.generation,
+                    }));
+                }
+                Err(error) if attempt == 0 && is_generation_changed(&error) => {
+                    self.archive_cache.invalidate_generation(&archive.key);
+                    self.load_bootstrap_local(tileset_id).await?;
+                }
+                Err(error) => return Err(error),
             }
-            match self.metadata_inflight.begin(tileset_id.clone()) {
+        }
+        unreachable!("generation retry loop returns on its second attempt")
+    }
+
+    async fn load_metadata_for(
+        self: &Arc<Self>,
+        archive: &VersionedArchive,
+    ) -> Result<Arc<Metadata>> {
+        loop {
+            if let Some(current) = self.archive_cache.get(&archive.key.tileset_id)
+                && current.key.generation == archive.key.generation
+                && let Some(metadata) = current.archive.metadata
+            {
+                return Ok(metadata);
+            }
+            match self.metadata_inflight.begin(archive.key.clone()) {
                 Flight::Leader(guard) => {
-                    let result = self.load_metadata_uncached(tileset_id).await;
+                    let result = self.load_metadata_uncached(archive).await;
                     return complete_reader_flight(guard, result);
                 }
                 Flight::Follower(follower) => {
@@ -430,31 +519,25 @@ where
 
     async fn load_metadata_uncached(
         self: &Arc<Self>,
-        tileset_id: &TilesetId,
-    ) -> Result<Option<Arc<Metadata>>> {
-        // Metadata and header callers join the same bootstrap flight. The
-        // leader asks a peer for metadata when possible; if a header-only
-        // leader won the race, only the missing metadata section is read below.
-        let Some(archive) = self.load_bootstrap_with_metadata(tileset_id, true).await? else {
-            return Ok(None);
-        };
-        if let Some(metadata) = archive.metadata.clone() {
-            return Ok(Some(metadata));
+        archive: &VersionedArchive,
+    ) -> Result<Arc<Metadata>> {
+        if let Some(metadata) = archive.archive.metadata.clone() {
+            return Ok(metadata);
         }
         let metadata = Arc::new(
-            self.load_metadata_from_backend(tileset_id, &archive)
+            self.load_metadata_from_backend(&archive.key, &archive.archive)
                 .await?,
         );
         self.archive_cache
-            .put_metadata(tileset_id, metadata.clone());
-        Ok(Some(metadata))
+            .put_metadata(&archive.key, metadata.clone());
+        Ok(metadata)
     }
 
     /// Loads a routed archive bootstrap, reusing a peer before falling back to backend reads.
     async fn load_bootstrap(
         self: &Arc<Self>,
         tileset_id: &TilesetId,
-    ) -> Result<Option<ArchiveBootstrap>> {
+    ) -> Result<Option<VersionedArchive>> {
         self.load_bootstrap_with_metadata(tileset_id, false).await
     }
 
@@ -462,7 +545,7 @@ where
         self: &Arc<Self>,
         tileset_id: &TilesetId,
         include_metadata: bool,
-    ) -> Result<Option<ArchiveBootstrap>> {
+    ) -> Result<Option<VersionedArchive>> {
         loop {
             if let Some(archive) = self.archive_cache.get(tileset_id) {
                 return Ok(Some(archive));
@@ -475,9 +558,21 @@ where
             }
             match self.bootstrap_inflight.begin(tileset_id.clone()) {
                 Flight::Leader(guard) => {
-                    let result = self
-                        .load_bootstrap_uncached(tileset_id, include_metadata)
-                        .await;
+                    // Another leader may have filled the cache between our
+                    // lookup and election. Recheck before doing or routing I/O.
+                    let result = if let Some(archive) = self.archive_cache.get(tileset_id) {
+                        Ok(Some(archive))
+                    } else if self.archive_cache.is_known_absent(tileset_id) {
+                        Ok(None)
+                    // Revalidation must observe the authoritative backend. A
+                    // peer may still hold the old generation and would
+                    // otherwise restart this process's freshness window.
+                    } else if self.archive_cache.requires_revalidation(tileset_id) {
+                        self.revalidate_bootstrap(tileset_id).await
+                    } else {
+                        self.load_bootstrap_uncached(tileset_id, include_metadata)
+                            .await
+                    };
                     return complete_reader_flight(guard, result);
                 }
                 Flight::Follower(follower) => {
@@ -487,17 +582,40 @@ where
         }
     }
 
+    async fn revalidate_bootstrap(
+        self: &Arc<Self>,
+        tileset_id: &TilesetId,
+    ) -> Result<Option<VersionedArchive>> {
+        match self.load_bootstrap_local_uncached(tileset_id).await {
+            Ok(archive) => Ok(archive),
+            Err(error) => {
+                self.archive_cache.defer_expired_revalidation(tileset_id);
+                if let Some(stale) = self.archive_cache.get(tileset_id) {
+                    debug!(
+                        tileset_id = %tileset_id,
+                        error = %error,
+                        "archive revalidation failed; serving the last coherent generation"
+                    );
+                    Ok(Some(stale))
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     async fn load_bootstrap_uncached(
         self: &Arc<Self>,
         tileset_id: &TilesetId,
         include_metadata: bool,
-    ) -> Result<Option<ArchiveBootstrap>> {
+    ) -> Result<Option<VersionedArchive>> {
         match self
             .storage
             .fetch_bootstrap_bytes(tileset_id, include_metadata)
             .await
         {
             Ok(Some(transfer)) => {
+                let generation = transfer.generation;
                 let bootstrap = transfer.bootstrap;
                 let mut archive =
                     decode_bootstrap_bytes(bootstrap.clone(), DEFAULT_MAX_DECOMPRESSED_BYTES)
@@ -512,9 +630,13 @@ where
                         .context("failed to decode metadata from peer")?,
                     ));
                 }
+                let loaded = VersionedArchive {
+                    key: ArchiveKey::new(tileset_id, generation.clone()),
+                    archive: archive.clone(),
+                };
                 self.archive_cache
-                    .put(tileset_id, archive.clone(), bootstrap);
-                return Ok(Some(archive));
+                    .put(tileset_id, generation, archive, bootstrap);
+                return Ok(Some(loaded));
             }
             Ok(None) => {}
             Err(error) => {
@@ -533,7 +655,7 @@ where
     pub(crate) async fn load_bootstrap_local(
         self: &Arc<Self>,
         tileset_id: &TilesetId,
-    ) -> Result<Option<ArchiveBootstrap>> {
+    ) -> Result<Option<VersionedArchive>> {
         loop {
             if let Some(archive) = self.archive_cache.get(tileset_id) {
                 return Ok(Some(archive));
@@ -556,13 +678,13 @@ where
     async fn load_bootstrap_local_uncached(
         self: &Arc<Self>,
         tileset_id: &TilesetId,
-    ) -> Result<Option<ArchiveBootstrap>> {
-        let initial_bytes = match self
+    ) -> Result<Option<VersionedArchive>> {
+        let observed = match self
             .storage
-            .read_range(tileset_id, 0, MIN_BOOTSTRAP_BYTES, None)
+            .observe_range(tileset_id, 0, MIN_BOOTSTRAP_BYTES)
             .await
         {
-            Ok(bytes) => bytes,
+            Ok(observed) => observed,
             // Authoritative absence (shared object storage): remember it briefly
             // so repeat/burst lookups for this missing archive don't re-probe.
             Err(StorageError::NotFound) => {
@@ -571,6 +693,7 @@ where
             }
             Err(error) => return Err(error).context("failed to read PMTiles header"),
         };
+        let initial_bytes = observed.bytes;
 
         let archive =
             decode_bootstrap_bytes(initial_bytes.clone(), DEFAULT_MAX_DECOMPRESSED_BYTES)?;
@@ -588,10 +711,14 @@ where
             data_length = header.data_length,
             "parsed PMTiles header"
         );
+        let loaded = VersionedArchive {
+            key: ArchiveKey::new(tileset_id, observed.generation.clone()),
+            archive: archive.clone(),
+        };
         self.archive_cache
-            .put(tileset_id, archive.clone(), initial_bytes);
+            .put(tileset_id, observed.generation, archive, initial_bytes);
 
-        Ok(Some(archive))
+        Ok(Some(loaded))
     }
 
     /// Loads local raw bootstrap bytes for internal forwarding, optionally including metadata.
@@ -603,28 +730,28 @@ where
         let Some(archive) = self.load_bootstrap_local(tileset_id).await? else {
             return Ok(None);
         };
-        let end = archive.archive_len();
+        let end = archive.archive.archive_len();
         let bootstrap_length = usize::try_from(end.min(MIN_BOOTSTRAP_BYTES as u64))
             .context("PMTiles bootstrap length exceeds usize")?;
 
-        let bootstrap = if let Some(bytes) = self.archive_cache.get_bootstrap_bytes(tileset_id) {
+        let bootstrap = if let Some(bytes) = self.archive_cache.get_bootstrap_bytes(&archive.key) {
             bytes
         } else {
             self.storage
-                .read_range(tileset_id, 0, bootstrap_length, Some(end))
+                .read_range(&archive.key, 0, bootstrap_length, end)
                 .await
                 .context("failed to read archive bootstrap bytes")?
         };
 
-        let metadata = if include_metadata && archive.header.metadata_length > 0 {
+        let metadata = if include_metadata && archive.archive.header.metadata_length > 0 {
             Some(
                 self.storage
                     .read_range(
-                        tileset_id,
-                        archive.header.metadata_offset,
-                        usize::try_from(archive.header.metadata_length)
+                        &archive.key,
+                        archive.archive.header.metadata_offset,
+                        usize::try_from(archive.archive.header.metadata_length)
                             .context("PMTiles metadata length exceeds usize")?,
-                        Some(end),
+                        end,
                     )
                     .await
                     .context("failed to read PMTiles metadata")?,
@@ -634,6 +761,7 @@ where
         };
 
         Ok(Some(BootstrapTransfer {
+            generation: archive.key.generation,
             bootstrap,
             metadata,
         }))
@@ -642,13 +770,13 @@ where
     /// Loads a routed leaf directory from the tileset owner, falling back to local backend reads.
     async fn load_leaf_directory(
         self: &Arc<Self>,
-        tileset_id: &TilesetId,
+        archive: &ArchiveKey,
         offset: u64,
         length: usize,
         compression: Compression,
         archive_len: u64,
     ) -> Result<Arc<Directory>> {
-        let leaf_key = LeafCacheKey::new(tileset_id, offset, length);
+        let leaf_key = LeafCacheKey::new(archive, offset, length);
         loop {
             if let Some(directory) = self.archive_cache.get_leaf(&leaf_key) {
                 return Ok(directory);
@@ -657,7 +785,7 @@ where
                 Flight::Leader(guard) => {
                     let result = self
                         .load_leaf_directory_uncached(
-                            tileset_id,
+                            archive,
                             leaf_key,
                             offset,
                             length,
@@ -676,18 +804,14 @@ where
 
     async fn load_leaf_directory_uncached(
         self: &Arc<Self>,
-        tileset_id: &TilesetId,
+        archive: &ArchiveKey,
         leaf_key: LeafCacheKey,
         offset: u64,
         length: usize,
         compression: Compression,
         archive_len: u64,
     ) -> Result<Arc<Directory>> {
-        match self
-            .storage
-            .fetch_leaf_bytes(tileset_id, offset, length)
-            .await
-        {
+        match self.storage.fetch_leaf_bytes(archive, offset, length).await {
             Ok(Some(body)) => {
                 let directory = Directory::parse(compression, body)
                     .context("failed to decode leaf directory from peer")?;
@@ -699,7 +823,7 @@ where
             Ok(None) => {}
             Err(error) => {
                 warn!(
-                    tileset_id = %tileset_id,
+                    tileset_id = %archive.tileset_id,
                     offset = offset,
                     error = %error,
                     "leaf forward failed; falling back"
@@ -708,7 +832,7 @@ where
         }
 
         let directory = Arc::new(
-            self.read_directory_from_backend(tileset_id, offset, length, compression, archive_len)
+            self.read_directory_from_backend(archive, offset, length, compression, archive_len)
                 .await?,
         );
         self.archive_cache.put_leaf(leaf_key, directory.clone());
@@ -721,29 +845,32 @@ where
         tileset_id: &TilesetId,
         offset: u64,
         length: usize,
-    ) -> std::result::Result<Option<Bytes>, LocalLeafError> {
+    ) -> std::result::Result<Option<ArchiveResource<Bytes>>, LocalLeafError> {
         let Some(archive) = self.load_bootstrap_local(tileset_id).await? else {
             return Ok(None);
         };
-        let range = ValidatedLeafRange::from_archive(&archive, offset, length)
+        let range = ValidatedLeafRange::from_archive(&archive.archive, offset, length)
             .map_err(|_| LocalLeafError::InvalidRange)?;
         let leaf = self
             .storage
             .read_range(
-                tileset_id,
+                &archive.key,
                 range.offset,
                 range.length,
-                Some(archive.archive_len()),
+                archive.archive.archive_len(),
             )
             .await
             .context("failed to read leaf bytes")?;
-        Ok(Some(leaf))
+        Ok(Some(ArchiveResource {
+            value: leaf,
+            generation: archive.key.generation,
+        }))
     }
 
     /// Reads and decodes a PMTiles directory block from local backend storage.
     async fn read_directory_from_backend(
         self: &Arc<Self>,
-        tileset_id: &TilesetId,
+        archive: &ArchiveKey,
         offset: u64,
         length: usize,
         compression: Compression,
@@ -751,7 +878,7 @@ where
     ) -> Result<Directory> {
         let bytes = self
             .storage
-            .read_range(tileset_id, offset, length, Some(archive_len))
+            .read_range(archive, offset, length, archive_len)
             .await
             .context("failed to read directory")?;
         Directory::parse(compression, bytes)
@@ -760,7 +887,7 @@ where
     /// Loads and decodes the metadata section for a tileset from backend storage.
     async fn load_metadata_from_backend(
         self: &Arc<Self>,
-        tileset_id: &TilesetId,
+        archive_key: &ArchiveKey,
         archive: &ArchiveBootstrap,
     ) -> Result<Metadata> {
         if archive.header.metadata_length == 0 {
@@ -769,11 +896,11 @@ where
         let bytes = self
             .storage
             .read_range(
-                tileset_id,
+                archive_key,
                 archive.header.metadata_offset,
                 usize::try_from(archive.header.metadata_length)
                     .context("PMTiles metadata length exceeds usize")?,
-                Some(archive.archive_len()),
+                archive.archive_len(),
             )
             .await
             .context("failed to read PMTiles metadata")?;
@@ -798,9 +925,15 @@ mod tests {
     };
 
     use super::{
-        BootstrapTransfer, InvalidLeafRange, Reader, Storage, StorageError, ValidatedLeafRange,
+        BootstrapTransfer, InvalidLeafRange, ObservedRange, Reader, Storage, StorageError,
+        ValidatedLeafRange,
     };
     use crate::interned::TilesetId;
+    use crate::storage::{ArchiveGeneration, ArchiveKey};
+
+    fn generation() -> ArchiveGeneration {
+        ArchiveGeneration::from_wire("e:test").expect("valid test generation")
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct RecordedRead {
@@ -819,27 +952,37 @@ mod tests {
     }
 
     impl Storage for RecordingStorage {
-        async fn read_range<'a>(
+        async fn observe_range<'a>(
             &'a self,
             _tileset_id: &'a TilesetId,
             start: u64,
             length: usize,
-            archive_len: Option<u64>,
+        ) -> Result<ObservedRange, StorageError> {
+            let bytes = slice_archive(&self.archive, start, length)?;
+            self.reads.lock().unwrap().push(RecordedRead {
+                start,
+                length,
+                archive_len: None,
+            });
+            Ok(ObservedRange {
+                bytes,
+                generation: generation(),
+            })
+        }
+
+        async fn read_range<'a>(
+            &'a self,
+            _archive: &'a ArchiveKey,
+            start: u64,
+            length: usize,
+            archive_len: u64,
         ) -> Result<Bytes, StorageError> {
             self.reads.lock().unwrap().push(RecordedRead {
                 start,
                 length,
-                archive_len,
+                archive_len: Some(archive_len),
             });
-            let start = usize::try_from(start)
-                .map_err(|_| StorageError::Message("range start exceeds usize".into()))?;
-            let end = start
-                .checked_add(length)
-                .ok_or_else(|| StorageError::Message("range end overflows usize".into()))?;
-            if end > self.archive.len() {
-                return Err(StorageError::Message("range exceeds archive".into()));
-            }
-            Ok(self.archive.slice(start..end))
+            slice_archive(&self.archive, start, length)
         }
 
         async fn fetch_bootstrap_bytes<'a>(
@@ -853,6 +996,7 @@ mod tests {
                 .push(include_metadata);
             tokio::time::sleep(self.bootstrap_delay).await;
             Ok(self.peer_bootstrap.then(|| BootstrapTransfer {
+                generation: generation(),
                 bootstrap: self.archive.clone(),
                 metadata: include_metadata
                     .then(|| self.peer_metadata.clone())
@@ -862,12 +1006,24 @@ mod tests {
 
         fn fetch_leaf_bytes<'a>(
             &'a self,
-            _tileset_id: &'a TilesetId,
+            _archive: &'a ArchiveKey,
             _offset: u64,
             _length: usize,
         ) -> impl Future<Output = Result<Option<Bytes>>> + Send + 'a {
             std::future::ready(Ok(None))
         }
+    }
+
+    fn slice_archive(archive: &Bytes, start: u64, length: usize) -> Result<Bytes, StorageError> {
+        let start = usize::try_from(start)
+            .map_err(|_| StorageError::Message("range start exceeds usize".into()))?;
+        let end = start
+            .checked_add(length)
+            .ok_or_else(|| StorageError::Message("range end overflows usize".into()))?;
+        if end > archive.len() {
+            return Err(StorageError::Message("range exceeds archive".into()));
+        }
+        Ok(archive.slice(start..end))
     }
 
     fn archive_bytes(root: &[u8], metadata: &[u8], data: &[u8]) -> Bytes {
@@ -947,7 +1103,7 @@ mod tests {
                 .expect("valid short bootstrap");
         reader
             .archive_cache
-            .put(&tileset_id, bootstrap, archive.clone());
+            .put(&tileset_id, generation(), bootstrap, archive.clone());
 
         let transfer = reader
             .load_bootstrap_bytes_local(&tileset_id, false)
@@ -987,6 +1143,43 @@ mod tests {
         assert_eq!(
             reads.lock().unwrap().as_slice(),
             &[RecordedRead {
+                start: 0,
+                length: MIN_BOOTSTRAP_BYTES,
+                archive_len: None,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn due_bootstrap_revalidates_against_backend_not_peer() {
+        let archive = archive_bytes(&[0], &[], &[]);
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let bootstrap_fetches = Arc::new(Mutex::new(Vec::new()));
+        let reader = Arc::new(
+            Reader::with_index_cache_capacities(
+                RecordingStorage {
+                    archive,
+                    peer_bootstrap: true,
+                    peer_metadata: None,
+                    bootstrap_delay: Duration::ZERO,
+                    reads: Arc::clone(&reads),
+                    bootstrap_fetches: Arc::clone(&bootstrap_fetches),
+                },
+                1024 * 1024,
+                1024 * 1024,
+                Duration::ZERO,
+            )
+            .unwrap(),
+        );
+        let tileset_id = TilesetId::try_new("mutable/archive").unwrap();
+
+        assert!(reader.header(&tileset_id).await.unwrap().is_some());
+        assert!(reader.header(&tileset_id).await.unwrap().is_some());
+
+        assert_eq!(*bootstrap_fetches.lock().unwrap(), vec![false]);
+        assert_eq!(
+            *reads.lock().unwrap(),
+            vec![RecordedRead {
                 start: 0,
                 length: MIN_BOOTSTRAP_BYTES,
                 archive_len: None,
@@ -1044,7 +1237,7 @@ mod tests {
         let tileset_id = TilesetId::try_new("cached-leaf").unwrap();
         reader
             .archive_cache
-            .put(&tileset_id, decoded, archive.clone());
+            .put(&tileset_id, generation(), decoded, archive.clone());
 
         let bytes = reader
             .load_leaf_bytes_local(&tileset_id, leaf_offset, leaf.len())
@@ -1052,7 +1245,7 @@ mod tests {
             .expect("leaf load")
             .expect("archive exists");
 
-        assert_eq!(bytes, Bytes::from_static(leaf));
+        assert_eq!(bytes.value, Bytes::from_static(leaf));
         assert_eq!(
             reads.lock().unwrap().as_slice(),
             &[RecordedRead {
@@ -1083,7 +1276,13 @@ mod tests {
         );
         let tileset_id = TilesetId::try_new("peer/archive").unwrap();
 
-        let tile = reader.get_tile(&tileset_id, 0).await.unwrap().unwrap();
+        let tile = reader
+            .get_tile(&tileset_id, 0)
+            .await
+            .unwrap()
+            .unwrap()
+            .value
+            .unwrap();
 
         assert_eq!(tile.bytes, Bytes::from_static(b"tile"));
         assert_eq!(tile.content_type, "application/vnd.mapbox-vector-tile");
@@ -1096,6 +1295,82 @@ mod tests {
                 archive_len: Some((HEADER_SIZE + root.len() + 4) as u64),
             }]
         );
+    }
+
+    struct ReplacingStorage {
+        first: Bytes,
+        second: Bytes,
+        observations: AtomicUsize,
+    }
+
+    impl Storage for ReplacingStorage {
+        async fn observe_range<'a>(
+            &'a self,
+            _tileset_id: &'a TilesetId,
+            _start: u64,
+            _length: usize,
+        ) -> Result<ObservedRange, StorageError> {
+            let observation = self.observations.fetch_add(1, Ordering::SeqCst);
+            let (bytes, generation) = if observation == 0 {
+                (&self.first, "e:first")
+            } else {
+                (&self.second, "e:second")
+            };
+            Ok(ObservedRange {
+                bytes: bytes.clone(),
+                generation: ArchiveGeneration::from_wire(generation).unwrap(),
+            })
+        }
+
+        async fn read_range<'a>(
+            &'a self,
+            archive: &'a ArchiveKey,
+            start: u64,
+            length: usize,
+            _archive_len: u64,
+        ) -> Result<Bytes, StorageError> {
+            if archive.generation.to_wire() == "e:first" {
+                return Err(StorageError::GenerationChanged);
+            }
+            slice_archive(&self.second, start, length)
+        }
+
+        fn fetch_bootstrap_bytes<'a>(
+            &'a self,
+            _tileset_id: &'a TilesetId,
+            _include_metadata: bool,
+        ) -> impl Future<Output = Result<Option<BootstrapTransfer>>> + Send + 'a {
+            std::future::ready(Ok(None))
+        }
+
+        fn fetch_leaf_bytes<'a>(
+            &'a self,
+            _archive: &'a ArchiveKey,
+            _offset: u64,
+            _length: usize,
+        ) -> impl Future<Output = Result<Option<Bytes>>> + Send + 'a {
+            std::future::ready(Ok(None))
+        }
+    }
+
+    #[tokio::test]
+    async fn generation_change_restarts_the_whole_tile_lookup() {
+        let root = [1, 0, 1, 4, 1];
+        let reader = Arc::new(
+            Reader::new(ReplacingStorage {
+                first: archive_bytes(&root, &[], b"old!"),
+                second: archive_bytes(&root, &[], b"new!"),
+                observations: AtomicUsize::new(0),
+            })
+            .unwrap(),
+        );
+        let tileset_id = TilesetId::try_new("replaced").unwrap();
+
+        let tile = reader.get_tile(&tileset_id, 0).await.unwrap().unwrap();
+
+        assert_eq!(tile.generation.to_wire(), "e:second");
+        assert_eq!(tile.value.unwrap().bytes.as_ref(), b"new!");
+        assert_eq!(reader.storage.observations.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -1117,9 +1392,9 @@ mod tests {
         );
         let tileset_id = TilesetId::try_new("peer/metadata").unwrap();
 
-        let metadata = reader.metadata(&tileset_id).await.unwrap().unwrap();
+        let info = reader.info(&tileset_id).await.unwrap().unwrap();
 
-        assert_eq!(metadata.name.as_deref(), Some("world"));
+        assert_eq!(info.value.1.name.as_deref(), Some("world"));
         assert_eq!(*bootstrap_fetches.lock().unwrap(), vec![true]);
         assert!(reads.lock().unwrap().is_empty());
     }
@@ -1145,11 +1420,13 @@ mod tests {
 
         // `join!` polls the header first, so its header-only peer request becomes
         // leader; metadata must join that flight and fetch only its own section.
-        let (header, metadata) =
-            tokio::join!(reader.header(&tileset_id), reader.metadata(&tileset_id));
+        let (header, info) = tokio::join!(reader.header(&tileset_id), reader.info(&tileset_id));
 
         assert!(header.unwrap().is_some());
-        assert_eq!(metadata.unwrap().unwrap().name.as_deref(), Some("world"));
+        assert_eq!(
+            info.unwrap().unwrap().value.1.name.as_deref(),
+            Some("world")
+        );
         assert_eq!(*bootstrap_fetches.lock().unwrap(), vec![false]);
         assert_eq!(
             *reads.lock().unwrap(),
@@ -1166,12 +1443,23 @@ mod tests {
     }
 
     impl Storage for SlowFailingStorage {
-        async fn read_range<'a>(
+        async fn observe_range<'a>(
             &'a self,
             _tileset_id: &'a TilesetId,
             _start: u64,
             _length: usize,
-            _archive_len: Option<u64>,
+        ) -> Result<ObservedRange, StorageError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Err(StorageError::Timeout("injected timeout".into()))
+        }
+
+        async fn read_range<'a>(
+            &'a self,
+            _archive: &'a ArchiveKey,
+            _start: u64,
+            _length: usize,
+            _archive_len: u64,
         ) -> Result<Bytes, StorageError> {
             self.reads.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1188,7 +1476,7 @@ mod tests {
 
         fn fetch_leaf_bytes<'a>(
             &'a self,
-            _tileset_id: &'a TilesetId,
+            _archive: &'a ArchiveKey,
             _offset: u64,
             _length: usize,
         ) -> impl Future<Output = Result<Option<Bytes>>> + Send + 'a {

@@ -4,7 +4,7 @@ use std::{hash::Hash, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use biei_core::{
-    style_catalog::StyleCatalog,
+    style_catalog::{StyleCatalog, style_content_version},
     types::{
         AddLayerSource, CredentialCachePartition, InternalTask, ProfilePreparationError,
         RenderAuthorization, SourceHash, StyleId, StyleRevision,
@@ -17,8 +17,9 @@ use tokio::time::Instant;
 use crate::renderer::{PreparedProfile, ProfilePreparer, StyleAvailabilityError};
 
 use super::profile_fetch::{
-    addlayer_source_from_task, addlayer_source_hash_from_task, fetch_style_json_with_auth,
-    fetch_tileset_json_with_auth, rewrite_tileset_source_json, source_url_from_addlayer_source,
+    FetchedStyleJson, addlayer_source_from_task, addlayer_source_hash_from_task,
+    fetch_style_json_with_auth, fetch_tileset_json_with_auth, rewrite_tileset_source_json,
+    source_url_from_addlayer_source,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -131,13 +132,9 @@ impl MapLibreProfilePreparer {
             .map_err(|failure| failure.error)
     }
 
-    /// Single-flight JSON load shared by style and tileset resolution: serve a
-    /// cache hit, join an in-flight load, honor the negative cache, or become the
-    /// loader (await `fetch`, store the result, wake waiters). `lookup` stays
-    /// per-resource because the style and tileset caches probe positive vs error
-    /// entries in the opposite order. `fetch` is a lazy future — it only runs on
-    /// the loader path and is otherwise dropped un-awaited.
-    async fn single_flight_load<K>(
+    /// Single-flight TileJSON load: serve a cache hit, join an in-flight load,
+    /// honor the negative cache, or become the loader.
+    async fn single_flight_tileset_load<K>(
         &self,
         key: K,
         caches: JsonCaches<'_, K>,
@@ -205,17 +202,7 @@ impl MapLibreProfilePreparer {
             credential: credential_partition(authorization),
         };
         let style_json = self
-            .single_flight_load(
-                key.clone(),
-                JsonCaches {
-                    json: &self.style_json_cache,
-                    error: &self.style_error_cache,
-                    inflight: &self.inflight_style_loads,
-                },
-                deadline,
-                || self.lookup_style_cache(&key),
-                self.fetch_uncached_style(style, authorization, deadline),
-            )
+            .load_style_json(key, style, authorization, deadline)
             .await?;
         Ok(PreparedProfile {
             revision: style.clone(),
@@ -223,6 +210,149 @@ impl MapLibreProfilePreparer {
             style_json,
             addlayer_source: None,
         })
+    }
+
+    /// Loads one exact requested revision while independently advancing the
+    /// catalog to content observed during a due revalidation.
+    ///
+    /// If a refresh discovers changed bytes, the already-admitted request keeps
+    /// its cached old representation and the new bytes are installed under the
+    /// new revision before the catalog switches. A later ingress request then
+    /// resolves directly to the new revision. The first ever fetch may use the
+    /// configured placeholder revision for that one admitted request; it also
+    /// installs the content-addressed entry, avoiding a second origin fetch.
+    async fn load_style_json(
+        &self,
+        key: StyleCacheKey,
+        style: &StyleRevision,
+        authorization: Option<&RenderAuthorization>,
+        deadline: Instant,
+    ) -> Result<Arc<str>, ProfileFetchError> {
+        loop {
+            if let Some(error) = self.style_error_cache.get(&key) {
+                return Err(ProfileFetchError::permanent(error));
+            }
+            let cached = self.style_json_cache.get(&key);
+            if let Some(json) = cached.as_ref()
+                && !self.style_catalog.needs_revalidation(&style.id)
+            {
+                return Ok(Arc::clone(json));
+            }
+
+            match self.inflight_style_loads.begin(key.clone()) {
+                Flight::Leader(guard) => {
+                    // A prior flight may have populated the cache just before
+                    // this caller acquired leadership.
+                    if let Some(error) = self.style_error_cache.get(&key) {
+                        drop(guard);
+                        return Err(ProfileFetchError::permanent(error));
+                    }
+                    let stale = self.style_json_cache.get(&key);
+                    if let Some(json) = stale.as_ref()
+                        && !self.style_catalog.needs_revalidation(&style.id)
+                    {
+                        drop(guard);
+                        return Ok(Arc::clone(json));
+                    }
+
+                    let first_observation =
+                        self.style_catalog.observed_version(&style.id).is_none();
+                    let revalidation_fence = self.style_catalog.revalidation_fence(&style.id);
+                    let result = self
+                        .fetch_uncached_style(style, authorization, deadline)
+                        .await;
+                    let fetched = match result {
+                        Ok(fetched) => fetched,
+                        Err(failure) => {
+                            if failure.negative_cacheable {
+                                self.style_error_cache
+                                    .insert(key.clone(), failure.error.clone());
+                            }
+                            if failure.is_attempt_wide() {
+                                guard.complete_with_error(failure.clone());
+                            } else {
+                                drop(guard);
+                            }
+                            return Err(failure);
+                        }
+                    };
+
+                    let json: Arc<str> = Arc::from(fetched.json);
+                    let observed_version = style_content_version(&json);
+                    let observed_revision = StyleRevision {
+                        id: style.id.clone(),
+                        version: observed_version,
+                    };
+                    let observed_key = StyleCacheKey {
+                        revision: observed_revision,
+                        credential: key.credential,
+                    };
+
+                    // Make the representation reachable before publishing its
+                    // revision through the catalog.
+                    self.style_json_cache
+                        .insert(observed_key.clone(), Arc::clone(&json));
+                    self.style_error_cache.invalidate(&observed_key);
+                    self.style_error_cache.invalidate(&key);
+
+                    let changed = self.style_catalog.record_observed_for_generation(
+                        &style.id,
+                        observed_version,
+                        fetched.served_freshness,
+                        revalidation_fence,
+                    );
+
+                    let response = if observed_version == style.version {
+                        Arc::clone(&json)
+                    } else if let Some(stale) = stale {
+                        // Revision changed during revalidation. Do not label
+                        // new bytes with the already-admitted old revision.
+                        stale
+                    } else if first_observation {
+                        // The configured revision is only a bootstrap identity.
+                        // Retain the bytes under it for this admitted request and
+                        // under the content revision for every later request.
+                        self.style_json_cache.insert(key.clone(), Arc::clone(&json));
+                        Arc::clone(&json)
+                    } else if self.style_catalog.is_bootstrap_revision(style) {
+                        // Another credential partition may have been admitted
+                        // under the configured placeholder before the first
+                        // partition published the content-derived revision.
+                        // This is not a genuine old content revision, so the
+                        // independently fetched and validated bytes are safe
+                        // to retain for that already-admitted bootstrap task.
+                        self.style_json_cache.insert(key.clone(), Arc::clone(&json));
+                        Arc::clone(&json)
+                    } else {
+                        let failure = ProfileFetchError::transient_load(
+                            &style.id,
+                            "requested style revision was superseded before its representation could be served; retry with the latest revision",
+                        );
+                        guard.complete_with_error(failure.clone());
+                        return Err(failure);
+                    };
+
+                    if changed && observed_version != style.version {
+                        tracing::info!(
+                            style_id = style.id.as_str(),
+                            requested_version = style.version,
+                            observed_version,
+                            "style content changed; later requests use the new revision"
+                        );
+                    }
+                    drop(guard);
+                    return Ok(response);
+                }
+                Flight::Follower(follower) => {
+                    if let Some(failure) = tokio::time::timeout_at(deadline, follower.wait())
+                        .await
+                        .map_err(|_| ProfileFetchError::caller_deadline())?
+                    {
+                        return Err(failure);
+                    }
+                }
+            }
+        }
     }
 
     async fn resolve_addlayer_source(
@@ -273,7 +403,7 @@ impl MapLibreProfilePreparer {
             url: tileset_url.to_string(),
             credential: credential_partition(authorization),
         };
-        self.single_flight_load(
+        self.single_flight_tileset_load(
             key.clone(),
             JsonCaches {
                 json: &self.tileset_json_cache,
@@ -286,16 +416,6 @@ impl MapLibreProfilePreparer {
         )
         .await
         .map_err(|failure| failure.error)
-    }
-
-    fn lookup_style_cache(
-        &self,
-        key: &StyleCacheKey,
-    ) -> Option<Result<Arc<str>, ProfileFetchError>> {
-        if let Some(err) = self.style_error_cache.get(key) {
-            return Some(Err(ProfileFetchError::permanent(err)));
-        }
-        self.style_json_cache.get(key).map(Ok)
     }
 
     fn lookup_tileset_cache(
@@ -316,7 +436,7 @@ impl MapLibreProfilePreparer {
         style: &StyleRevision,
         authorization: Option<&RenderAuthorization>,
         deadline: Instant,
-    ) -> Result<Arc<str>, ProfileFetchError> {
+    ) -> Result<FetchedStyleJson, ProfileFetchError> {
         let _permit = tokio::time::timeout_at(deadline, self.fetch_permits.acquire())
             .await
             .map_err(|_| ProfileFetchError::caller_deadline())?
@@ -335,19 +455,16 @@ impl MapLibreProfilePreparer {
                     style.version
                 )))
             })?;
-        Ok(Arc::from(
-            fetch_style_json_with_auth(
-                &self.http_client,
-                &self.url_policy,
-                &style.id,
-                &definition.style_url,
-                authorization
-                    .and_then(|authorization| authorization.provider_bearer_token.as_ref()),
-                self.auth_provider_origin.as_ref(),
-                deadline,
-            )
-            .await?,
-        ))
+        fetch_style_json_with_auth(
+            &self.http_client,
+            &self.url_policy,
+            &style.id,
+            &definition.style_url,
+            authorization.and_then(|authorization| authorization.provider_bearer_token.as_ref()),
+            self.auth_provider_origin.as_ref(),
+            deadline,
+        )
+        .await
     }
 
     async fn fetch_uncached_tileset(
@@ -501,10 +618,11 @@ impl ProfileFetchError {
     }
 
     fn into_availability_error(self) -> StyleAvailabilityError {
-        if self.negative_cacheable {
-            StyleAvailabilityError::NotFound(self.error)
-        } else {
-            StyleAvailabilityError::Unavailable(self.error)
+        match self.error {
+            error @ ProfilePreparationError::StyleNotFound { .. } => {
+                StyleAvailabilityError::NotFound(error)
+            }
+            error => StyleAvailabilityError::Unavailable(error),
         }
     }
 
@@ -607,7 +725,10 @@ mod tests {
             converted,
             ProfilePreparationError::SourceUnavailable { hash: 42, .. }
         ));
-        assert_eq!(converted.failure_kind(), FailureKind::SourceUnavailable);
+        assert_eq!(
+            converted.failure_kind(),
+            Some(FailureKind::SourceUnavailable)
+        );
 
         assert!(matches!(
             source_unavailable_from(ProfilePreparationError::CallerDeadlineExceeded, 42),

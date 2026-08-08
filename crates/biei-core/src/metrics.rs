@@ -269,6 +269,16 @@ impl NodeMetrics {
         self.forwards.with_label_values(&["retryable"]).inc();
     }
 
+    /// A peer refused the forwarded style *revision* rather than the style. The
+    /// task fails over (normally to a local render), so without this counter the
+    /// condition is indistinguishable from ordinary local routing even though it
+    /// shifts work away from the peer the router chose.
+    pub fn record_forward_unconverged_style(&self) {
+        self.forwards
+            .with_label_values(&["unconverged_style"])
+            .inc();
+    }
+
     pub fn record_forward_fatal(&self) {
         self.forwards.with_label_values(&["fatal"]).inc();
     }
@@ -455,7 +465,7 @@ impl NodeMetrics {
                 .with_label_values(&[outcome])
                 .inc_by(0);
         }
-        for outcome in ["success", "retryable", "fatal"] {
+        for outcome in ["success", "retryable", "unconverged_style", "fatal"] {
             self.forwards.with_label_values(&[outcome]).inc_by(0);
         }
         for stage in DEADLINE_STAGES {
@@ -690,6 +700,7 @@ mod tests {
         });
         metrics.record_forward_success();
         metrics.record_forward_retryable();
+        metrics.record_forward_unconverged_style();
         metrics.record_forward_fatal();
         metrics.record_profile_prepare(Duration::from_millis(2), true);
         metrics.record_profile_prepare(Duration::from_millis(5), false);
@@ -705,6 +716,7 @@ mod tests {
         );
         assert!(rendered.contains("biei_forwards_total{outcome=\"success\"} 1"));
         assert!(rendered.contains("biei_forwards_total{outcome=\"retryable\"} 1"));
+        assert!(rendered.contains("biei_forwards_total{outcome=\"unconverged_style\"} 1"));
         assert!(rendered.contains("biei_forwards_total{outcome=\"fatal\"} 1"));
         assert!(rendered.contains(
             "biei_render_duration_seconds_count{format=\"webp\",render_mode=\"static\",scale=\"2x\",scope=\"ingress\",size=\"le_1024px\",state=\"cold\"} 1"

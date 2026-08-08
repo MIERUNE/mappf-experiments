@@ -23,6 +23,9 @@ component_management:
     - component_id: ishikari
       flag_regexes:
         - ishikari
+    - component_id: abashiri
+      flag_regexes:
+        - abashiri
     - component_id: shared
       flag_regexes:
         - shared
@@ -44,6 +47,11 @@ flags:
       - crates/mmpf-terrain/
       - servers/ishikari/
       - sims/ishikari-sim/
+    carryforward: true
+  abashiri:
+    paths:
+      - crates/abashiri-core/
+      - servers/abashiri/
     carryforward: true
   shared:
     paths:

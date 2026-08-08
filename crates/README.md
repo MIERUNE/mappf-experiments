@@ -9,10 +9,6 @@
 - `mmpf-pmtiles`: customizable PMTiles v3 decoding and single-archive range reader
 - `mmpf-terrain`: MMPF terrain decoding and derived products
 
-Executables live in `servers/` and `sims/`; dependency direction is always from
-those binaries into these libraries. Server crates own the CLI, logging setup,
-OS signal handling, and the HTTP serving / rendering runtime; the `-core`
-libraries hold the shared domain logic (routing, caching, scheduling, node
-orchestration) that both a service's server and its simulator drive.
+Executables live in `servers/` and `sims/`; dependency direction is always from those binaries into these libraries. Server crates own the CLI, logging setup, OS signal handling, and the HTTP serving / rendering runtime; the `-core` libraries hold the shared domain logic (routing, caching, scheduling, node orchestration) that both a service's server and its simulator drive.
 
 Cross-service primitives belong in `mmpf-common` only when their meaning and behavior are intentionally shared; similarly named policy is not treated as equivalent by default.

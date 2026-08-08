@@ -267,6 +267,30 @@ fn exposes_provider_resource_cache_activity() {
     ));
 }
 
+/// A suppressed hint answers `202` exactly as the first delivery does, so this
+/// counter is the only signal separating them. Registration alone is not enough:
+/// a family that is built but never handed to the registry silently renders
+/// nothing, so the assertion is on encoded output.
+#[test]
+fn exposes_style_refresh_hint_outcomes() {
+    let metrics = NodeMetrics::new();
+
+    metrics.record_style_refresh_hint("accepted");
+    metrics.record_style_refresh_hint("suppressed");
+    metrics.record_style_refresh_hint("rejected");
+    metrics.record_style_refresh_hint("unknown_style");
+
+    let encoded = metrics.encode();
+    for expected in [
+        "ishikari_style_refresh_hints_total{outcome=\"accepted\"} 1",
+        "ishikari_style_refresh_hints_total{outcome=\"suppressed\"} 1",
+        "ishikari_style_refresh_hints_total{outcome=\"rejected\"} 1",
+        "ishikari_style_refresh_hints_total{outcome=\"unknown_style\"} 1",
+    ] {
+        assert!(encoded.contains(expected), "missing {expected}");
+    }
+}
+
 #[test]
 fn records_actual_backend_bytes_once_at_fetch_completion() {
     let metrics = NodeMetrics::new();

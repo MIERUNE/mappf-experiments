@@ -5,6 +5,7 @@
 // production-only lint pass cannot infer.
 #[cfg_attr(not(feature = "simulator-support"), allow(unreachable_pub))]
 mod chunked_store;
+pub(crate) mod generation;
 #[cfg_attr(not(feature = "simulator-support"), allow(unreachable_pub))]
 mod peer;
 mod pmtiles;
@@ -21,13 +22,14 @@ mod tuning;
 pub use peer::InternalTileSource;
 #[doc(hidden)]
 pub use peer::{
-    InternalFetchResponse, InternalProviderNegative, ProviderRequest, ProviderResourceKind,
-    ProviderRouteOutcome, ProviderSpriteVariant,
+    ARCHIVE_GENERATION_HEADER, PROVIDER_AGE_HEADER, PROVIDER_CACHE_CONTROL_HEADER,
+    PROVIDER_ETAG_HEADER, PROVIDER_LAST_MODIFIED_HEADER, PROVIDER_NEGATIVE_HEADER,
+    TILE_SOURCE_HEADER,
 };
 #[doc(hidden)]
 pub use peer::{
-    PROVIDER_AGE_HEADER, PROVIDER_CACHE_CONTROL_HEADER, PROVIDER_ETAG_HEADER,
-    PROVIDER_LAST_MODIFIED_HEADER, PROVIDER_NEGATIVE_HEADER, TILE_SOURCE_HEADER,
+    InternalFetchResponse, InternalProviderNegative, ProviderRequest, ProviderResourceKind,
+    ProviderRouteOutcome, ProviderSpriteVariant,
 };
 pub use peer::{Peer, PeerDirectory, PeerFuture, PeerSnapshotCache};
 #[doc(hidden)]
@@ -38,9 +40,11 @@ pub use peer::{
 // which owns the concrete (reqwest-based) implementation. These are the seam
 // types it needs; not a stable public API, hence `doc(hidden)`.
 #[doc(hidden)]
+pub use generation::{ArchiveGeneration, ArchiveKey};
+#[doc(hidden)]
 pub use peer::{FetchFuture, InternalTransport, PeerFetchError};
 pub use resolver::{
-    ArchivePresence, LeafBytesError, ResourceCacheCapacities, ResourceResolver,
+    ArchivePresence, LeafBytesError, ResolvedTile, ResourceCacheCapacities, ResourceResolver,
     ResourceResolverConfig, TileSource, TilesetError, TilesetInfo,
 };
 pub use store_registry::ObjectStoreRegistry;

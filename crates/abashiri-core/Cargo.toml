@@ -1,0 +1,31 @@
+[package]
+name = "abashiri-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Management and publishing domain logic for Abashiri"
+repository.workspace = true
+publish = false
+
+[features]
+default = []
+# The server enables portable cloud backends. Core tests stay on the in-memory
+# and local-filesystem stores.
+cloud = ["object_store/aws", "object_store/gcp"]
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+bytes.workspace = true
+http = "1"
+mmpf-http.workspace = true
+object_store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

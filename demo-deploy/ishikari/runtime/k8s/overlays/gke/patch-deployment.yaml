@@ -15,6 +15,10 @@ spec:
       containers:
         - name: ishikari
           imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "308m"
+              memory: "2Gi"
           env:
             - name: ISKR_TILESET_SOURCES
               value: "gs://mappf-experiment-demo/tilesets/{tileset_id}.pmtiles"
@@ -30,6 +34,10 @@ spec:
               value: "mapterhorn/planet"
             - name: ISKR_MAPTERHORN_MAXZOOM
               value: "16"
+            # The demo mutates its experimental archive inventory. Do not let a
+            # pre-publication miss hide a new detail archive for an hour.
+            - name: ISKR_MAPTERHORN_NEGATIVE_TTL
+              value: "60"
             # Bound aggregate GCS range-read concurrency across all archives.
             - name: ISKR_BACKEND_FETCH_CONCURRENCY
               value: "32"

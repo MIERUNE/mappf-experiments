@@ -460,6 +460,33 @@ impl Harness {
         (status, headers, body)
     }
 
+    async fn request_json(
+        &self,
+        router: &Router,
+        method: Method,
+        path: &str,
+        body: impl Into<Body>,
+    ) -> (StatusCode, HeaderMap, Bytes) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(body.into())
+                    .expect("request"),
+            )
+            .await
+            .expect("router response");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        (status, headers, body)
+    }
+
     async fn cleanup(self) {
         self.membership_owner
             .shutdown()
@@ -467,6 +494,64 @@ impl Harness {
             .expect("membership shutdown");
         let _ = std::fs::remove_dir_all(&self.tiles_dir);
     }
+}
+
+#[tokio::test]
+async fn style_refresh_is_internal_bounded_and_validated() {
+    let harness = harness("style-refresh-contract").await;
+    let valid = r#"{"schema_version":1,"hint_id":"mutation-42","style_id":"base"}"#;
+
+    assert_eq!(
+        harness
+            .request_json(
+                &harness.internal,
+                Method::POST,
+                "/_internal/refresh/style",
+                valid,
+            )
+            .await
+            .0,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        harness
+            .request_json(
+                &harness.public,
+                Method::POST,
+                "/_internal/refresh/style",
+                valid,
+            )
+            .await
+            .0,
+        StatusCode::NOT_FOUND,
+        "refresh receiver must not exist on the public listener"
+    );
+    assert_eq!(
+        harness
+            .request_json(
+                &harness.internal,
+                Method::POST,
+                "/_internal/refresh/style",
+                r#"{"schema_version":1,"hint_id":"x","style_id":"../secret"}"#,
+            )
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        harness
+            .request_json(
+                &harness.internal,
+                Method::POST,
+                "/_internal/refresh/style",
+                vec![b'x'; mmpf_cluster::MAX_STYLE_REFRESH_HINT_BYTES + 1],
+            )
+            .await
+            .0,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+
+    harness.cleanup().await;
 }
 
 struct StaticPeerDirectory {
@@ -713,6 +798,7 @@ async fn harness_config(
             tile_cache_max_bytes: 1024 * 1024,
             chunk_cache_max_bytes: 1024 * 1024,
             tile_negative_ttl: Duration::from_secs(60),
+            archive_revalidation_interval: Duration::from_secs(300),
         }
         .resolve()
         .expect("valid resolver tuning"),
@@ -735,7 +821,7 @@ async fn harness_config(
     .expect("provider config");
 
     let state = AppState::new(
-        membership.clone(),
+        membership,
         metrics,
         Arc::new(resolver),
         DrainController::new(),
@@ -894,6 +980,7 @@ async fn distribution_cors_precedes_auth_and_excludes_operational_routes() {
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+    assert_eq!(headers[header::CACHE_CONTROL], cache::ERROR);
 
     let (status, headers, _) = harness
         .get_with(
@@ -950,6 +1037,22 @@ async fn distribution_cors_precedes_auth_and_excludes_operational_routes() {
         headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
         "internal provider routes must not inherit distribution CORS"
     );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn public_delivery_errors_cannot_be_negative_cached_by_a_shared_cache() {
+    let harness = harness("public-error-cache-policy").await;
+
+    let (status, headers, _) = harness.get(&harness.public, "/tilesets/missing").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(headers[header::CACHE_CONTROL], cache::ERROR);
+
+    let (_, internal_headers, _) = harness
+        .get(&harness.internal, "/_internal/pmtiles/missing/bootstrap")
+        .await;
+    assert!(internal_headers.get(header::CACHE_CONTROL).is_none());
 
     harness.cleanup().await;
 }
@@ -1789,6 +1892,27 @@ async fn tile_routes_serve_stored_mvt_and_negotiate_mlt() {
 }
 
 #[tokio::test]
+async fn tile_routes_reject_tilejson_encoding_queries() {
+    let harness = harness("tile-encoding-query").await;
+
+    for path in [
+        "/tilesets/fixture/0/0/0?encoding=mlt",
+        "/tilesets/weather/fixture/0/0/0?encoding=mlt",
+        "/tilesets/fixture/derived/contours/0/0/0?encoding=mlt",
+        "/tilesets/weather/fixture/derived/contours/0/0/0?encoding=mlt",
+    ] {
+        let (status, _, body) = harness.get(&harness.public, path).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+        assert_eq!(
+            body, "tile encoding must be selected with a path suffix such as .mlt",
+            "{path}"
+        );
+    }
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
 async fn tilejson_emits_a_derived_etag_and_answers_conditional_requests() {
     let harness = harness("tilejson-conditional").await;
     let path = "/tilesets/fixture";
@@ -1920,6 +2044,7 @@ async fn internal_paths_are_not_exposed_on_the_public_router() {
         "/_internal/provider/styles/base/style.json",
         "/_internal/provider/fonts/TestFont/0-255.pbf",
         "/_internal/tiles/demo/0",
+        "/_internal/refresh/style",
     ] {
         let (status, _, _) = harness.get(&harness.public, path).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{path} must 404 publicly");

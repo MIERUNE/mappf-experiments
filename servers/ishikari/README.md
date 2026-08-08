@@ -9,26 +9,13 @@ Ishikari focuses on large-scale PMTiles serving workloads:
 
 - **Backend request batching** - reduces object storage requests, traffic, and latency.
 - **Distributed cache** - uses gossip membership, locality-aware routing, and caching tuned for Hilbert-sorted PMTiles archives.
-- **Optional derived terrain products** - generates hillshade and contour tiles
-  from raster DEM sources such as Mapterhorn while preserving the ordinary
-  PMTiles delivery path for source data.
+- **Optional derived terrain products** - generates hillshade and contour tiles from raster DEM sources such as Mapterhorn while preserving the ordinary PMTiles delivery path for source data.
 
-CPU-heavy DEM decode, terrain generation, and MLT transcoding share one bounded
-worker budget. `ISKR_CPU_WORK_CONCURRENCY` defaults to the process's available
-parallelism and can be set explicitly per deployment.
+CPU-heavy DEM decode, terrain generation, and MLT transcoding share one bounded worker budget. `ISKR_CPU_WORK_CONCURRENCY` defaults to the process's available parallelism and can be set explicitly per deployment.
 
-Ishikari also validates one aggregate ceiling for its byte-weighted material
-caches. The defaults allocate 1 GiB in total: 256 MiB each for tile and chunk
-data, with the remaining 512 MiB assigned to resource, PMTiles index, provider,
-MLT, derived-tile, and decoded-DEM caches. Override
-`ISKR_CACHE_WEIGHT_BUDGET_BYTES` only when the process has additional RSS
-headroom; Moka cache weights do not include every allocation made by the
-process. Separately, startup verifies that the configured chunk size, fetch
-width, and backend concurrency fit `ISKR_BACKEND_ACTIVE_BODY_BUDGET_BYTES`
-(128 MiB by default) without arithmetic overflow.
+Ishikari also validates one aggregate ceiling for its byte-weighted material caches. The defaults allocate 1 GiB in total: 256 MiB each for tile and chunk data, with the remaining 512 MiB assigned to resource, PMTiles index, provider, MLT, derived-tile, and decoded-DEM caches. Override `ISKR_CACHE_WEIGHT_BUDGET_BYTES` only when the process has additional RSS headroom; Moka cache weights do not include every allocation made by the process. Separately, startup verifies that the configured chunk size, fetch width, and backend concurrency fit `ISKR_BACKEND_ACTIVE_BODY_BUDGET_BYTES` (128 MiB by default) without arithmetic overflow.
 
 LICENSE: MIT OR Apache-2.0
-
 
 ## Demo
 
@@ -57,145 +44,59 @@ ISKR_SPRITE_TEMPLATES='carto=https://basemaps.cartocdn.com/{style_id}/sprite' \
 cargo run -p ishikari -- --tileset-sources data
 ```
 
-The style endpoint rewrites provider-relative `/{tileset_key}` sources to
-Ishikari TileJSON URLs and points `glyphs` and `sprite` back to Ishikari.
-Style, glyph, and sprite upstream fetches use bounded in-process caching and
-single-flight coordination to absorb cold concurrent renders. Stale provider
-entries revalidate conditionally, so an unchanged HTTP or object-store origin
-can refresh freshness without sending the body again.
+The style endpoint rewrites provider-relative `/{tileset_key}` sources to Ishikari TileJSON URLs and points `glyphs` and `sprite` back to Ishikari. Style, glyph, and sprite upstream fetches use bounded in-process caching and single-flight coordination to absorb cold concurrent renders. Stale provider entries revalidate conditionally, so an unchanged HTTP or object-store origin can refresh freshness without sending the body again.
 
-For a comma-separated glyph request such as
-`/fonts/Primary,Fallback/0-255.pbf`, Ishikari resolves and caches
-`Primary/0-255.pbf` and `Fallback/0-255.pbf` independently, then caches the
-merged PBF under the ordered composite key. The first font wins when both
-components contain the same glyph ID. Single-font requests remain
-byte-for-byte passthrough. A stack is limited to eight distinct fonts to bound
-provider fan-out; `ISKR_GLYPH_URL_TEMPLATE` must therefore resolve individual
-font names rather than require a pre-composed object.
+For a comma-separated glyph request such as `/fonts/Primary,Fallback/0-255.pbf`, Ishikari resolves and caches `Primary/0-255.pbf` and `Fallback/0-255.pbf` independently, then caches the merged PBF under the ordered composite key. The first font wins when both components contain the same glyph ID. Single-font requests remain byte-for-byte passthrough. A stack is limited to eight distinct fonts to bound provider fan-out; `ISKR_GLYPH_URL_TEMPLATE` must therefore resolve individual font names rather than require a pre-composed object.
 
-All public styles, sprites, glyphs, TileJSON, tiles, derived products, and
-previews allow browser use from any origin with
-`Access-Control-Allow-Origin: *`. Preflight accepts the delivery
-`Authorization` header and common cache/range request headers. Health, metrics,
-and cluster-internal peer routes do not inherit this policy. Cookie credentials
-are intentionally unsupported.
+All public styles, sprites, glyphs, TileJSON, tiles, derived products, and previews allow browser use from any origin with `Access-Control-Allow-Origin: *`. Preflight accepts the delivery `Authorization` header and common cache/range request headers. Health, metrics, and cluster-internal peer routes do not inherit this policy. Cookie credentials are intentionally unsupported.
 
 ## Optional delivery authentication
 
-Authentication is disabled by default. Set `ISKR_AUTH_REGISTRIES` to a
-semicolon-separated `registry_id=auth-root` catalog to protect all public
-styles, sprites, glyphs, TileJSON, tiles, derived products, and previews. Each
-root must end in `/` and contain a complete `current.json` snapshot:
+Authentication is disabled by default. Set `ISKR_AUTH_REGISTRIES` to a semicolon-separated `registry_id=auth-root` catalog to protect all public styles, sprites, glyphs, TileJSON, tiles, derived products, and previews. Each root must end in `/` and contain a complete `current.json` snapshot:
 
 ```bash
 ISKR_AUTH_REGISTRIES='public=gs://example-auth/registries/public/'
 ISKR_ANONYMOUS_REGISTRY='public'
 ```
 
-The shared MMPF verifier accepts exactly one `Authorization: Bearer ...` header
-or `access_token` query parameter. A token with the `read` action is checked
-against the first segment of a style or tileset key; a flat key uses its own ID
-as that segment. Glyph ranges are shared globally and therefore require the
-action but no fabricated namespace. Health, metrics, and cluster-internal peer
-routes are outside this delivery-auth boundary.
+The shared MMPF verifier accepts exactly one `Authorization: Bearer ...` header or `access_token` query parameter. A token with the `read` action is checked against the first segment of a style or tileset key; a flat key uses its own ID as that segment. Glyph ranges are shared globally and therefore require the action but no fabricated namespace. Health, metrics, and cluster-internal peer routes are outside this delivery-auth boundary.
 
-`ISKR_ANONYMOUS_REGISTRY` is optional. A credential-free request then uses only
-that registry snapshot's explicit `anonymous` namespace/action grant. For the
-demo's intended public catalog, the grant may allow `mierune`, `carto`, and
-`mapterhorn`. Invalid credentials never fall back to anonymous access; they
-remain `401`, while a valid anonymous principal outside its namespace set is
-`403`. Without this setting, missing credentials retain the existing
-token-required behavior.
+`ISKR_ANONYMOUS_REGISTRY` is optional. A credential-free request then uses only that registry snapshot's explicit `anonymous` namespace/action grant. For the demo's intended public catalog, the grant may allow `mierune`, `carto`, and `mapterhorn`. Invalid credentials never fall back to anonymous access; they remain `401`, while a valid anonymous principal outside its namespace set is `403`. Without this setting, missing credentials retain the existing token-required behavior.
 
-When a verified request uses `access_token`, Ishikari copies it only into
-same-origin style, sprite, glyph, TileJSON, tile, derived-tile, and preview URLs
-that Ishikari generated itself. It never adds the token to arbitrary upstream
-URLs from a style. A Bearer header is never converted into a URL credential.
-Query credentials are intended for browser clients that cannot set headers;
-enable them only with URL-log redaction and an explicit CDN query/cache-key
-policy. This experimental mechanism is not enabled by the demo deployment.
+When a verified request uses `access_token`, Ishikari copies it only into same-origin style, sprite, glyph, TileJSON, tile, derived-tile, and preview URLs that Ishikari generated itself. It never adds the token to arbitrary upstream URLs from a style. A Bearer header is never converted into a URL credential. Query credentials are intended for browser clients that cannot set headers; enable them only with URL-log redaction and an explicit CDN query/cache-key policy. This experimental mechanism is not enabled by the demo deployment.
 
-`ISKR_TILESET_SOURCES` accepts `namespace=value;…;default=value`, so tilesets can
-be backed by multiple object-store locations. A value may be a root or an
-absolute URL template. Roots preserve the original behavior: a namespace match
-strips the namespace before appending `.pmtiles`, while the default root receives
-the complete logical id. A bare value remains the default root.
+`ISKR_TILESET_SOURCES` accepts `namespace=value;…;default=value`, so tilesets can be backed by multiple object-store locations. A value may be a root or an absolute URL template. Roots preserve the original behavior: a namespace match strips the namespace before appending `.pmtiles`, while the default root receives the complete logical id. A bare value remains the default root.
 
-Templates require `{tileset_id}` and may use `{namespace}` as a complete optional
-path segment. A default template without `{namespace}` expands `{tileset_id}` to
-the complete logical id, making the compact form preserve namespaces. In a named
-template, or when `{namespace}` is explicit, `{tileset_id}` means the id after
-the namespace:
+Templates require `{tileset_id}` and may use `{namespace}` as a complete optional path segment. A default template without `{namespace}` expands `{tileset_id}` to the complete logical id, making the compact form preserve namespaces. In a named template, or when `{namespace}` is explicit, `{tileset_id}` means the id after the namespace:
 
 ```text
 regional=gs://regional-bucket/maps/{tileset_id}.pmtiles;
 default=gs://main-bucket/tilesets/{tileset_id}.pmtiles
 ```
 
-This maps `regional/streets` to
-`gs://regional-bucket/maps/streets.pmtiles`, `analysis/hrnowc` to
-`gs://main-bucket/tilesets/analysis/hrnowc.pmtiles`, and a flat `planet` id to
-`gs://main-bucket/tilesets/planet.pmtiles`. The explicit default form
-`tilesets/{namespace}/{tileset_id}.pmtiles` resolves to the same paths;
-`{namespace}` is omitted for a flat id and is never replaced with `default`.
+This maps `regional/streets` to `gs://regional-bucket/maps/streets.pmtiles`, `analysis/hrnowc` to `gs://main-bucket/tilesets/analysis/hrnowc.pmtiles`, and a flat `planet` id to `gs://main-bucket/tilesets/planet.pmtiles`. The explicit default form `tilesets/{namespace}/{tileset_id}.pmtiles` resolves to the same paths; `{namespace}` is omitted for a flat id and is never replaced with `default`.
 
 ## Composite Mapterhorn tileset
 
-Set `ISKR_MAPTERHORN_TILESET` to a logical tileset such as
-`mapterhorn/planet` and `ISKR_MAPTERHORN_MAXZOOM` to the advertised detail
-zoom to expose Mapterhorn's base and detail archives as one tileset. Requests at
-z0–12 use the logical base archive. Requests at z13+ resolve to the z6 ancestor
-detail archive in the same namespace (`mapterhorn/6-{x6}-{y6}.pmtiles`).
+Set `ISKR_MAPTERHORN_TILESET` to a logical tileset such as `mapterhorn/planet` and `ISKR_MAPTERHORN_MAXZOOM` to the advertised detail zoom to expose Mapterhorn's base and detail archives as one tileset. Requests at z0–12 use the logical base archive. Requests at z13+ resolve to the z6 ancestor detail archive in the same namespace (`mapterhorn/6-{x6}-{y6}.pmtiles`).
 
-Detail presence is probed on first use, single-flighted, and cached. Missing
-detail coverage returns 404; Ishikari does not substitute an overzoomed z12
-tile. Source reads still use normal HRW routing, chunk caching, range batching,
-and negative caching.
+Detail presence is probed on first use, single-flighted, and cached. Missing detail coverage returns 404; Ishikari does not substitute an overzoomed z12 tile. Source reads still use normal HRW routing, chunk caching, range batching, and negative caching.
 
-Generated contour and hillshade outputs use the same tile-group HRW placement.
-The owner single-flights generation, caches the result, and performs optional
-MLT transcoding; another node generates locally only when the owner is
-unavailable.
+Logical PMTiles bootstrap pointers are revalidated directly against object storage every five minutes by default (`ISKR_ARCHIVE_REVALIDATION_INTERVAL`). If the generation is unchanged, the larger generation-keyed data caches remain warm. `ISKR_MAPTERHORN_NEGATIVE_TTL` separately bounds how long a missing detail archive is remembered.
+
+Generated contour and hillshade outputs use the same tile-group HRW placement. The owner single-flights generation, caches the result, and performs optional MLT transcoding; another node generates locally only when the owner is unavailable.
 
 ## MLT output
 
-PMTiles containing native MLT tiles are served as stored. Stored MVT tiles can
-also be transcoded on demand by using the `.mlt` path suffix or
-`Accept: application/vnd.maplibre-tile`. The earlier
-`application/vnd.maplibre-vector-tile` spelling is accepted as a compatibility
-alias; responses use the canonical shorter media type. Ordinary requests remain
-as stored.
-Transcodes are single-flighted into a bounded per-pod cache and run on the
-blocking pool behind the shared `ISKR_CPU_WORK_CONCURRENCY` budget. Transcoded
-outputs are not forwarded between peers.
+PMTiles containing native MLT tiles are served as stored. Stored MVT tiles can also be transcoded on demand by using the `.mlt` path suffix or `Accept: application/vnd.maplibre-tile`. The earlier `application/vnd.maplibre-vector-tile` spelling is accepted as a compatibility alias; responses use the canonical shorter media type. Ordinary requests remain as stored. The `encoding=mlt` query belongs only on TileJSON URLs; tile payload routes reject it with `400` and direct callers to the `.mlt` suffix. Transcodes are single-flighted into a bounded per-pod cache and run on the blocking pool behind the shared `ISKR_CPU_WORK_CONCURRENCY` budget. Transcoded outputs are not forwarded between peers.
 
 ## Observability
 
-Prometheus metrics are exposed only on the internal listener at
-`/_internal/metrics`. In addition to bounded route/status counters, Ishikari
-reports end-to-end HTTP latency by route and status class, object-store range
-fetch duration, size, admission queue delay, and concurrency saturation; chunk
-batching and waiter fan-in; weighted cache bytes; and peer-routing outcomes.
-`ISKR_BACKEND_FETCH_CONCURRENCY` bounds range fetches across all tilesets in a
-process and defaults to 32. `ISKR_BACKEND_FETCH_MAX_INFLIGHT` bounds active plus
-permit-waiting fetch groups and defaults to four times that concurrency; excess
-distinct work is shed with 503 while callers joining an admitted group still
-coalesce. `ISKR_CHUNK_FETCH_MERGE_WINDOW_MS` controls how long nearby missing
-chunks are collected before dispatch (10 ms by default; 0 removes the intentional
-wait while preserving pending/inflight sharing). CPU-heavy DEM
-decode, terrain generation, and MLT
-transcoding expose admission, queue delay, current saturation, and shed counts.
-Derived terrain cold-generation metrics separate source fetch/decode time from
-product generation time and record compressed output size per fixed product.
+Prometheus metrics are exposed only on the internal listener at `/_internal/metrics`. In addition to bounded route/status counters, Ishikari reports end-to-end HTTP latency by route and status class, object-store range fetch duration, size, admission queue delay, and concurrency saturation; chunk batching and waiter fan-in; weighted cache bytes; and peer-routing outcomes. `ISKR_BACKEND_FETCH_CONCURRENCY` bounds range fetches across all tilesets in a process and defaults to 32. `ISKR_BACKEND_FETCH_MAX_INFLIGHT` bounds active plus permit-waiting fetch groups and defaults to four times that concurrency; excess distinct work is shed with 503 while callers joining an admitted group still coalesce. `ISKR_CHUNK_FETCH_MERGE_WINDOW_MS` controls how long nearby missing chunks are collected before dispatch (10 ms by default; 0 removes the intentional wait while preserving pending/inflight sharing). CPU-heavy DEM decode, terrain generation, and MLT transcoding expose admission, queue delay, current saturation, and shed counts. Derived terrain cold-generation metrics separate source fetch/decode time from product generation time and record compressed output size per fixed product.
 
 ## Simulator
 
-`ishikari-sim` generates deterministic population-weighted viewport traces and
-estimates how a deployment behaves without allocating the equivalent cluster,
-cache memory, object-store traffic, or wall-clock time. It reuses Ishikari's
-production HRW, PMTiles range planning, request batching, and cache policy, then
-combines them with logical byte capacity, virtual time, and cloud-calibrated
-latency models:
+`ishikari-sim` generates deterministic population-weighted viewport traces and estimates how a deployment behaves without allocating the equivalent cluster, cache memory, object-store traffic, or wall-clock time. It reuses Ishikari's production HRW, PMTiles range planning, request batching, and cache policy, then combines them with logical byte capacity, virtual time, and cloud-calibrated latency models:
 
 ```bash
 cargo run -p ishikari-sim -- \
@@ -211,18 +112,9 @@ cargo run -p ishikari-sim -- \
   --report report.json
 ```
 
-Add `--zoom-walk-probability 0.1` when generating a trace to replace 10% of
-non-reset pan steps with a one-level `z±1` transition at the same geographic
-center. The default is `0`, preserving the pan/reset-only workload. Generate a
-separate trace for each probability before running replay-only sweeps so every
-cache configuration in one sweep still receives exactly the same requests.
+Add `--zoom-walk-probability 0.1` when generating a trace to replace 10% of non-reset pan steps with a one-level `z±1` transition at the same geographic center. The default is `0`, preserving the pan/reset-only workload. Generate a separate trace for each probability before running replay-only sweeps so every cache configuration in one sweep still receives exactly the same requests.
 
-Without `--viewport-batches`, requests run serially for deterministic cache and
-placement studies. With it, each viewport is polled concurrently under paused
-Tokio time, exercising the configured production chunk merge window (10 ms by
-default) without adding wall-clock delay. Use
-`--chunk-fetch-merge-window-ms 0` for the no-delay baseline; the value is
-recorded in `cluster.chunk_fetch_merge_window_ms`.
+Without `--viewport-batches`, requests run serially for deterministic cache and placement studies. With it, each viewport is polled concurrently under paused Tokio time, exercising the configured production chunk merge window (10 ms by default) without adding wall-clock delay. Use `--chunk-fetch-merge-window-ms 0` for the no-delay baseline; the value is recorded in `cluster.chunk_fetch_merge_window_ms`.
 
 Replay the exact same trace against another cache or batching configuration:
 
@@ -238,10 +130,7 @@ cargo run -p ishikari-sim -- \
   --report replay-report.json
 ```
 
-The simulator can compare the production entry-node hot-cache policy with
-owner-only positive tile caching using `--peer-tile-cache entry` (default) or
-`--peer-tile-cache owner-only`. Both modes execute the production resolver;
-the selected policy is recorded in the report as `cluster.cache_peer_tiles`.
+The simulator can compare the production entry-node hot-cache policy with owner-only positive tile caching using `--peer-tile-cache entry` (default) or `--peer-tile-cache owner-only`. Both modes execute the production resolver; the selected policy is recorded in the report as `cluster.cache_peer_tiles`.
 
 Run replay-only modeled-cache parameter sweeps from a versioned JSON spec:
 
@@ -264,11 +153,7 @@ Run replay-only modeled-cache parameter sweeps from a versioned JSON spec:
 }
 ```
 
-Paths are relative to the sweep spec. The runner builds the PMTiles catalog
-once, expands the Cartesian grid in a stable order, creates a fresh modeled
-cluster per run, and flushes one self-contained versioned document per JSONL
-line. Each line includes effective configuration, aggregate/per-node results,
-churn-style periodic samples, and FNV-1a fingerprints of the spec and trace:
+Paths are relative to the sweep spec. The runner builds the PMTiles catalog once, expands the Cartesian grid in a stable order, creates a fresh modeled cluster per run, and flushes one self-contained versioned document per JSONL line. Each line includes effective configuration, aggregate/per-node results, churn-style periodic samples, and FNV-1a fingerprints of the spec and trace:
 
 ```bash
 cargo run -p ishikari-sim --release -- \
@@ -276,16 +161,9 @@ cargo run -p ishikari-sim --release -- \
   --output sweep-results.jsonl
 ```
 
-Version 1 sweeps only modeled-cache parameters that affect request-order and
-capacity results. Timed controls such as merge-window duration and backend
-concurrency remain real-cache/Phase 2 experiments; modeled reports record those
-settings but do not execute their timing behavior.
+Version 1 sweeps only modeled-cache parameters that affect request-order and capacity results. Timed controls such as merge-window duration and backend concurrency remain real-cache/Phase 2 experiments; modeled reports record those settings but do not execute their timing behavior.
 
-Replay the same trace over real HTTP for simulator calibration. Repeated
-`--node-url` values are ordered: trace `entry_node: 0` selects the first URL,
-`entry_node: 1` the second, and so on. When metrics URLs are supplied, the runner
-scrapes each node before and after replay and reports restart-checked deltas for
-tile sources, client/peer/backend bytes, backend fetches, and chunk-cache work:
+Replay the same trace over real HTTP for simulator calibration. Repeated `--node-url` values are ordered: trace `entry_node: 0` selects the first URL, `entry_node: 1` the second, and so on. When metrics URLs are supplied, the runner scrapes each node before and after replay and reports restart-checked deltas for tile sources, client/peer/backend bytes, backend fetches, and chunk-cache work:
 
 ```bash
 # Start `bash demo-deploy/ishikari/demo.sh` in another terminal, then run:
@@ -300,8 +178,7 @@ cargo run -p ishikari-sim --release -- replay-http trace.jsonl \
   --output direct-http-report.json
 ```
 
-Gateway mode deliberately ignores recorded entry-node assignments while still
-aggregating per-pod internal metrics:
+Gateway mode deliberately ignores recorded entry-node assignments while still aggregating per-pod internal metrics:
 
 ```bash
 cargo run -p ishikari-sim --release -- replay-http trace.jsonl \
@@ -313,21 +190,11 @@ cargo run -p ishikari-sim --release -- replay-http trace.jsonl \
   --output gateway-http-report.json
 ```
 
-HTTP replay sends `Cache-Control: no-cache`, follows no redirects, performs no
-retries, fully consumes response bodies, and writes bounded failure samples plus
-client-observed latency percentiles. `200` and `404` are normal outcomes; any
-transport error, other status, counter reset, or incomplete metrics capture
-makes the command exit nonzero after preserving the report. Run calibration on
-an otherwise idle deployment because the Prometheus counters are process-wide.
-The public target and internal metrics endpoints are intentionally separate.
+HTTP replay sends `Cache-Control: no-cache`, follows no redirects, performs no retries, fully consumes response bodies, and writes bounded failure samples plus client-observed latency percentiles. `200` and `404` are normal outcomes; any transport error, other status, counter reset, or incomplete metrics capture makes the command exit nonzero after preserving the report. Run calibration on an otherwise idle deployment because the Prometheus counters are process-wide. The public target and internal metrics endpoints are intentionally separate.
 
-Reports identify their trace source as `generated` or `replay` and include the
-full cluster configuration and aggregate/per-node metrics.
+Reports identify their trace source as `generated` or `replay` and include the full cluster configuration and aggregate/per-node metrics.
 
-Replay node additions and removals with a churn plan. Events are applied at
-request boundaries in serial mode and at the next completed viewport boundary
-with `--viewport-batches`; the report records both requested and actual request
-indices:
+Replay node additions and removals with a churn plan. Events are applied at request boundaries in serial mode and at the next completed viewport boundary with `--viewport-batches`; the report records both requested and actual request indices:
 
 ```bash
 cargo run -p ishikari-sim -- \
@@ -342,22 +209,7 @@ cargo run -p ishikari-sim -- \
   --report churn-report.json
 ```
 
-New nodes join with empty tile and chunk caches. Removed nodes leave the ingress
-set and in-process transport immediately; in real mode, stale chitchat views may
-still select them briefly and exercise the production peer fallback path. Their
-cumulative requests, backend bytes, and metrics remain in the final report with
-`active: false`. Churn samples make cache-hit loss, peer redistribution, and
-backend refetches visible over time.
-Each event has `pre_event` and `post_event` samples at the same request index;
-samples also include active cache occupancy and per-node request counters.
-To make added nodes eligible for ingress, churn replay deterministically
-reassigns requests over the current active set using `--entry-affinity`; it does
-not reuse the trace's fixed node indices. In `real` cache mode every simulated
-node runs Ishikari's production chitchat membership over an in-memory transport
-and Tokio's virtual clock. Node-local peer views therefore converge after
-churn, including the production failure detector and peer-list TTL. The
-metadata-only `modeled` mode keeps membership changes instantaneous so large
-node/capacity sweeps remain cheap.
+New nodes join with empty tile and chunk caches. Removed nodes leave the ingress set and in-process transport immediately; in real mode, stale chitchat views may still select them briefly and exercise the production peer fallback path. Their cumulative requests, backend bytes, and metrics remain in the final report with `active: false`. Churn samples make cache-hit loss, peer redistribution, and backend refetches visible over time. Each event has `pre_event` and `post_event` samples at the same request index; samples also include active cache occupancy and per-node request counters. To make added nodes eligible for ingress, churn replay deterministically reassigns requests over the current active set using `--entry-affinity`; it does not reuse the trace's fixed node indices. In `real` cache mode every simulated node runs Ishikari's production chitchat membership over an in-memory transport and Tokio's virtual clock. Node-local peer views therefore converge after churn, including the production failure detector and peer-list TTL. The metadata-only `modeled` mode keeps membership changes instantaneous so large node/capacity sweeps remain cheap.
 
 Generate a self-contained visualization from any simulation report:
 
@@ -367,26 +219,11 @@ cargo run -p ishikari-sim -- visualize \
   --output churn-report.html
 ```
 
-Churn reports provide request-indexed trend charts with churn event markers,
-interval cache/peer rates, peer failover and backoff activity, backend fetch
-rate and transfer volume per 1,000 requests, active cache occupancy, and final
-node load.
-The HTML embeds the report and has no server or external asset dependency.
+Churn reports provide request-indexed trend charts with churn event markers, interval cache/peer rates, peer failover and backoff activity, backend fetch rate and transfer volume per 1,000 requests, active cache occupancy, and final node load. The HTML embeds the report and has no server or external asset dependency.
 
-Tile source labels distinguish both placement and backend involvement.
-`self_cache` covers entry-node L1 hits and local resolutions completed entirely
-from PMTiles/index and chunk caches. `peer_cache` is the equivalent response
-from an HRW peer. `self_backend` and `peer_backend` mean that tile resolution
-waited for at least one object-storage chunk fetch, including joining pending or
-inflight work. `miss` includes positive lookup misses and negative-cache hits.
-The reported `cache_hit_rate` is `(self_cache + peer_cache) / requests`, so it
-includes positive L1 hits and PMTiles resolutions completed from chunk caches.
-`l1_cache_hit_rate` remains available separately in the JSON report.
-`Client egress` is the successful tile payload sent to end users; `Peer
-transfer` is internal east-west traffic.
+Tile source labels distinguish both placement and backend involvement. `self_cache` covers entry-node L1 hits and local resolutions completed entirely from PMTiles/index and chunk caches. `peer_cache` is the equivalent response from an HRW peer. `self_backend` and `peer_backend` mean that tile resolution waited for at least one object-storage chunk fetch, including joining pending or inflight work. `miss` includes positive lookup misses and negative-cache hits. The reported `cache_hit_rate` is `(self_cache + peer_cache) / requests`, so it includes positive L1 hits and PMTiles resolutions completed from chunk caches. `l1_cache_hit_rate` remains available separately in the JSON report. `Client egress` is the successful tile payload sent to end users; `Peer transfer` is internal east-west traffic.
 
-For a majority-loss scenario, start with 10 nodes and remove seven at the same
-viewport boundary:
+For a majority-loss scenario, start with 10 nodes and remove seven at the same viewport boundary:
 
 ```bash
 cargo run -p ishikari-sim --release -- \
@@ -400,21 +237,9 @@ cargo run -p ishikari-sim --release -- \
   --report majority-failure-report.json
 ```
 
-This validates HRW redistribution and cold-cache recovery on the three
-surviving nodes. Use `--cache-mode real` to include node-local chitchat
-convergence, or `--cache-mode modeled` to isolate placement and logical cache
-recovery with instantaneous membership. Gossip packet loss remains a separate
-failure-injection model.
-Use `churn-steady-state-example.json` for an event-free baseline with the same
-dynamic ingress assignment; a regular replay preserves the trace's original
-entry-node indices and is not comparable when changing the node count.
-`churn-mixed-example.json` provides a longer-running deterministic sequence of
-staggered additions, removals, temporary contraction, and removal of a node
-that joined during the run.
+This validates HRW redistribution and cold-cache recovery on the three surviving nodes. Use `--cache-mode real` to include node-local chitchat convergence, or `--cache-mode modeled` to isolate placement and logical cache recovery with instantaneous membership. Gossip packet loss remains a separate failure-injection model. Use `churn-steady-state-example.json` for an event-free baseline with the same dynamic ingress assignment; a regular replay preserves the trace's original entry-node indices and is not comparable when changing the node count. `churn-mixed-example.json` provides a longer-running deterministic sequence of staggered additions, removals, temporary contraction, and removal of a node that joined during the run.
 
-For large cache-capacity and node-count sweeps, use metadata-only modeled
-caches. The catalog reads PMTiles directories once, but tile and chunk cache
-entries retain only logical byte weights rather than payloads:
+For large cache-capacity and node-count sweeps, use metadata-only modeled caches. The catalog reads PMTiles directories once, but tile and chunk cache entries retain only logical byte weights rather than payloads:
 
 ```bash
 cargo run -p ishikari-sim -- \
@@ -429,19 +254,9 @@ cargo run -p ishikari-sim -- \
   --report modeled-report.json
 ```
 
-`real` remains the default reference mode and executes production resolvers
-with real payload caches; it is useful for checking model fidelity on small
-runs, not for representing production-scale memory. `modeled` is the scalable
-capacity-study mode. It currently accepts one local PMTiles root and reuses
-production HRW placement, Moka TinyLFU/LRU policy, byte weights, and chunk range
-planning without retaining tile payloads. The production 1 GiB per-node
-chunk-cache cap also applies in modeled mode.
+`real` remains the default reference mode and executes production resolvers with real payload caches; it is useful for checking model fidelity on small runs, not for representing production-scale memory. `modeled` is the scalable capacity-study mode. It currently accepts one local PMTiles root and reuses production HRW placement, Moka TinyLFU/LRU policy, byte weights, and chunk range planning without retaining tile payloads. The production 1 GiB per-node chunk-cache cap also applies in modeled mode.
 
-For latency and queueing experiments, replay a trace with concurrent virtual
-users under Tokio's paused clock. This runs the production resolver, caches,
-single-flight, configured merge window, and 32 concurrent range-fetch limit while
-adding deterministic backend and peer latency. The repository includes a GCS
-profile measured from the demo cluster in `asia-northeast1`:
+For latency and queueing experiments, replay a trace with concurrent virtual users under Tokio's paused clock. This runs the production resolver, caches, single-flight, configured merge window, and 32 concurrent range-fetch limit while adding deterministic backend and peer latency. The repository includes a GCS profile measured from the demo cluster in `asia-northeast1`:
 
 ```bash
 cargo run -p ishikari-sim -- \
@@ -455,16 +270,7 @@ cargo run -p ishikari-sim -- \
   --report timed-report.json
 ```
 
-The timed report includes throughput, request latency percentiles overall and
-by source, timeouts, and peak in-flight requests per node. The common result
-also reports backend fetch size/duration, batching queue delay, pending chunks,
-group waiters, and node request-load skew (max/mean and coefficient of
-variation). Each virtual user waits for its viewport batch, then sleeps for
-`1200 +/- 500 ms` by default, matching the closed-user workload model. The
-measured profile uses a deterministic lognormal range-fetch latency plus a
-per-MiB transfer term. Fixed controlled sweeps remain available through
-`--artificial-backend-delay-ms`; sigma and the transfer slope can also be
-supplied directly.
+The timed report includes throughput, request latency percentiles overall and by source, timeouts, and peak in-flight requests per node. The common result also reports backend fetch size/duration, batching queue delay, pending chunks, group waiters, and node request-load skew (max/mean and coefficient of variation). Each virtual user waits for its viewport batch, then sleeps for `1200 +/- 500 ms` by default, matching the closed-user workload model. The measured profile uses a deterministic lognormal range-fetch latency plus a per-MiB transfer term. Fixed controlled sweeps remain available through `--artificial-backend-delay-ms`; sigma and the transfer slope can also be supplied directly.
 
 ## Development documents
 

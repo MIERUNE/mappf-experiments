@@ -5,20 +5,23 @@ use std::time::{Duration, Instant};
 
 use moka::{Expiry, sync::Cache};
 
-use crate::{cache_policy::tile_cache_entry_weight, interned::TilesetId, storage::TilesetInfo};
+use crate::{
+    cache_policy::tile_cache_entry_weight,
+    storage::{TilesetInfo, generation::ArchiveKey},
+};
 
 /// Identifies a cached tile payload within a tileset.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct TileCacheKey {
-    pub tileset_id: TilesetId,
+    pub archive: ArchiveKey,
     pub tile_id: u64,
 }
 
 impl TileCacheKey {
     /// Builds a tile cache key from a tileset id and PMTiles tile id.
-    pub(crate) fn new(tileset_id: &TilesetId, tile_id: u64) -> Self {
+    pub(crate) fn new(archive: &ArchiveKey, tile_id: u64) -> Self {
         Self {
-            tileset_id: tileset_id.clone(),
+            archive: archive.clone(),
             tile_id,
         }
     }
@@ -44,20 +47,17 @@ pub(crate) struct TileCache {
 /// Per-node cache of tileset metadata.
 #[derive(Clone)]
 pub(crate) struct TilesetInfoCache {
-    cache: Cache<TilesetId, Arc<TilesetInfo>>,
+    cache: Cache<ArchiveKey, Arc<TilesetInfo>>,
 }
 
 /// Per-entry expiry policy for the tile cache.
 ///
-/// Positive (`Found`) entries never expire on their own — PMTiles archives are
-/// treated as immutable, so a tile that exists keeps its bytes until capacity
-/// eviction. Negative (`NotFound`) entries expire after `negative_ttl`: absence
-/// is the *mutable* state (a tile can be published later, or a whole archive
-/// republished), so bounding the negative lifetime caps how long a newly-added
-/// tile stays hidden — and stops a caller from poisoning the cache with lookups
-/// of not-yet-existing tiles to delay their rollout. A cache *hit* does not
-/// extend the entry (`expire_after_read` keeps the default), so hammering an
-/// absent tile cannot keep its negative entry alive past `negative_ttl`.
+/// Positive (`Found`) entries never expire on their own because their key
+/// includes the object generation. Replacing a logical archive selects a new
+/// key; old entries become unreachable and leave through capacity eviction.
+/// Negative (`NotFound`) entries still expire after `negative_ttl`, limiting how
+/// long an added tile stays hidden within one generation. A cache *hit* does
+/// not extend that lifetime (`expire_after_read` keeps the default).
 struct TileExpiry {
     negative_ttl: Duration,
 }
@@ -137,13 +137,13 @@ impl TilesetInfoCache {
     }
 
     /// Returns a cached tileset metadata bundle if present.
-    pub(crate) fn get(&self, tileset_id: &TilesetId) -> Option<Arc<TilesetInfo>> {
-        self.cache.get(tileset_id)
+    pub(crate) fn get(&self, archive: &ArchiveKey) -> Option<Arc<TilesetInfo>> {
+        self.cache.get(archive)
     }
 
     /// Inserts or replaces a cached tileset metadata bundle.
-    pub(crate) fn put(&self, tileset_id: &TilesetId, info: Arc<TilesetInfo>) {
-        self.cache.insert(tileset_id.clone(), info);
+    pub(crate) fn put(&self, archive: &ArchiveKey, info: Arc<TilesetInfo>) {
+        self.cache.insert(archive.clone(), info);
     }
 
     /// Returns the current weighted byte size of cached tileset metadata.
@@ -163,14 +163,25 @@ fn tile_cache_weight(_key: &TileCacheKey, value: &CachedTile) -> u32 {
 }
 
 /// Estimates the weight of cached tileset metadata.
-fn resource_cache_weight(tileset_id: &TilesetId, info: &Arc<TilesetInfo>) -> u32 {
-    let total = std::mem::size_of_val(tileset_id).saturating_add(info.approx_byte_size());
+fn resource_cache_weight(archive: &ArchiveKey, info: &Arc<TilesetInfo>) -> u32 {
+    let total = std::mem::size_of_val(archive).saturating_add(info.approx_byte_size());
     total.min(u32::MAX as usize) as u32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        interned::TilesetId,
+        storage::{ArchiveGeneration, ArchiveKey},
+    };
+
+    fn archive_key(tileset_id: &TilesetId) -> ArchiveKey {
+        ArchiveKey::new(
+            tileset_id,
+            ArchiveGeneration::from_wire("e:test").expect("valid test generation"),
+        )
+    }
 
     fn found() -> CachedTile {
         CachedTile::Found {
@@ -200,7 +211,7 @@ mod tests {
         };
         let now = Instant::now();
         let tileset_id = TilesetId::try_new("demo/streets").unwrap();
-        let key = TileCacheKey::new(&tileset_id, 42);
+        let key = TileCacheKey::new(&archive_key(&tileset_id), 42);
         // A NotFound→Found update (tile published) must clear the negative TTL.
         assert_eq!(
             expiry.expire_after_update(&key, &found(), now, Some(Duration::from_secs(30))),

@@ -5,7 +5,10 @@
 //! transport and `resource` owns the value that results.
 
 use std::{
-    sync::{Arc, atomic::AtomicUsize},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -17,11 +20,11 @@ use tokio::{sync::Semaphore, time::Instant as TokioInstant};
 
 use super::fetch::{fetch_limited_bytes_uncached, provider_fetch_cache_weight};
 use super::{
-    CachedProviderRepresentation, FetchedProviderNegative, FetchedProviderResource,
-    PROVIDER_FETCH_CONCURRENCY, PROVIDER_FETCH_MAX_INFLIGHT,
+    CachedProviderRepresentation, FetchFence, FetchedProviderNegative, FetchedProviderResource,
+    PROVIDER_FETCH_CONCURRENCY, PROVIDER_FETCH_MAX_INFLIGHT, PROVIDER_INVALIDATION_FENCE_RETENTION,
     PROVIDER_STALE_REVALIDATION_FAILURE_COOLDOWN, PROVIDER_STALE_REVALIDATION_FAILURE_MAX_KEYS,
-    ProviderFetchPermit, ProviderFetchSlot, ProviderFlightOutcome, ProviderOriginOutcome,
-    ProviderResource, provider_http_client, provider_negative_error,
+    ProviderFetchPermit, ProviderFetchSlot, ProviderFlightOutcome, ProviderFlightResult,
+    ProviderOriginOutcome, ProviderResource, provider_http_client, provider_negative_error,
 };
 use crate::server::provider_body::BodyValidation;
 use crate::server::{HttpError, conditional::Validators};
@@ -29,9 +32,40 @@ use ishikari_core::metrics::NodeMetrics;
 use ishikari_core::storage::ObjectStoreRegistry;
 use mmpf_common::singleflight::{Flight, LeaderGuard, SingleFlight};
 
+/// Why a completed fetch was or was not retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderCacheStore {
+    Stored,
+    /// Fetched successfully, but the response policy forbids retention.
+    Uncacheable,
+    /// A refresh hint advanced the fence while the fetch was in flight, so these
+    /// bytes were already unreachable before they arrived.
+    Superseded,
+}
+
+impl ProviderCacheStore {
+    /// Production code distinguishes all three outcomes for its metric label, so
+    /// this collapse to a boolean exists only for assertions.
+    #[cfg(test)]
+    fn is_stored(self) -> bool {
+        self == Self::Stored
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct ProviderFetchCache {
     entries: Cache<ProviderFetchCacheKey, CachedProviderFetch>,
+    /// Bounded per-key generation fences for explicit management refreshes. A
+    /// refresh removes the cached entry outright and a pre-hint fetch completing
+    /// afterwards is refused rather than stored, so this map only has to outlive
+    /// the fetches that captured a value — see
+    /// [`PROVIDER_INVALIDATION_FENCE_RETENTION`]. Because it is bounded, losing an
+    /// entry must never be mistaken for "never refreshed": see `refreshes`.
+    invalidation_epochs: Cache<ProviderFetchCacheKey, u64>,
+    /// Process-wide count of refreshes, which no eviction or expiry can lower.
+    /// This is what makes an evicted per-key fence fail closed instead of open;
+    /// [`FetchFence`] documents the reasoning.
+    refreshes: Arc<AtomicU64>,
     failed_revalidations: Cache<ProviderFetchCacheKey, TokioInstant>,
     inflight: SingleFlight<ProviderFetchCacheKey, ProviderFlightOutcome>,
     pub(super) http_client: Client,
@@ -46,9 +80,14 @@ impl ProviderFetchCache {
                 .max_capacity(max_capacity_bytes)
                 .weigher(provider_fetch_cache_weight)
                 .build(),
+            invalidation_epochs: Cache::builder()
+                .max_capacity(PROVIDER_STALE_REVALIDATION_FAILURE_MAX_KEYS)
+                .time_to_live(PROVIDER_INVALIDATION_FENCE_RETENTION)
+                .build(),
             failed_revalidations: Cache::builder()
                 .max_capacity(PROVIDER_STALE_REVALIDATION_FAILURE_MAX_KEYS)
                 .build(),
+            refreshes: Arc::new(AtomicU64::new(0)),
             inflight: SingleFlight::default(),
             http_client: provider_http_client(),
             fetch_semaphore: Arc::new(Semaphore::new(PROVIDER_FETCH_CONCURRENCY)),
@@ -63,6 +102,9 @@ impl ProviderFetchCache {
     /// value until replacement or eviction.
     fn get(&self, key: &ProviderFetchCacheKey) -> Option<(CachedProviderFetch, Freshness)> {
         let entry = self.entries.get(key)?;
+        if entry.invalidation_epoch() != self.invalidation_epoch(key) {
+            return None;
+        }
         match entry.freshness() {
             Freshness::Expired => None,
             freshness => Some((entry, freshness)),
@@ -79,15 +121,24 @@ impl ProviderFetchCache {
         entry.representation()
     }
 
-    fn put_found(&self, key: ProviderFetchCacheKey, fetched: &FetchedProviderResource) -> bool {
+    fn put_found(
+        &self,
+        key: ProviderFetchCacheKey,
+        fetched: &FetchedProviderResource,
+        fence: FetchFence,
+    ) -> ProviderCacheStore {
         // Modified and 304 responses both arrive here. Either is a successful
         // revalidation and resets any prior failed-refresh cooldown.
         self.failed_revalidations.invalidate(&key);
+        if self.is_superseded(&key, fence) {
+            self.invalidate(&key);
+            return ProviderCacheStore::Superseded;
+        }
         if !fetched.policy.store {
             // A successful refresh can tighten an existing stale entry to
             // `no-store`/`private`/`no-cache`. Remove that old body promptly.
             self.invalidate(&key);
-            return false;
+            return ProviderCacheStore::Uncacheable;
         }
         let stored_at = Instant::now();
         let fresh_remaining = fetched.policy.fresh.saturating_sub(fetched.initial_age);
@@ -98,12 +149,13 @@ impl ProviderFetchCache {
             .saturating_sub(fetched.initial_age);
         if retention_remaining.is_zero() {
             self.invalidate(&key);
-            return false;
+            return ProviderCacheStore::Uncacheable;
         }
         let fresh_until = stored_at + fresh_remaining;
         self.entries.insert(
             key,
             CachedProviderFetch::Found {
+                invalidation_epoch: fence.stored_epoch(),
                 bytes: fetched.bytes.clone(),
                 cache_control: Arc::clone(&fetched.policy.response_cache_control),
                 validators: fetched.validators.clone(),
@@ -114,31 +166,80 @@ impl ProviderFetchCache {
                 stale_until: stored_at + retention_remaining,
             },
         );
-        true
+        ProviderCacheStore::Stored
     }
 
-    fn put_negative(&self, key: ProviderFetchCacheKey, negative: &FetchedProviderNegative) -> bool {
+    fn put_negative(
+        &self,
+        key: ProviderFetchCacheKey,
+        negative: &FetchedProviderNegative,
+        fence: FetchFence,
+    ) -> ProviderCacheStore {
         // A terminal origin response is also a successful revalidation attempt.
         self.failed_revalidations.invalidate(&key);
+        if self.is_superseded(&key, fence) {
+            self.invalidate(&key);
+            return ProviderCacheStore::Superseded;
+        }
         if !negative.policy.store {
             self.invalidate(&key);
-            return false;
+            return ProviderCacheStore::Uncacheable;
         }
         let fresh = negative.policy.fresh.saturating_sub(negative.initial_age);
         if fresh.is_zero() {
             self.invalidate(&key);
-            return false;
+            return ProviderCacheStore::Uncacheable;
         }
         let fresh_until = Instant::now() + fresh;
         self.entries.insert(
             key,
             CachedProviderFetch::Negative {
+                invalidation_epoch: fence.stored_epoch(),
                 status: negative.status,
                 fresh_until,
                 stale_until: fresh_until,
             },
         );
-        true
+        ProviderCacheStore::Stored
+    }
+
+    /// Whether a refresh hint advanced the fence while this fetch was running.
+    ///
+    /// Such bytes must not be stored at all. Storing them and relying on the
+    /// read-side epoch comparison in [`get`](Self::get) would make the fence
+    /// depend on `invalidation_epochs` retaining the key forever: that map is
+    /// bounded, and once it drops the key the epoch reads back as zero, so a
+    /// stored pre-hint entry whose own epoch was zero becomes reachable again.
+    ///
+    /// Refusing the store is necessary but not sufficient, because the per-key
+    /// entry can be *capacity*-evicted mid-flight — which no expiry setting can
+    /// prevent. So the per-key comparison is only trusted while the entry is
+    /// actually present; an absent entry is trusted only when the process-wide
+    /// refresh count proves no refresh happened at all during the flight.
+    fn is_superseded(&self, key: &ProviderFetchCacheKey, fence: FetchFence) -> bool {
+        if self.refreshes.load(Ordering::Acquire) == fence.refreshes {
+            // Nothing was refreshed anywhere while this fetch ran, so the per-key
+            // map cannot have lost an entry that matters here. This is the
+            // overwhelmingly common path and costs one atomic load.
+            return false;
+        }
+        match self.invalidation_epochs.get(key) {
+            Some(current) => Some(current) != fence.key_epoch,
+            // A refresh happened while this fetch ran and this key now has no
+            // fence entry. Absence is indistinguishable from an entry a refresh
+            // set and eviction then dropped, so refuse rather than risk
+            // republishing superseded bytes. The cost is one extra fetch, and
+            // only for a fetch that overlapped an actual refresh.
+            None => true,
+        }
+    }
+
+    /// Captures the refresh fence immediately before provider I/O begins.
+    fn fetch_fence(&self, key: &ProviderFetchCacheKey) -> FetchFence {
+        FetchFence {
+            key_epoch: self.invalidation_epochs.get(key),
+            refreshes: self.refreshes.load(Ordering::Acquire),
+        }
     }
 
     fn begin_fetch(
@@ -176,6 +277,21 @@ impl ProviderFetchCache {
     fn invalidate(&self, key: &ProviderFetchCacheKey) {
         self.entries.invalidate(key);
         self.failed_revalidations.invalidate(key);
+    }
+
+    fn invalidate_for_refresh(&self, key: &ProviderFetchCacheKey) {
+        // Raise the process-wide count first, so a fetch completing concurrently
+        // can never see the pre-refresh count together with post-refresh per-key
+        // state. Dropping the entry last is what makes the interleaving safe
+        // either way: a store that slips through in between is removed here.
+        self.refreshes.fetch_add(1, Ordering::AcqRel);
+        let next = self.invalidation_epoch(key).wrapping_add(1);
+        self.invalidation_epochs.insert(key.clone(), next);
+        self.invalidate(key);
+    }
+
+    fn invalidation_epoch(&self, key: &ProviderFetchCacheKey) -> u64 {
+        self.invalidation_epochs.get(key).unwrap_or_default()
     }
 
     pub(super) async fn admit_fetch(
@@ -250,6 +366,7 @@ pub(super) enum Freshness {
 #[derive(Clone)]
 pub(super) enum CachedProviderFetch {
     Found {
+        invalidation_epoch: u64,
         bytes: Bytes,
         cache_control: Arc<str>,
         validators: Validators,
@@ -260,6 +377,7 @@ pub(super) enum CachedProviderFetch {
         stale_until: Instant,
     },
     Negative {
+        invalidation_epoch: u64,
         status: StatusCode,
         fresh_until: Instant,
         stale_until: Instant,
@@ -267,6 +385,17 @@ pub(super) enum CachedProviderFetch {
 }
 
 impl CachedProviderFetch {
+    fn invalidation_epoch(&self) -> u64 {
+        match self {
+            Self::Found {
+                invalidation_epoch, ..
+            }
+            | Self::Negative {
+                invalidation_epoch, ..
+            } => *invalidation_epoch,
+        }
+    }
+
     fn freshness(&self) -> Freshness {
         let (fresh_until, stale_until) = match self {
             Self::Found {
@@ -382,6 +511,7 @@ fn spawn_stale_revalidation(
         drop(guard);
         return;
     };
+    let fence = fetcher.cache.fetch_fence(&key);
     let fetcher = fetcher.clone();
     tokio::spawn(async move {
         let result = fetch_limited_bytes_uncached(
@@ -401,7 +531,7 @@ fn spawn_stale_revalidation(
         }
         // The refreshed body (or error) reaches later requests through the cache
         // and the single-flight guard; this task only drives the revalidation.
-        let _ = store_leader_result(&fetcher, &key, resource, result, guard);
+        let _ = store_leader_result(&fetcher, &key, resource, result, fence, guard);
     });
 }
 
@@ -412,21 +542,22 @@ fn store_leader_result(
     key: &ProviderFetchCacheKey,
     resource: &'static str,
     result: Result<ProviderOriginOutcome, HttpError>,
+    fence: FetchFence,
     guard: LeaderGuard<ProviderFetchCacheKey, ProviderFlightOutcome>,
 ) -> Result<ProviderResource, HttpError> {
     match result {
         Ok(ProviderOriginOutcome::Negative(negative)) => {
             let error = provider_negative_error(negative.status);
-            let stored = fetcher.cache.put_negative(key.clone(), &negative);
+            let stored = fetcher.cache.put_negative(key.clone(), &negative, fence);
             fetcher.metrics.record_provider_resource_cache(
                 resource,
-                if stored {
-                    "negative_insert"
-                } else {
-                    "negative_uncacheable"
+                match stored {
+                    ProviderCacheStore::Stored => "negative_insert",
+                    ProviderCacheStore::Uncacheable => "negative_uncacheable",
+                    ProviderCacheStore::Superseded => "negative_superseded_by_refresh",
                 },
             );
-            guard.complete_with_error(ProviderFlightOutcome::Error(error.clone()));
+            guard.complete_with_error(ProviderFlightOutcome::error(fence, error.clone()));
             Err(error)
         }
         Ok(origin) => {
@@ -436,25 +567,25 @@ fn store_leader_result(
                 ProviderOriginOutcome::Negative(_) => unreachable!("handled above"),
             };
             let response = ProviderResource::fetched(&fetched);
-            let stored = fetcher.cache.put_found(key.clone(), &fetched);
+            let stored = fetcher.cache.put_found(key.clone(), &fetched, fence);
             // An uncacheable response was fetched successfully but intentionally
             // not retained. This can also happen when a 304 tightens policy.
-            let outcome = if stored {
-                stored_outcome
-            } else {
-                "uncacheable"
+            let outcome = match stored {
+                ProviderCacheStore::Stored => stored_outcome,
+                ProviderCacheStore::Uncacheable => "uncacheable",
+                ProviderCacheStore::Superseded => "superseded_by_refresh",
             };
             fetcher
                 .metrics
                 .record_provider_resource_cache(resource, outcome);
-            guard.complete_with(ProviderFlightOutcome::Resource(response.clone()));
+            guard.complete_with(ProviderFlightOutcome::resource(fence, response.clone()));
             Ok(response)
         }
         Err(error) => {
             fetcher
                 .metrics
                 .record_provider_resource_cache(resource, "error");
-            guard.complete_with_error(ProviderFlightOutcome::Error(error.clone()));
+            guard.complete_with_error(ProviderFlightOutcome::error(fence, error.clone()));
             Err(error)
         }
     }
@@ -516,6 +647,21 @@ impl ProviderFetcher {
             BodyValidation::Json,
         )
         .await
+    }
+
+    pub(crate) fn invalidate_json(
+        &self,
+        url: String,
+        resource: &'static str,
+        accepted_content_types: &'static [&'static str],
+    ) {
+        let key = ProviderFetchCacheKey::new(
+            resource,
+            Arc::<str>::from(url),
+            accepted_content_types,
+            BodyValidation::Json,
+        );
+        self.cache.invalidate_for_refresh(&key);
     }
 
     pub(crate) fn weighted_size(&self) -> u64 {
@@ -582,6 +728,7 @@ async fn fetch_limited_bytes_with_validation(
                     drop(guard);
                     continue;
                 }
+                let fence = fetcher.cache.fetch_fence(&key);
                 let result = fetch_limited_bytes_uncached(
                     fetcher,
                     &url,
@@ -592,7 +739,7 @@ async fn fetch_limited_bytes_with_validation(
                     None,
                 )
                 .await;
-                return store_leader_result(fetcher, &key, resource, result, guard);
+                return store_leader_result(fetcher, &key, resource, result, fence, guard);
             }
             Flight::Follower(follower) => {
                 // Request-scoped: an uncacheable success stores nothing, so a
@@ -605,10 +752,22 @@ async fn fetch_limited_bytes_with_validation(
                     joined_singleflight = true;
                 }
                 if let Some(outcome) = follower.wait().await {
-                    return match outcome {
-                        ProviderFlightOutcome::Error(error) => Err(error),
-                        ProviderFlightOutcome::Resource(resource) => Ok(resource),
-                    };
+                    // A refresh hint may have advanced the fence while this
+                    // flight was in progress. Publication to followers bypasses
+                    // the cache, so the fence has to be re-checked here or the
+                    // hint would be ignored for every joined request. A stale
+                    // outcome re-enters the loop, which re-reads the cache and
+                    // either leads a fresh fetch or joins the next flight.
+                    if !fetcher.cache.is_superseded(&key, outcome.fence) {
+                        return match outcome.result {
+                            ProviderFlightResult::Error(error) => Err(error),
+                            ProviderFlightResult::Resource(resource) => Ok(resource),
+                        };
+                    }
+                    fetcher.metrics.record_provider_resource_cache(
+                        resource,
+                        "singleflight_refetch_after_hint",
+                    );
                 }
             }
         }
@@ -622,9 +781,10 @@ mod tests {
     };
     use super::{
         BodyValidation, CachedProviderFetch, FetchedProviderNegative, FetchedProviderResource,
-        Freshness, PROVIDER_STALE_REVALIDATION_FAILURE_COOLDOWN, ProviderFetchCache,
-        ProviderFetchCacheKey, ProviderFetchSlot, ProviderFetcher, ProviderFlightOutcome,
-        ProviderOriginOutcome, Validators, record_cached_provider_fetch, store_leader_result,
+        Freshness, PROVIDER_STALE_REVALIDATION_FAILURE_COOLDOWN, ProviderCacheStore,
+        ProviderFetchCache, ProviderFetchCacheKey, ProviderFetchSlot, ProviderFetcher,
+        ProviderFlightResult, ProviderOriginOutcome, Validators, record_cached_provider_fetch,
+        store_leader_result,
     };
     use crate::server::provider_cache_policy::{NegativeCachePolicy, cache_policy};
     use axum::http::{HeaderMap, StatusCode, header};
@@ -660,6 +820,7 @@ mod tests {
     fn stale_found(stale_for: Duration) -> CachedProviderFetch {
         let now = std::time::Instant::now();
         CachedProviderFetch::Found {
+            invalidation_epoch: 0,
             bytes: Bytes::from_static(b"stale"),
             cache_control: "public, max-age=0, stale-while-revalidate=60".into(),
             validators: Validators::default(),
@@ -703,6 +864,7 @@ mod tests {
     #[test]
     fn not_modified_reuses_body_and_refreshes_origin_metadata() {
         let cached = CachedProviderFetch::Found {
+            invalidation_epoch: 0,
             bytes: Bytes::from_static(b"validated-style"),
             cache_control: "public, max-age=0, s-maxage=0, stale-while-revalidate=60".into(),
             validators: Validators::new(Some("\"v1\"".into()), None),
@@ -767,6 +929,7 @@ mod tests {
         let stored_at = std::time::Instant::now();
         let fresh_until = stored_at + Duration::from_secs(60);
         let entry = CachedProviderFetch::Found {
+            invalidation_epoch: 0,
             bytes: Bytes::from_static(b"style"),
             cache_control: "public, max-age=60".into(),
             validators: Validators::default(),
@@ -804,7 +967,7 @@ mod tests {
             content_encoding: None,
             initial_age: Duration::ZERO,
         };
-        cache.put_found(key.clone(), &old);
+        cache.put_found(key.clone(), &old, cache.fetch_fence(&key));
         assert!(cache.get(&key).is_some());
 
         let new = FetchedProviderResource {
@@ -814,7 +977,7 @@ mod tests {
             content_encoding: None,
             initial_age: Duration::ZERO,
         };
-        cache.put_found(key.clone(), &new);
+        cache.put_found(key.clone(), &new, cache.fetch_fence(&key));
         assert!(cache.get(&key).is_none());
     }
 
@@ -835,7 +998,11 @@ mod tests {
             },
             initial_age: Duration::ZERO,
         };
-        assert!(cache.put_negative(key.clone(), &gone));
+        assert!(
+            cache
+                .put_negative(key.clone(), &gone, cache.fetch_fence(&key))
+                .is_stored()
+        );
         let result = cache.get(&key).expect("negative entry").0.into_result();
         let error = match result {
             Err(error) => error,
@@ -851,7 +1018,11 @@ mod tests {
             },
             initial_age: Duration::ZERO,
         };
-        assert!(!cache.put_negative(key.clone(), &no_store));
+        assert!(
+            !cache
+                .put_negative(key.clone(), &no_store, cache.fetch_fence(&key))
+                .is_stored()
+        );
         assert!(cache.get(&key).is_none());
     }
 
@@ -871,7 +1042,11 @@ mod tests {
             content_encoding: None,
             initial_age: Duration::from_secs(45),
         };
-        assert!(cache.put_found(key.clone(), &fetched));
+        assert!(
+            cache
+                .put_found(key.clone(), &fetched, cache.fetch_fence(&key))
+                .is_stored()
+        );
         let (entry, freshness) = cache.get(&key).expect("aged entry");
         assert_eq!(freshness, Freshness::Fresh);
         let resource = entry.into_result().expect("resource");
@@ -881,7 +1056,11 @@ mod tests {
             initial_age: Duration::from_secs(60),
             ..fetched
         };
-        assert!(!cache.put_found(key.clone(), &already_expired));
+        assert!(
+            !cache
+                .put_found(key.clone(), &already_expired, cache.fetch_fence(&key))
+                .is_stored()
+        );
         assert!(cache.get(&key).is_none());
     }
 
@@ -902,7 +1081,11 @@ mod tests {
             initial_age: Duration::from_secs(300),
         };
 
-        assert!(!cache.put_found(key.clone(), &fetched));
+        assert!(
+            !cache
+                .put_found(key.clone(), &fetched, cache.fetch_fence(&key))
+                .is_stored()
+        );
         assert!(cache.get(&key).is_none());
     }
 
@@ -933,16 +1116,249 @@ mod tests {
             &key,
             "style",
             Ok(ProviderOriginOutcome::Modified(fetched)),
+            fetcher.cache.fetch_fence(&key),
             guard,
         )
         .expect("leader response");
         fetcher.cache.invalidate(&key);
 
         let outcome = follower.wait().await.expect("published leader result");
-        let ProviderFlightOutcome::Resource(follower_resource) = outcome else {
+        assert!(
+            !fetcher.cache.is_superseded(&key, outcome.fence),
+            "plain eviction must not advance the fence, so the outcome stays usable"
+        );
+        let ProviderFlightResult::Resource(follower_resource) = outcome.result else {
             panic!("follower must receive the leader representation");
         };
         assert_eq!(follower_resource.bytes(), leader_resource.bytes());
+    }
+
+    /// A refresh hint that lands while a fetch is in flight must also reach the
+    /// requests that joined that fetch. The fence filters at *lookup*, but
+    /// publication to followers bypasses lookup entirely, so the epoch has to
+    /// travel on the outcome — otherwise a hint is silently ignored for exactly
+    /// the concurrent requests it is most likely to overlap.
+    #[tokio::test]
+    async fn a_refresh_hint_during_a_flight_is_detectable_by_the_follower() {
+        let fetcher = ProviderFetcher::new(
+            NodeMetrics::new(),
+            Arc::new(ObjectStoreRegistry::without_options()),
+            TEST_PROVIDER_CACHE_MAX_BYTES,
+        );
+        let key = provider_key("https://example/hinted-during-flight.json");
+        let Flight::Leader(guard) = fetcher.cache.begin_fetch(key.clone()) else {
+            panic!("first caller must lead");
+        };
+        let Flight::Follower(follower) = fetcher.cache.begin_fetch(key.clone()) else {
+            panic!("second caller must follow");
+        };
+        let fetched = FetchedProviderResource {
+            bytes: Bytes::from_static(br#"{"version":8}"#),
+            policy: cache_policy("style", Some("max-age=3600")),
+            validators: Validators::default(),
+            content_encoding: None,
+            initial_age: Duration::ZERO,
+        };
+
+        let fetch_start_fence = fetcher.cache.fetch_fence(&key);
+        // The hint lands while the leader is still fetching.
+        fetcher.cache.invalidate_for_refresh(&key);
+
+        store_leader_result(
+            &fetcher,
+            &key,
+            "style",
+            Ok(ProviderOriginOutcome::Modified(fetched)),
+            fetch_start_fence,
+            guard,
+        )
+        .expect("the leader still returns the response it fetched");
+        assert!(
+            fetcher.cache.get(&key).is_none(),
+            "the pre-hint completion must stay unreachable by lookup"
+        );
+
+        let outcome = follower.wait().await.expect("published leader result");
+        assert_eq!(outcome.fence, fetch_start_fence);
+        assert!(
+            fetcher.cache.is_superseded(&key, outcome.fence),
+            "the follower must be able to tell that its outcome predates the hint"
+        );
+    }
+
+    #[test]
+    fn explicit_json_invalidation_removes_only_the_matching_representation() {
+        let fetcher = ProviderFetcher::new(
+            NodeMetrics::new(),
+            Arc::new(ObjectStoreRegistry::without_options()),
+            TEST_PROVIDER_CACHE_MAX_BYTES,
+        );
+        let url = "https://example/style.json";
+        let json_key =
+            ProviderFetchCacheKey::new("style", url, &["application/json"], BodyValidation::Json);
+        let bytes_key =
+            ProviderFetchCacheKey::new("sprite", url, &["application/json"], BodyValidation::Bytes);
+        let fetched = FetchedProviderResource {
+            bytes: Bytes::from_static(br#"{"version":8}"#),
+            policy: cache_policy("style", Some("max-age=60")),
+            validators: Validators::default(),
+            content_encoding: None,
+            initial_age: Duration::ZERO,
+        };
+        assert!(
+            fetcher
+                .cache
+                .put_found(
+                    json_key.clone(),
+                    &fetched,
+                    fetcher.cache.fetch_fence(&json_key)
+                )
+                .is_stored()
+        );
+        assert!(
+            fetcher
+                .cache
+                .put_found(
+                    bytes_key.clone(),
+                    &fetched,
+                    fetcher.cache.fetch_fence(&bytes_key)
+                )
+                .is_stored()
+        );
+
+        fetcher.invalidate_json(url.to_string(), "style", &["application/json"]);
+
+        assert!(fetcher.cache.get(&json_key).is_none());
+        assert!(fetcher.cache.get(&bytes_key).is_some());
+    }
+
+    #[test]
+    fn refresh_fence_rejects_a_pre_hint_inflight_completion() {
+        let cache = ProviderFetchCache::new(TEST_PROVIDER_CACHE_MAX_BYTES);
+        let key = provider_key("https://example/raced-style.json");
+        let fetched = FetchedProviderResource {
+            bytes: Bytes::from_static(br#"{"version":8}"#),
+            policy: cache_policy("style", Some("max-age=3600")),
+            validators: Validators::default(),
+            content_encoding: None,
+            initial_age: Duration::ZERO,
+        };
+        let fetch_start_fence = cache.fetch_fence(&key);
+
+        cache.invalidate_for_refresh(&key);
+        assert_eq!(
+            cache.put_found(key.clone(), &fetched, fetch_start_fence),
+            ProviderCacheStore::Superseded,
+            "a completion from before the hint must be refused, not stored and filtered"
+        );
+        assert!(
+            cache.get(&key).is_none(),
+            "completion from before the hint must remain unreachable"
+        );
+
+        let retry_fence = cache.fetch_fence(&key);
+        assert!(
+            cache
+                .put_found(key.clone(), &fetched, retry_fence)
+                .is_stored()
+        );
+        assert!(cache.get(&key).is_some());
+    }
+
+    /// The fence is bounded and expiring, so it must not be the only thing
+    /// keeping superseded bytes unreachable. Losing a fence entry may cost an
+    /// extra fetch; it must never make pre-hint content visible again.
+    #[test]
+    fn a_fence_entry_evicted_mid_flight_still_refuses_the_stale_completion() {
+        let cache = ProviderFetchCache::new(TEST_PROVIDER_CACHE_MAX_BYTES);
+        let key = provider_key("https://example/forgotten-fence.json");
+        let fetched = FetchedProviderResource {
+            bytes: Bytes::from_static(br#"{"version":8}"#),
+            policy: cache_policy("style", Some("max-age=3600")),
+            validators: Validators::default(),
+            content_encoding: None,
+            initial_age: Duration::ZERO,
+        };
+
+        // A fetch begins on a key that has never been refreshed, so it captures
+        // *no* per-key epoch at all.
+        let fetch_start_fence = cache.fetch_fence(&key);
+        assert_eq!(fetch_start_fence.key_epoch, None);
+
+        cache.invalidate_for_refresh(&key);
+
+        // The fence entry is dropped while the fetch is still running. Capacity
+        // eviction can do this at any moment and no expiry setting prevents it,
+        // so the per-key epoch now reads back as absent — indistinguishable from
+        // the "never refreshed" state the fetch captured.
+        cache.invalidation_epochs.invalidate(&key);
+        cache.invalidation_epochs.run_pending_tasks();
+        assert_eq!(cache.invalidation_epochs.get(&key), None);
+        assert_eq!(
+            cache.invalidation_epoch(&key),
+            fetch_start_fence.stored_epoch()
+        );
+
+        // Only the process-wide refresh count still records that a refresh
+        // happened, and it is what must make this fail closed.
+        assert_eq!(
+            cache.put_found(key.clone(), &fetched, fetch_start_fence),
+            ProviderCacheStore::Superseded,
+            "an evicted fence must not let a pre-hint completion be stored"
+        );
+        assert!(
+            cache.get(&key).is_none(),
+            "pre-hint content must stay unreachable after the fence is forgotten"
+        );
+    }
+
+    /// The fail-closed rule above must not tax ordinary traffic: with no refresh
+    /// anywhere, a completion is stored regardless of per-key fence state.
+    #[test]
+    fn without_any_refresh_a_completion_is_stored_even_with_no_fence_entry() {
+        let cache = ProviderFetchCache::new(TEST_PROVIDER_CACHE_MAX_BYTES);
+        let key = provider_key("https://example/never-refreshed.json");
+        let fetched = FetchedProviderResource {
+            bytes: Bytes::from_static(br#"{"version":8}"#),
+            policy: cache_policy("style", Some("max-age=3600")),
+            validators: Validators::default(),
+            content_encoding: None,
+            initial_age: Duration::ZERO,
+        };
+        let fence = cache.fetch_fence(&key);
+        assert_eq!(fence.key_epoch, None);
+        assert!(cache.put_found(key.clone(), &fetched, fence).is_stored());
+        assert!(cache.get(&key).is_some());
+    }
+
+    /// A refresh of an unrelated key advances the process-wide count. That alone
+    /// must not supersede a fetch whose own key still matches its captured epoch,
+    /// or every hint would discard concurrent work across the whole cache.
+    #[test]
+    fn a_refresh_of_another_key_does_not_supersede_a_matching_fence() {
+        let cache = ProviderFetchCache::new(TEST_PROVIDER_CACHE_MAX_BYTES);
+        let key = provider_key("https://example/mine.json");
+        let other = provider_key("https://example/theirs.json");
+        let fetched = FetchedProviderResource {
+            bytes: Bytes::from_static(br#"{"version":8}"#),
+            policy: cache_policy("style", Some("max-age=3600")),
+            validators: Validators::default(),
+            content_encoding: None,
+            initial_age: Duration::ZERO,
+        };
+
+        // Give this key a fence entry, so its state is present rather than absent.
+        cache.invalidate_for_refresh(&key);
+        let fence = cache.fetch_fence(&key);
+        assert!(fence.key_epoch.is_some());
+
+        cache.invalidate_for_refresh(&other);
+
+        assert!(
+            cache.put_found(key.clone(), &fetched, fence).is_stored(),
+            "another key's refresh must not discard this fetch"
+        );
+        assert!(cache.get(&key).is_some());
     }
 
     #[tokio::test(start_paused = true)]
@@ -992,7 +1408,11 @@ mod tests {
             initial_age: Duration::ZERO,
         };
         // Modified and 304 outcomes share this successful insertion path.
-        assert!(cache.put_found(first.clone(), &refreshed));
+        assert!(
+            cache
+                .put_found(first.clone(), &refreshed, cache.fetch_fence(&first))
+                .is_stored()
+        );
         assert!(cache.stale_revalidation_allowed(&first));
         assert!(!cache.stale_revalidation_allowed(&second));
     }
@@ -1017,6 +1437,7 @@ mod tests {
         cache.entries.insert(
             key.clone(),
             CachedProviderFetch::Found {
+                invalidation_epoch: 0,
                 bytes: Bytes::from_static(b"expired"),
                 cache_control: "public, max-age=0, stale-while-revalidate=60".into(),
                 validators: Validators::default(),
@@ -1051,7 +1472,11 @@ mod tests {
             content_encoding: None,
             initial_age: Duration::ZERO,
         };
-        assert!(cache.put_found(key.clone(), &refreshed));
+        assert!(
+            cache
+                .put_found(key.clone(), &refreshed, cache.fetch_fence(&key))
+                .is_stored()
+        );
 
         assert!(matches!(cache.get(&key), Some((_, Freshness::Fresh))));
         assert!(cache.stale_representation(&key).is_none());
@@ -1070,6 +1495,7 @@ mod tests {
             .checked_sub(Duration::from_secs(1))
             .expect("test instant supports a one-second lookback");
         let entry = CachedProviderFetch::Found {
+            invalidation_epoch: 0,
             bytes: Bytes::from_static(b"x"),
             cache_control: "public, max-age=60".into(),
             validators: Validators::default(),
@@ -1083,6 +1509,7 @@ mod tests {
         assert_eq!(entry.cache_outcome(Freshness::Stale), "stale_hit");
 
         let expired = CachedProviderFetch::Found {
+            invalidation_epoch: 0,
             bytes: Bytes::from_static(b"x"),
             cache_control: "public, max-age=60".into(),
             validators: Validators::default(),

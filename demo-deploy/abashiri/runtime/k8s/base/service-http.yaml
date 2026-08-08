@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: abashiri
+  labels:
+    app: abashiri
+spec:
+  type: ClusterIP
+  selector:
+    app: abashiri
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

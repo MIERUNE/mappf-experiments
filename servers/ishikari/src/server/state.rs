@@ -74,13 +74,21 @@ struct DecodedDemExpiry {
 
 impl
     moka::Expiry<
-        (ishikari_core::interned::TilesetId, u64),
+        (
+            ishikari_core::interned::TilesetId,
+            ishikari_core::storage::ArchiveGeneration,
+            u64,
+        ),
         Option<Arc<super::tileset::terrain::dem::DemTile>>,
     > for DecodedDemExpiry
 {
     fn expire_after_create(
         &self,
-        _key: &(ishikari_core::interned::TilesetId, u64),
+        _key: &(
+            ishikari_core::interned::TilesetId,
+            ishikari_core::storage::ArchiveGeneration,
+            u64,
+        ),
         value: &Option<Arc<super::tileset::terrain::dem::DemTile>>,
         _created_at: std::time::Instant,
     ) -> Option<Duration> {
@@ -101,11 +109,17 @@ pub(crate) struct AppStateInner {
     pub(super) provider_fetcher: ProviderFetcher,
     pub(super) glyph_composite_cache: super::glyph::GlyphCompositeCache,
     pub(super) delivery_auth: Option<mmpf_auth::DeliveryAuth>,
-    /// Per-pod cache of transcoded MLT tiles, keyed by (resource routing key,
-    /// tile id). Populated lazily on first `.mlt` request; see
+    /// Per-pod cache of transcoded MLT tiles, keyed by resource, archive
+    /// generation, and tile id. Populated lazily on first `.mlt` request; see
     /// `server::tileset::mlt`.
-    pub(super) mlt_cache:
-        moka::future::Cache<(ishikari_core::interned::ResourceRoutingKey, u64), bytes::Bytes>,
+    pub(super) mlt_cache: moka::future::Cache<
+        (
+            ishikari_core::interned::ResourceRoutingKey,
+            ishikari_core::storage::ArchiveGeneration,
+            u64,
+        ),
+        bytes::Bytes,
+    >,
     /// Generated contour/hillshade MVTs. Async cache initialization single-flights
     /// the 3x3 source fetch and CPU generation for each derived tile.
     pub(super) derived_tile_cache: moka::future::Cache<
@@ -116,7 +130,11 @@ pub(crate) struct AppStateInner {
     /// neighboring derived tiles (each 3x3 window overlaps its neighbors in six
     /// of nine sources), so each source tile is WebP-decoded roughly once.
     pub(super) dem_tile_cache: moka::future::Cache<
-        (ishikari_core::interned::TilesetId, u64),
+        (
+            ishikari_core::interned::TilesetId,
+            ishikari_core::storage::ArchiveGeneration,
+            u64,
+        ),
         Option<Arc<super::tileset::terrain::dem::DemTile>>,
     >,
     /// Coalesces Moka maintenance when multiple metrics collectors scrape at
@@ -206,7 +224,11 @@ impl AppState {
             dem_tile_cache: moka::future::Cache::builder()
                 .max_capacity(cache_capacities.dem_tile_bytes())
                 .weigher(
-                    |_key: &(ishikari_core::interned::TilesetId, u64),
+                    |_key: &(
+                        ishikari_core::interned::TilesetId,
+                        ishikari_core::storage::ArchiveGeneration,
+                        u64,
+                    ),
                      value: &Option<Arc<super::tileset::terrain::dem::DemTile>>| {
                         value.as_ref().map_or(1, |tile| {
                             u32::try_from(tile.byte_size()).unwrap_or(u32::MAX)
@@ -223,11 +245,17 @@ impl AppState {
         }))
     }
 
-    /// Per-pod transcoded-MLT cache, keyed by `(resource routing key, tile id)`.
+    /// Per-pod transcoded-MLT cache, including the source archive generation.
     pub(crate) fn mlt_cache(
         &self,
-    ) -> &moka::future::Cache<(ishikari_core::interned::ResourceRoutingKey, u64), bytes::Bytes>
-    {
+    ) -> &moka::future::Cache<
+        (
+            ishikari_core::interned::ResourceRoutingKey,
+            ishikari_core::storage::ArchiveGeneration,
+            u64,
+        ),
+        bytes::Bytes,
+    > {
         &self.mlt_cache
     }
 
@@ -253,7 +281,11 @@ impl AppState {
     pub(crate) fn dem_tile_cache(
         &self,
     ) -> &moka::future::Cache<
-        (ishikari_core::interned::TilesetId, u64),
+        (
+            ishikari_core::interned::TilesetId,
+            ishikari_core::storage::ArchiveGeneration,
+            u64,
+        ),
         Option<Arc<super::tileset::terrain::dem::DemTile>>,
     > {
         &self.dem_tile_cache
@@ -353,6 +385,7 @@ mod tests {
         };
         let key = (
             ishikari_core::interned::TilesetId::try_new("terrain").unwrap(),
+            ishikari_core::storage::ArchiveGeneration::from_wire("e:test").unwrap(),
             1,
         );
         assert_eq!(

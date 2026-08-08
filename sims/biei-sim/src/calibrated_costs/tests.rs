@@ -188,7 +188,7 @@ fn derive_with_base_cpu_for_test(
     base: &CostConfig,
 ) -> Result<CalibratedCosts> {
     ensure_uncensored_render_tail(profile, "test profile")?;
-    derive_with_cpu_reference(
+    Ok(derive_with_cpu_reference(
         profile,
         base,
         (
@@ -197,7 +197,7 @@ fn derive_with_base_cpu_for_test(
             CalibrationStageCoverage::default(),
         ),
         Vec::new(),
-    )
+    ))
 }
 
 fn tile_task(scale: Scale, format: ImageFormat, tile_size: u16) -> InternalTask {

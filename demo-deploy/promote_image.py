@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SERVICES = ("biei", "ishikari")
+SERVICES = ("abashiri", "biei", "ishikari")
 DIGEST = r"sha256:[0-9a-f]{64}"
 BUILD_OUTPUT = re.compile(rf"mmpf-image-v1\nrepository=([^\n]+)\ndigest=({DIGEST})\n?")
 

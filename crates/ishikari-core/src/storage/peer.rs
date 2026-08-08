@@ -24,6 +24,7 @@ use crate::{
 };
 use mmpf_pmtiles::{DEFAULT_MAX_DECOMPRESSED_BYTES, MIN_BOOTSTRAP_BYTES};
 
+use super::generation::{ArchiveGeneration, ArchiveKey};
 use super::routing::{HrwRouter, ScoredPeer};
 use mmpf_common::sync::lock_unpoisoned;
 
@@ -196,6 +197,7 @@ pub type FetchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<InternalFetchResponse, PeerFetchError>> + Send + 'a>>;
 
 pub const TILE_SOURCE_HEADER: &str = "x-ishikari-tile-source";
+pub const ARCHIVE_GENERATION_HEADER: &str = "x-ishikari-archive-generation";
 pub const PROVIDER_CACHE_CONTROL_HEADER: &str = "x-ishikari-provider-cache-control";
 pub const PROVIDER_AGE_HEADER: &str = "x-ishikari-provider-age";
 pub const PROVIDER_ETAG_HEADER: &str = "x-ishikari-provider-etag";
@@ -435,6 +437,7 @@ impl InternalTileSource {
 /// Body and optional metadata returned by Ishikari's internal transport.
 pub struct InternalFetchResponse {
     pub bytes: Bytes,
+    pub archive_generation: Option<ArchiveGeneration>,
     pub tile_source: Option<InternalTileSource>,
     pub provider_cache_control: Option<String>,
     pub provider_age_seconds: Option<u64>,
@@ -461,6 +464,7 @@ impl InternalFetchResponse {
     pub(crate) fn bytes(bytes: Bytes) -> Self {
         Self {
             bytes,
+            archive_generation: None,
             tile_source: None,
             provider_cache_control: None,
             provider_age_seconds: None,
@@ -474,6 +478,7 @@ impl InternalFetchResponse {
     pub(crate) fn tile(bytes: Bytes, source: InternalTileSource) -> Self {
         Self {
             bytes,
+            archive_generation: None,
             tile_source: Some(source),
             provider_cache_control: None,
             provider_age_seconds: None,
@@ -598,12 +603,21 @@ impl PeerBackend {
         } else {
             format!("/_internal/pmtiles/{key}/bootstrap")
         };
+        let candidates = self.route_tileset_for(tileset_id, "bootstrap").await;
         let result = self
-            .route_fetch_optional(tileset_id, &path, "bootstrap")
+            .route_fetch_optional_response_candidates(
+                candidates,
+                tileset_id.as_ref(),
+                &path,
+                "bootstrap",
+            )
             .await?;
         match result {
-            Some(bytes) => {
-                let transfer = decode_bootstrap_wire(bytes, include_metadata)?;
+            Some(response) => {
+                let generation = response.archive_generation.ok_or_else(|| {
+                    anyhow::anyhow!("peer bootstrap response omitted archive generation")
+                })?;
+                let transfer = decode_bootstrap_wire(response.bytes, generation, include_metadata)?;
                 Ok(Some(transfer))
             }
             None => Ok(None),
@@ -613,13 +627,25 @@ impl PeerBackend {
     /// Routes a leaf request across candidate peers, returning the first successful result.
     pub(super) async fn route_leaf(
         &self,
-        tileset_id: &TilesetId,
+        archive: &ArchiveKey,
         offset: u64,
         length: usize,
     ) -> Result<Option<Bytes>> {
-        let key = encode_tileset_path(tileset_id);
+        let key = encode_tileset_path(&archive.tileset_id);
         let path = format!("/_internal/pmtiles/{key}/leaf/{offset}/{length}");
-        self.route_fetch_optional(tileset_id, &path, "leaf").await
+        let candidates = self.route_tileset_for(&archive.tileset_id, "leaf").await;
+        let response = self
+            .route_fetch_optional_response_candidates(
+                candidates,
+                archive.tileset_id.as_ref(),
+                &path,
+                "leaf",
+            )
+            .await?;
+        Ok(response.and_then(|response| {
+            (response.archive_generation.as_ref() == Some(&archive.generation))
+                .then_some(response.bytes)
+        }))
     }
 
     /// Fetches tile bytes from a peer over the internal tile endpoint.
@@ -837,20 +863,6 @@ impl PeerBackend {
             "all resource forwards failed; falling back local"
         );
         Ok(None)
-    }
-
-    /// Routes a request across tileset candidate peers, returning `None` to signal local fallback.
-    async fn route_fetch_optional(
-        &self,
-        tileset_id: &TilesetId,
-        path: &str,
-        kind: &str,
-    ) -> Result<Option<Bytes>> {
-        let candidates = self.route_tileset_for(tileset_id, kind).await;
-        Ok(self
-            .route_fetch_optional_response_candidates(candidates, tileset_id.as_ref(), path, kind)
-            .await?
-            .map(|response| response.bytes))
     }
 
     async fn fetch_from_peer(
@@ -1071,13 +1083,18 @@ fn encode_tileset_path(tileset_id: &TilesetId) -> String {
 ///
 /// Without metadata: raw bootstrap bytes.
 /// With metadata: `[8 bytes: bootstrap_len as u64 LE][bootstrap][metadata]`.
-fn decode_bootstrap_wire(body: Bytes, include_metadata: bool) -> Result<BootstrapTransfer> {
+fn decode_bootstrap_wire(
+    body: Bytes,
+    generation: ArchiveGeneration,
+    include_metadata: bool,
+) -> Result<BootstrapTransfer> {
     if !include_metadata {
         anyhow::ensure!(
             body.len() <= MIN_BOOTSTRAP_BYTES,
             "bootstrap transfer exceeds the accepted bootstrap size"
         );
         return Ok(BootstrapTransfer {
+            generation,
             bootstrap: body,
             metadata: None,
         });
@@ -1112,6 +1129,7 @@ fn decode_bootstrap_wire(body: Bytes, include_metadata: bool) -> Result<Bootstra
         None
     };
     Ok(BootstrapTransfer {
+        generation,
         bootstrap,
         metadata,
     })
@@ -1142,13 +1160,21 @@ mod tests {
     use crate::{
         interned::{ResourceRoutingKey, TilesetId},
         metrics::NodeMetrics,
-        storage::routing::HrwRouter,
+        storage::{ArchiveGeneration, ArchiveKey, routing::HrwRouter},
     };
 
     use super::Peer;
 
     fn tileset_id(value: &str) -> TilesetId {
         TilesetId::try_new(value).expect("valid test tileset id")
+    }
+
+    fn generation() -> ArchiveGeneration {
+        ArchiveGeneration::from_wire("e:test").expect("valid test generation")
+    }
+
+    fn archive_key(value: &str) -> ArchiveKey {
+        ArchiveKey::new(&tileset_id(value), generation())
     }
 
     fn derived_routing_key() -> ResourceRoutingKey {
@@ -1163,7 +1189,7 @@ mod tests {
             frame.put_u64_le(declared_len);
             frame.extend_from_slice(&[1, 2]);
 
-            let error = decode_bootstrap_wire(frame.freeze(), true)
+            let error = decode_bootstrap_wire(frame.freeze(), generation(), true)
                 .err()
                 .expect("invalid bootstrap length must fail");
             assert!(
@@ -1181,7 +1207,7 @@ mod tests {
         frame.extend_from_slice(&bootstrap);
         frame.extend_from_slice(&[8, 9]);
 
-        let transfer = decode_bootstrap_wire(frame.freeze(), true)
+        let transfer = decode_bootstrap_wire(frame.freeze(), generation(), true)
             .expect("maximum bootstrap and bounded metadata must decode");
         assert_eq!(transfer.bootstrap.as_ref(), bootstrap);
         assert_eq!(transfer.metadata.as_deref(), Some([8, 9].as_slice()));
@@ -1190,7 +1216,7 @@ mod tests {
     #[test]
     fn bootstrap_only_wire_rejects_oversized_payloads() {
         let body = Bytes::from(vec![0; MIN_BOOTSTRAP_BYTES + 1]);
-        let error = decode_bootstrap_wire(body, false)
+        let error = decode_bootstrap_wire(body, generation(), false)
             .err()
             .expect("oversized bootstrap-only transfer must fail");
         assert!(error.to_string().contains("accepted bootstrap size"));
@@ -1340,10 +1366,12 @@ mod tests {
                     .await
                     .expect("release semaphore closed")
                     .forget();
-                Ok(InternalFetchResponse::tile(
+                let mut response = InternalFetchResponse::tile(
                     Bytes::from_static(b"peer response"),
                     InternalTileSource::Cache,
-                ))
+                );
+                response.archive_generation = Some(generation());
+                Ok(response)
             })
         }
     }
@@ -1370,10 +1398,12 @@ mod tests {
                 if self.fatal_peers.contains(&peer.id) {
                     return Err(PeerFetchError::Fatal("injected failure".into()));
                 }
-                Ok(InternalFetchResponse::tile(
+                let mut response = InternalFetchResponse::tile(
                     Bytes::from_static(b"peer response"),
                     InternalTileSource::Cache,
-                ))
+                );
+                response.archive_generation = Some(generation());
+                Ok(response)
             })
         }
     }
@@ -1926,7 +1956,7 @@ mod tests {
         );
 
         let result = backend
-            .route_leaf(&tileset_id("demo/terrain"), 128, 256)
+            .route_leaf(&archive_key("demo/terrain"), 128, 256)
             .await
             .expect("routed leaf");
 
@@ -1981,5 +2011,23 @@ mod tests {
         assert!(
             encoded.contains("ishikari_peer_fetch_total{outcome=\"success\",resource=\"leaf\"} 1")
         );
+    }
+
+    #[tokio::test]
+    async fn leaf_bytes_from_another_generation_are_ignored() {
+        let peers = vec![peer("node-a", 8001)];
+        let backend = PeerBackend::with_dependencies(
+            "entry".to_string(),
+            Arc::new(StaticPeerDirectory { peers }),
+            HrwRouter::new(1, 512),
+            Arc::new(RecordingTransport::default()),
+            NodeMetrics::new(),
+        );
+        let archive = ArchiveKey::new(
+            &tileset_id("demo/terrain"),
+            ArchiveGeneration::from_wire("e:other").unwrap(),
+        );
+
+        assert_eq!(backend.route_leaf(&archive, 128, 256).await.unwrap(), None);
     }
 }

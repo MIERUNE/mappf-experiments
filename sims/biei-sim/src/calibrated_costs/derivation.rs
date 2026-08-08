@@ -200,7 +200,7 @@ pub fn derive_costs_with_cpu_reference(
             CalibrationStageCoverage::derived(reference_warm_actual.count),
         ),
         notes,
-    )?;
+    );
     derived.sampling_model.add_cpu_reference(cpu_reference);
     Ok(derived)
 }
@@ -316,7 +316,7 @@ pub(super) fn derive_with_cpu_reference(
     base: &CostConfig,
     cpu_reference: (CostRange, Duration, CalibrationStageCoverage),
     mut notes: Vec<String>,
-) -> Result<CalibratedCosts> {
+) -> CalibratedCosts {
     let render = histogram(profile, "biei_render_duration_seconds");
     let warm = render.map_or_else(MergedHistogram::empty, |render| {
         let render_shapes = render
@@ -405,7 +405,7 @@ pub(super) fn derive_with_cpu_reference(
         )
     };
 
-    Ok(CalibratedCosts {
+    CalibratedCosts {
         costs: CostConfig {
             style_setup_cost,
             source_load_cost,
@@ -426,7 +426,7 @@ pub(super) fn derive_with_cpu_reference(
             sla: CalibrationStageCoverage::default(),
         },
         sampling_model: EmpiricalCostModel::from_profile(profile),
-    })
+    }
 }
 
 /// Record resource activity in the realistic traffic window. This window is

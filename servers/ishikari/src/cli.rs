@@ -163,6 +163,15 @@ struct Cli {
         default_value_t = 60
     )]
     tile_negative_ttl_secs: u64,
+    /// Seconds a cached logical PMTiles bootstrap may be reused before its
+    /// object generation is observed again. Generation-keyed data caches remain
+    /// reusable when the archive is unchanged.
+    #[arg(
+        long = "archive-revalidation-interval",
+        env = "ISKR_ARCHIVE_REVALIDATION_INTERVAL",
+        default_value_t = 300
+    )]
+    archive_revalidation_interval_secs: u64,
     #[arg(long, env = "ISKR_STYLE_TEMPLATES")]
     style_templates: Option<String>,
     #[arg(long, env = "ISKR_GLYPH_URL_TEMPLATE")]
@@ -278,6 +287,7 @@ fn resolve(cli: Cli) -> Result<Options, String> {
         tile_cache_max_bytes: cli.tile_cache_max_bytes,
         chunk_cache_max_bytes: cli.chunk_cache_max_bytes,
         tile_negative_ttl_secs: cli.tile_negative_ttl_secs,
+        archive_revalidation_interval_secs: cli.archive_revalidation_interval_secs,
         style_templates: cli.style_templates,
         glyph_url_template: cli.glyph_url_template,
         sprite_templates: cli.sprite_templates,
@@ -362,6 +372,7 @@ mod tests {
             tile_cache_max_bytes: DEFAULT_TILE_CACHE_MAX_BYTES,
             chunk_cache_max_bytes: DEFAULT_CHUNK_CACHE_MAX_BYTES,
             tile_negative_ttl_secs: 60,
+            archive_revalidation_interval_secs: 300,
             style_templates: None,
             glyph_url_template: None,
             sprite_templates: None,

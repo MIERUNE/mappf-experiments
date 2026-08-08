@@ -13,6 +13,7 @@ use tracing::{debug, warn};
 
 use super::{
     chunked_store::{BackendLatencyModel, ChunkedStore, ChunkedStoreConfig},
+    generation::{ArchiveGeneration, ArchiveKey},
     peer::{
         InternalTileSource, InternalTransport, Peer, PeerBackend, PeerDirectory, PeerFetchError,
         ProviderRequest, ProviderRouteOutcome,
@@ -26,8 +27,9 @@ use crate::{
     interned::{ResourceRoutingKey, TilesetId},
     metrics::NodeMetrics,
     pmtiles::{
-        BootstrapTransfer, DEFAULT_ARCHIVE_CACHE_MAX_BYTES, DEFAULT_LEAF_CACHE_MAX_BYTES, Header,
-        LocalLeafError, Metadata, Reader as PmtilesReader, StorageError, TileData,
+        ArchiveResource, BootstrapTransfer, DEFAULT_ARCHIVE_CACHE_MAX_BYTES,
+        DEFAULT_LEAF_CACHE_MAX_BYTES, Header, LocalLeafError, Metadata, Reader as PmtilesReader,
+        StorageError, TileData,
     },
 };
 
@@ -57,6 +59,13 @@ impl Default for ResourceCacheCapacities {
 pub struct TilesetInfo {
     pub header: Header,
     pub metadata: Arc<Metadata>,
+    pub generation: ArchiveGeneration,
+}
+
+/// Tile bytes bound to the object generation used for their PMTiles lookup.
+pub struct ResolvedTile {
+    pub data: TileData,
+    pub generation: ArchiveGeneration,
 }
 
 impl TilesetInfo {
@@ -119,7 +128,7 @@ pub enum PeerTileCachePolicy {
 }
 
 enum CachedTileLookup {
-    Found(TileData),
+    Found(ResolvedTile),
     NotFound,
     None,
 }
@@ -240,6 +249,7 @@ impl ResourceResolver {
             pmtiles_storage,
             cache_capacities.archive_max_bytes,
             cache_capacities.leaf_max_bytes,
+            tuning.archive_revalidation_interval(),
         )?);
         Ok(Self {
             peer_backend,
@@ -318,14 +328,23 @@ impl ResourceResolver {
         &self,
         tileset_id: TilesetId,
         tile_id: u64,
-    ) -> Result<(Option<TileData>, TileSource), TilesetError> {
+    ) -> Result<(Option<ResolvedTile>, TileSource), TilesetError> {
         debug!(
             tileset_id = %tileset_id,
             tile_id = tile_id,
             "tile request"
         );
 
-        match self.load_cached_tile(&tileset_id, tile_id) {
+        let Some(archive) = self
+            .pmtiles
+            .archive_key(&tileset_id)
+            .await
+            .map_err(internal_tileset_error)?
+        else {
+            return Ok((None, TileSource::SelfMiss));
+        };
+
+        match self.load_cached_tile(&archive, tile_id) {
             CachedTileLookup::Found(tile) => {
                 return Ok((Some(tile), TileSource::SelfTileCache));
             }
@@ -349,7 +368,7 @@ impl ResourceResolver {
             }
 
             match self
-                .load_tile_from_peer(&peer.peer, &tileset_id, tile_id)
+                .load_tile_from_peer(&peer.peer, &archive, tile_id)
                 .await
             {
                 Ok(Some((tile, peer_source))) => {
@@ -359,25 +378,13 @@ impl ResourceResolver {
                     };
                     return Ok((Some(tile), source));
                 }
-                // A reachable owner resolves the tile against the same shared
-                // object storage as every other node, so its "not found" is
-                // authoritative: no other candidate and no local re-resolution
-                // can find it. Record a negative L1 entry and stop, rather than
-                // forwarding the same 404 to the remaining candidates and then
-                // resolving it locally — which turned every absent tile (common
-                // in sparse archives) into up to `candidate_count` peer
-                // round-trips plus a full local backend resolve. (Staleness of
-                // that negative entry is bounded by cache eviction today; a TTL
-                // on negative entries is the separate, correct fix.)
                 Err(TilesetError::Miss) => {
                     debug!(
                         peer_id = %peer.peer.id,
                         tileset_id = %tileset_id,
                         tile_id = tile_id,
-                        "peer reported tile absent; negative-caching and stopping"
+                        "peer reported tile absent; falling back to the locally pinned generation"
                     );
-                    self.cache_tile_miss(&tileset_id, tile_id);
-                    return Ok((None, TileSource::PeerMiss));
                 }
                 // The peer served tile bytes but the tileset header could not be
                 // resolved here — inconclusive, so fall back rather than
@@ -405,7 +412,7 @@ impl ResourceResolver {
         &self,
         tileset_id: &TilesetId,
         tile_id: u64,
-    ) -> Result<(Option<TileData>, TileSource), TilesetError> {
+    ) -> Result<(Option<ResolvedTile>, TileSource), TilesetError> {
         let (tile, read_source) = self.load_local_tile(tileset_id, tile_id).await?;
         let source = if tile.is_some() && read_source == PmtilesReadSource::Cache {
             TileSource::SelfChunkCache
@@ -422,14 +429,22 @@ impl ResourceResolver {
         &self,
         tileset_id: TilesetId,
         tile_id: u64,
-    ) -> Result<(Option<TileData>, TileSource), TilesetError> {
+    ) -> Result<(Option<ResolvedTile>, TileSource), TilesetError> {
         debug!(
             tileset_id = %tileset_id,
             tile_id = tile_id,
             "internal tile request"
         );
 
-        match self.load_cached_tile(&tileset_id, tile_id) {
+        let Some(archive) = self
+            .pmtiles
+            .archive_key(&tileset_id)
+            .await
+            .map_err(internal_tileset_error)?
+        else {
+            return Ok((None, TileSource::SelfMiss));
+        };
+        match self.load_cached_tile(&archive, tile_id) {
             CachedTileLookup::Found(tile) => {
                 return Ok((Some(tile), TileSource::SelfTileCache));
             }
@@ -445,7 +460,15 @@ impl ResourceResolver {
         &self,
         tileset_id: TilesetId,
     ) -> Result<Option<Arc<TilesetInfo>>, TilesetError> {
-        if let Some(info) = self.resource_cache.get(&tileset_id) {
+        let Some(archive) = self
+            .pmtiles
+            .archive_key(&tileset_id)
+            .await
+            .map_err(internal_tileset_error)?
+        else {
+            return Ok(None);
+        };
+        if let Some(info) = self.resource_cache.get(&archive) {
             debug!(
                 tileset_id = %tileset_id,
                 "tileset info cache hit"
@@ -458,11 +481,12 @@ impl ResourceResolver {
             "tileset info request"
         );
 
-        let Some((header, metadata)) = self.read_tileset_info(&tileset_id).await? else {
+        let Some(info) = self.read_tileset_info(&tileset_id).await? else {
             return Ok(None);
         };
-        let info = Arc::new(TilesetInfo { header, metadata });
-        self.resource_cache.put(&tileset_id, info.clone());
+        let archive = ArchiveKey::new(&tileset_id, info.generation.clone());
+        let info = Arc::new(info);
+        self.resource_cache.put(&archive, info.clone());
         Ok(Some(info))
     }
 
@@ -476,10 +500,6 @@ impl ResourceResolver {
         &self,
         tileset_id: TilesetId,
     ) -> Result<ArchivePresence, TilesetError> {
-        // A cached full tileset info means the archive is definitely present.
-        if self.resource_cache.get(&tileset_id).is_some() {
-            return Ok(ArchivePresence::Present);
-        }
         let header = self
             .pmtiles
             .header(&tileset_id)
@@ -509,7 +529,7 @@ impl ResourceResolver {
         tileset_id: TilesetId,
         offset: u64,
         length: usize,
-    ) -> Result<Option<Bytes>, LeafBytesError> {
+    ) -> Result<Option<ArchiveResource<Bytes>>, LeafBytesError> {
         match self
             .pmtiles
             .load_leaf_bytes_local(&tileset_id, offset, length)
@@ -548,7 +568,11 @@ impl ResourceResolver {
                 _ => return Err(PeerFetchError::NotFound),
             };
             return tile
-                .map(|tile| InternalFetchResponse::tile(tile.bytes, source))
+                .map(|tile| {
+                    let mut response = InternalFetchResponse::tile(tile.data.bytes, source);
+                    response.archive_generation = Some(tile.generation);
+                    response
+                })
                 .ok_or(PeerFetchError::NotFound);
         }
 
@@ -578,9 +602,13 @@ impl ResourceResolver {
                 body.put_u64_le(transfer.bootstrap.len() as u64);
                 body.extend_from_slice(&transfer.bootstrap);
                 body.extend_from_slice(&metadata);
-                return Ok(InternalFetchResponse::bytes(body.freeze()));
+                let mut response = InternalFetchResponse::bytes(body.freeze());
+                response.archive_generation = Some(transfer.generation);
+                return Ok(response);
             }
-            return Ok(InternalFetchResponse::bytes(transfer.bootstrap));
+            let mut response = InternalFetchResponse::bytes(transfer.bootstrap);
+            response.archive_generation = Some(transfer.generation);
+            return Ok(response);
         }
 
         if let Some(arguments) = operation.strip_prefix("leaf/") {
@@ -602,7 +630,11 @@ impl ResourceResolver {
                     }
                     LeafBytesError::Tileset(error) => simulator_fetch_error(error),
                 })?
-                .map(InternalFetchResponse::bytes)
+                .map(|leaf| {
+                    let mut response = InternalFetchResponse::bytes(leaf.value);
+                    response.archive_generation = Some(leaf.generation);
+                    response
+                })
                 .ok_or(PeerFetchError::NotFound);
         }
 
@@ -615,26 +647,21 @@ impl ResourceResolver {
     async fn read_tileset_info(
         &self,
         tileset_id: &TilesetId,
-    ) -> Result<Option<(Header, Arc<Metadata>)>, TilesetError> {
-        let header = self
+    ) -> Result<Option<TilesetInfo>, TilesetError> {
+        let info = self
             .pmtiles
-            .header(tileset_id)
+            .info(tileset_id)
             .await
             .map_err(internal_tileset_error)?;
-        let Some(header) = header else {
+        let Some(info) = info else {
             return Ok(None);
         };
-
-        let metadata = self
-            .pmtiles
-            .metadata(tileset_id)
-            .await
-            .map_err(internal_tileset_error)?;
-        let Some(metadata) = metadata else {
-            return Ok(None);
-        };
-
-        Ok(Some((header, metadata)))
+        let (header, metadata) = info.value;
+        Ok(Some(TilesetInfo {
+            header,
+            metadata,
+            generation: info.generation,
+        }))
     }
 
     /// Fetches a tile from the local PMTiles-backed storage path.
@@ -642,7 +669,7 @@ impl ResourceResolver {
         &self,
         tileset_id: &TilesetId,
         tile_id: u64,
-    ) -> Result<(Option<TileData>, PmtilesReadSource), TilesetError> {
+    ) -> Result<(Option<ResolvedTile>, PmtilesReadSource), TilesetError> {
         let (tile, source) = self
             .pmtiles
             .storage()
@@ -650,25 +677,34 @@ impl ResourceResolver {
             .await;
         let tile = tile.map_err(internal_tileset_error)?;
 
-        let Some(tile) = tile else {
-            self.cache_tile_miss(tileset_id, tile_id);
+        let Some(resource) = tile else {
             return Ok((None, source));
         };
-
-        self.cache_tile_hit(tileset_id, tile_id, &tile);
-        Ok((Some(tile), source))
+        let archive = ArchiveKey::new(tileset_id, resource.generation.clone());
+        let Some(tile) = resource.value else {
+            self.cache_tile_miss(&archive, tile_id);
+            return Ok((None, source));
+        };
+        self.cache_tile_hit(&archive, tile_id, &tile);
+        Ok((
+            Some(ResolvedTile {
+                data: tile,
+                generation: resource.generation,
+            }),
+            source,
+        ))
     }
 
     /// Forwards a tile request to the selected peer over the internal HTTP API.
     async fn load_tile_from_peer(
         &self,
         peer: &Peer,
-        tileset_id: &TilesetId,
+        archive: &ArchiveKey,
         tile_id: u64,
-    ) -> Result<Option<(TileData, InternalTileSource)>, TilesetError> {
+    ) -> Result<Option<(ResolvedTile, InternalTileSource)>, TilesetError> {
         let response = self
             .peer_backend
-            .fetch_tile_bytes(peer, tileset_id, tile_id)
+            .fetch_tile_bytes(peer, &archive.tileset_id, tile_id)
             .await
             .map_err(|error| match error {
                 PeerFetchError::NotFound => TilesetError::Miss,
@@ -682,35 +718,41 @@ impl ResourceResolver {
                 PeerFetchError::Fatal(message) => TilesetError::Upstream(message),
             })?;
 
+        if response.archive_generation.as_ref() != Some(&archive.generation) {
+            return Ok(None);
+        }
         let header = self
             .pmtiles
-            .header(tileset_id)
+            .header(&archive.tileset_id)
             .await
             .map_err(internal_tileset_error)?;
-        let Some(header) = header else {
+        let Some(header) = header.filter(|header| header.generation == archive.generation) else {
             return Ok(None);
         };
         let tile = TileData {
             bytes: response.bytes,
-            content_type: header.tile_type.content_type(),
-            content_encoding: header.tile_compression.content_encoding(),
+            content_type: header.value.tile_type.content_type(),
+            content_encoding: header.value.tile_compression.content_encoding(),
         };
         if self.peer_tile_cache_policy == PeerTileCachePolicy::EntryAndOwner {
-            self.cache_tile_hit(tileset_id, tile_id, &tile);
+            self.cache_tile_hit(archive, tile_id, &tile);
         }
         Ok(Some((
-            tile,
+            ResolvedTile {
+                data: tile,
+                generation: archive.generation.clone(),
+            },
             response.tile_source.unwrap_or(InternalTileSource::Backend),
         )))
     }
 
     /// Returns a tile from the local L1 tile cache when present.
-    fn load_cached_tile(&self, tileset_id: &TilesetId, tile_id: u64) -> CachedTileLookup {
-        let Some(entry) = self.tile_cache.get(&TileCacheKey::new(tileset_id, tile_id)) else {
+    fn load_cached_tile(&self, archive: &ArchiveKey, tile_id: u64) -> CachedTileLookup {
+        let Some(entry) = self.tile_cache.get(&TileCacheKey::new(archive, tile_id)) else {
             return CachedTileLookup::None;
         };
         tracing::debug!(
-            tileset_id = %tileset_id,
+            tileset_id = %archive.tileset_id,
             tile_id = tile_id,
             "tile cache hit"
         );
@@ -719,19 +761,22 @@ impl ResourceResolver {
                 bytes,
                 content_type,
                 content_encoding,
-            } => CachedTileLookup::Found(TileData {
-                bytes,
-                content_type,
-                content_encoding,
+            } => CachedTileLookup::Found(ResolvedTile {
+                data: TileData {
+                    bytes,
+                    content_type,
+                    content_encoding,
+                },
+                generation: archive.generation.clone(),
             }),
             CachedTile::NotFound => CachedTileLookup::NotFound,
         }
     }
 
     /// Stores a positive tile cache entry in the local L1 tile cache.
-    fn cache_tile_hit(&self, tileset_id: &TilesetId, tile_id: u64, tile: &TileData) {
+    fn cache_tile_hit(&self, archive: &ArchiveKey, tile_id: u64, tile: &TileData) {
         self.tile_cache.put(
-            TileCacheKey::new(tileset_id, tile_id),
+            TileCacheKey::new(archive, tile_id),
             CachedTile::Found {
                 bytes: tile.bytes.clone(),
                 content_type: tile.content_type,
@@ -741,9 +786,9 @@ impl ResourceResolver {
     }
 
     /// Stores a negative tile cache entry in the local L1 tile cache.
-    fn cache_tile_miss(&self, tileset_id: &TilesetId, tile_id: u64) {
+    fn cache_tile_miss(&self, archive: &ArchiveKey, tile_id: u64) {
         self.tile_cache
-            .put(TileCacheKey::new(tileset_id, tile_id), CachedTile::NotFound);
+            .put(TileCacheKey::new(archive, tile_id), CachedTile::NotFound);
     }
 }
 
@@ -769,6 +814,13 @@ pub enum TilesetError {
     Overloaded(String),
     #[error("forward miss")]
     Miss,
+    /// The archive was replaced while this lookup was reading it, and the single
+    /// internal restart also observed a change. Retrying is the correct client
+    /// response: the next attempt admits the new generation. A larger internal
+    /// retry count cannot fix sustained publication churn, so this is surfaced
+    /// instead of absorbed.
+    #[error("{0}")]
+    Superseded(String),
     #[error("{0}")]
     Internal(String),
 }
@@ -779,8 +831,18 @@ impl TilesetError {
         Self::RetryableUpstream(message)
     }
 
+    /// Whether a peer failure should fall back to local storage rather than
+    /// failing the request.
+    ///
+    /// `Superseded` belongs here: the archive changed under *that* peer's read, so
+    /// this node may well resolve the tile itself, and the same condition returned
+    /// to a client is a retryable `503`. Treating it as fatal would abort a request
+    /// that local storage could have served.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::RetryableUpstream(_) | Self::Overloaded(_))
+        matches!(
+            self,
+            Self::RetryableUpstream(_) | Self::Overloaded(_) | Self::Superseded(_)
+        )
     }
 }
 
@@ -827,6 +889,7 @@ fn internal_tileset_error(error: anyhow::Error) -> TilesetError {
         Some(StorageError::Timeout(_)) => TilesetError::Timeout(message),
         Some(StorageError::Overloaded(_)) => TilesetError::Overloaded(message),
         Some(StorageError::Backend(_)) => TilesetError::retryable_upstream(message),
+        Some(StorageError::GenerationChanged) => TilesetError::Superseded(message),
         _ => TilesetError::Internal(message),
     }
 }
@@ -846,6 +909,47 @@ mod error_classification_tests {
             internal_tileset_error(error),
             TilesetError::RetryableUpstream(message)
                 if message.contains("object-store service unavailable")
+        ));
+    }
+
+    /// `is_retryable` gates peer-failure fallback to local storage. It is a
+    /// `matches!`, so a new variant is silently non-retryable until listed —
+    /// which is how `Superseded` was first missed. This pins every variant's
+    /// answer so the next addition has to make a deliberate choice.
+    #[test]
+    fn every_error_states_whether_a_peer_failure_falls_back_locally() {
+        let message = || "m".to_string();
+        for (error, retryable) in [
+            (TilesetError::RetryableUpstream(message()), true),
+            (TilesetError::Overloaded(message()), true),
+            // The archive changed under that peer's read; this node may still
+            // resolve the tile, and clients see a retryable 503.
+            (TilesetError::Superseded(message()), true),
+            (TilesetError::Upstream(message()), false),
+            (TilesetError::Timeout(message()), false),
+            (TilesetError::Internal(message()), false),
+            (TilesetError::Miss, false),
+        ] {
+            assert_eq!(
+                error.is_retryable(),
+                retryable,
+                "{error:?} must {}fall back to local storage",
+                if retryable { "" } else { "not " }
+            );
+        }
+    }
+
+    /// A generation change that escapes the reader's single restart must classify
+    /// as retryable, not as an internal fault: it is an ordinary consequence of
+    /// republishing, and `Internal` would surface it as `500`.
+    #[test]
+    fn generation_change_classifies_as_superseded_not_internal() {
+        let error = anyhow::Error::new(StorageError::GenerationChanged)
+            .context("failed to read PMTiles tile");
+
+        assert!(matches!(
+            internal_tileset_error(error),
+            TilesetError::Superseded(message) if message.contains("failed to read PMTiles tile")
         ));
     }
 
@@ -877,7 +981,8 @@ fn simulator_fetch_error(error: TilesetError) -> PeerFetchError {
     match error {
         TilesetError::RetryableUpstream(message)
         | TilesetError::Timeout(message)
-        | TilesetError::Overloaded(message) => PeerFetchError::Retryable(message),
+        | TilesetError::Overloaded(message)
+        | TilesetError::Superseded(message) => PeerFetchError::Retryable(message),
         TilesetError::Miss => PeerFetchError::NotFound,
         TilesetError::Upstream(message) | TilesetError::Internal(message) => {
             PeerFetchError::Fatal(message)
@@ -965,6 +1070,7 @@ mod tests {
             tile_cache_max_bytes: 1024 * 1024,
             chunk_cache_max_bytes: 1024 * 1024,
             tile_negative_ttl: Duration::from_secs(60),
+            archive_revalidation_interval: Duration::from_secs(300),
         }
         .resolve()
         .expect("valid resolver tuning");
@@ -984,29 +1090,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authoritative_peer_miss_stops_after_one_forward_and_negative_caches() {
+    async fn peer_miss_falls_back_to_the_shared_backend_generation() {
         let transport = Arc::new(NotFoundTransport::default());
         let resolver = resolver_with_transport(transport.clone());
         let tileset = TilesetId::try_new("demo/streets").unwrap();
 
-        // A reachable owner's 404 is authoritative: exactly one forward, no
-        // walk over the remaining candidates and no local re-resolution.
+        // A peer 404 may describe an older generation, so it is not authoritative
+        // for a mutable logical archive. Fall back to shared object storage.
         let (tile, source) = resolver
             .route_tile(tileset.clone(), 700)
             .await
             .expect("route tile");
         assert!(tile.is_none());
-        assert_eq!(source, TileSource::PeerMiss);
+        assert_eq!(source, TileSource::SelfMiss);
         assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
 
-        // The negative entry is now cached locally, so a repeat is a negative
-        // L1 hit with no further peer forwarding.
+        // The short archive-absence cache avoids another peer/backend probe.
         let (tile, source) = resolver
             .route_tile(tileset, 700)
             .await
             .expect("route tile again");
         assert!(tile.is_none());
-        assert_eq!(source, TileSource::NegativeCache);
+        assert_eq!(source, TileSource::SelfMiss);
         assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
     }
 

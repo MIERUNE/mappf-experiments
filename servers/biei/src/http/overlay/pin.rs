@@ -58,7 +58,7 @@ fn parse_pin_head(value: &str) -> Result<(PinSize, Option<String>), OverlayParse
     Ok((size, label))
 }
 
-/// Normalize the Mapbox-compatible generated-pin label subset.
+/// Normalize the generated-pin label subset accepted at ingress.
 ///
 /// Letters are case-insensitive at ingress and stored lowercase because they
 /// are rendered uppercase. Numeric labels use their canonical decimal spelling

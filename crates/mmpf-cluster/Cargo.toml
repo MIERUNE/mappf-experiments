@@ -9,15 +9,15 @@ publish = false
 
 [features]
 default = []
-simulation = ["dep:async-trait", "dep:mmpf-common", "dep:serde", "dep:serde_json"]
+simulation = ["dep:async-trait", "dep:mmpf-common"]
 
 [dependencies]
 anyhow.workspace = true
 async-trait = { workspace = true, optional = true }
 chitchat.workspace = true
 mmpf-common = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing.workspace = true
 

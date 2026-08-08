@@ -6,6 +6,7 @@ use flate2::{Compression as GzLevel, write::GzEncoder};
 use ishikari_core::{
     interned::TilesetId,
     pmtiles::{TileCoord, TileData, TileId, TileType},
+    storage::{ArchiveGeneration, ResolvedTile},
 };
 use mmpf_terrain::{contours, hillshade};
 use tokio::task::JoinSet;
@@ -27,14 +28,21 @@ const MAPTERHORN_DEM_TILE_DIMENSION: u32 = 512;
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct DerivedTileKey {
     tileset_id: TilesetId,
+    generation: ArchiveGeneration,
     product: DerivedProduct,
     tile_id: u64,
 }
 
 impl DerivedTileKey {
-    pub(super) fn new(tileset_id: TilesetId, product: DerivedProduct, tile_id: u64) -> Self {
+    pub(super) fn new(
+        tileset_id: TilesetId,
+        generation: ArchiveGeneration,
+        product: DerivedProduct,
+        tile_id: u64,
+    ) -> Self {
         Self {
             tileset_id,
+            generation,
             product,
             tile_id,
         }
@@ -44,6 +52,7 @@ impl DerivedTileKey {
     pub(crate) fn for_test() -> Self {
         Self::new(
             TilesetId::try_new("terrain").expect("valid test tileset id"),
+            ArchiveGeneration::from_wire("e:test").expect("valid test generation"),
             DerivedProduct::Hillshade,
             0,
         )
@@ -293,16 +302,17 @@ async fn load_decoded_dem(
         TileCoord::new(z, x, y).map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?,
     )
     .value();
-    let cache = state.dem_tile_cache().clone();
     let state = state.clone();
+    let Some(raw) = fetch_source_tile(&state, tileset_id.clone(), tile_id, z, x, y).await? else {
+        return Ok(None);
+    };
+    let cache = state.dem_tile_cache().clone();
+    let cache_key = (tileset_id, raw.generation.clone(), tile_id);
     cache
         .try_get_with(
-            (tileset_id.clone(), tile_id),
+            cache_key,
             Box::pin(async move {
-                let Some(raw) = fetch_source_tile(&state, tileset_id, tile_id, z, x, y).await?
-                else {
-                    return Ok::<Option<Arc<dem::DemTile>>, HttpError>(None);
-                };
+                let raw = raw.data;
                 if raw.content_encoding.is_some() {
                     return Err((
                         StatusCode::BAD_GATEWAY,
@@ -350,7 +360,7 @@ async fn fetch_source_tile(
     z: u8,
     x: u32,
     y: u32,
-) -> Result<Option<TileData>, HttpError> {
+) -> Result<Option<ResolvedTile>, HttpError> {
     let Some(archive) = resolve_archive(state, tileset_id, z, x, y).await? else {
         return Ok(None);
     };

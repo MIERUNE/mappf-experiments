@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+const MAX_ARCHIVE_REVALIDATION_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 /// Raw resolver tuning supplied by a production or simulation composition root.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResolverTuningInput {
@@ -17,6 +19,7 @@ pub struct ResolverTuningInput {
     pub tile_cache_max_bytes: u64,
     pub chunk_cache_max_bytes: u64,
     pub tile_negative_ttl: Duration,
+    pub archive_revalidation_interval: Duration,
 }
 
 impl ResolverTuningInput {
@@ -24,6 +27,12 @@ impl ResolverTuningInput {
     pub fn resolve(self) -> Result<ResolverTuning, ResolverTuningError> {
         if self.chunk_size_bytes == 0 {
             return Err(ResolverTuningError::ZeroChunkSizeBytes);
+        }
+        if self.archive_revalidation_interval.is_zero() {
+            return Err(ResolverTuningError::ZeroArchiveRevalidationInterval);
+        }
+        if self.archive_revalidation_interval > MAX_ARCHIVE_REVALIDATION_INTERVAL {
+            return Err(ResolverTuningError::ArchiveRevalidationIntervalTooLong);
         }
 
         let backend_fetch_concurrency = self.backend_fetch_concurrency.max(1);
@@ -40,6 +49,7 @@ impl ResolverTuningInput {
             tile_cache_max_bytes: self.tile_cache_max_bytes,
             chunk_cache_max_bytes: self.chunk_cache_max_bytes,
             tile_negative_ttl: self.tile_negative_ttl,
+            archive_revalidation_interval: self.archive_revalidation_interval,
         })
     }
 }
@@ -57,6 +67,7 @@ pub struct ResolverTuning {
     tile_cache_max_bytes: u64,
     chunk_cache_max_bytes: u64,
     tile_negative_ttl: Duration,
+    archive_revalidation_interval: Duration,
 }
 
 impl ResolverTuning {
@@ -99,6 +110,10 @@ impl ResolverTuning {
     pub fn tile_negative_ttl(self) -> Duration {
         self.tile_negative_ttl
     }
+
+    pub fn archive_revalidation_interval(self) -> Duration {
+        self.archive_revalidation_interval
+    }
 }
 
 /// Invalid resolver tuning that cannot be normalized safely.
@@ -106,6 +121,10 @@ impl ResolverTuning {
 pub enum ResolverTuningError {
     #[error("chunk_size_bytes must be greater than zero")]
     ZeroChunkSizeBytes,
+    #[error("archive_revalidation_interval must be greater than zero")]
+    ZeroArchiveRevalidationInterval,
+    #[error("archive_revalidation_interval must not exceed 7 days")]
+    ArchiveRevalidationIntervalTooLong,
 }
 
 #[cfg(test)]
@@ -124,6 +143,7 @@ mod tests {
             tile_cache_max_bytes: 512 * 1024 * 1024,
             chunk_cache_max_bytes: 256 * 1024 * 1024,
             tile_negative_ttl: Duration::from_secs(60),
+            archive_revalidation_interval: Duration::from_secs(300),
         }
     }
 
@@ -154,6 +174,10 @@ mod tests {
         assert_eq!(tuning.tile_cache_max_bytes(), 0);
         assert_eq!(tuning.chunk_cache_max_bytes(), 17);
         assert_eq!(tuning.tile_negative_ttl(), Duration::ZERO);
+        assert_eq!(
+            tuning.archive_revalidation_interval(),
+            Duration::from_secs(300)
+        );
     }
 
     #[test]
@@ -169,6 +193,28 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "chunk_size_bytes must be greater than zero"
+        );
+    }
+
+    #[test]
+    fn bounds_archive_revalidation_interval() {
+        assert_eq!(
+            ResolverTuningInput {
+                archive_revalidation_interval: Duration::ZERO,
+                ..input()
+            }
+            .resolve()
+            .unwrap_err(),
+            ResolverTuningError::ZeroArchiveRevalidationInterval
+        );
+        assert_eq!(
+            ResolverTuningInput {
+                archive_revalidation_interval: Duration::from_secs(7 * 24 * 60 * 60 + 1),
+                ..input()
+            }
+            .resolve()
+            .unwrap_err(),
+            ResolverTuningError::ArchiveRevalidationIntervalTooLong
         );
     }
 }

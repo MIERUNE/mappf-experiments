@@ -40,9 +40,10 @@ use self::{
     tilejson::derived_tilejson,
 };
 use super::{
+    TileRepresentationQuery,
     error::tileset_error_response,
     mlt::{RequestedTileFormat, TranscodeCachePolicy, mlt_response_bytes},
-    tile::{ensure_content_encoding_acceptable, tile_data_response},
+    tile::{ensure_content_encoding_acceptable, resolve_archive, tile_data_response},
 };
 
 pub(super) fn hillshade_opacity_stops(shadow: bool) -> Vec<(u8, f64)> {
@@ -204,10 +205,27 @@ async fn serve_tilejson(
 )]
 pub(crate) async fn derived_tile_handler(
     State(state): State<AppState>,
-    Path((tileset_id, product, z, x, y_raw)): Path<(String, String, u8, u32, String)>,
+    Path((tileset_id, product, z_raw, x_raw, y_raw)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+    Query(query): Query<TileRepresentationQuery>,
     headers: HeaderMap,
 ) -> Result<Response<Body>, HttpError> {
-    serve_derived_tile(state, tileset_id, product, z, x, y_raw, headers).await
+    query.reject_encoding()?;
+    serve_derived_tile(
+        state,
+        tileset_id,
+        product,
+        crate::server::tileset::parse_tile_coordinate("z", &z_raw)?,
+        crate::server::tileset::parse_tile_coordinate("x", &x_raw)?,
+        y_raw,
+        headers,
+    )
+    .await
 }
 
 #[cfg_attr(
@@ -241,22 +259,24 @@ pub(crate) async fn derived_tile_handler(
 )]
 pub(crate) async fn namespaced_derived_tile_handler(
     State(state): State<AppState>,
-    Path((namespace, tileset_id, product, z, x, y_raw)): Path<(
+    Path((namespace, tileset_id, product, z_raw, x_raw, y_raw)): Path<(
         String,
         String,
         String,
-        u8,
-        u32,
+        String,
+        String,
         String,
     )>,
+    Query(query): Query<TileRepresentationQuery>,
     headers: HeaderMap,
 ) -> Result<Response<Body>, HttpError> {
+    query.reject_encoding()?;
     serve_derived_tile(
         state,
         super::join_tileset_key(&namespace, &tileset_id),
         product,
-        z,
-        x,
+        crate::server::tileset::parse_tile_coordinate("z", &z_raw)?,
+        crate::server::tileset::parse_tile_coordinate("x", &x_raw)?,
         y_raw,
         headers,
     )
@@ -387,7 +407,32 @@ async fn local_derived_output(
     state: &AppState,
     request: &DerivedTileRequest,
 ) -> Result<DerivedOutcome, HttpError> {
-    let key = DerivedTileKey::new(request.tileset_id.clone(), request.product, request.tile_id);
+    let Some(source_archive) = resolve_archive(
+        state,
+        request.tileset_id.clone(),
+        request.z,
+        request.x,
+        request.y,
+    )
+    .await?
+    else {
+        return Ok(DerivedOutcome::Absent);
+    };
+    let Some(info) = state
+        .resource_resolver
+        .load_tileset_info(source_archive.clone())
+        .await
+        .map_err(|error| tileset_error_response(&error))?
+    else {
+        return Ok(DerivedOutcome::Absent);
+    };
+    let generation = info.generation.clone();
+    let key = DerivedTileKey::new(
+        source_archive,
+        generation.clone(),
+        request.product,
+        request.tile_id,
+    );
     let outcome = state
         .derived_tile_cache()
         .try_get_with(
@@ -421,9 +466,15 @@ async fn local_derived_output(
             } else {
                 TranscodeCachePolicy::Retain
             };
-            let (bytes, content_encoding, _) =
-                mlt_response_bytes(state, &cache_key, request.tile_id, generated, cache_policy)
-                    .await?;
+            let (bytes, content_encoding, _) = mlt_response_bytes(
+                state,
+                &cache_key,
+                &generation,
+                request.tile_id,
+                generated,
+                cache_policy,
+            )
+            .await?;
             let tile = TileData {
                 bytes,
                 content_type: MLT_CONTENT_TYPE,

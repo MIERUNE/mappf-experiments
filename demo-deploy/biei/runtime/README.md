@@ -1,15 +1,13 @@
 # biei k8s demo
 
-Runs a 3-node biei rendering cluster. The local overlay renders against remote
-style/tile providers. The GKE overlay attaches biei to the shared demo Gateway
-and can also render styles/tiles served by the in-cluster provider.
+Runs a 3-node biei rendering cluster. The local overlay renders against remote style/tile providers. The GKE overlay attaches biei to the shared demo Gateway and can also render styles/tiles served by the in-cluster provider.
 
 This is a demo, not a production deployment.
 
 ## Layout
 
 | Path | Purpose |
-|---|---|
+| --- | --- |
 | `Dockerfile` | Linux OpenGL/EGL image using Mesa llvmpipe for headless rendering. |
 | `k8s/base/` | Deployment, ClusterIP HTTP Service, and headless gossip Service. |
 | `k8s/overlays/local/` | Local Kubernetes overlay; exposes `svc/biei` with a local LoadBalancer. |
@@ -33,11 +31,7 @@ kubectl -n biei-demo port-forward svc/biei 8080:8080
 
 ## GKE
 
-Build and push the image, then deploy the overlay. The shared Gateway
-(`demo-gw` in namespace `map-demo`) must already exist. The GKE overlay points
-all style and tileset resolution at the in-cluster `ishikari` Service, so deploy
-Ishikari's GKE overlay first. Public namespaces such as `/carto/*`, `/mierune/*`,
-and `/ishikari/*` are style-id prefixes under Ishikari's backing store.
+Build and push the image, then deploy the overlay. The shared Gateway (`demo-gw` in namespace `map-demo`) must already exist. The GKE overlay points all style and tileset resolution at the in-cluster `ishikari` Service, so deploy Ishikari's GKE overlay first. Public namespaces such as `/carto/*`, `/mierune/*`, and `/ishikari/*` are style-id prefixes under Ishikari's backing store.
 
 ```sh
 BUILD_ID="$(gcloud builds submit \
@@ -53,20 +47,9 @@ kubectl apply -k demo-deploy/biei/runtime/k8s/overlays/gke
 kubectl -n map-demo rollout status deploy/biei
 ```
 
-Cloud Build exports a BuildKit `mode=max` cache to the separate
-`biei-buildcache:latest` Artifact Registry package. `cargo-chef` keeps dependency
-compilation reusable when only Rust sources change, and the final image stage
-copies only the production sources (plus workspace manifests) so simulator,
-docs, and deploy-only source changes do not rebuild the biei binary. The first
-build populates the cache; subsequent builds import
-it. Install the narrowly scoped cleanup policy once so superseded, untagged
-cache manifests do not grow indefinitely:
+Cloud Build exports a BuildKit `mode=max` cache to the separate `biei-buildcache:latest` Artifact Registry package. `cargo-chef` keeps dependency compilation reusable when only Rust sources change, and the final image stage copies only the production sources (plus workspace manifests) so simulator, docs, and deploy-only source changes do not rebuild the biei binary. The first build populates the cache; subsequent builds import it. Install the narrowly scoped cleanup policy once so superseded, untagged cache manifests do not grow indefinitely:
 
-BuildKit pushes the runtime image directly to Artifact Registry to avoid a
-local `--load` followed by Cloud Build's second push. Buildx writes the pushed
-digest into that build's Cloud Build result. Promotion reads the recorded
-result rather than the mutable `:dev` convenience tag, so a later registry
-change cannot alter the selected artifact.
+BuildKit pushes the runtime image directly to Artifact Registry to avoid a local `--load` followed by Cloud Build's second push. Buildx writes the pushed digest into that build's Cloud Build result. Promotion reads the recorded result rather than the mutable `:dev` convenience tag, so a later registry change cannot alter the selected artifact.
 
 ```sh
 gcloud artifacts repositories set-cleanup-policies biei \
@@ -80,19 +63,9 @@ The GKE demo also has an explicit low-cost observability profile:
 bash demo-deploy/biei/runtime/configure-gke-observability.sh
 ```
 
-It retains mandatory system metrics and the explicit biei/ishikari Prometheus
-scrapes, but disables the unused cAdvisor/Kubelet/kube-state/DCGM packages.
-Autopilot retains advanced datapath metrics and requires image streaming even
-though the demo images are small and same-region, so a narrow exclusion drops
-its informational `gcfsd`/snapshotter noise instead of trying to disable the
-feature. The same exclusion covers INFO-only kubelet/runtime noise plus serial
-port 3/debug; warnings/errors and serial port 1 remain stored. On Standard GKE,
-the script also disables advanced datapath metrics and image streaming because
-node provisioning, rather than same-region image transfer, dominates this
-demo's scale-out latency.
+It retains mandatory system metrics and the explicit biei/ishikari Prometheus scrapes, but disables the unused cAdvisor/Kubelet/kube-state/DCGM packages. Autopilot retains advanced datapath metrics and requires image streaming even though the demo images are small and same-region, so a narrow exclusion drops its informational `gcfsd`/snapshotter noise instead of trying to disable the feature. The same exclusion covers INFO-only kubelet/runtime noise plus serial port 3/debug; warnings/errors and serial port 1 remain stored. On Standard GKE, the script also disables advanced datapath metrics and image streaming because node provisioning, rather than same-region image transfer, dominates this demo's scale-out latency.
 
-The shared Gateway uses the Certificate Manager map
-`mappf-demo-cert-map`. Add Biei's hostname to that map once:
+The shared Gateway uses the Certificate Manager map `mappf-demo-cert-map`. Add Biei's hostname to that map once:
 
 ```sh
 gcloud services enable certificatemanager.googleapis.com
@@ -121,19 +94,9 @@ gcloud certificate-manager dns-authorizations describe mappf-biei-demo \
   --format='value(dnsResourceRecord.name,dnsResourceRecord.type,dnsResourceRecord.data)'
 ```
 
-The Gateway routes a catch-all `/` to biei's public listener (`:8080`), which
-serves the render namespaces plus top-level `/livez` `/readyz`. `/_internal/*`,
-`/metrics` and peer forwarding live on a separate cluster-internal port
-(`:9090`) that the Service does not expose and the Gateway does not route, so
-nothing internal is reachable publicly. The shared Gateway listens on HTTPS
-only.
+The Gateway routes a catch-all `/` to biei's public listener (`:8080`), which serves the render namespaces plus top-level `/livez` `/readyz`. `/_internal/*`, `/metrics` and peer forwarding live on a separate cluster-internal port (`:9090`) that the Service does not expose and the Gateway does not route, so nothing internal is reachable publicly. The shared Gateway listens on HTTPS only.
 
-**Trust boundary:** the GKE overlay installs `biei-internal-boundary`: public
-`:8080` remains reachable, while peer forwarding on TCP `:9090` and gossip on
-UDP `:7946` are limited to biei pods in `map-demo`; the managed Prometheus
-collector may scrape `:9090`. If you deploy the base or another overlay, install
-an equivalent NetworkPolicy or service-mesh policy—the application protocol has
-no peer authentication of its own.
+**Trust boundary:** the GKE overlay installs `biei-internal-boundary`: public `:8080` remains reachable, while peer forwarding on TCP `:9090` and gossip on UDP `:7946` are limited to biei pods in `map-demo`; the managed Prometheus collector may scrape `:9090`. If you deploy the base or another overlay, install an equivalent NetworkPolicy or service-mesh policy—the application protocol has no peer authentication of its own.
 
 ## Checks
 
@@ -176,15 +139,7 @@ curl -s localhost:9090/_internal/metrics
 
 ## Notes
 
-- The demo uses a Deployment, not a StatefulSet; chitchat handles dynamic
-  membership.
-- The headless gossip Service uses `publishNotReadyAddresses: true` so pods can
-  discover each other during cold start. Each pod listens on wildcard UDP via
-  `BIEI_GOSSIP_BIND` and advertises `$(POD_IP):7946` via
-  `BIEI_GOSSIP_ADVERTISE_ADDR`.
-- Rendering combines CPU work with in-render provider I/O. Tune `BIEI_CORES`
-  and CPU limits together, but do not infer queue health from CPU alone.
-- The GKE overlay keeps `minReplicas: 2` for cost and sets
-  `BIEI_QUEUE_CAPACITY_MULTIPLIER=3` so each three-slot pod can buffer nine
-  tasks while scale-out catches up. The soft routing limit and five-second SLA
-  remain unchanged.
+- The demo uses a Deployment, not a StatefulSet; chitchat handles dynamic membership.
+- The headless gossip Service uses `publishNotReadyAddresses: true` so pods can discover each other during cold start. Each pod listens on wildcard UDP via `BIEI_GOSSIP_BIND` and advertises `$(POD_IP):7946` via `BIEI_GOSSIP_ADVERTISE_ADDR`.
+- Rendering combines CPU work with in-render provider I/O. Tune `BIEI_CORES` and CPU limits together, but do not infer queue health from CPU alone.
+- The GKE overlay keeps `minReplicas: 2` for cost and sets `BIEI_QUEUE_CAPACITY_MULTIPLIER=3` so each three-slot pod can buffer nine tasks while scale-out catches up. The soft routing limit and five-second SLA remain unchanged.

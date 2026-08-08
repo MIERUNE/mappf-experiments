@@ -129,7 +129,7 @@ async fn serve_preview(
         .is_some_and(|resolver| resolver.matches(&tileset_id));
     let html = preview_html(
         &tileset_id,
-        query.encoding.as_deref(),
+        super::canonical_encoding(query.encoding.as_deref())?,
         info.header.tile_type,
         is_mapterhorn,
         token.as_ref(),
@@ -244,7 +244,7 @@ async fn serve_preview_style(
         &tileset_id,
         &base_url,
         &info,
-        query.encoding.as_deref(),
+        super::canonical_encoding(query.encoding.as_deref())?,
         maxzoom_override,
         is_mapterhorn,
     );
@@ -262,6 +262,52 @@ async fn serve_preview_style(
 }
 
 /// Renders the shared MapLibre preview page for any style URL.
+/// Escape for an HTML text node — `__TITLE__` sits in `<title>` and `<strong>`.
+fn escape_html_text(raw: &str) -> String {
+    let mut escaped = String::with_capacity(raw.len());
+    for character in raw.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+/// Escape for a double-quoted JavaScript string inside `<script>` — where
+/// `__STYLE_URL__` is substituted. `<` and `>` become `<`/`>` so no
+/// substitution can close the script element early; the decoded runtime value is
+/// unchanged, so an escaped URL still resolves identically.
+fn escape_js_string(raw: &str) -> String {
+    let mut escaped = String::with_capacity(raw.len());
+    for character in raw.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\'' => escaped.push_str("\\u0027"),
+            '<' => escaped.push_str("\\u003C"),
+            '>' => escaped.push_str("\\u003E"),
+            '&' => escaped.push_str("\\u0026"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+/// Fill the preview shell.
+///
+/// Both substituted values are escaped for the context they land in. Every
+/// current caller already builds them from validated parts — a charset-checked
+/// tileset or style key, an encoding narrowed to a `&'static str` — so this is a
+/// second independent barrier rather than the only one: the template does plain
+/// text substitution, so any future caller that forwards caller-supplied bytes
+/// would otherwise be injecting straight into a JavaScript string literal.
 pub(crate) fn render_preview_html(
     title: &str,
     style_url: &str,
@@ -270,8 +316,8 @@ pub(crate) fn render_preview_html(
     terrain_products: bool,
 ) -> String {
     PREVIEW_HTML_TEMPLATE
-        .replace("__TITLE__", title)
-        .replace("__STYLE_URL__", style_url)
+        .replace("__TITLE__", &escape_html_text(title))
+        .replace("__STYLE_URL__", &escape_js_string(style_url))
         .replace("__MAPLIBRE_GL_VERSION__", MAPLIBRE_GL_VERSION)
         .replace("__TERRAIN_CONTROL__", terrain_control)
         .replace(
@@ -904,7 +950,10 @@ mod tests {
     use bytes::{BufMut, BytesMut};
     use serde_json::json;
 
-    use super::{preview_html, preview_style};
+    use super::{
+        PREVIEW_HTML_TEMPLATE, escape_html_text, escape_js_string, preview_html, preview_style,
+        render_preview_html,
+    };
     use ishikari_core::{
         interned::TilesetId,
         pmtiles::{Header, Metadata, TileType},
@@ -939,6 +988,7 @@ mod tests {
         TilesetInfo {
             header: header_with_tile_type(tile_type),
             metadata: Arc::new(Metadata::default()),
+            generation: ishikari_core::storage::ArchiveGeneration::from_wire("e:test").unwrap(),
         }
     }
 
@@ -1067,5 +1117,72 @@ mod tests {
             assert!(preview.contains("map.showTileBoundaries = tileBoundaryInput.checked"));
         }
         assert!(mapterhorn.contains("tileBoundaryInput.checked = true"));
+    }
+
+    /// The popup reports each attribute's type, not only its value. A quantity
+    /// delivered as text renders identically to the number it should be, so
+    /// without this the preview cannot show the corruption class that motivated
+    /// it — and `bigint` is the precise failure MLT integer narrowing prevents.
+    ///
+    /// The rendering itself is JavaScript; this only pins that the template still
+    /// carries it, so an edit cannot silently drop the diagnostic.
+    #[test]
+    fn the_preview_popup_reports_attribute_types() {
+        for marker in [
+            "function attributeType(",
+            "function attributeValueHtml(",
+            "function attributeTypeHtml(",
+            "SUSPECT_ATTRIBUTE_TYPES",
+            "attr-suspect",
+            // Strings are quoted so text-shaped numbers stand out unaided.
+            "attr-string\">&quot;",
+        ] {
+            assert!(
+                PREVIEW_HTML_TEMPLATE.contains(marker),
+                "preview template lost {marker:?}"
+            );
+        }
+        // Values must never be interpolated unescaped.
+        assert!(!PREVIEW_HTML_TEMPLATE.contains("${value}"));
+    }
+
+    /// `__STYLE_URL__` is substituted into `style: "__STYLE_URL__"` — a
+    /// double-quoted JavaScript string — and `__TITLE__` into `<title>` and
+    /// `<strong>`. The template does plain text replacement, so a bare `"` in a
+    /// URL would close the literal and everything after it would be script.
+    #[test]
+    fn the_preview_shell_escapes_both_substitutions_for_their_context() {
+        let html = render_preview_html(
+            "tileset a<script>b",
+            "/tilesets/x/preview.json?encoding=\"+alert(1)+\"",
+            "",
+            true,
+            false,
+        );
+        assert!(!html.contains("<script>b"), "title escaped into markup");
+        assert!(
+            html.contains("a&lt;script&gt;b"),
+            "title not escaped:\n{html}"
+        );
+        assert!(
+            !html.contains(r#"encoding="+alert(1)+""#),
+            "style URL broke out of the JavaScript string:\n{html}"
+        );
+        assert!(
+            html.contains(r#"encoding=\"+alert(1)+\""#),
+            "style URL not escaped:\n{html}"
+        );
+        // Only the literal is escaped: the URL a browser resolves is unchanged.
+        assert!(!html.contains("\\u003Cscript"), "no stray double-escaping");
+    }
+
+    #[test]
+    fn escaping_leaves_an_ordinary_style_url_byte_identical() {
+        let url = "/tilesets/mierune/omt/preview.json?encoding=mlt&token=abc";
+        assert_eq!(escape_js_string(url), url.replace('&', "\\u0026"));
+        assert_eq!(
+            escape_html_text("tileset mierune/omt"),
+            "tileset mierune/omt"
+        );
     }
 }

@@ -161,13 +161,13 @@ async fn serve_tilejson(
         &tileset_id,
         &base_url,
         &data,
-        query.encoding.as_deref(),
+        super::canonical_encoding(query.encoding.as_deref())?,
         maxzoom_override,
         token.as_ref(),
     );
     // TileJSON embeds the request origin in its tile URLs, so it is a derived
     // representation: validate by a strong ETag over the exact bytes served
-    // (like rewritten style JSON), not the immutable archive's own identity.
+    // (like rewritten style JSON), not the selected archive generation itself.
     let body = serde_json::to_vec(&document).map_err(|error| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -280,6 +280,7 @@ mod tests {
         TilesetInfo {
             header: header_with_tile_type(tile_type),
             metadata: Arc::new(metadata),
+            generation: ishikari_core::storage::ArchiveGeneration::from_wire("e:test").unwrap(),
         }
     }
 

@@ -10,7 +10,10 @@ use ishikari_core::{
     },
     storage::{Peer, PeerDirectory, PeerFuture, PeerSnapshotCache},
 };
-use mmpf_cluster::{Cluster, ClusterOwner, Config as ClusterNodeConfig, GossipEndpoint};
+use mmpf_cluster::{
+    Cluster, ClusterOwner, Config as ClusterNodeConfig, GossipEndpoint, HintAdmission,
+    RefreshHintDedup, StyleRefreshHint, StyleRefreshHintTracker,
+};
 use tracing::info;
 
 /// Runtime configuration for one production membership node.
@@ -28,6 +31,10 @@ pub(crate) struct Membership {
     handle: Cluster,
     self_node_id: Arc<str>,
     peers_cache: PeerSnapshotCache,
+    /// Suppresses repeated HTTP refresh hints. Without it every publisher retry
+    /// performs another invalidation, and each invalidation discards concurrent
+    /// in-flight provider work.
+    refresh_dedup: Arc<RefreshHintDedup>,
 }
 
 /// Snapshot of the current cluster state exposed by the diagnostics API.
@@ -57,6 +64,7 @@ impl Membership {
             handle: owner.handle(),
             self_node_id,
             peers_cache: PeerSnapshotCache::new(peers_cache_ttl),
+            refresh_dedup: Arc::new(RefreshHintDedup::default()),
         };
         membership.spawn_membership_watcher().await;
         Ok((membership, owner))
@@ -65,6 +73,49 @@ impl Membership {
     /// Marks this node as draining or active in membership state.
     pub(crate) async fn set_draining(&self, draining: bool) {
         self.handle.set_draining(draining).await;
+    }
+
+    /// Records a hint and reports whether this process has already applied it.
+    ///
+    /// The gossip receiver needs no equivalent: an unchanged slot value is
+    /// already ignored there.
+    pub(crate) fn admit_style_refresh(&self, hint: &StyleRefreshHint) -> HintAdmission {
+        self.refresh_dedup.admit(hint)
+    }
+
+    /// Publishes one advisory style refresh into the bounded membership ring.
+    pub(crate) async fn publish_style_refresh(&self, hint: &StyleRefreshHint) -> Result<()> {
+        let encoded = hint.encode()?;
+        self.handle.set(&hint.gossip_key(), &encoded).await;
+        Ok(())
+    }
+
+    /// Applies new cluster refresh hints with a service-owned local callback.
+    pub(crate) async fn spawn_style_refresh_watcher<F>(&self, apply: F)
+    where
+        F: Fn(StyleRefreshHint) + Send + Sync + 'static,
+    {
+        let mut live_nodes = self.handle.live_nodes_watcher().await;
+        let self_node_id = Arc::clone(&self.self_node_id);
+        tokio::spawn(async move {
+            let mut tracker = StyleRefreshHintTracker::default();
+            loop {
+                let batch =
+                    live_nodes.inspect(|nodes| tracker.observe(nodes, Some(self_node_id.as_ref())));
+                if batch.invalid != 0 {
+                    tracing::warn!(
+                        invalid = batch.invalid,
+                        "ignored invalid style refresh gossip hints"
+                    );
+                }
+                for hint in batch.hints {
+                    apply(hint);
+                }
+                if live_nodes.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
     }
 
     /// Returns a cluster-wide diagnostic snapshot.

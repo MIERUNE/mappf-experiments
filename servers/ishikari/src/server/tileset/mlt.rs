@@ -41,6 +41,7 @@ use mlt_core::{PropKind, PropValue, TileLayer};
 use crate::server::{AppState, HttpError};
 use ishikari_core::interned::ResourceRoutingKey;
 use ishikari_core::pmtiles::{MLT_CONTENT_TYPE, TileData, TileType};
+use ishikari_core::storage::ArchiveGeneration;
 
 /// Earlier MLT clients used the longer subtype; Martin accepts it as an alias
 /// while emitting the current canonical media type.
@@ -311,6 +312,7 @@ pub(crate) enum TranscodeCachePolicy {
 pub(crate) async fn mlt_response_bytes(
     state: &AppState,
     routing_key: &ResourceRoutingKey,
+    generation: &ArchiveGeneration,
     tile_id: u64,
     tile: TileData,
     cache_policy: TranscodeCachePolicy,
@@ -325,7 +327,7 @@ pub(crate) async fn mlt_response_bytes(
             format!("cannot serve {} tile as MLT", tile.content_type),
         ));
     }
-    let bytes = transcoded_mlt(state, routing_key, tile_id, tile, cache_policy).await?;
+    let bytes = transcoded_mlt(state, routing_key, generation, tile_id, tile, cache_policy).await?;
     Ok((bytes, Some("gzip"), "mlt_transcoded"))
 }
 
@@ -339,6 +341,7 @@ pub(crate) fn is_mlt_tile(tile: &TileData) -> bool {
 async fn transcoded_mlt(
     state: &AppState,
     routing_key: &ResourceRoutingKey,
+    generation: &ArchiveGeneration,
     tile_id: u64,
     tile: TileData,
     cache_policy: TranscodeCachePolicy,
@@ -346,7 +349,7 @@ async fn transcoded_mlt(
     if cache_policy == TranscodeCachePolicy::Bypass {
         return transcode_mlt_admitted(state.clone(), tile).await;
     }
-    let key = (routing_key.clone(), tile_id);
+    let key = (routing_key.clone(), generation.clone(), tile_id);
     let cache = state.mlt_cache().clone();
     let state = state.clone();
     cache

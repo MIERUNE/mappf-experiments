@@ -36,6 +36,13 @@ spec:
     - port: 7946
       protocol: UDP
   - from:
+    - podSelector:
+        matchLabels:
+          app: abashiri
+    ports:
+    - port: 9090
+      protocol: TCP
+  - from:
     - namespaceSelector:
         matchLabels:
           kubernetes.io/metadata.name: gke-gmp-system
@@ -61,6 +68,6 @@ fi
 
 printf '%s\n' \
   'PASS: public/probe TCP 8080 is allowed' \
-  'PASS: Ishikari peers may use internal TCP 9090 and gossip UDP 7946' \
+  'PASS: Ishikari peers and Abashiri hints may use internal TCP 9090; peers may use gossip UDP 7946' \
   'PASS: managed Prometheus collectors may scrape TCP 9090' \
   'PASS: all other ingress to Ishikari pods is denied'

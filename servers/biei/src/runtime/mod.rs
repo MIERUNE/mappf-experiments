@@ -179,11 +179,62 @@ async fn spawn_cluster_node_with_catalog(
             options,
             gossip,
             transport,
-            Some(membership),
+            Some(membership.clone()),
         )
     })();
     match runtime_result {
-        Ok(runtime) => Ok((runtime, owner)),
+        Ok(runtime) => {
+            let refresh_catalog = Arc::clone(&runtime.style_catalog);
+            let refresh_node = runtime.node.clone();
+            let revision_catalog = Arc::clone(&runtime.style_catalog);
+            let revision_node = runtime.node.clone();
+            membership
+                .spawn_style_state_watcher(
+                    move |hint| {
+                        // The transport envelope spans every service's identifier
+                        // shape, so Biei still validates the id before resolving it.
+                        let Ok(style_id) = crate::http::path::resolve_style_id_str(&hint.style_id)
+                        else {
+                            return;
+                        };
+                        if refresh_catalog.resolve_latest(&style_id).is_some() {
+                            if refresh_catalog
+                                .request_revalidation_for_hint(&style_id, &hint.hint_id)
+                                == biei_core::style_catalog::RevalidationRequest::AcceptedWithoutFence
+                            {
+                                tracing::warn!(
+                                    style_id = %hint.style_id,
+                                    "style refresh fence capacity exhausted; hint applied without a per-style fence"
+                                );
+                            }
+                            refresh_node.invalidate_render_output_cache(&style_id);
+                            tracing::info!(
+                                hint_id = %hint.hint_id,
+                                style_id = %hint.style_id,
+                                "applied gossiped style refresh"
+                            );
+                        }
+                    },
+                    move |observation| {
+                        let style_id = observation.style_id.clone();
+                        let version = observation.version;
+                        if revision_catalog.apply_cluster_observation(&observation) {
+                            if let Ok(style_id) = crate::http::path::resolve_style_id_str(&style_id)
+                            {
+                                revision_node.invalidate_render_output_cache(&style_id);
+                            }
+                            tracing::info!(
+                                style_id,
+                                version,
+                                hint_id = %observation.hint_id,
+                                "adopted renderer-observed style revision from gossip"
+                            );
+                        }
+                    },
+                )
+                .await;
+            Ok((runtime, owner))
+        }
         Err(error) => match owner.shutdown().await {
             Ok(()) => Err(error),
             Err(shutdown_error) => {

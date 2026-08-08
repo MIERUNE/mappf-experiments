@@ -51,6 +51,7 @@ where
         chunk_size_bytes = resolver_tuning.chunk_size_bytes(),
         max_fetch_chunks = resolver_tuning.max_fetch_chunks(),
         chunk_fetch_merge_window_ms = resolver_tuning.chunk_fetch_merge_window().as_millis(),
+        archive_revalidation_interval_secs = resolver_tuning.archive_revalidation_interval().as_secs(),
         backend_fetch_concurrency = resolver_tuning.backend_fetch_concurrency(),
         backend_fetch_max_inflight = resolver_tuning.backend_fetch_max_inflight(),
         backend_max_active_body_bytes = options.backend_max_active_body_bytes,
@@ -120,24 +121,40 @@ where
         metrics.clone(),
     );
 
+    let app_state = AppState::new(
+        membership.clone(),
+        metrics,
+        resource_resolver,
+        drain.clone(),
+        options.provider,
+        object_store_registry,
+        ServerRuntimeConfig {
+            gossip_bootstrap_readiness,
+            delivery_auth: auth,
+            mapterhorn,
+            cpu_work_concurrency: options.cpu_work_concurrency,
+            cpu_work_max_inflight: options.cpu_work_max_inflight,
+            derived_negative_ttl: resolver_tuning.tile_negative_ttl(),
+            cache_capacities,
+        },
+    );
+    let refresh_state = app_state.clone();
+    membership
+        .spawn_style_refresh_watcher(move |hint| {
+            if crate::server::style::request_style_revalidation(&refresh_state, &hint.style_id)
+                .is_ok()
+            {
+                tracing::info!(
+                    hint_id = %hint.hint_id,
+                    style_id = %hint.style_id,
+                    "applied gossiped style refresh"
+                );
+            }
+        })
+        .await;
+
     let serve_result = run_http_server(
-        AppState::new(
-            membership.clone(),
-            metrics,
-            resource_resolver,
-            drain.clone(),
-            options.provider,
-            object_store_registry,
-            ServerRuntimeConfig {
-                gossip_bootstrap_readiness,
-                delivery_auth: auth,
-                mapterhorn,
-                cpu_work_concurrency: options.cpu_work_concurrency,
-                cpu_work_max_inflight: options.cpu_work_max_inflight,
-                derived_negative_ttl: resolver_tuning.tile_negative_ttl(),
-                cache_capacities,
-            },
-        ),
+        app_state,
         options.http_listen_addr,
         options.internal_listen_addr,
         shutdown_signal(shutdown_requested, membership.clone(), drain),

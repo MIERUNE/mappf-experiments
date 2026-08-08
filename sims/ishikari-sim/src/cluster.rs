@@ -656,7 +656,7 @@ pub(crate) async fn execute_request(request: PreparedRequest) -> Result<ServedRe
         request.metrics.record_tile_cache(outcome);
     }
     let bytes = tile.map(|tile| {
-        let bytes = tile.bytes.len() as u64;
+        let bytes = tile.data.bytes.len() as u64;
         request.metrics.add_egress_bytes(bytes);
         bytes
     });

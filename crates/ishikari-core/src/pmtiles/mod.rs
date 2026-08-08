@@ -18,7 +18,11 @@ pub use mmpf_pmtiles::{
 };
 pub(crate) use reader::LocalLeafError;
 #[cfg(not(feature = "simulator-support"))]
-pub(crate) use reader::{BootstrapTransfer, Reader, Storage, StorageError};
+pub(crate) use reader::{
+    ArchiveResource, BootstrapTransfer, ObservedRange, Reader, Storage, StorageError,
+};
 #[cfg(feature = "simulator-support")]
 #[doc(hidden)]
-pub use reader::{BootstrapTransfer, Reader, Storage, StorageError};
+pub use reader::{
+    ArchiveResource, BootstrapTransfer, ObservedRange, Reader, Storage, StorageError,
+};

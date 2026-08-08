@@ -1,5 +1,8 @@
 //! Style and TileJSON fetching, validation, and URL resolution.
 
+use std::time::{Duration, SystemTime};
+
+use reqwest::header::{AGE, CACHE_CONTROL, DATE, EXPIRES, HeaderMap};
 use tokio::time::Instant;
 
 use biei_core::types::{
@@ -14,6 +17,14 @@ use super::profile::{ProfileFetchError, is_permanent_profile_http_status, style_
 
 const MAX_STYLE_JSON_BYTES: usize = 2 * 1024 * 1024;
 const MAX_TILESET_JSON_BYTES: usize = 1024 * 1024;
+
+/// A validated style representation plus the freshness that its provider
+/// actually served. The profile coordinator owns the product-level minimum
+/// revalidation interval and revision activation.
+pub(super) struct FetchedStyleJson {
+    pub(super) json: String,
+    pub(super) served_freshness: Duration,
+}
 
 pub(super) fn addlayer_source_from_task(task: &InternalTask) -> Option<&AddLayerSource> {
     match &task.request {
@@ -330,6 +341,7 @@ pub(super) async fn fetch_style_json(
         client, url_policy, style_id, style_url, None, None, deadline,
     )
     .await
+    .map(|fetched| fetched.json)
 }
 
 pub(super) async fn fetch_style_json_with_auth(
@@ -340,8 +352,8 @@ pub(super) async fn fetch_style_json_with_auth(
     provider_token: Option<&ProviderBearerToken>,
     auth_provider_origin: Option<&url::Url>,
     deadline: Instant,
-) -> Result<String, ProfileFetchError> {
-    let json = match url::Url::parse(style_url) {
+) -> Result<FetchedStyleJson, ProfileFetchError> {
+    let fetched = match url::Url::parse(style_url) {
         Ok(mut url) if url.scheme() == "http" || url.scheme() == "https" => {
             attach_provider_token(
                 style_id,
@@ -359,7 +371,10 @@ pub(super) async fn fetch_style_json_with_auth(
                     format!("style file URL is not a local path: {style_url}"),
                 )
             })?;
-            read_style_json_file(style_id, &path, deadline).await?
+            FetchedStyleJson {
+                json: read_style_json_file(style_id, &path, deadline).await?,
+                served_freshness: Duration::ZERO,
+            }
         }
         Ok(url) => {
             return Err(ProfileFetchError::permanent_invalid(
@@ -367,16 +382,19 @@ pub(super) async fn fetch_style_json_with_auth(
                 format!("unsupported style URL scheme: {}", url.scheme()),
             ));
         }
-        Err(_) => read_style_json_file(style_id, std::path::Path::new(style_url), deadline).await?,
+        Err(_) => FetchedStyleJson {
+            json: read_style_json_file(style_id, std::path::Path::new(style_url), deadline).await?,
+            served_freshness: Duration::ZERO,
+        },
     };
 
     // TODO: this keeps error taxonomy under biei's control, but MapLibre
     // Native parses the same JSON again in load_style_from_json. Revisit if
     // cold profile setup cost becomes visible in production profiles.
-    serde_json::from_str::<serde_json::Value>(&json).map_err(|err| {
+    serde_json::from_str::<serde_json::Value>(&fetched.json).map_err(|err| {
         ProfileFetchError::permanent_invalid(style_id, format!("style JSON parse failed: {err}"))
     })?;
-    Ok(json)
+    Ok(fetched)
 }
 
 fn attach_provider_token(
@@ -412,7 +430,7 @@ async fn fetch_http_style_json(
     style_id: &biei_core::types::StyleId,
     style_url: url::Url,
     deadline: Instant,
-) -> Result<String, ProfileFetchError> {
+) -> Result<FetchedStyleJson, ProfileFetchError> {
     let safe_url = redacted_url(&style_url);
     if !url_policy.permits_url_without_dns(&style_url) {
         return Err(ProfileFetchError::permanent_invalid(
@@ -420,6 +438,7 @@ async fn fetch_http_style_json(
             format!("blocked style URL destination: {safe_url}"),
         ));
     }
+    let request_started = Instant::now();
     let response = tokio::time::timeout_at(deadline, client.get(style_url.clone()).send())
         .await
         .map_err(|_| ProfileFetchError::caller_deadline())?
@@ -446,10 +465,15 @@ async fn fetch_http_style_json(
             %status,
             "style provider returned a non-success status"
         );
-        let err = style_load_failed(
-            style_id,
-            format!("style GET failed for {safe_url}: HTTP status code {status}"),
-        );
+        let source = format!("style GET failed for {safe_url}: HTTP status code {status}");
+        let err = if matches!(
+            status,
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+        ) {
+            ProfilePreparationError::style_not_found(style_id, source)
+        } else {
+            style_load_failed(style_id, source)
+        };
         // Most 4xx responses are deterministic for this URL and may absorb a
         // short burst. 408 and 429 explicitly describe transient conditions
         // and must not poison the profile negative cache.
@@ -459,6 +483,7 @@ async fn fetch_http_style_json(
             ProfileFetchError::transient(err)
         });
     }
+    let response_headers = response.headers().clone();
     let bytes = read_bounded_body(response, MAX_STYLE_JSON_BYTES, deadline)
         .await
         .map_err(|err| match err {
@@ -471,10 +496,64 @@ async fn fetch_http_style_json(
                 ProfileFetchError::permanent_invalid(style_id, err.to_string())
             }
         })?;
+    let served_freshness = style_response_freshness(&response_headers, request_started.elapsed());
 
-    String::from_utf8(bytes).map_err(|err| {
+    let json = String::from_utf8(bytes).map_err(|err| {
         ProfileFetchError::permanent_invalid(style_id, format!("style JSON is not UTF-8: {err}"))
+    })?;
+    Ok(FetchedStyleJson {
+        json,
+        served_freshness,
     })
+}
+
+/// Remaining freshness of an HTTP style response before Biei applies its
+/// product-level minimum revalidation interval. Explicit shared freshness wins
+/// over browser freshness; an absent policy is deliberately zero so the
+/// coordinator uses only its bounded floor.
+fn style_response_freshness(headers: &HeaderMap, response_delay: Duration) -> Duration {
+    let control = mmpf_http::cache_control::parse_values(
+        headers
+            .get_all(CACHE_CONTROL)
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
+    );
+    if control
+        .as_ref()
+        .is_some_and(|control| control.no_store || control.no_cache || control.private)
+    {
+        return Duration::ZERO;
+    }
+    if let Some(seconds) = control
+        .as_ref()
+        .and_then(|control| control.s_maxage.or(control.max_age))
+    {
+        return Duration::from_secs(seconds)
+            .saturating_sub(response_current_age(headers, response_delay));
+    }
+    header_date(headers, EXPIRES)
+        .and_then(|expires| expires.duration_since(SystemTime::now()).ok())
+        .unwrap_or_default()
+}
+
+fn response_current_age(headers: &HeaderMap, response_delay: Duration) -> Duration {
+    let age = header_str(headers, AGE)
+        .and_then(|age| age.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_default()
+        .saturating_add(response_delay);
+    let apparent_age = header_date(headers, DATE)
+        .and_then(|date| SystemTime::now().duration_since(date).ok())
+        .unwrap_or_default();
+    age.max(apparent_age)
+}
+
+fn header_str(headers: &HeaderMap, name: reqwest::header::HeaderName) -> Option<&str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+fn header_date(headers: &HeaderMap, name: reqwest::header::HeaderName) -> Option<SystemTime> {
+    header_str(headers, name).and_then(|value| httpdate::parse_http_date(value).ok())
 }
 
 async fn read_style_json_file(
@@ -668,7 +747,7 @@ mod tests {
         let style_id = StyleId("test/style".to_string());
         let token = ProviderBearerToken::try_new("public.a+b&c".to_string()).unwrap();
 
-        let json = fetch_style_json_with_auth(
+        let fetched = fetch_style_json_with_auth(
             &client,
             &policy,
             &style_id,
@@ -679,10 +758,32 @@ mod tests {
         )
         .await
         .unwrap_or_else(|error| panic!("authenticated style fetch failed: {}", error.error()));
-        assert!(json.contains("\"version\":8"));
+        assert!(fetched.json.contains("\"version\":8"));
         assert_eq!(
             server.await.expect("profile fixture task"),
             "GET /styles/test/style.json?encoding=mvt&access_token=public.a%2Bb%26c HTTP/1.1"
+        );
+    }
+
+    #[test]
+    fn style_freshness_honors_short_shared_ttl_and_age() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CACHE_CONTROL,
+            reqwest::header::HeaderValue::from_static("max-age=30, s-maxage=7"),
+        );
+        headers.insert(AGE, reqwest::header::HeaderValue::from_static("5"));
+        assert_eq!(
+            style_response_freshness(&headers, Duration::ZERO),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn style_freshness_without_cache_policy_is_immediately_due_for_the_floor() {
+        assert_eq!(
+            style_response_freshness(&HeaderMap::new(), Duration::ZERO),
+            Duration::ZERO
         );
     }
 

@@ -127,6 +127,7 @@ mod tests {
         TilesetInfo {
             header: Header::parse(bytes.freeze()).expect("test header parses"),
             metadata: Arc::new(Metadata::default()),
+            generation: ishikari_core::storage::ArchiveGeneration::from_wire("e:test").unwrap(),
         }
     }
 

@@ -44,13 +44,82 @@ pub(super) const PROVIDER_STALE_REVALIDATION_FAILURE_COOLDOWN: Duration = Durati
 /// Failure state is auxiliary to the byte-bounded representation cache. Bound
 /// it independently so cache eviction cannot leave an unbounded key set.
 pub(super) const PROVIDER_STALE_REVALIDATION_FAILURE_MAX_KEYS: u64 = 4_096;
+/// How long a refresh fence entry is retained.
+///
+/// A fence value is only consulted by fetches that captured it before their I/O,
+/// and [`PROVIDER_FETCH_TIMEOUT`] is a single deadline covering a fetch's whole
+/// lifetime, so nothing can still be holding a value older than that. Retaining
+/// well beyond it keeps ordinary operation clear of the boundary; expiring at all
+/// is what stops a hint-heavy deployment from pinning one entry per refreshed key
+/// for the life of the process. Losing an entry early is safe but not free: a
+/// fetch in flight across the expiry sees a fence mismatch and is refetched
+/// rather than stored, so this must stay comfortably above the fetch timeout.
+pub(super) const PROVIDER_INVALIDATION_FENCE_RETENTION: Duration = Duration::from_secs(600);
+
+/// The refresh fence a fetch captured immediately before its I/O.
+///
+/// `key_epoch` is `None` when the key had no fence entry at all, which is
+/// deliberately *not* the same as `Some(0)`. The per-key fence map is bounded, so
+/// an absent entry is ambiguous: it may mean "never refreshed", or it may mean a
+/// refresh set an entry that capacity eviction then dropped while this fetch was
+/// still running. Treating absence as epoch zero is what lets a pre-hint fetch
+/// match and republish bytes the refresh had already made unreachable.
+///
+/// `refreshes` resolves the ambiguity. It counts refreshes process-wide, lives in
+/// an atomic that nothing can evict or lower, and is captured with the epoch. An
+/// unchanged value proves no refresh happened *anywhere* during the flight, so the
+/// per-key map cannot have lost anything relevant. Once it has changed, an absent
+/// per-key entry is treated as superseded rather than trusted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct FetchFence {
+    pub(super) key_epoch: Option<u64>,
+    pub(super) refreshes: u64,
+}
+
+impl FetchFence {
+    /// The epoch value to record on a stored entry for the read-side comparison
+    /// in the cache's own lookup path.
+    pub(super) fn stored_epoch(self) -> u64 {
+        self.key_epoch.unwrap_or_default()
+    }
+}
+
+/// A completed flight, tagged with the refresh fence the leader fetched under.
+///
+/// The fence is part of the outcome because a follower may join *after* a refresh
+/// hint advanced the epoch and invalidated the cache. Publication to followers
+/// bypasses the cache entirely, so without the fence a follower would receive
+/// pre-hint bytes that the fence had already made unreachable by lookup —
+/// defeating the refresh contract for exactly the concurrent requests a refresh
+/// is most likely to overlap.
+#[derive(Clone)]
+pub(super) struct ProviderFlightOutcome {
+    pub(super) fence: FetchFence,
+    pub(super) result: ProviderFlightResult,
+}
 
 #[derive(Clone)]
-pub(super) enum ProviderFlightOutcome {
+pub(super) enum ProviderFlightResult {
     Error(HttpError),
-    /// The leader's completed representation. Current followers reuse this
-    /// directly; cache retention and eviction are independent concerns.
+    /// The leader's completed representation. A follower reuses it only while the
+    /// fence it was fetched under is still current.
     Resource(ProviderResource),
+}
+
+impl ProviderFlightOutcome {
+    pub(super) fn resource(fence: FetchFence, resource: ProviderResource) -> Self {
+        Self {
+            fence,
+            result: ProviderFlightResult::Resource(resource),
+        }
+    }
+
+    pub(super) fn error(fence: FetchFence, error: HttpError) -> Self {
+        Self {
+            fence,
+            result: ProviderFlightResult::Error(error),
+        }
+    }
 }
 
 pub(super) struct FetchedProviderResource {

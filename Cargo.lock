@@ -19,6 +19,48 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 
 [[package]]
+name = "abashiri"
+version = "0.1.0"
+dependencies = [
+ "abashiri-core",
+ "anyhow",
+ "axum",
+ "bytes",
+ "clap",
+ "futures-util",
+ "http-body-util",
+ "mmpf-cluster",
+ "mmpf-http",
+ "object_store",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
+name = "abashiri-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bytes",
+ "http",
+ "mmpf-http",
+ "object_store",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -400,6 +442,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures-util",
+ "httpdate",
  "humantime",
  "image",
  "maplibre_native",
@@ -438,8 +481,10 @@ dependencies = [
  "rand_xoshiro",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -3638,6 +3683,8 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

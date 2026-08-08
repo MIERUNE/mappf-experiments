@@ -1,0 +1,29 @@
+substitutions:
+  _IMAGE_REPOSITORY: asia-northeast1-docker.pkg.dev/mappf-experiment/abashiri/abashiri
+  _CACHE_IMAGE: asia-northeast1-docker.pkg.dev/mappf-experiment/abashiri/abashiri-buildcache:latest
+options:
+  machineType: E2_HIGHCPU_8
+  diskSizeGb: 30
+timeout: 1800s
+steps:
+  - name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        docker buildx create --driver docker-container --use --name abashiri-builder
+        docker buildx build \
+          --file demo-deploy/abashiri/runtime/Dockerfile \
+          --tag "${_IMAGE_REPOSITORY}:dev" \
+          --cache-from "type=registry,ref=${_CACHE_IMAGE}" \
+          --cache-to "type=registry,ref=${_CACHE_IMAGE},mode=max,oci-mediatypes=true,image-manifest=true" \
+          --metadata-file /workspace/image-metadata.json \
+          --push \
+          .
+        digest="$$(sed -n 's/.*"containerimage\.digest"[[:space:]]*:[[:space:]]*"\(sha256:[0-9a-f]\{64\}\)".*/\1/p' /workspace/image-metadata.json)"
+        if [[ ! "$$digest" =~ ^sha256:[0-9a-f]{64}$$ ]]; then
+          echo "buildx did not report one valid image digest" >&2
+          exit 1
+        fi
+        printf 'mmpf-image-v1\nrepository=%s\ndigest=%s\n' \
+          "${_IMAGE_REPOSITORY}" "$$digest" > "$${BUILDER_OUTPUT}/output"

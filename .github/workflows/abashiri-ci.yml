@@ -1,0 +1,81 @@
+name: Abashiri CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/codecov.yml"
+      - "crates/abashiri-core/**"
+      - "crates/mmpf-http/**"
+      - "servers/abashiri/**"
+      - ".github/workflows/abashiri-ci.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/codecov.yml"
+      - "crates/abashiri-core/**"
+      - "crates/mmpf-http/**"
+      - "servers/abashiri/**"
+      - ".github/workflows/abashiri-ci.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WORKSPACE_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: clippy,rustfmt,llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2
+        with:
+          tool: cargo-llvm-cov@0.8.6
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: v0.16.0
+      - name: Cache Cargo dependencies and build outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: . -> target
+          key: abashiri
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: >-
+          cargo clippy -p abashiri-core -p abashiri --all-targets --locked --
+          -D warnings
+          -D clippy::unchecked_time_subtraction
+          -D clippy::large_futures
+          -D clippy::large_stack_arrays
+          -D clippy::unused_async
+      - name: Test and collect coverage
+        run: >-
+          cargo llvm-cov -p abashiri-core -p abashiri --all-targets --locked
+          --lcov --output-path lcov-abashiri.info
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          files: lcov-abashiri.info
+          flags: abashiri
+          name: abashiri
+          disable_search: true
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}

@@ -29,13 +29,12 @@ Availability under attacker- or tenant-controlled cardinality counts as security
 This section is the source of truth. Detailed catalog notes explain a candidate but do not authorize implementation.
 
 | Class | Items | Policy |
-|---|---|---|
+| --- | --- | --- |
 | **Active measurement** | **#41 [SEC↔PERF]** | Measure first. Add only the admission boundary demonstrated necessary. |
 | **Active deployment validation** | **#109 [GUARDRAIL]** | Termination-test Biei's implemented shared shutdown deadline under in-flight work. |
 | **Before the next affected simulator study** | **#38, #64, #65, #66, #67, #68, #88, #92** | Activate only when a named experiment depends on the affected report, chronology, provenance, or comparison. |
 | **Named fidelity study only** | **#7 [PERF][GUARDRAIL], #63, #90** | Do not improve fidelity in the abstract; define the decision and validation data first. |
 | **Production evidence required** | **#11 [SEC][PERF][GUARDRAIL], #30 [SEC][PERF][GUARDRAIL], #33 [SEC][PERF][GUARDRAIL], #106 [SEC][PERF][GUARDRAIL]** | Require a profile, incident, or concrete capacity/diagnostic failure. |
-| **Product-contract change required** | **#59 [SEC↔PERF]** | Keep immutable logical archive ids unless mutable replacement is explicitly supported. |
 | **Before the next GKE capacity decision** | **#110 [PERF][GUARDRAIL]** | Make the effective CPU request and HPA denominator explicit before tuning cost or scaling. |
 | **Before the next protocol epoch bump** | **#111 [GUARDRAIL]** | Validate rollout behavior when old and new gossip clusters intentionally cannot communicate. |
 | **Before production hardening** | **#112 [SEC], #113 [SEC↔PERF]** | Apply least privilege to metrics collection and make the public edge abuse boundary auditable. |
@@ -188,13 +187,6 @@ Deferred entries intentionally contain no implementation recipe. If a trigger oc
 - **Outcome:** one physical peer attempt with cancellation-safe followers and separate physical/joined metrics.
 - **Guardrail:** complete typed key plus peer identity; bounded waiter/body retention; no cross-peer backoff poisoning or credential sharing.
 - **Opinion:** **probably avoid.** Existing simulator evidence found very low peer-tile overlap; coordination cost is unjustified until production disproves it.
-
-### 59. Add archive-generation identity to Ishikari cache keys
-
-- **Trigger:** the product explicitly supports replacing a PMTiles archive at a stable object key.
-- **Outcome:** a trustworthy immutable generation/version participates in every archive-derived cache and flight key.
-- **Guardrail:** use an object generation, version, strong validator, or content digest—not timestamp or length—and include it before cache lookup.
-- **Opinion:** **prefer not to implement.** Enforce immutable logical tileset ids instead; a revision label may live inside the opaque id, and this avoids per-request metadata work.
 
 ## Simulator and report validity
 

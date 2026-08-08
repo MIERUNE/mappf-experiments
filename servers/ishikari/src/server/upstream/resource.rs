@@ -271,6 +271,7 @@ mod tests {
         };
         let peer_resource = ProviderResource::from_peer(InternalFetchResponse {
             bytes: resource.bytes().clone(),
+            archive_generation: None,
             tile_source: None,
             provider_cache_control: header_string(PROVIDER_CACHE_CONTROL_HEADER),
             provider_age_seconds: header_string(PROVIDER_AGE_HEADER)
@@ -327,6 +328,7 @@ mod tests {
     fn peer_without_provider_metadata_is_rejected() {
         let result = ProviderResource::from_peer(InternalFetchResponse {
             bytes: Bytes::from_static(b"missing metadata"),
+            archive_generation: None,
             tile_source: None,
             provider_cache_control: None,
             provider_age_seconds: None,

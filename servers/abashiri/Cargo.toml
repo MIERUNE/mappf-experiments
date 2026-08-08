@@ -1,0 +1,34 @@
+[package]
+name = "abashiri"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The Abashiri management and publishing API for MMPF experiments"
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "abashiri"
+path = "src/main.rs"
+
+[dependencies]
+abashiri-core = { workspace = true, features = ["cloud"] }
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+http-body-util.workspace = true
+mmpf-cluster.workspace = true
+mmpf-http = { workspace = true, features = ["serve"] }
+object_store.workspace = true
+reqwest = { workspace = true, features = ["rustls", "http2", "json"] }
+serde.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+serde_json.workspace = true
+tower = { version = "0.5", features = ["util"] }

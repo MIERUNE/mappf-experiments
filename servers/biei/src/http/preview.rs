@@ -169,7 +169,7 @@ mod tests {
 
     async fn style_missing(revision: StyleRevision) -> Result<(), StyleAvailabilityError> {
         Err(StyleAvailabilityError::NotFound(
-            ProfilePreparationError::style_unavailable(&revision.id, "provider returned 404"),
+            ProfilePreparationError::style_not_found(&revision.id, "provider returned 404"),
         ))
     }
 

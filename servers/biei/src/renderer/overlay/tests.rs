@@ -285,7 +285,7 @@ fn indexed_union_feature_collection_preserves_geometry_and_properties() {
                 "name": "Shikisai Hill",
                 "fill": "#9ed4bd"
             },
-            "geometry": geometry.clone()
+            "geometry": geometry
         }),
     };
 

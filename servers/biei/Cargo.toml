@@ -16,6 +16,7 @@ bytes.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 humantime.workspace = true
+httpdate.workspace = true
 image = "0.25"
 maplibre_native.workspace = true
 mmpf-cluster.workspace = true

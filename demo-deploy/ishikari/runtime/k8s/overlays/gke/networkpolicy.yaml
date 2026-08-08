@@ -24,6 +24,15 @@ spec:
           protocol: TCP
         - port: 7946
           protocol: UDP
+    # Abashiri may send only the advisory refresh hint over internal HTTP; it
+    # does not join the gossip cluster or receive peer-forwarding authority.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: abashiri
+      ports:
+        - port: 9090
+          protocol: TCP
     # Google Managed Service for Prometheus scrapes the internal metrics port.
     - from:
         - namespaceSelector:

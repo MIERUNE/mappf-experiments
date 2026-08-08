@@ -16,9 +16,9 @@ use mmpf_common::resource_templates::{
     NamespaceKeyPolicy, NamespacedEntries, NamespacedEntriesPolicy,
 };
 use mmpf_common::rng::{splitmix64, uniform_open};
-use object_store::{
-    Error as ObjectStoreError, ObjectStore, ObjectStoreExt, path::Path as ObjectPath,
-};
+#[cfg(test)]
+use object_store::ObjectStoreExt;
+use object_store::{Error as ObjectStoreError, GetOptions, ObjectStore, path::Path as ObjectPath};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tracing::debug;
@@ -27,7 +27,11 @@ use url::Url;
 use crate::{
     interned::TilesetId,
     metrics::NodeMetrics,
-    storage::{ObjectStoreRegistry, store_registry::redacted_source_label},
+    storage::{
+        ObjectStoreRegistry,
+        generation::{ArchiveGeneration, ArchiveKey},
+        store_registry::redacted_source_label,
+    },
 };
 
 pub(super) const BACKEND_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -115,8 +119,15 @@ pub(crate) enum ChunkFetchError {
     /// absence. Preserved separately from local range and coordination errors.
     #[error("{0}")]
     Backend(String),
+    #[error("archive generation changed while reading")]
+    GenerationChanged,
     #[error("{0}")]
     Message(String),
+}
+
+pub(crate) struct ObservedBytes {
+    pub(crate) bytes: Bytes,
+    pub(crate) generation: ArchiveGeneration,
 }
 
 /// One object-store source that backs some set of tilesets.
@@ -277,9 +288,35 @@ impl ChunkFetcher {
         self.received_bytes.load(Ordering::Relaxed)
     }
 
-    pub(super) async fn fetch_chunk_group(
+    #[cfg(test)]
+    pub(super) async fn observe_archive(
         &self,
         tileset_id: &TilesetId,
+    ) -> std::result::Result<(ArchiveKey, u64), ChunkFetchError> {
+        let (object_store, path) = self.sources.resolve(tileset_id.as_str()).ok_or_else(|| {
+            ChunkFetchError::Message(format!(
+                "no data source configured for tileset {tileset_id}"
+            ))
+        })?;
+        let meta = tokio::time::timeout(BACKEND_FETCH_TIMEOUT, object_store.head(&path))
+            .await
+            .map_err(|error| {
+                ChunkFetchError::Timeout(format!(
+                    "timed out reading object-store metadata: {error}"
+                ))
+            })?
+            .map_err(ChunkFetchError::from)?;
+        let generation = ArchiveGeneration::from_meta(&meta).map_err(|error| {
+            ChunkFetchError::Backend(format!(
+                "object-store backend did not provide a usable archive validator: {error}"
+            ))
+        })?;
+        Ok((ArchiveKey::new(tileset_id, generation), meta.size))
+    }
+
+    pub(super) async fn fetch_chunk_group(
+        &self,
+        archive: &ArchiveKey,
         chunk_range: Range<u64>,
         archive_len: u64,
     ) -> std::result::Result<Bytes, ChunkFetchError> {
@@ -309,7 +346,8 @@ impl ChunkFetcher {
         }
         let prefetched_chunks = end_chunk - start_chunk;
         debug!(
-            tileset_id = %tileset_id,
+            tileset_id = %archive.tileset_id,
+            archive_generation = %archive.generation.to_wire(),
             start_chunk = start_chunk,
             end_chunk = end_chunk,
             prefetched_chunks = prefetched_chunks,
@@ -318,12 +356,14 @@ impl ChunkFetcher {
         );
 
         self.fetch_range(
-            tileset_id,
+            &archive.tileset_id,
             range_start..range_end,
             prefetched_chunks,
             RangeLengthPolicy::Exact,
+            Some(&archive.generation),
         )
         .await
+        .map(|observed| observed.bytes)
     }
 
     /// Fetches a bounded non-cacheable range before the archive length is known.
@@ -333,12 +373,20 @@ impl ChunkFetcher {
         &self,
         tileset_id: &TilesetId,
         range: Range<u64>,
-    ) -> std::result::Result<Bytes, ChunkFetchError> {
+    ) -> std::result::Result<ObservedBytes, ChunkFetchError> {
         if range.start >= range.end {
-            return Ok(Bytes::new());
+            return Err(ChunkFetchError::Message(
+                "cannot observe an archive generation with an empty range".to_string(),
+            ));
         }
-        self.fetch_range(tileset_id, range, 1, RangeLengthPolicy::AllowShortAtEof)
-            .await
+        self.fetch_range(
+            tileset_id,
+            range,
+            1,
+            RangeLengthPolicy::AllowShortAtEof,
+            None,
+        )
+        .await
     }
 
     async fn fetch_range(
@@ -347,7 +395,8 @@ impl ChunkFetcher {
         range: Range<u64>,
         fetched_chunks: u64,
         range_length_policy: RangeLengthPolicy,
-    ) -> std::result::Result<Bytes, ChunkFetchError> {
+        expected_generation: Option<&ArchiveGeneration>,
+    ) -> std::result::Result<ObservedBytes, ChunkFetchError> {
         let (object_store, path) = self.sources.resolve(tileset_id.as_str()).ok_or_else(|| {
             ChunkFetchError::Message(format!(
                 "no data source configured for tileset {tileset_id}"
@@ -410,9 +459,12 @@ impl ChunkFetcher {
             if !backend_delay.is_zero() {
                 tokio::time::sleep(backend_delay).await;
             }
-            object_store
-                .get_range(&path, range_start..requested_range_end)
-                .await
+            let options = GetOptions::new().with_range(Some(range_start..requested_range_end));
+            let options = match expected_generation {
+                Some(generation) => generation.apply_to_get(options),
+                None => options,
+            };
+            object_store.get_opts(&path, options).await
         })
         .await;
         let record_backend_fetch = |outcome: &str, bytes: u64| {
@@ -423,11 +475,11 @@ impl ChunkFetcher {
                 bytes,
             );
         };
-        let bytes = match fetch_result {
-            Ok(Ok(bytes)) => bytes,
+        let result = match fetch_result {
+            Ok(Ok(result)) => result,
             Ok(Err(error)) => {
                 record_backend_fetch(backend_fetch_outcome(&error), 0);
-                return Err(ChunkFetchError::from(error));
+                return Err(map_object_store_error(error, expected_generation.is_some()));
             }
             Err(error) => {
                 record_backend_fetch("timeout", 0);
@@ -436,6 +488,20 @@ impl ChunkFetcher {
                 )));
             }
         };
+        let generation = ArchiveGeneration::from_meta(&result.meta).map_err(|error| {
+            record_backend_fetch("error", 0);
+            ChunkFetchError::Backend(format!(
+                "object-store backend did not provide a usable archive validator: {error}"
+            ))
+        })?;
+        if expected_generation.is_some_and(|expected| expected != &generation) {
+            record_backend_fetch("generation_changed", 0);
+            return Err(ChunkFetchError::GenerationChanged);
+        }
+        let bytes = result.bytes().await.map_err(|error| {
+            record_backend_fetch(backend_fetch_outcome(&error), 0);
+            map_object_store_error(error, expected_generation.is_some())
+        })?;
         let requested_bytes = requested_range_end.saturating_sub(range_start);
         let expected_len = usize::try_from(requested_bytes).map_err(|_| {
             ChunkFetchError::Message(format!(
@@ -467,7 +533,7 @@ impl ChunkFetcher {
             "fetched backend bytes"
         );
 
-        Ok(bytes)
+        Ok(ObservedBytes { bytes, generation })
     }
 }
 
@@ -511,6 +577,18 @@ impl From<ObjectStoreError> for ChunkFetchError {
         }
         Self::Backend(format!("object-store backend failure: {error}"))
     }
+}
+
+fn map_object_store_error(error: ObjectStoreError, generation_was_pinned: bool) -> ChunkFetchError {
+    if generation_was_pinned
+        && matches!(
+            error,
+            ObjectStoreError::NotFound { .. } | ObjectStoreError::Precondition { .. }
+        )
+    {
+        return ChunkFetchError::GenerationChanged;
+    }
+    ChunkFetchError::from(error)
 }
 
 /// Builds an object path under `base` from a `/`-delimited key, appending the
@@ -650,8 +728,17 @@ mod tests {
         BACKEND_FETCH_TIMEOUT, BackendLatencyModel, ChunkFetchError, ChunkFetcher, TilesetSources,
         object_path_under,
     };
-    use crate::{interned::TilesetId, metrics::NodeMetrics, storage::ObjectStoreRegistry};
+    use crate::{
+        interned::TilesetId,
+        metrics::NodeMetrics,
+        storage::{ArchiveKey, ObjectStoreRegistry},
+    };
     use object_store::{Error as ObjectStoreError, path::Path as ObjectPath};
+
+    async fn archive(fetcher: &ChunkFetcher, id: &str) -> ArchiveKey {
+        let tileset_id = TilesetId::try_new(id).unwrap();
+        fetcher.observe_archive(&tileset_id).await.unwrap().0
+    }
 
     #[test]
     fn source_configuration_errors_do_not_echo_raw_values() {
@@ -892,10 +979,8 @@ mod tests {
             metrics.clone(),
         )
         .unwrap();
-        let bytes = fetcher
-            .fetch_chunk_group(&TilesetId::try_new("fixture").unwrap(), 0..1, 8)
-            .await
-            .unwrap();
+        let archive = archive(&fetcher, "fixture").await;
+        let bytes = fetcher.fetch_chunk_group(&archive, 0..1, 8).await.unwrap();
 
         assert_eq!(bytes.as_ref(), b"abcd");
         assert_eq!(fetcher.received_bytes(), 4);
@@ -935,18 +1020,17 @@ mod tests {
             metrics.clone(),
         )
         .unwrap();
+        let first_archive = archive(&fetcher, "first").await;
+        let second_archive = archive(&fetcher, "second").await;
         let first_fetcher = fetcher.clone();
         let first = tokio::spawn(async move {
             first_fetcher
-                .fetch_chunk_group(&TilesetId::try_new("first").unwrap(), 0..1, 8)
+                .fetch_chunk_group(&first_archive, 0..1, 8)
                 .await
         });
         tokio::task::yield_now().await;
-        let second = tokio::spawn(async move {
-            fetcher
-                .fetch_chunk_group(&TilesetId::try_new("second").unwrap(), 0..1, 8)
-                .await
-        });
+        let second =
+            tokio::spawn(async move { fetcher.fetch_chunk_group(&second_archive, 0..1, 8).await });
         tokio::task::yield_now().await;
 
         let saturated = metrics.encode();
@@ -994,17 +1078,19 @@ mod tests {
             NodeMetrics::new(),
         )
         .unwrap();
+        let first_archive = archive(&fetcher, "first").await;
+        let second_archive = archive(&fetcher, "second").await;
         let first_fetcher = fetcher.clone();
         let first = tokio::spawn(async move {
             first_fetcher
-                .fetch_chunk_group(&TilesetId::try_new("first").unwrap(), 0..1, 8)
+                .fetch_chunk_group(&first_archive, 0..1, 8)
                 .await
         });
         tokio::task::yield_now().await;
 
         let started_at = tokio::time::Instant::now();
         let error = fetcher
-            .fetch_chunk_group(&TilesetId::try_new("second").unwrap(), 0..1, 8)
+            .fetch_chunk_group(&second_archive, 0..1, 8)
             .await
             .expect_err("second fetch must exhaust its end-to-end deadline");
         assert!(matches!(error, ChunkFetchError::Timeout(_)));

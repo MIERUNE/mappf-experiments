@@ -33,6 +33,7 @@ struct Inner {
     peer_fetch_duplicate_inflight: IntCounterVec,
     internal_resource_requests: IntCounterVec,
     provider_resource_cache: IntCounterVec,
+    style_refresh_hints: IntCounterVec,
     mapterhorn_resolve: IntCounterVec,
     cache_bytes: IntGaugeVec,
     backend_fetch_bytes: IntCounter,
@@ -272,6 +273,11 @@ impl NodeMetrics {
             "Provider resource cache activity by resource and outcome",
             &["resource", "outcome"],
         );
+        let style_refresh_hints = counter_vec(
+            "ishikari_style_refresh_hints_total",
+            "Advisory style refresh hints received over HTTP by outcome",
+            &["outcome"],
+        );
         let mapterhorn_resolve = counter_vec(
             "ishikari_mapterhorn_resolve_total",
             "Mapterhorn composite tile resolutions by outcome",
@@ -453,6 +459,7 @@ impl NodeMetrics {
                 Box::new(peer_fetch_duplicate_inflight.clone()),
                 Box::new(internal_resource_requests.clone()),
                 Box::new(provider_resource_cache.clone()),
+                Box::new(style_refresh_hints.clone()),
                 Box::new(mapterhorn_resolve.clone()),
                 Box::new(cache_bytes.clone()),
                 Box::new(backend_fetch_bytes.clone()),
@@ -495,6 +502,7 @@ impl NodeMetrics {
             peer_fetch_duplicate_inflight,
             internal_resource_requests,
             provider_resource_cache,
+            style_refresh_hints,
             mapterhorn_resolve,
             cache_bytes,
             backend_fetch_bytes,
@@ -605,6 +613,22 @@ impl NodeMetrics {
         self.0
             .provider_resource_cache
             .with_label_values(&[resource, outcome])
+            .inc();
+    }
+
+    /// Records one advisory style-refresh hint received over HTTP.
+    ///
+    /// A suppressed retry answers `202` exactly as the first delivery does, so
+    /// the HTTP status cannot distinguish them. Without this counter the
+    /// deduplication that bounds retry amplification is invisible in production,
+    /// which defeats its purpose.
+    ///
+    /// Outcomes: `accepted`, `suppressed` (a duplicate inside the dedup window),
+    /// `rejected` (invalid hint), `unknown_style`.
+    pub fn record_style_refresh_hint(&self, outcome: &str) {
+        self.0
+            .style_refresh_hints
+            .with_label_values(&[outcome])
             .inc();
     }
 

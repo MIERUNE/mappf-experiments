@@ -5,21 +5,21 @@ use moka::{policy::EvictionPolicy, sync::Cache};
 
 use crate::{
     cache_policy::{chunk_cache_entry_weight, effective_chunk_cache_capacity},
-    interned::TilesetId,
+    storage::generation::ArchiveKey,
 };
 
 /// Identifies a cached fixed-size chunk within an object.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct ChunkCacheKey {
-    pub tileset_id: TilesetId,
+    pub archive: ArchiveKey,
     pub chunk_index: u64,
 }
 
 impl ChunkCacheKey {
     /// Builds a chunk cache key from an object id and fixed-size chunk index.
-    pub(super) fn new(tileset_id: &TilesetId, chunk_index: u64) -> Self {
+    pub(super) fn new(archive: &ArchiveKey, chunk_index: u64) -> Self {
         Self {
-            tileset_id: tileset_id.clone(),
+            archive: archive.clone(),
             chunk_index,
         }
     }

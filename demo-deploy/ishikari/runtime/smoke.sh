@@ -65,6 +65,21 @@ check_type_with_accept() { # name expected-code expected-content-type-prefix acc
   fi
 }
 
+check_header() { # name expected-code header-name expected-value url
+  local tmp code value
+  tmp="$(mktemp)"
+  code=$(curl -g -s -D "$tmp" -o /dev/null -w '%{http_code}' --max-time "$TIMEOUT" "$5" 2>/dev/null)
+  value=$(awk -v name="$3" 'BEGIN{IGNORECASE=1} $1 == name ":" {sub(/\r$/, "", $0); sub(/^[^:]+:[[:space:]]*/, "", $0); print; exit}' "$tmp")
+  rm -f "$tmp"
+  if [ "$code" = "$2" ] && [ "$value" = "$4" ]; then
+    printf 'OK   %-34s %s %s: %s\n' "$1" "$code" "$3" "$value"
+  else
+    printf 'FAIL %-34s got %s %s: %s want %s %s: %s  (%s)\n' \
+      "$1" "$code" "$3" "${value:-<none>}" "$2" "$3" "$4" "$5"
+    fail=$((fail + 1))
+  fi
+}
+
 echo "== ishikari smoke: ${base} =="
 # Public provider routes (catch-all -> :8080).
 check_type "tilejson"        200 "application/json" "${base}/tilesets/${TILESET}"
@@ -84,6 +99,11 @@ check "livez"           200 "${base}/livez"
 # Internal surface must NOT be reachable through the Gateway.
 check "internal-metrics blocked" 404 "${base}/_internal/metrics"
 check "internal-cluster blocked" 404 "${base}/_internal/cluster"
+# Use a unique path so a pre-fix CDN entry cannot mask the current origin policy.
+missing_style="smoke-missing-${RANDOM:-0}-$$"
+check_header \
+  "missing style is not cacheable" 404 "cache-control" "private, no-store" \
+  "${base}/styles/${missing_style}/style.json"
 
 if [ "$fail" -eq 0 ]; then
   echo "== ishikari smoke: PASS =="

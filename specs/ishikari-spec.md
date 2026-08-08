@@ -1,266 +1,93 @@
 # Ishikari Specification
 
-Durable design contract for Ishikari: what it is, what it must not become, and
-the invariants and module boundaries the implementation must uphold. Active work
-items and open decisions live in `../issues/ishikari-todo.md`. Component-level
-contracts are in [`isoline-and-hillshade-spec.md`](isoline-and-hillshade-spec.md)
-and [`ishikari-sim-spec.md`](ishikari-sim-spec.md).
+Durable design contract for Ishikari: what it is, what it must not become, and the invariants and module boundaries the implementation must uphold. Active work items and open decisions live in `../issues/ishikari-todo.md`. Component-level contracts are in [`isoline-and-hillshade-spec.md`](isoline-and-hillshade-spec.md) and [`ishikari-sim-spec.md`](ishikari-sim-spec.md).
 
 ## Positioning
 
-Ishikari's primary purpose is efficient, low-cost delivery of PMTiles archives
-stored in object storage. Its core product is PMTiles-backed TileJSON and tile
-bytes over ordinary HTTP, with distributed cache locality and backend range-read
-batching.
+Ishikari's primary purpose is efficient, low-cost delivery of PMTiles archives stored in object storage. Its core product is PMTiles-backed TileJSON and tile bytes over ordinary HTTP, with distributed cache locality and backend range-read batching.
 
-Style JSON, glyphs, sprites, preview pages, and renderer integration are
-supporting provider features. Biei is the primary demo consumer, but Ishikari
-must remain a standalone provider and must not grow renderer-specific routing or
-worker concepts.
+Style JSON, glyphs, sprites, preview pages, and renderer integration are supporting provider features. Biei is the primary demo consumer, but Ishikari must remain a standalone provider and must not grow renderer-specific routing or worker concepts.
 
 ## Specification Evolution
 
-These specifications capture the best-known design, not a performance ceiling
-or a requirement to preserve a particular implementation technique. When a
-different approach has well-founded evidence that it can outperform the
-specified approach while preserving the public contract, correctness, safety,
-and architectural guardrails, Ishikari should revise the specification and
-adopt the better approach rather than treating the current technique as fixed.
+These specifications capture the best-known design, not a performance ceiling or a requirement to preserve a particular implementation technique. When a different approach has well-founded evidence that it can outperform the specified approach while preserving the public contract, correctness, safety, and architectural guardrails, Ishikari should revise the specification and adopt the better approach rather than treating the current technique as fixed.
 
-Performance claims must be supported by reproducible measurements on
-representative workloads. Evaluation must consider the relevant trade-offs
-together, including latency, throughput, memory, backend requests and bytes,
-network egress, and operating cost. Update the specification and regression
-tests with the implementation; an optimization must not silently weaken an
-existing contract merely because it wins one benchmark.
+Performance claims must be supported by reproducible measurements on representative workloads. Evaluation must consider the relevant trade-offs together, including latency, throughput, memory, backend requests and bytes, network egress, and operating cost. Update the specification and regression tests with the implementation; an optimization must not silently weaken an existing contract merely because it wins one benchmark.
 
 ## Non-Goals and Guardrails
 
 - Do not move Biei render routing into Ishikari.
-- Do not make Ishikari aware of Biei worker slots, render permits, or render
-  output caches.
+- Do not make Ishikari aware of Biei worker slots, render permits, or render output caches.
 - Do not require Biei or other consumers to understand PMTiles archives directly.
-- Keep generic one-node Chitchat lifecycle and cluster-state inspection in
-  `mmpf-cluster`. Keep Ishikari KV schemas, view decoding, and routing policy in
-  Ishikari-owned crates.
-- Do not put attacker-controlled `style_id` or `tileset_id` values in metric
-  labels.
-- Keep `/_internal/*`, including `/_internal/metrics`, on the cluster-internal
-  listener (`ISKR_INTERNAL_HTTP_PORT`) only. Never route that port through a
-  Service, Gateway, or Ingress, and keep the public listener returning 404 for
-  those paths.
-- Keep the headless gossip Service gossip-only; do not publish public HTTP
-  `8080` there.
-- Keep generic PMTiles v3 format decoding, bounded directory traversal, and
-  archive-reader primitives in `mmpf-pmtiles`. Keep Ishikari's distributed
-  PMTiles cache/orchestration in `crates/ishikari-core/src/pmtiles`, byte access
-  and peer routing in `crates/ishikari-core/src/storage`, and HTTP/provider
-  behavior in `servers/ishikari`.
+- Keep generic one-node Chitchat lifecycle and cluster-state inspection in `mmpf-cluster`. Keep Ishikari KV schemas, view decoding, and routing policy in Ishikari-owned crates.
+- Do not put attacker-controlled `style_id` or `tileset_id` values in metric labels.
+- Keep `/_internal/*`, including `/_internal/metrics`, on the cluster-internal listener (`ISKR_INTERNAL_HTTP_PORT`) only. Never route that port through a Service, Gateway, or Ingress, and keep the public listener returning 404 for those paths.
+- Keep the headless gossip Service gossip-only; do not publish public HTTP `8080` there.
+- Keep generic PMTiles v3 format decoding, bounded directory traversal, and archive-reader primitives in `mmpf-pmtiles`. Keep Ishikari's distributed PMTiles cache/orchestration in `crates/ishikari-core/src/pmtiles`, byte access and peer routing in `crates/ishikari-core/src/storage`, and HTTP/provider behavior in `servers/ishikari`.
 
 ## PMTiles Tile Delivery Contract
 
 ### Archive identity and HTTP behavior
 
-- A tileset id identifies one PMTiles archive for the lifetime of cached data.
-  Positive tiles, PMTiles directories, metadata, and backend chunks are treated
-  as immutable and may remain cached until byte-capacity eviction. Replacing an
-  archive under the same id is unsupported until an explicit invalidation
-  contract exists; publish changed content under a new immutable logical id
-  instead. A revision suffix is a publisher naming convention inside that id,
-  not a separate Ishikari version field.
-  Runtime reads do not perform per-request object-generation checks, so the
-  publishing workflow—not eventual cache convergence—must prevent or detect
-  overwrite of a live id.
-- TileJSON is derived from the PMTiles header and metadata. Ordinary tile
-  requests serve the archive's stored format and `Content-Encoding` when that
-  coding is acceptable to the request. A missing `Accept-Encoding` accepts the
-  stored coding. Ishikari does not spend CPU decompressing or cross-compressing
-  a tile solely for content-coding negotiation; if the only stored/generated
-  representation is excluded, the public route returns `406 Not Acceptable`.
-  Explicit `.mlt` requests, or `Accept: application/vnd.maplibre-tile` where
-  supported, may transcode stored MVT under the bounded CPU-work budget. The
-  earlier `application/vnd.maplibre-vector-tile` spelling is accepted as an
-  input alias; responses use the canonical shorter media type. Public
-  tile responses emit `Vary: Accept, Accept-Encoding`; the `.mlt` suffix remains
-  the canonical cache-stable media-type form.
-- Public tile responses use `public, max-age=3600, s-maxage=86400,
-  stale-while-revalidate=604800`. TileJSON uses `public, max-age=300,
-  s-maxage=3600, stale-while-revalidate=86400`. These policies describe the
-  immutable public representation and do not inherit object-storage metadata.
-- Tile absence is cached internally for the configured short negative TTL;
-  positive entries do not acquire that TTL. A negative hit must not be extended
-  by reads, and transient backend or peer failures must not become authoritative
-  absence. Public negative caching is opt-in per endpoint rather than implied by
-  the positive tile policy.
+- A tileset id is a logical name and may be replaced in object storage. The first bootstrap response establishes an archive generation from the object version, or from a strong ETag when no version is available. Ishikari never derives identity from a timestamp or a length itself, and rejects a store that offers neither validator.
+- **The guarantee is only as strong as the backend's validator.** Ishikari can reject a syntactically weak ETag, but it cannot inspect how a backend composed a strong one. `object_store`'s local filesystem, for example, builds its ETag from inode, mtime, and size, so a same-size in-place rewrite within one mtime tick can repeat it on a coarse-granularity filesystem. GCS object generation is the production-grade path and is preferred whenever available; other backends inherit their own validator's strength.
+- Header, metadata, directory, chunk, tile, per-source decoded DEM, derived terrain, and MLT caches include that generation. Every later object-store range read is pinned with the corresponding version or `If-Match`, and every response is additionally checked by comparing its validator against the admitted generation before its body is consumed. That second check is what makes the guarantee independent of whether a backend honors the pinning options; pinning is what avoids paying for a request whose bytes would be discarded.
+- A missing/precondition-failed generation, or a response carrying a different validator, invalidates the admitted bootstrap and restarts the complete tile lookup once. Bytes from two generations are therefore never assembled into one PMTiles result. A restart that observes yet another change is reported as `503` rather than absorbed: a larger internal retry count cannot resolve sustained publication churn, and the next client attempt admits the new generation.
+- Internal bootstrap, leaf, and tile responses carry the generation. A caller accepts peer bytes only when they match its admitted archive; a peer miss or mismatch falls back to the caller's pinned object-store path instead of becoming an authoritative negative cache entry.
+- This is a snapshot-consistency rule, not an immediate purge mechanism. The logical bootstrap pointer is reused for at most `ISKR_ARCHIVE_REVALIDATION_INTERVAL` (five minutes by default, validated to at most seven days), then re-observed directly from the authoritative backend rather than copied from a peer. An unchanged generation keeps generation-keyed leaf, chunk, tile, DEM, derived, and MLT entries reusable. A failed revalidation may serve the last coherent generation and retries after a five-second cooldown, preserving a warm serving set without allowing request-rate backend amplification; convergence is therefore bounded only while the authoritative backend is reachable. A publisher-to-Ishikari refresh signal remains required before stable-id replacement can promise a shorter SLA.
+- TileJSON is derived from the PMTiles header and metadata. Ordinary tile requests serve the archive's stored format and `Content-Encoding` when that coding is acceptable to the request. A missing `Accept-Encoding` accepts the stored coding. Ishikari does not spend CPU decompressing or cross-compressing a tile solely for content-coding negotiation; if the only stored/generated representation is excluded, the public route returns `406 Not Acceptable`. Explicit `.mlt` requests, or `Accept: application/vnd.maplibre-tile` where supported, may transcode stored MVT under the bounded CPU-work budget. The earlier `application/vnd.maplibre-vector-tile` spelling is accepted as an input alias; responses use the canonical shorter media type. Public tile responses emit `Vary: Accept, Accept-Encoding`; the `.mlt` suffix remains the canonical cache-stable media-type form. `encoding=mlt` selects an MLT TileJSON document only; tile payload routes reject that query with `400` instead of silently serving stored MVT.
+- `?encoding=` is narrowed to a fixed vocabulary and an unrecognized value is a `400`. Falling through to MVT meant a caller that misspelled `mlt` was served MVT tile URLs while believing otherwise, and every distinct spelling minted its own cacheable URL for identical content. The narrowing yields a borrowed constant rather than the caller's bytes, which is what keeps request text out of generated TileJSON URLs and out of the preview shell, where a substituted value lands inside a JavaScript string literal. The shell independently escapes both of its substitutions for the context they occupy, so the boundary vocabulary and the sink are two barriers rather than one.
+- Tile coordinates are accepted only in canonical decimal form. Rust's integer parsing accepts a leading `+` and unlimited leading zeros, so a single tile had unboundedly many spellings, all returning identical bytes under the hour-long `max-age` above. The internal caches key on parsed integers and collapse them, so origin CPU was never the exposure; each spelling is a separate entry in every cache in front of Ishikari, so the aliases can fill a shared cache with entries that can never be hit again and that displace tiles a client wants. One shared parser decides for the flat, namespaced, and derived tile routes, and it distinguishes a malformed shape from a canonical value that is merely out of range.
+- Public tile responses use `public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800`. TileJSON uses `public, max-age=300, s-maxage=3600, stale-while-revalidate=86400`. These policies do not inherit object-storage metadata. A stable-id publisher must also purge the CDN or publish a versioned delivery URL when its activation SLA is shorter than those shared-cache windows.
+- Tile absence is cached internally for the configured short negative TTL; positive entries do not acquire that TTL. A negative hit must not be extended by reads, and transient backend or peer failures must not become authoritative absence. Every public delivery `4xx` or `5xx` response carries `private, no-store`, so a shared cache cannot turn a request made before publication into a longer activation delay; cacheable `304` responses retain their representation policy. Internal peer responses do not inherit this public error header.
 
 ### Distributed resolution and backend access
 
-- `ISKR_TILESET_SOURCES` selects a root or URL template by the optional first
-  segment of the logical tileset id. A default template without `{namespace}`
-  expands `{tileset_id}` to the complete logical id. Named templates, and
-  templates with an explicit whole-segment `{namespace}`, expand `{tileset_id}`
-  to the id after the namespace. For a flat id an explicit namespace segment is
-  omitted. Root-only values remain shorthand for appending the selected relative
-  key and `.pmtiles`.
+- `ISKR_TILESET_SOURCES` selects a root or URL template by the optional first segment of the logical tileset id. A default template without `{namespace}` expands `{tileset_id}` to the complete logical id. Named templates, and templates with an explicit whole-segment `{namespace}`, expand `{tileset_id}` to the id after the namespace. For a flat id an explicit namespace segment is omitted. Root-only values remain shorthand for appending the selected relative key and `.pmtiles`.
 
-- Nodes use a stable HRW key per resource class so a converged membership view
-  selects the same preferred owner. Peer unavailability may add fallback work
-  or latency but must not change tile correctness; candidates are tried in score
-  order before local object-storage fallback.
-- The cache hierarchy has distinct jobs: tile bytes form a bounded near-entry
-  and owner hot tier; PMTiles bootstrap/leaf data avoids repeated directory
-  traversal; fixed-size backend chunks provide aggregate byte reuse around
-  Hilbert-local tile requests. Cache placement may evolve only from measured
-  latency, peer traffic, backend bytes, and effective aggregate capacity.
-- Object-storage reads are aligned to chunks. Concurrent missing chunks may be
-  merged into bounded range reads and consumers of pending or in-flight chunks
-  share that work. The merge window is configurable per process through
-  `ISKR_CHUNK_FETCH_MERGE_WINDOW_MS`, defaults to 10 ms, and accepts 0 as a
-  no-intentional-wait baseline; bootstrap and capacity-release dispatches remain
-  immediate. Correctness must not depend on a particular merge window, chunk
-  size, or range cap; those are measured operating parameters.
-- Memory, distinct admitted work, backend concurrency, peer requests, and
-  CPU-heavy transformations remain bounded. Overload sheds work rather than
-  creating an unbounded queue.
-- Production resolves every byte-weighted material-cache capacity at the
-  server composition root and rejects a sum above
-  `ISKR_CACHE_WEIGHT_BUDGET_BYTES`. This ceiling bounds configured Moka weights,
-  not process RSS; deployments must separately reserve headroom for keys,
-  auxiliary entry-count caches, in-flight bodies, decompression/transform work,
-  runtime state, gossip, and allocator fragmentation.
+- Nodes use a stable HRW key per resource class so a converged membership view selects the same preferred owner. Peer unavailability may add fallback work or latency but must not change tile correctness; candidates are tried in score order before local object-storage fallback.
+- The cache hierarchy has distinct jobs: tile bytes form a bounded near-entry and owner hot tier; PMTiles bootstrap/leaf data avoids repeated directory traversal; fixed-size backend chunks provide aggregate byte reuse around Hilbert-local tile requests. Cache placement may evolve only from measured latency, peer traffic, backend bytes, and effective aggregate capacity.
+- Object-storage reads are aligned to chunks. Concurrent missing chunks may be merged into bounded range reads and consumers of pending or in-flight chunks share that work. The merge window is configurable per process through `ISKR_CHUNK_FETCH_MERGE_WINDOW_MS`, defaults to 10 ms, and accepts 0 as a no-intentional-wait baseline; bootstrap and capacity-release dispatches remain immediate. Correctness must not depend on a particular merge window, chunk size, or range cap; those are measured operating parameters.
+- Memory, distinct admitted work, backend concurrency, peer requests, and CPU-heavy transformations remain bounded. Overload sheds work rather than creating an unbounded queue.
+- Production resolves every byte-weighted material-cache capacity at the server composition root and rejects a sum above `ISKR_CACHE_WEIGHT_BUDGET_BYTES`. This ceiling bounds configured Moka weights, not process RSS; deployments must separately reserve headroom for keys, auxiliary entry-count caches, in-flight bodies, decompression/transform work, runtime state, gossip, and allocator fragmentation.
 
 ### Work coalescing principle
 
-Coalesce equivalent work when the avoided cost and observed overlap justify the
-coordination, cancellation, and tail-latency cost. Bootstrap, leaf, provider,
-chunk, and derived-generation work currently meet that test. Entry-side peer
-tile responses do not: a 50-VU, 3-node replay measured identical overlap in
-only 0.23% of peer tile fetches. Re-evaluate from production measurements rather
-than treating either coalescing or non-coalescing as a resource-wide rule.
+Coalesce equivalent work when the avoided cost and observed overlap justify the coordination, cancellation, and tail-latency cost. Bootstrap, leaf, provider, chunk, and derived-generation work currently meet that test. Entry-side peer tile responses do not: a 50-VU, 3-node replay measured identical overlap in only 0.23% of peer tile fetches. Re-evaluate from production measurements rather than treating either coalescing or non-coalescing as a resource-wide rule.
 
 ## Provider Resource Caching
 
-- Every peer in one protocol cluster must use equivalent provider catalog and
-  URL-template configuration. The caller's HRW placement identity includes its
-  resolved upstream URL, but the current internal request carries only logical
-  style/glyph/sprite identity; a configuration-skewed peer can therefore resolve
-  a different upstream. Mixed provider revisions are unsupported until the wire
-  contract binds and validates a bounded configuration revision.
-- Style, glyph, and sprite fetches honor upstream `Cache-Control` in both the
-  pod-local shared cache and the public response. The normalized policy and
-  current age must survive an internal peer hop. HTTP `Age` and `Date` contribute
-  to the entry's initial age only when the upstream declares explicit freshness
-  (`max-age`/`s-maxage`), so an already-old response consumes that declared
-  lifetime rather than restarting it at Ishikari. When Ishikari applies a default
-  policy (no upstream freshness), the clock starts at fetch time, so a transported
-  `Age` must not shorten or evict the defaulted entry. Repeated `Cache-Control`
-  field lines are combined before directive parsing.
-- `no-store`, `no-cache`, and `private` responses do not enter Ishikari's shared
-  provider cache. A successful uncacheable refresh invalidates any older stale
-  entry for the same resource. Concurrent followers may reuse that successful
-  representation ephemerally, without retaining it for later requests.
-- `must-revalidate` and `proxy-revalidate` disable stale serving. Duplicate
-  freshness directives use the most conservative parsed value so their order
-  cannot extend freshness. Explicit freshness and stale windows are capped at
-  seven days so a pathological upstream cannot pin shared-cache bytes
-  indefinitely.
-- A stale-while-revalidate leader sends the cached origin `ETag` (or
-  `Last-Modified` when no ETag exists) as a conditional request. An origin `304`
-  rebuilds the cache entry around the existing validated bytes, retaining
-  representation metadata absent from the `304`, applying updated cache policy
-  and validators, and restarting freshness without downloading the body.
-  Object-store origins use the equivalent `GetOptions` preconditions. The
-  `revalidated` provider-cache metric distinguishes this path from a full-body
-  replacement; refresh errors leave the stale entry untouched.
-- When an upstream supplies no cache policy, style responses use `STYLE` and
-  glyph/sprite responses use `GLYPH_SPRITE` from
-  `servers/ishikari/src/server/cache.rs`. Provider
-  `404 Not Found` results are cached internally for 30 seconds with no stale
-  window; transient failures are not negative-cached.
-- Distinct provider URLs are protected by a process-wide fetch concurrency and
-  admission bound in addition to per-key single-flight. A slow or hung upstream
-  must not pin request tasks or body memory without a bound.
-- A comma-separated glyph stack is split into at most eight distinct font
-  names. Each single-font 256-codepoint PBF is fetched through the ordinary
-  provider cache, then the ordered first-font-wins composite is protobuf-decoded,
-  bounded, generated under CPU-work admission, and stored in a separate
-  byte-weighted cache. The original 64 MiB provider budget is partitioned into
-  48 MiB for upstream representations and 16 MiB for glyph composites, so this
-  feature does not silently raise the process cache ceiling. HRW placement
-  remains keyed by the complete ordered stack, concentrating composite entries
-  on the same owner and preserving peer failover.
-- The direct HTTP provider fetch does not follow redirects. Upstreams answer
-  directly; chasing a redirect would let a compromised or open-redirecting
-  upstream steer the fetch at cluster-internal or link-local addresses that the
-  internal-listener isolation otherwise fences off.
-- `Content-Encoding` is representation metadata and survives byte-identical
-  glyph/sprite responses and peer hops. Compressed style JSON is decoded with a
-  bounded output before validation and rewriting; invalid JSON never enters the
-  provider cache.
-- Validators pass through only for byte-identical bodies: single-font glyphs
-  and sprites emit the upstream `ETag`/`Last-Modified` and answer `If-None-Match`
-  (weak comparison, precedence over `If-Modified-Since`) and second-granular
-  `If-Modified-Since` with `304 Not Modified`. The `304` carries the same cache
-  metadata (`Cache-Control`, `Age`, validators) as the `200` but omits
-  representation metadata such as `Content-Encoding` (RFC 9110 §15.4.5).
-  `If-None-Match: *` matches any existing representation even
-  when no `ETag` is available. Derived representations — composite glyphs,
-  rewritten style JSON, TileJSON, and derived-product TileJSON — instead emit
-  an Ishikari-computed strong `ETag` over the exact bytes served and no
-  `Last-Modified`, and answer `If-None-Match` with a `304`. Ishikari never emits a validator that the
-  upstream did not supply for a byte-identical body, and validators survive the
-  internal peer hop alongside the cache policy.
-- TileJSON, rewritten style JSON, and generated preview/derived documents embed
-  the effective request origin. They emit `Vary: Origin, X-Forwarded-Proto`.
-  Standards-compliant caches already include the request URI's scheme,
-  authority, path, and query in their primary key; deployments must not place a
-  shared cache in front of Ishikari that collapses different authorities or
-  ignores query parameters.
+- Every peer in one protocol cluster must use equivalent provider catalog and URL-template configuration. The caller's HRW placement identity includes its resolved upstream URL, but the current internal request carries only logical style/glyph/sprite identity; a configuration-skewed peer can therefore resolve a different upstream. Mixed provider revisions are unsupported until the wire contract binds and validates a bounded configuration revision.
+- Style, glyph, and sprite fetches honor upstream `Cache-Control` in both the pod-local shared cache and the public response. The normalized policy and current age must survive an internal peer hop. HTTP `Age` and `Date` contribute to the entry's initial age only when the upstream declares explicit freshness (`max-age`/`s-maxage`), so an already-old response consumes that declared lifetime rather than restarting it at Ishikari. When Ishikari applies a default policy (no upstream freshness), the clock starts at fetch time, so a transported `Age` must not shorten or evict the defaulted entry. Repeated `Cache-Control` field lines are combined before directive parsing.
+- `no-store`, `no-cache`, and `private` responses do not enter Ishikari's shared provider cache. A successful uncacheable refresh invalidates any older stale entry for the same resource. Concurrent followers may reuse that successful representation ephemerally, without retaining it for later requests.
+- `must-revalidate` and `proxy-revalidate` disable stale serving. Duplicate freshness directives use the most conservative parsed value so their order cannot extend freshness. Explicit freshness and stale windows are capped at seven days so a pathological upstream cannot pin shared-cache bytes indefinitely.
+- A stale-while-revalidate leader sends the cached origin `ETag` (or `Last-Modified` when no ETag exists) as a conditional request. An origin `304` rebuilds the cache entry around the existing validated bytes, retaining representation metadata absent from the `304`, applying updated cache policy and validators, and restarting freshness without downloading the body. Object-store origins use the equivalent `GetOptions` preconditions. The `revalidated` provider-cache metric distinguishes this path from a full-body replacement; refresh errors leave the stale entry untouched.
+- `POST /_internal/refresh/style` accepts a versioned, at-most-1 KiB advisory document containing only a bounded hint id and logical style id. It resolves the provider URL from local trusted configuration, invalidates exactly that local JSON representation, and publishes the hint through a fixed 16-slot per-node membership ring. Every peer performs the same local invalidation. Public listeners do not expose this route.
+- A hint accepts no URL, credential, body, cache policy, or authoritative revision and performs no origin I/O. The next ordinary request fetches through existing admission, validation, and single-flight. Ring overwrite or loss affects only propagation latency because provider freshness and conditional revalidation remain the correctness path. Cached provider representations carry a bounded invalidation epoch, so a fetch that started before a newer hint cannot reinstall visible old bytes afterward.
+- When an upstream supplies no cache policy, style responses use `STYLE` and glyph/sprite responses use `GLYPH_SPRITE` from `servers/ishikari/src/server/cache.rs`. Provider `404 Not Found` results are cached internally for 30 seconds with no stale window; transient failures are not negative-cached.
+- Distinct provider URLs are protected by a process-wide fetch concurrency and admission bound in addition to per-key single-flight. A slow or hung upstream must not pin request tasks or body memory without a bound.
+- A comma-separated glyph stack is split into at most eight distinct font names. Each single-font 256-codepoint PBF is fetched through the ordinary provider cache, then the ordered first-font-wins composite is protobuf-decoded, bounded, generated under CPU-work admission, and stored in a separate byte-weighted cache. The original 64 MiB provider budget is partitioned into 48 MiB for upstream representations and 16 MiB for glyph composites, so this feature does not silently raise the process cache ceiling. HRW placement remains keyed by the complete ordered stack, concentrating composite entries on the same owner and preserving peer failover.
+- The direct HTTP provider fetch does not follow redirects. Upstreams answer directly; chasing a redirect would let a compromised or open-redirecting upstream steer the fetch at cluster-internal or link-local addresses that the internal-listener isolation otherwise fences off.
+- `Content-Encoding` is representation metadata and survives byte-identical glyph/sprite responses and peer hops. Compressed style JSON is decoded with a bounded output before validation and rewriting; invalid JSON never enters the provider cache.
+- Validators pass through only for byte-identical bodies: single-font glyphs and sprites emit the upstream `ETag`/`Last-Modified` and answer `If-None-Match` (weak comparison, precedence over `If-Modified-Since`) and second-granular `If-Modified-Since` with `304 Not Modified`. The `304` carries the same cache metadata (`Cache-Control`, `Age`, validators) as the `200` but omits representation metadata such as `Content-Encoding` (RFC 9110 §15.4.5). `If-None-Match: *` matches any existing representation even when no `ETag` is available. Derived representations — composite glyphs, rewritten style JSON, TileJSON, and derived-product TileJSON — instead emit an Ishikari-computed strong `ETag` over the exact bytes served and no `Last-Modified`, and answer `If-None-Match` with a `304`. Ishikari never emits a validator that the upstream did not supply for a byte-identical body, and validators survive the internal peer hop alongside the cache policy.
+- TileJSON, rewritten style JSON, and generated preview/derived documents embed the effective request origin. They emit `Vary: Origin, X-Forwarded-Proto`. Standards-compliant caches already include the request URI's scheme, authority, path, and query in their primary key; deployments must not place a shared cache in front of Ishikari that collapses different authorities or ignores query parameters.
 
-Cluster-internal provider responses must carry normalized cache policy and age
-metadata. A response missing either field is rejected and the requester fetches
-the resource locally; it never guesses cache semantics from an incomplete peer
-response.
+Cluster-internal provider responses must carry normalized cache policy and age metadata. A response missing either field is rejected and the requester fetches the resource locally; it never guesses cache semantics from an incomplete peer response.
 
 ## Implementation Boundaries
 
-Do not move files only for aesthetics. Move modules when a new responsibility
-needs a clearer boundary.
+Do not move files only for aesthetics. Move modules when a new responsibility needs a clearer boundary.
 
-`servers/ishikari/src/server/provider_cache_policy.rs` owns upstream
-`Cache-Control` normalization and TTL selection. It consumes the allocation-free
-directive tokenizer and conservative duplicate delta-seconds handling from
-`mmpf-http`; service-specific policy does not move into the shared crate.
-`servers/ishikari/src/server/provider_body.rs` owns bounded representation
-decoding, JSON validation, and media-type checks.
-`servers/ishikari/src/server/upstream.rs` exposes a `ProviderFetcher` capability
-that owns admission, metrics, shared-cache and freshness state, per-key
-single-flight, and revalidation orchestration without depending on the complete
-HTTP `AppState`. Its child `server/upstream/fetch.rs` owns origin transport,
-conditional HTTP/object-store requests, bounded body collection, response
-metadata extraction, and representation validation. That child borrows the
-parent capability; it does not own a second cache, semaphore, or coordination
-layer.
+`servers/ishikari/src/server/provider_cache_policy.rs` owns upstream `Cache-Control` normalization and TTL selection. It consumes the allocation-free directive tokenizer and conservative duplicate delta-seconds handling from `mmpf-http`; service-specific policy does not move into the shared crate. `servers/ishikari/src/server/provider_body.rs` owns bounded representation decoding, JSON validation, and media-type checks. `servers/ishikari/src/server/upstream.rs` exposes a `ProviderFetcher` capability that owns admission, metrics, shared-cache and freshness state, per-key single-flight, and revalidation orchestration without depending on the complete HTTP `AppState`. Its child `server/upstream/fetch.rs` owns origin transport, conditional HTTP/object-store requests, bounded body collection, response metadata extraction, and representation validation. That child borrows the parent capability; it does not own a second cache, semaphore, or coordination layer.
 
-Cancellation-safe single-flight election is the service-independent primitive
-in `mmpf-common`. Provider resources and the distributed PMTiles reader reuse
-it, while each owner defines its own key, cached-success path, transient error
-propagation, and negative-cache policy. `PeerSnapshotCache` remains in
-`ishikari-core::storage`: it coalesces concurrent Chitchat snapshot refreshes
-and gives normal routing reads a short-lived immutable peer snapshot without
-making membership a generic server concern.
+Cancellation-safe single-flight election is the service-independent primitive in `mmpf-common`. Provider resources and the distributed PMTiles reader reuse it, while each owner defines its own key, cached-success path, transient error propagation, and negative-cache policy. `PeerSnapshotCache` remains in `ishikari-core::storage`: it coalesces concurrent Chitchat snapshot refreshes and gives normal routing reads a short-lived immutable peer snapshot without making membership a generic server concern.
 
 The current workspace boundary is intentional:
 
-- `ishikari-core` owns reusable cache, storage, peer-routing, and distributed
-  PMTiles mechanisms;
-- `servers/ishikari` owns CLI/environment parsing, runtime assembly, HTTP
-  response shaping, provider handlers, and terrain-service orchestration;
+- `ishikari-core` owns reusable cache, storage, peer-routing, and distributed PMTiles mechanisms;
+- `servers/ishikari` owns CLI/environment parsing, runtime assembly, HTTP response shaping, provider handlers, and terrain-service orchestration;
 - `mmpf-pmtiles` owns service-independent PMTiles primitives;
 - `mmpf-terrain` owns service-independent DEM and derived-product algorithms;
-- `mmpf-cluster`, `mmpf-http`, and `mmpf-common` contain only proven shared
-  mechanisms, not Ishikari domain policy.
+- `mmpf-cluster`, `mmpf-http`, and `mmpf-common` contain only proven shared mechanisms, not Ishikari domain policy.
 
-Do not move HTTP handlers into `ishikari-core` merely to make the server crate
-smaller. Revisit a boundary only when a component has an independent consumer
-or independently evolving contract.
+Do not move HTTP handlers into `ishikari-core` merely to make the server crate smaller. Revisit a boundary only when a component has an independent consumer or independently evolving contract.

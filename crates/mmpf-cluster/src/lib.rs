@@ -19,9 +19,15 @@ use chitchat::{
 };
 
 mod bootstrap;
+mod refresh_hint;
 pub use bootstrap::{
     BootstrapReadinessGate, BootstrapReadinessObservation, BootstrapReadinessState,
     BootstrapReadinessTransition, DEFAULT_BOOTSTRAP_GRACE,
+};
+pub use refresh_hint::{
+    HintAdmission, MAX_STYLE_REFRESH_HINT_BYTES, RefreshHintBatch, RefreshHintDedup,
+    RefreshHintError, STYLE_REFRESH_HINT_SLOTS, StyleRefreshHint, StyleRefreshHintTracker,
+    style_refresh_hint_key,
 };
 
 #[cfg(feature = "simulation")]

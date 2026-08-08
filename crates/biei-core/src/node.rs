@@ -181,12 +181,14 @@ impl Node {
         let publisher = {
             let snap = snapshotter.clone();
             let gossip = gossip.clone();
+            let style_catalog = Arc::clone(&style_catalog);
             let interval = gossip_config.publish_interval;
             let render_admission = Arc::clone(&render_admission);
             tokio::spawn(async move {
                 let mut last_sent = crate::types::NodeKvs::new();
                 loop {
                     let mut kvs = snap.snapshot_kvs();
+                    kvs.extend(style_catalog.revision_gossip_kvs());
                     let accepts_new_renders = render_admission();
                     kvs.insert(
                         RENDER_ADMISSION_GOSSIP_KEY.to_string(),
@@ -471,6 +473,25 @@ impl Node {
         task: &InternalTask,
         miss_admission: CacheMissAdmission,
     ) -> Result<Option<RenderFlightLeader>, TaskOutcome> {
+        let style_revalidation_blocks_cache = !self
+            .inner
+            .style_catalog
+            .is_current_cluster_revision(&task.style)
+            && (self
+                .inner
+                .style_catalog
+                .has_pending_revalidation(&task.style.id)
+                || self.inner.style_catalog.needs_revalidation(&task.style.id));
+        if style_revalidation_blocks_cache {
+            // A publisher hint may arrive before its 10-second fetch floor. Do
+            // not let a stale output hit — or a render during that floor — hide
+            // the provider revalidation once it becomes due.
+            if miss_admission.requires_local_renderer() && !self.can_start_render() {
+                return Err(self.renderer_degraded_reject(task));
+            }
+            self.inner.metrics.record_render_output_cache_miss();
+            return Ok(None);
+        }
         let mut joined_existing_render = false;
         let mut lookup = self.inner.render_output_cache.lookup_or_join(task);
         loop {
@@ -647,6 +668,12 @@ impl Node {
             .await
     }
 
+    /// Invalidates completed and in-flight output-cache work for one style.
+    /// The style catalog remains responsible for revalidating provider bytes.
+    pub fn invalidate_render_output_cache(&self, style_id: &crate::types::StyleId) {
+        self.inner.render_output_cache.invalidate_style(style_id);
+    }
+
     fn maybe_insert_render_output_cache(
         &self,
         cache_flight: Option<&RenderFlightLeader>,
@@ -685,6 +712,7 @@ impl Node {
 
         let mut last_retryable_rejection: Option<RejectionReason> = None;
         let mut saw_transport_failure = false;
+        let mut saw_unconverged_style = false;
 
         for candidate in candidates {
             if forward_budget_too_small(&forwarded_task) {
@@ -740,6 +768,27 @@ impl Node {
                         last_retryable_rejection = Some(reason);
                         continue;
                     }
+                    // A peer can answer `UnknownStyle` while it is still learning
+                    // a revision that this node already resolved. Only the
+                    // forwarding node can distinguish that skew from a missing
+                    // style, so retry it while the local revision remains valid.
+                    if resp.rejected_reason() == Some(RejectionReason::UnknownStyle)
+                        && self
+                            .inner
+                            .style_catalog
+                            .accepts_revision(&forwarded_task.style)
+                    {
+                        self.inner.metrics.record_forward_unconverged_style();
+                        tracing::debug!(
+                            task_id = meta.task_id,
+                            target = %target,
+                            style_id = %forwarded_task.style.id.as_str(),
+                            version = forwarded_task.style.version,
+                            "peer has not converged on the forwarded style revision"
+                        );
+                        saw_unconverged_style = true;
+                        continue;
+                    }
                     self.inner.metrics.record_forward_success();
                     return resp.into_task_outcome(meta.arrived_at);
                 }
@@ -772,7 +821,13 @@ impl Node {
         // try local overflow, but gate on render admission first (no wasted
         // profile I/O when degraded) and re-check the deadline before rendering.
         let exhaustion_reason = last_retryable_rejection.unwrap_or({
-            if saw_transport_failure {
+            if saw_unconverged_style {
+                // Every peer refused the revision, not the style. The cluster
+                // converges on its own, so the caller should retry rather than
+                // be told the style is missing or that the forward machinery
+                // broke.
+                RejectionReason::NoCapacity
+            } else if saw_transport_failure {
                 RejectionReason::ForwardFailed
             } else {
                 RejectionReason::NoCapacity
@@ -883,8 +938,10 @@ impl TaskMeta {
     }
 
     fn preparation_error_outcome(&self, err: ProfilePreparationError) -> TaskOutcome {
-        let kind = err.failure_kind();
-        self.fail(err.to_string(), kind)
+        match err.failure_kind() {
+            Some(kind) => self.fail(err.to_string(), kind),
+            None => self.reject(RejectionReason::UnknownStyle),
+        }
     }
 
     fn process_error_outcome(&self, err: ProcessError) -> TaskOutcome {
@@ -1313,6 +1370,8 @@ mod tests {
 
     struct DeadlineFailingPreparer;
 
+    struct MissingStylePreparer;
+
     struct BlockingRenderer {
         render_started: Option<Arc<Notify>>,
         render_continue: Option<Arc<Notify>>,
@@ -1395,6 +1454,19 @@ mod tests {
             _task: &InternalTask,
         ) -> Result<Option<PreparedProfile>, ProfilePreparationError> {
             Err(ProfilePreparationError::CallerDeadlineExceeded)
+        }
+    }
+
+    #[async_trait]
+    impl ProfilePreparer for MissingStylePreparer {
+        async fn prepare_profile(
+            &self,
+            task: &InternalTask,
+        ) -> Result<Option<PreparedProfile>, ProfilePreparationError> {
+            Err(ProfilePreparationError::style_not_found(
+                &task.style.id,
+                "provider returned 404",
+            ))
         }
     }
 
@@ -1607,6 +1679,11 @@ mod tests {
         catalog.upsert_definition(
             StyleId("cached/style".to_string()),
             crate::style_catalog::StyleDefinition::new("https://styles.test/style.json", 1),
+        );
+        catalog.record_observed(
+            &StyleId("cached/style".to_string()),
+            1,
+            Duration::from_secs(3_600),
         );
         catalog
     }
@@ -1974,6 +2051,32 @@ mod tests {
         assert!(
             rendered.contains("biei_render_timeout_lower_bound_seconds_count{scope=\"ingress\"} 0")
         );
+    }
+
+    #[tokio::test]
+    async fn definitive_missing_style_uses_unknown_style_rejection() {
+        let renders = Arc::new(AtomicUsize::new(0));
+        let node = node_with_catalog_cache_and_preparer(
+            registered_catalog(),
+            vec![Box::new(CountingRenderer {
+                renders: renders.clone(),
+            })],
+            Arc::new(NoopGossip),
+            0,
+            Arc::new(MissingStylePreparer),
+        );
+
+        let outcome = node
+            .handle_incoming(internal_task(1, "missing-style"))
+            .await;
+
+        assert!(matches!(
+            outcome.result,
+            TaskResult::Rejected {
+                reason: RejectionReason::UnknownStyle
+            }
+        ));
+        assert_eq!(renders.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -2593,6 +2696,134 @@ mod tests {
             }
         ));
         assert_eq!(failures.load(Ordering::SeqCst), 1);
+    }
+
+    struct RejectingTransport {
+        reason: RejectionReason,
+        sends: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl InternalTransport for RejectingTransport {
+        async fn send(
+            &self,
+            _target: NodeId,
+            fwd: ForwardRequest,
+        ) -> Result<ForwardResponse, ForwardError> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(ForwardResponse {
+                outcome: OutcomeHeader {
+                    task_id: fwd.task.id,
+                    request_id: fwd.task.request_id.clone(),
+                    style_id: fwd.task.style.id,
+                    had_source: false,
+                    image_format: None,
+                    result: OutcomeResult::Rejected {
+                        reason: self.reason,
+                        deadline_stage: None,
+                    },
+                },
+                output: None,
+            })
+        }
+    }
+
+    /// A peer that has not learned a locally held revision must not turn a
+    /// resolvable style into a public `404 unknown_style`.
+    #[tokio::test]
+    async fn peer_unknown_style_for_a_held_revision_falls_back_locally() {
+        let renders = Arc::new(AtomicUsize::new(0));
+        let sends = Arc::new(AtomicUsize::new(0));
+        let catalog = registered_catalog();
+        let task = internal_task(11, "unconverged-peer");
+        assert!(
+            catalog.accepts_revision(&task.style),
+            "premise: this node holds the forwarded revision"
+        );
+        let node = spawn_test_node(
+            catalog,
+            vec![Box::new(CountingRenderer {
+                renders: renders.clone(),
+            })],
+            Arc::new(NoopGossip),
+            Arc::new(RejectingTransport {
+                reason: RejectionReason::UnknownStyle,
+                sends: sends.clone(),
+            }),
+            0,
+            Arc::new(NoopProfilePreparer),
+            Arc::new(|| true),
+        );
+
+        let outcome = node
+            .forward_with_failover(
+                task,
+                RouteTier::Tier2HrwBl,
+                vec![crate::types::ForwardCandidate {
+                    node_id: NodeId::from_index(2),
+                    drain_worker: None,
+                }],
+            )
+            .await;
+
+        assert_eq!(sends.load(Ordering::SeqCst), 1, "the peer was tried");
+        assert!(
+            matches!(outcome.result, TaskResult::Completed { .. }),
+            "expected a local render after the peer refused the revision, got {:?}",
+            outcome.result
+        );
+        assert_eq!(renders.load(Ordering::SeqCst), 1, "rendered locally");
+    }
+
+    /// The same peer answer is definitive when this node cannot place the
+    /// revision either: nothing establishes that the style exists, so the caller
+    /// keeps its `404`.
+    #[tokio::test]
+    async fn peer_unknown_style_for_an_unheld_revision_stays_definitive() {
+        let renders = Arc::new(AtomicUsize::new(0));
+        let sends = Arc::new(AtomicUsize::new(0));
+        let mut task = internal_task(12, "genuinely-missing");
+        task.style = StyleRevision {
+            id: StyleId("no/such-style".to_string()),
+            version: 9,
+        };
+        let node = spawn_test_node(
+            registered_catalog(),
+            vec![Box::new(CountingRenderer {
+                renders: renders.clone(),
+            })],
+            Arc::new(NoopGossip),
+            Arc::new(RejectingTransport {
+                reason: RejectionReason::UnknownStyle,
+                sends: sends.clone(),
+            }),
+            0,
+            Arc::new(NoopProfilePreparer),
+            Arc::new(|| true),
+        );
+
+        let outcome = node
+            .forward_with_failover(
+                task,
+                RouteTier::Tier2HrwBl,
+                vec![crate::types::ForwardCandidate {
+                    node_id: NodeId::from_index(2),
+                    drain_worker: None,
+                }],
+            )
+            .await;
+
+        assert!(
+            matches!(
+                outcome.result,
+                TaskResult::Rejected {
+                    reason: RejectionReason::UnknownStyle
+                }
+            ),
+            "expected the peer's 404 to stand, got {:?}",
+            outcome.result
+        );
+        assert_eq!(renders.load(Ordering::SeqCst), 0, "no wasted render");
     }
 
     #[tokio::test]

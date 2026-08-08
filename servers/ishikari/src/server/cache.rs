@@ -30,3 +30,9 @@ pub(crate) const GLYPH: &str =
 /// sprites are addressed by content hash (`specs/resource-layout-sketch.md` still
 /// lists that as proposed).
 pub(crate) const SPRITE: &str = "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400";
+
+/// Public errors are never retained by browsers or shared caches. Origin-local
+/// negative caches already collapse repeated misses with resource-specific
+/// bounds; allowing a CDN to invent a longer 404 lifetime would let a request
+/// made before publication delay activation.
+pub(crate) const ERROR: &str = "private, no-store";

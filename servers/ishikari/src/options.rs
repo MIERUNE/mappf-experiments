@@ -284,6 +284,7 @@ pub(crate) struct OptionsInput {
     pub(crate) tile_cache_max_bytes: u64,
     pub(crate) chunk_cache_max_bytes: u64,
     pub(crate) tile_negative_ttl_secs: u64,
+    pub(crate) archive_revalidation_interval_secs: u64,
     pub(crate) style_templates: Option<String>,
     pub(crate) glyph_url_template: Option<String>,
     pub(crate) sprite_templates: Option<String>,
@@ -319,6 +320,9 @@ impl Options {
             tile_cache_max_bytes: cache_capacities.tile_bytes(),
             chunk_cache_max_bytes: cache_capacities.chunk_bytes(),
             tile_negative_ttl: Duration::from_secs(input.tile_negative_ttl_secs),
+            archive_revalidation_interval: Duration::from_secs(
+                input.archive_revalidation_interval_secs,
+            ),
         }
         .resolve()
         .map_err(|error| error.to_string())?;
@@ -491,6 +495,7 @@ mod tests {
             tile_cache_max_bytes: DEFAULT_TILE_CACHE_MAX_BYTES,
             chunk_cache_max_bytes: DEFAULT_CHUNK_CACHE_MAX_BYTES,
             tile_negative_ttl_secs: 60,
+            archive_revalidation_interval_secs: 300,
             style_templates: None,
             glyph_url_template: None,
             sprite_templates: None,

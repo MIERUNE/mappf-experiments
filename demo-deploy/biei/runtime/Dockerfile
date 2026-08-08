@@ -51,6 +51,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 # real Biei production sources so simulator and Ishikari edits do not invalidate
 # this application layer.
 COPY Cargo.toml Cargo.lock ./
+COPY crates/abashiri-core/Cargo.toml crates/abashiri-core/Cargo.toml
 COPY crates/biei-core/Cargo.toml crates/biei-core/Cargo.toml
 COPY crates/ishikari-core/Cargo.toml crates/ishikari-core/Cargo.toml
 COPY crates/mmpf-auth/Cargo.toml crates/mmpf-auth/Cargo.toml
@@ -60,6 +61,7 @@ COPY crates/mmpf-http/Cargo.toml crates/mmpf-http/Cargo.toml
 COPY crates/mmpf-mln-filesource/Cargo.toml crates/mmpf-mln-filesource/Cargo.toml
 COPY crates/mmpf-pmtiles/Cargo.toml crates/mmpf-pmtiles/Cargo.toml
 COPY crates/mmpf-terrain/Cargo.toml crates/mmpf-terrain/Cargo.toml
+COPY servers/abashiri/Cargo.toml servers/abashiri/Cargo.toml
 COPY servers/biei/Cargo.toml servers/biei/Cargo.toml
 COPY servers/ishikari/Cargo.toml servers/ishikari/Cargo.toml
 COPY sims/biei-sim/Cargo.toml sims/biei-sim/Cargo.toml

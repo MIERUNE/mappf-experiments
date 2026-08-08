@@ -200,6 +200,22 @@ async fn fetch_style_bytes_local(
         .await
 }
 
+/// Invalidates only the local provider representation for a logical style.
+///
+/// This intentionally performs no I/O. The next ordinary request resolves and
+/// validates the provider body through the existing single-flight path.
+pub(crate) fn request_style_revalidation(
+    state: &AppState,
+    style_key: &str,
+) -> Result<(), HttpError> {
+    validate_style_key(style_key)?;
+    let upstream = resolve_style_url(state, style_key)?;
+    state
+        .provider_fetcher
+        .invalidate_json(upstream, "style", STYLE_CONTENT_TYPES);
+    Ok(())
+}
+
 fn rewrite_style(
     style: &mut Value,
     base_url: &str,

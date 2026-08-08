@@ -5,5 +5,6 @@ kind: Kustomization
 # deployable; this composes them with the shared namespace and Gateway.
 resources:
   - platform
+  - abashiri/runtime/k8s/overlays/gke
   - ishikari/runtime/k8s/overlays/gke
   - biei/runtime/k8s/overlays/gke

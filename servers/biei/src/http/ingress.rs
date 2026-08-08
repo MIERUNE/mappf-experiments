@@ -113,11 +113,21 @@ impl<'a> ParsedRenderPath<'a> {
                 ParsedRenderKind::Static { static_index },
             ),
             None => {
-                let suffix_index = parts.len().checked_sub(3).ok_or_else(|| {
-                    crate::http::error::invalid(
-                        "tile path must be /{style_id}/{z}/{x}/{y}{@scale}.{format}",
-                    )
-                })?;
+                // At least one segment has to remain for the style id after
+                // `{z}/{x}/{y}`. Without the `> 0` filter a three-segment path
+                // left no style id and the request was reported by whichever
+                // coordinate failed to parse first — `/totally/bogus/path`
+                // answered "tile z must be an integer in 0..=255", naming the
+                // parse order instead of the shape the caller got wrong.
+                let suffix_index = parts
+                    .len()
+                    .checked_sub(3)
+                    .filter(|style_segments| *style_segments > 0)
+                    .ok_or_else(|| {
+                        crate::http::error::invalid(
+                            "tile path must be /{style_id}/{z}/{x}/{y}{@scale}.{format}",
+                        )
+                    })?;
                 (
                     resolve_style_id(&parts[..suffix_index])?,
                     ParsedRenderKind::Tile,
@@ -186,6 +196,10 @@ impl HttpIngress {
 
     pub(crate) fn node(&self) -> Node {
         self.node.clone()
+    }
+
+    pub(crate) fn style_catalog(&self) -> Arc<StyleCatalog> {
+        Arc::clone(&self.catalog)
     }
 
     pub(crate) fn renderer_supervisor(&self) -> crate::renderer::actor::RendererActorSupervisor {
@@ -731,5 +745,30 @@ mod tests {
             "degraded shedding no longer precedes path processing"
         );
         assert!((400..500).contains(&response.status));
+    }
+
+    /// A tile path needs at least one segment for the style id on top of
+    /// `{z}/{x}/{y}`. Three segments left none, and `resolve_style_id` accepted an
+    /// empty component slice — so the request was reported by whichever
+    /// coordinate failed to parse first, naming Biei's internal parse order
+    /// instead of the shape the caller got wrong.
+    #[test]
+    fn a_path_too_short_to_hold_a_style_id_names_the_tile_shape() {
+        for path in ["/totally/bogus/path", "/a/b/c", "/8/227/100.png"] {
+            let error = ParsedPublicPath::parse(path).expect_err(path);
+            let message = error.to_string();
+            assert!(
+                message.contains("tile path must be"),
+                "{path} reported {message:?}"
+            );
+        }
+        // One more segment is a legitimate tile path and still parses.
+        ParsedPublicPath::parse("/carto/8/227/100.png").expect("four segments parse");
+    }
+
+    #[test]
+    fn an_empty_style_id_is_refused_rather_than_joined_to_nothing() {
+        let error = crate::http::path::resolve_style_id(&[]).expect_err("empty slice");
+        assert!(error.to_string().contains("must not be empty"), "{error}");
     }
 }

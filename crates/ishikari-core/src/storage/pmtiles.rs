@@ -4,7 +4,8 @@ use std::{cell::Cell, future::Future};
 
 use crate::{
     interned::TilesetId,
-    pmtiles::{BootstrapTransfer, Storage as PmtilesStorage, StorageError},
+    pmtiles::{BootstrapTransfer, ObservedRange, Storage as PmtilesStorage, StorageError},
+    storage::generation::ArchiveKey,
 };
 use anyhow::Result;
 use anyhow::bail;
@@ -73,12 +74,40 @@ impl DistributedPmtilesStorage {
 
 impl PmtilesStorage for DistributedPmtilesStorage {
     #[allow(clippy::manual_async_fn)]
-    fn read_range<'a>(
+    fn observe_range<'a>(
         &'a self,
         tileset_id: &'a TilesetId,
         start: u64,
         length: usize,
-        archive_len: Option<u64>,
+    ) -> impl Future<Output = Result<ObservedRange, StorageError>> + Send + 'a {
+        async move {
+            enforce_chunk_limit(
+                "observed range",
+                start,
+                length as u64,
+                self.chunked_store.chunk_size(),
+            )
+            .map_err(|error| StorageError::Message(error.to_string()))?;
+            let observed = self
+                .chunked_store
+                .observe_bytes(tileset_id, start, length)
+                .await
+                .map_err(storage_error)?;
+            let _ = BACKEND_WAITED.try_with(|waited| waited.set(true));
+            Ok(ObservedRange {
+                bytes: observed.bytes,
+                generation: observed.generation,
+            })
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn read_range<'a>(
+        &'a self,
+        archive: &'a ArchiveKey,
+        start: u64,
+        length: usize,
+        archive_len: u64,
     ) -> impl std::future::Future<Output = Result<Bytes, StorageError>> + Send + 'a {
         async move {
             if length == 0 {
@@ -95,15 +124,9 @@ impl PmtilesStorage for DistributedPmtilesStorage {
 
             let read = self
                 .chunked_store
-                .read_bytes(tileset_id, start, length, archive_len)
+                .read_bytes(archive, start, length, archive_len)
                 .await
-                .map_err(|error| match error {
-                    ChunkFetchError::NotFound => StorageError::NotFound,
-                    ChunkFetchError::Overloaded(message) => StorageError::Overloaded(message),
-                    ChunkFetchError::Timeout(message) => StorageError::Timeout(message),
-                    ChunkFetchError::Backend(message) => StorageError::Backend(message),
-                    ChunkFetchError::Message(message) => StorageError::Message(message),
-                })?;
+                .map_err(storage_error)?;
 
             if read.source == ChunkReadSource::Backend {
                 let _ = BACKEND_WAITED.try_with(|waited| waited.set(true));
@@ -124,11 +147,22 @@ impl PmtilesStorage for DistributedPmtilesStorage {
 
     fn fetch_leaf_bytes<'a>(
         &'a self,
-        tileset_id: &'a TilesetId,
+        archive: &'a ArchiveKey,
         offset: u64,
         length: usize,
     ) -> impl std::future::Future<Output = Result<Option<Bytes>>> + Send + 'a {
-        self.peer_backend.route_leaf(tileset_id, offset, length)
+        self.peer_backend.route_leaf(archive, offset, length)
+    }
+}
+
+fn storage_error(error: ChunkFetchError) -> StorageError {
+    match error {
+        ChunkFetchError::NotFound => StorageError::NotFound,
+        ChunkFetchError::Overloaded(message) => StorageError::Overloaded(message),
+        ChunkFetchError::Timeout(message) => StorageError::Timeout(message),
+        ChunkFetchError::Backend(message) => StorageError::Backend(message),
+        ChunkFetchError::GenerationChanged => StorageError::GenerationChanged,
+        ChunkFetchError::Message(message) => StorageError::Message(message),
     }
 }
 

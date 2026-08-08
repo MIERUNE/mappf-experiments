@@ -130,6 +130,29 @@
                 padding-right: 8px;
                 color: #555;
             }
+            /* An attribute's type is as diagnostic as its value: a quantity
+               delivered as text renders identically to the number it should be,
+               and a 64-bit column arriving as `bigint` is the exact failure the
+               MLT integer narrowing exists to prevent. */
+            .feature-popup .attr-type {
+                margin-left: 6px;
+                color: rgba(0, 0, 0, 0.42);
+                font: 400 10px/1.3 ui-monospace, monospace;
+            }
+            .feature-popup .attr-string {
+                color: #0b6b3a;
+            }
+            .feature-popup .attr-number {
+                color: #12408f;
+            }
+            .feature-popup .attr-suspect {
+                color: #a11;
+                font-weight: 600;
+            }
+            .feature-popup .attr-empty {
+                color: rgba(0, 0, 0, 0.4);
+                font-style: italic;
+            }
         </style>
     </head>
     <body>
@@ -331,14 +354,61 @@
                     .replaceAll("'", "&#39;");
             }
 
+            // `bigint` cannot survive maplibre's worker transfer, so a 64-bit
+            // property column reaching here at all means the server-side integer
+            // narrowing regressed. `object` covers anything a decoder handed back
+            // unparsed. Both are called out rather than quietly stringified.
+            const SUSPECT_ATTRIBUTE_TYPES = new Set(["bigint", "object", "function", "symbol"]);
+
+            function attributeType(value) {
+                if (value === null) {
+                    return "null";
+                }
+                if (Array.isArray(value)) {
+                    return "array";
+                }
+                return typeof value;
+            }
+
+            // Strings are quoted so a quantity delivered as text is unmistakable
+            // even without reading the type: `"0.1"` and `0.1` must not look alike.
+            function attributeValueHtml(value) {
+                const type = attributeType(value);
+                if (type === "undefined") {
+                    return '<span class="attr-empty">absent</span>';
+                }
+                if (type === "null") {
+                    return '<span class="attr-empty">null</span>';
+                }
+                if (type === "string") {
+                    return `<span class="attr-string">&quot;${escapeHtml(value)}&quot;</span>`;
+                }
+                if (type === "number") {
+                    return `<span class="attr-number">${escapeHtml(String(value))}</span>`;
+                }
+                return escapeHtml(String(value));
+            }
+
+            function attributeTypeHtml(value) {
+                const type = attributeType(value);
+                const suspect = SUSPECT_ATTRIBUTE_TYPES.has(type) ? " attr-suspect" : "";
+                return `<span class="attr-type${suspect}">${escapeHtml(type)}</span>`;
+            }
+
             function popupFeatureHtml(feature) {
                 const properties = feature.properties ?? {};
                 const title = escapeHtml(feature.sourceLayer ?? "feature");
                 const geometryType = escapeHtml(feature.geometry?.type ?? "");
-                const rows = [["id", feature.id ?? ""], ...Object.entries(properties)]
-                    .map(([key, value]) => `<tr><td>${escapeHtml(key)}</td><td>${escapeHtml(value ?? "")}</td></tr>`)
+                // `id` is not a property: it is the feature id, so it carries no
+                // attribute type badge.
+                const idRow = `<tr><td>id</td><td>${attributeValueHtml(feature.id)}</td></tr>`;
+                const rows = Object.entries(properties)
+                    .map(
+                        ([key, value]) =>
+                            `<tr><td>${escapeHtml(key)}</td><td>${attributeValueHtml(value)}${attributeTypeHtml(value)}</td></tr>`,
+                    )
                     .join("");
-                return `<div class="feature-item"><h3>${title}<span class="geometry-type">${geometryType}</span></h3><table>${rows}</table></div>`;
+                return `<div class="feature-item"><h3>${title}<span class="geometry-type">${geometryType}</span></h3><table>${idRow}${rows}</table></div>`;
             }
 
             function popupHtml(features) {

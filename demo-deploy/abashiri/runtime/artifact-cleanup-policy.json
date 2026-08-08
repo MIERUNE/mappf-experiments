@@ -1,0 +1,11 @@
+[
+  {
+    "name": "delete-stale-abashiri-build-cache",
+    "action": { "type": "Delete" },
+    "condition": {
+      "tagState": "untagged",
+      "packageNamePrefixes": ["abashiri-buildcache"],
+      "olderThan": "1d"
+    }
+  }
+]

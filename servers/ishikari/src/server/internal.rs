@@ -3,7 +3,7 @@
 use axum::{
     body::Body,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode},
     response::Response,
 };
 use bytes::BufMut;
@@ -11,7 +11,10 @@ use serde::Deserialize;
 use tracing::debug;
 
 use crate::server::{AppState, HttpError, bytes_response};
-use ishikari_core::{interned::TilesetId, storage::LeafBytesError};
+use ishikari_core::{
+    interned::TilesetId,
+    storage::{ARCHIVE_GENERATION_HEADER, LeafBytesError},
+};
 
 use super::tileset::tileset_error_response;
 
@@ -36,6 +39,7 @@ pub(crate) async fn internal_bootstrap_handler(
         .await
         .map_err(|e| tileset_error_response(&e))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "not found".to_string()))?;
+    let generation = transfer.generation.to_wire();
 
     let body_bytes = if let Some(metadata) = transfer.metadata {
         let bootstrap_len = transfer.bootstrap.len() as u64;
@@ -58,7 +62,17 @@ pub(crate) async fn internal_bootstrap_handler(
             "served internal response"
         );
     }
-    Ok(bytes_response(body_bytes, "application/octet-stream", None))
+    let mut response = bytes_response(body_bytes, "application/octet-stream", None);
+    response.headers_mut().insert(
+        ARCHIVE_GENERATION_HEADER,
+        HeaderValue::from_str(&generation).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid archive generation".to_string(),
+            )
+        })?,
+    );
+    Ok(response)
 }
 
 /// Serves raw PMTiles leaf bytes for peer cache reuse.
@@ -74,16 +88,26 @@ pub(crate) async fn internal_leaf_handler(
         .await
         .map_err(|error| leaf_error_response(&error))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "not found".to_string()))?;
-    state.metrics.add_internal_bytes(leaf.len() as u64);
+    state.metrics.add_internal_bytes(leaf.value.len() as u64);
     if tracing::enabled!(tracing::Level::DEBUG) {
         debug!(
             endpoint = "internal_leaf",
             tileset_id = %tileset_id,
-            served_bytes = leaf.len(),
+            served_bytes = leaf.value.len(),
             "served internal response"
         );
     }
-    Ok(bytes_response(leaf, "application/octet-stream", None))
+    let mut response = bytes_response(leaf.value, "application/octet-stream", None);
+    response.headers_mut().insert(
+        ARCHIVE_GENERATION_HEADER,
+        HeaderValue::from_str(&leaf.generation.to_wire()).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid archive generation".to_string(),
+            )
+        })?,
+    );
+    Ok(response)
 }
 
 fn leaf_error_response(error: &LeafBytesError) -> HttpError {

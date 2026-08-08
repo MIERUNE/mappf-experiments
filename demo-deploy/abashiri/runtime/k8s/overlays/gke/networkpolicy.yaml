@@ -1,0 +1,13 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: abashiri-internal-only
+spec:
+  podSelector:
+    matchLabels:
+      app: abashiri
+  policyTypes:
+    - Ingress
+  # Abashiri has no in-cluster Console client yet. Kubelet probes and
+  # kubectl port-forward arrive through the node rather than another pod.
+  ingress: []

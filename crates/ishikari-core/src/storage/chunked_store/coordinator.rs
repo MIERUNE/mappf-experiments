@@ -15,10 +15,10 @@ use tokio::{
 };
 use tracing::{debug, error};
 
-use crate::{interned::TilesetId, metrics::NodeMetrics};
+use crate::{interned::TilesetId, metrics::NodeMetrics, storage::generation::ArchiveKey};
 
 use super::{
-    fetcher::{ChunkFetchError, ChunkFetcher},
+    fetcher::{ChunkFetchError, ChunkFetcher, ObservedBytes},
     store::ChunkedStore,
 };
 
@@ -37,7 +37,7 @@ pub(super) struct ChunkFetchCoordinator {
     /// plus groups performing I/O. Reserved before a detached task is spawned.
     backend_group_permits: Arc<Semaphore>,
     /// Per-tileset fetch state keyed by tileset id.
-    tileset_states: Arc<Mutex<HashMap<TilesetId, TilesetFetchState>>>,
+    tileset_states: Arc<Mutex<HashMap<ArchiveKey, TilesetFetchState>>>,
 }
 
 /// Inflight and pending fetch coordination state for a single tileset.
@@ -85,9 +85,9 @@ struct GroupWaiterOutcome {
 /// Ensures a dispatched group reaches the state-completion path even when its
 /// task is aborted or unwinds before normal completion.
 struct GroupCompletionGuard {
-    tileset_states: Arc<Mutex<HashMap<TilesetId, TilesetFetchState>>>,
+    tileset_states: Arc<Mutex<HashMap<ArchiveKey, TilesetFetchState>>>,
     metrics: NodeMetrics,
-    tileset_id: TilesetId,
+    archive: ArchiveKey,
     chunk_range: Range<u64>,
     result: Option<Result<HashMap<u64, Bytes>, ChunkFetchError>>,
     completed: bool,
@@ -96,13 +96,13 @@ struct GroupCompletionGuard {
 impl GroupCompletionGuard {
     fn new(
         coordinator: &ChunkFetchCoordinator,
-        tileset_id: TilesetId,
+        archive: ArchiveKey,
         chunk_range: Range<u64>,
     ) -> Self {
         Self {
             tileset_states: Arc::clone(&coordinator.tileset_states),
             metrics: coordinator.metrics.clone(),
-            tileset_id,
+            archive,
             chunk_range,
             result: None,
             completed: false,
@@ -114,7 +114,7 @@ impl GroupCompletionGuard {
         complete_dispatched_group(
             Arc::clone(&self.tileset_states),
             self.metrics.clone(),
-            self.tileset_id.clone(),
+            self.archive.clone(),
             self.chunk_range.clone(),
             self.result
                 .as_ref()
@@ -138,11 +138,11 @@ impl Drop for GroupCompletionGuard {
         });
         let tileset_states = Arc::clone(&self.tileset_states);
         let metrics = self.metrics.clone();
-        let tileset_id = self.tileset_id.clone();
+        let archive = self.archive.clone();
         let chunk_range = self.chunk_range.clone();
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             error!(
-                tileset_id = %tileset_id,
+                tileset_id = %archive.tileset_id,
                 start_chunk = chunk_range.start,
                 end_chunk = chunk_range.end,
                 "unable to schedule chunk fetch completion outside a Tokio runtime"
@@ -150,8 +150,7 @@ impl Drop for GroupCompletionGuard {
             return;
         };
         runtime.spawn(async move {
-            complete_dispatched_group(tileset_states, metrics, tileset_id, chunk_range, &result)
-                .await;
+            complete_dispatched_group(tileset_states, metrics, archive, chunk_range, &result).await;
         });
     }
 }
@@ -363,6 +362,14 @@ impl ChunkFetchCoordinator {
         self.fetcher.received_bytes()
     }
 
+    #[cfg(test)]
+    pub(super) async fn observe_archive(
+        &self,
+        tileset_id: &TilesetId,
+    ) -> Result<(ArchiveKey, u64), ChunkFetchError> {
+        self.fetcher.observe_archive(tileset_id).await
+    }
+
     pub(super) fn metrics(&self) -> &NodeMetrics {
         &self.metrics
     }
@@ -374,7 +381,7 @@ impl ChunkFetchCoordinator {
         &self,
         tileset_id: &TilesetId,
         range: Range<u64>,
-    ) -> std::result::Result<Bytes, ChunkFetchError> {
+    ) -> std::result::Result<ObservedBytes, ChunkFetchError> {
         let _group_permit = self.try_reserve_backend_group()?;
         self.fetcher.fetch_exact_range(tileset_id, range).await
     }
@@ -397,7 +404,7 @@ impl ChunkFetchCoordinator {
     pub(super) async fn fetch_chunks(
         &self,
         store: ChunkedStore,
-        tileset_id: &TilesetId,
+        archive: &ArchiveKey,
         required_chunks: &[u64],
         archive_len: u64,
     ) -> std::result::Result<HashMap<u64, Bytes>, ChunkFetchError> {
@@ -406,7 +413,7 @@ impl ChunkFetchCoordinator {
 
         {
             let mut tileset_states = self.tileset_states.lock().await;
-            let tileset_state = tileset_states.entry(tileset_id.clone()).or_default();
+            let tileset_state = tileset_states.entry(archive.clone()).or_default();
             let was_idle = tileset_state.is_idle();
             tileset_state.archive_len = tileset_state.archive_len.max(archive_len);
 
@@ -423,11 +430,11 @@ impl ChunkFetchCoordinator {
                         .pending_chunks
                         .contains(&IMMEDIATE_CHUNK_INDEX);
                 let coordinator = self.clone();
-                let tileset_id = tileset_id.clone();
+                let archive = archive.clone();
                 let store = store.clone();
                 tokio::spawn(async move {
                     coordinator
-                        .run_scheduler(store, tileset_id, flush_immediately)
+                        .run_scheduler(store, archive, flush_immediately)
                         .await;
                 });
             }
@@ -447,7 +454,7 @@ impl ChunkFetchCoordinator {
     async fn run_scheduler(
         &self,
         store: ChunkedStore,
-        tileset_id: TilesetId,
+        archive: ArchiveKey,
         mut flush_immediately: bool,
     ) {
         loop {
@@ -460,7 +467,7 @@ impl ChunkFetchCoordinator {
 
             let (dispatch, capacity_available) = {
                 let mut tileset_states = self.tileset_states.lock().await;
-                let Some(state) = tileset_states.get_mut(&tileset_id) else {
+                let Some(state) = tileset_states.get_mut(&archive) else {
                     return;
                 };
                 let cancelled_waiters = state.prune_cancelled_waiters();
@@ -470,7 +477,7 @@ impl ChunkFetchCoordinator {
                 }
                 match state.select_dispatch_groups(self.max_fetch_chunks) {
                     DispatchDecision::Idle => {
-                        remove_drainable_state(&mut tileset_states, &tileset_id);
+                        remove_drainable_state(&mut tileset_states, &archive);
                         return;
                     }
                     DispatchDecision::Throttled(capacity_available) => {
@@ -511,13 +518,13 @@ impl ChunkFetchCoordinator {
                 match self.try_reserve_backend_group() {
                     Ok(group_permit) => {
                         let coordinator = self.clone();
-                        let tileset_id = tileset_id.clone();
+                        let archive = archive.clone();
                         let store = store.clone();
                         tokio::spawn(async move {
                             coordinator
                                 .run_fetch_chunk_group(
                                     store,
-                                    tileset_id,
+                                    archive,
                                     chunk_range,
                                     archive_len,
                                     group_permit,
@@ -529,7 +536,7 @@ impl ChunkFetchCoordinator {
                         complete_dispatched_group(
                             Arc::clone(&self.tileset_states),
                             self.metrics.clone(),
-                            tileset_id.clone(),
+                            archive.clone(),
                             chunk_range,
                             &Err(error),
                         )
@@ -543,19 +550,19 @@ impl ChunkFetchCoordinator {
     async fn run_fetch_chunk_group(
         &self,
         store: ChunkedStore,
-        tileset_id: TilesetId,
+        archive: ArchiveKey,
         chunk_range: Range<u64>,
         archive_len: u64,
         _group_permit: OwnedSemaphorePermit,
     ) {
-        let completion = GroupCompletionGuard::new(self, tileset_id.clone(), chunk_range.clone());
+        let completion = GroupCompletionGuard::new(self, archive.clone(), chunk_range.clone());
         let result = self
             .fetcher
-            .fetch_chunk_group(&tileset_id, chunk_range.clone(), archive_len)
+            .fetch_chunk_group(&archive, chunk_range.clone(), archive_len)
             .await
             .and_then(|bytes| {
                 store
-                    .cache_chunk_group(&tileset_id, chunk_range, archive_len, bytes)
+                    .cache_chunk_group(&archive, chunk_range, archive_len, bytes)
                     .map_err(|error| ChunkFetchError::Message(error.to_string()))
             });
         completion.complete(result).await;
@@ -563,14 +570,14 @@ impl ChunkFetchCoordinator {
 }
 
 async fn complete_dispatched_group(
-    tileset_states: Arc<Mutex<HashMap<TilesetId, TilesetFetchState>>>,
+    tileset_states: Arc<Mutex<HashMap<ArchiveKey, TilesetFetchState>>>,
     metrics: NodeMetrics,
-    tileset_id: TilesetId,
+    archive: ArchiveKey,
     chunk_range: Range<u64>,
     result: &Result<HashMap<u64, Bytes>, ChunkFetchError>,
 ) {
     let mut tileset_states = tileset_states.lock().await;
-    let Some(state) = tileset_states.get_mut(&tileset_id) else {
+    let Some(state) = tileset_states.get_mut(&archive) else {
         return;
     };
 
@@ -585,7 +592,7 @@ async fn complete_dispatched_group(
 
     let waiter_count: usize = state.waiters.values().map(Vec::len).sum();
     debug!(
-        tileset_id = %tileset_id,
+        tileset_id = %archive.tileset_id,
         start_chunk = chunk_range.start,
         end_chunk = chunk_range.end,
         fetch_succeeded = result.is_ok(),
@@ -597,24 +604,24 @@ async fn complete_dispatched_group(
         "completed chunk fetch group"
     );
 
-    remove_drainable_state(&mut tileset_states, &tileset_id);
+    remove_drainable_state(&mut tileset_states, &archive);
 }
 
 /// Removes a fully drained per-tileset coordination state while the coordinator
 /// map lock is held. Both scheduler-idle and final-fetch completion use this
 /// single lifecycle transition.
 fn remove_drainable_state(
-    tileset_states: &mut HashMap<TilesetId, TilesetFetchState>,
-    tileset_id: &TilesetId,
+    tileset_states: &mut HashMap<ArchiveKey, TilesetFetchState>,
+    archive: &ArchiveKey,
 ) -> bool {
     if !tileset_states
-        .get(tileset_id)
+        .get(archive)
         .is_some_and(TilesetFetchState::is_drainable)
     {
         return false;
     }
-    tileset_states.remove(tileset_id);
-    debug!(tileset_id = %tileset_id, "removed empty chunk fetch state");
+    tileset_states.remove(archive);
+    debug!(tileset_id = %archive.tileset_id, "removed empty chunk fetch state");
     true
 }
 
@@ -655,6 +662,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+    use crate::storage::generation::ArchiveGeneration;
 
     fn set(values: &[u64]) -> BTreeSet<u64> {
         values.iter().copied().collect()
@@ -663,12 +671,19 @@ mod tests {
     type CompletionGuardFixture = (
         GroupCompletionGuard,
         oneshot::Receiver<Result<Bytes, ChunkFetchError>>,
-        Arc<Mutex<HashMap<TilesetId, TilesetFetchState>>>,
-        TilesetId,
+        Arc<Mutex<HashMap<ArchiveKey, TilesetFetchState>>>,
+        ArchiveKey,
     );
 
+    fn archive_key(value: &str) -> ArchiveKey {
+        ArchiveKey::new(
+            &TilesetId::try_new(value).expect("tileset id"),
+            ArchiveGeneration::from_wire("e:test-generation").expect("generation"),
+        )
+    }
+
     fn completion_guard_fixture() -> CompletionGuardFixture {
-        let tileset_id = TilesetId::try_new("completion-guard").expect("tileset id");
+        let archive = archive_key("completion-guard");
         let mut state = TilesetFetchState::default();
         let receiver = state
             .enqueue_chunks(&[7], Instant::now())
@@ -680,16 +695,16 @@ mod tests {
         };
         assert_eq!(groups, vec![7..8]);
 
-        let tileset_states = Arc::new(Mutex::new(HashMap::from([(tileset_id.clone(), state)])));
+        let tileset_states = Arc::new(Mutex::new(HashMap::from([(archive.clone(), state)])));
         let guard = GroupCompletionGuard {
             tileset_states: Arc::clone(&tileset_states),
             metrics: NodeMetrics::new(),
-            tileset_id: tileset_id.clone(),
+            archive: archive.clone(),
             chunk_range: 7..8,
             result: None,
             completed: false,
         };
-        (guard, receiver, tileset_states, tileset_id)
+        (guard, receiver, tileset_states, archive)
     }
 
     #[test]
@@ -735,9 +750,9 @@ mod tests {
         ));
         assert!(state.is_drainable());
 
-        let tileset_id = TilesetId::try_new("cancelled").expect("tileset id");
-        let mut states = HashMap::from([(tileset_id.clone(), state)]);
-        assert!(remove_drainable_state(&mut states, &tileset_id));
+        let archive = archive_key("cancelled");
+        let mut states = HashMap::from([(archive.clone(), state)]);
+        assert!(remove_drainable_state(&mut states, &archive));
         assert!(states.is_empty());
     }
 

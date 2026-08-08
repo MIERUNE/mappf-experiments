@@ -11,3 +11,4 @@ resources:
   - pdb.yaml
   - service-gossip.yaml
   - service-http.yaml
+  - service-internal.yaml

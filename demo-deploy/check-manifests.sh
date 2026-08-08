@@ -7,6 +7,8 @@ root="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 
 for overlay in \
   "$root" \
+  "$root/abashiri/runtime/k8s/base" \
+  "$root/abashiri/runtime/k8s/overlays/gke" \
   "$root/biei/runtime/k8s/base" \
   "$root/biei/runtime/k8s/overlays/local" \
   "$root/biei/runtime/k8s/overlays/gke" \
@@ -94,5 +96,9 @@ for app in biei ishikari; do
   reject "$public_service" 'targetPort: (internal|gossip)' \
     "$app public Service must not expose peer or gossip listeners"
 done
+
+abashiri_policy="$(document NetworkPolicy abashiri-internal-only)"
+expect "$abashiri_policy" '^  ingress: \[\]$' \
+  "abashiri must deny pod-originated ingress until a Console client is deployed"
 
 printf 'PASS: all deployment compositions render and preserve cluster contracts\n'

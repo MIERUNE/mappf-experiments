@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: biei-internal
+  labels:
+    app: biei
+spec:
+  type: ClusterIP
+  selector:
+    app: biei
+  ports:
+    - name: internal
+      port: 9090
+      targetPort: internal

@@ -450,7 +450,7 @@ mod tests {
         let hint = StyleRefreshHint::new("mutation-42", "mierune/basic").unwrap();
         assert_eq!(dedup.admit(&hint), HintAdmission::Accepted);
 
-        tokio::time::advance(window - Duration::from_millis(1)).await;
+        tokio::time::advance(window.checked_sub(Duration::from_millis(1)).unwrap()).await;
         assert_eq!(dedup.admit(&hint), HintAdmission::Duplicate);
 
         tokio::time::advance(Duration::from_millis(2)).await;

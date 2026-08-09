@@ -15,6 +15,11 @@ use biei_core::types::NodeId;
 
 use crate::auth::RegistryCatalog;
 
+/// The per-request deadline is this multiple of the routing SLA, giving a cold
+/// render's one-time resource I/O headroom above the routing target without
+/// loosening the routing queue limit (which stays keyed on the SLA itself).
+const REQUEST_DEADLINE_SLA_MULTIPLIER: u32 = 2;
+
 const MAX_QUEUE_CAPACITY_MULTIPLIER: usize = 4;
 const STANDBY_RATIO_NUMERATOR: usize = 5;
 const STANDBY_RATIO_DENOMINATOR: usize = 4;
@@ -47,7 +52,17 @@ pub(crate) struct Options {
     pub gossip_seeds: Vec<String>,
     pub node_id: NodeId,
     pub cores: usize,
+    /// Routing latency target. Drives the BL soft queue limit and the
+    /// warm/HRW/overflow tier thresholds — how deep a worker queues before the
+    /// dispatcher prefers a peer.
     pub sla: Duration,
+    /// How long a single request may run before its deadline is enforced.
+    /// Deliberately larger than [`Self::sla`]: the first render of a cold style
+    /// pays one-time resource I/O (glyphs, sprites, source TileJSON) that can
+    /// approach the routing target, so tying the client deadline to `sla` made a
+    /// cold render time out at exactly the SLA. Kept separate from `sla` so this
+    /// headroom does not also loosen the routing queue limit.
+    pub request_deadline: Duration,
     /// Optional font override for static pin labels.
     pub pin_label_font_path: Option<PathBuf>,
     /// Used only when Rust FileSources are disabled; the default MLN Database
@@ -214,6 +229,7 @@ impl Options {
             node_id: NodeId::from(input.node_id),
             cores,
             sla: input.sla,
+            request_deadline: input.sla.saturating_mul(REQUEST_DEADLINE_SLA_MULTIPLIER),
             maplibre_cache_path: input.maplibre_cache_path,
             pin_label_font_path: input.pin_label_font_path,
             renderer_slots_per_node: renderer_slots,
@@ -432,6 +448,21 @@ fn test_input(style_templates: &str, cores: usize) -> OptionsInput {
 mod tests {
     use super::*;
     use biei_core::types::{StyleId, StyleRevision};
+
+    #[test]
+    fn request_deadline_exceeds_the_routing_sla_without_changing_it() {
+        let options = Options::resolve(test_input("https://styles.test/{style_id}/style.json", 4))
+            .expect("options resolve");
+
+        // The routing SLA is untouched — the BL queue limit and tier thresholds
+        // still key on it — while the client deadline gets cold-render headroom.
+        assert_eq!(options.sla, Duration::from_secs(5));
+        assert_eq!(options.request_deadline, Duration::from_secs(10));
+        assert!(
+            options.request_deadline > options.sla,
+            "a cold render must not time out at the routing target"
+        );
+    }
 
     #[test]
     fn resolves_capacity_defaults_without_process_state() {

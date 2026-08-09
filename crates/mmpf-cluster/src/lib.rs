@@ -26,16 +26,16 @@ pub use bootstrap::{
 };
 pub use refresh_hint::{
     HintAdmission, MAX_STYLE_REFRESH_HINT_BYTES, RefreshHintBatch, RefreshHintDedup,
-    RefreshHintError, STYLE_REFRESH_HINT_SLOTS, StyleRefreshHint, StyleRefreshHintTracker,
-    style_refresh_hint_key,
+    RefreshHintError, StyleRefreshHint, StyleRefreshHintTracker,
 };
 
 #[cfg(feature = "simulation")]
 pub mod simulation;
 #[cfg(feature = "simulation")]
+use simulation::SimulationTransport;
+#[cfg(feature = "simulation")]
 pub use simulation::{
-    SimulatedNetwork, SimulatedNode, SimulatedNodeContext, SimulationTransport,
-    SimulationTransportStats,
+    SimulatedNetwork, SimulatedNode, SimulatedNodeContext, SimulationTransportStats,
 };
 
 /// Canonical membership key used to remove draining nodes from live routing.
@@ -230,7 +230,7 @@ impl ClusterOwner {
     /// Starts a node over the shared in-process transport with an explicit
     /// generation ID for deterministic simulation.
     #[cfg(feature = "simulation")]
-    pub async fn spawn_simulated(
+    pub(crate) async fn spawn_simulated(
         config: Config,
         generation_id: u64,
         transport: &SimulationTransport,

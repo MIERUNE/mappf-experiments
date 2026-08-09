@@ -138,7 +138,7 @@ pub(crate) async fn glyph_handler(
     let fontstack = parse_fontstack(&fontstack)?;
     let range = validate_range(&range)?;
     let upstream = resolve_glyph_url(&state, &fontstack.canonical, range.as_str())?;
-    let resource = route_glyph_bytes(&state, &fontstack, &range, &upstream).await?;
+    let resource = route_glyph_bytes(&state, &fontstack, &range, upstream).await?;
     Ok(resource.public_response(&headers, resource.bytes().clone(), "application/x-protobuf"))
 }
 
@@ -175,15 +175,15 @@ async fn route_glyph_bytes(
     state: &AppState,
     fontstack: &ParsedFontstack,
     range: &GlyphRange,
-    upstream: &str,
+    upstream: String,
 ) -> Result<ProviderResource, HttpError> {
-    let request = ProviderRequest::glyph(&fontstack.canonical, range.as_str(), upstream);
+    let request = ProviderRequest::glyph(&fontstack.canonical, range.as_str(), &upstream);
     if let Some(resource) =
         crate::server::provider::route_peer_resource(&state.resource_resolver, &request).await?
     {
         return Ok(resource);
     }
-    local_glyph_resource(state, fontstack, range, request.upstream_url().to_string()).await
+    local_glyph_resource(state, fontstack, range, upstream).await
 }
 
 async fn local_glyph_resource(
@@ -242,8 +242,8 @@ async fn build_glyph_composite(
     // Protobuf decode/dedup/encode is CPU work. Fetch first, then admit it so no
     // CPU permit is held while object storage or an upstream server is pending.
     let permit = state.admit_cpu_work("glyph_merge").await?;
-    let display_name = Arc::clone(&fontstack.display_name);
-    let merge_range = range.clone();
+    let display_name = fontstack.display_name;
+    let merge_range = range;
     let merged = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let bodies = resources
@@ -284,8 +284,8 @@ fn parse_fontstack(fontstack: &str) -> Result<ParsedFontstack, HttpError> {
             "fontstack length invalid".to_string(),
         ));
     }
-    let mut seen = HashSet::new();
     let mut names = Vec::new();
+    let mut seen = HashSet::new();
     for part in fontstack.split(',') {
         let name = part.trim();
         if name.is_empty()
@@ -295,8 +295,8 @@ fn parse_fontstack(fontstack: &str) -> Result<ParsedFontstack, HttpError> {
         {
             return Err((StatusCode::BAD_REQUEST, "fontstack invalid".to_string()));
         }
-        if seen.insert(name.to_string()) {
-            names.push(name.to_string());
+        if seen.insert(name) {
+            names.push(name);
         }
     }
     if names.len() > MAX_FONTS_PER_STACK {
@@ -308,7 +308,11 @@ fn parse_fontstack(fontstack: &str) -> Result<ParsedFontstack, HttpError> {
     Ok(ParsedFontstack {
         canonical: Arc::from(names.join(",")),
         display_name: Arc::from(names.join(", ")),
-        names: names.into(),
+        names: names
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+            .into(),
     })
 }
 

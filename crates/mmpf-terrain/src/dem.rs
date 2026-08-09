@@ -134,6 +134,7 @@ fn tile_axis(value: i32, size: i32) -> (i32, i32) {
     }
 }
 
+/// Decodes a Terrarium WebP using the generic library safety ceiling.
 pub fn decode_terrarium(bytes: &[u8]) -> Result<DemTile> {
     decode_terrarium_with_dimension_limit(bytes, DEFAULT_MAX_DEM_TILE_DIMENSION)
 }

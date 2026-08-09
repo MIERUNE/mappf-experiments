@@ -313,16 +313,24 @@ impl Dispatcher {
         let task_profile = task.worker_profile();
         // Count by WorkerProfile (style revision + render mode + scale), so
         // Static/Tile and @1x/@2x allocations stay independent.
-        let mut cluster_counts: HashMap<WorkerProfile, usize> = HashMap::new();
-        let mut candidates: Vec<(NodeId, &WorkerView)> = Vec::new();
-        for (nid, node) in view.state_entries() {
+        let mut cluster_counts: HashMap<&WorkerProfile, usize> = HashMap::new();
+        for (_, node) in view.state_entries() {
             if !node.accepts_new_renders {
                 continue;
             }
             for worker in &node.workers {
                 if let Some(profile) = &worker.loaded_profile {
-                    *cluster_counts.entry(profile.clone()).or_insert(0) += 1;
+                    *cluster_counts.entry(profile).or_insert(0) += 1;
                 }
+            }
+        }
+
+        let mut candidates: Vec<(Tier3SortKey, NodeId, &WorkerView)> = Vec::new();
+        for (nid, node) in view.state_entries() {
+            if !node.accepts_new_renders {
+                continue;
+            }
+            for worker in &node.workers {
                 let is_candidate = worker.queue_depth < drain_max
                     && match &worker.loaded_profile {
                         None => true,
@@ -332,7 +340,15 @@ impl Dispatcher {
                         Some(_) => true,
                     };
                 if is_candidate {
-                    candidates.push((nid.clone(), worker));
+                    candidates.push((
+                        tier3_sort_key(
+                            worker.loaded_profile.as_ref(),
+                            &task_profile,
+                            &cluster_counts,
+                        ),
+                        nid.clone(),
+                        worker,
+                    ));
                 }
             }
         }
@@ -341,28 +357,18 @@ impl Dispatcher {
             return Vec::new();
         }
 
-        // Prefer over-allocated profiles first. Within that group, reuse the
-        // same renderer shape (mode + scale), then use queue depth and stable
-        // identity so the worker used for the SLA estimate is the one hinted
-        // to the owner.
-        candidates.sort_by(|(a_nid, a), (b_nid, b)| {
-            tier3_sort_key(a.loaded_profile.as_ref(), &task_profile, &cluster_counts)
-                .cmp(&tier3_sort_key(
-                    b.loaded_profile.as_ref(),
-                    &task_profile,
-                    &cluster_counts,
-                ))
-                // Break ties only on cluster-visible, deterministic state so every
-                // dispatcher with the same `ClusterView` picks the same eviction
-                // target regardless of local request history: least-queued worker
-                // first, then a stable (node, worker) identity order.
+        // Compute the profile key once per candidate, then retain the original
+        // deterministic queue/node/worker tie-break order.
+        candidates.sort_by(|(a_key, a_nid, a), (b_key, b_nid, b)| {
+            a_key
+                .cmp(b_key)
                 .then_with(|| a.queue_depth.cmp(&b.queue_depth))
                 .then_with(|| a_nid.cmp(b_nid))
                 .then_with(|| a.id.cmp(&b.id))
         });
 
         let mut selected = Vec::new();
-        for (nid, w) in &candidates {
+        for (_, nid, w) in &candidates {
             let eta = self.estimate_drain_eta(w, &task_profile);
             if sla_deadline.is_none_or(|deadline| {
                 now.checked_add(eta)
@@ -506,7 +512,7 @@ where
 fn tier3_sort_key(
     loaded_profile: Option<&WorkerProfile>,
     task_profile: &WorkerProfile,
-    cluster_counts: &HashMap<WorkerProfile, usize>,
+    cluster_counts: &HashMap<&WorkerProfile, usize>,
 ) -> Tier3SortKey {
     let Some(profile) = loaded_profile else {
         // Fresh workers have no profile to protect.
@@ -1087,6 +1093,37 @@ mod tests {
                 drain_worker: Some(1),
             }]
         );
+    }
+
+    #[test]
+    fn tier3_orders_candidates_by_key_then_stable_tie_break() {
+        let now = Instant::now();
+        let d = dispatcher();
+        let task = make_task(9, now);
+        let picked = d.tier3_candidates(
+            &view(vec![
+                WorkerView {
+                    id: 5,
+                    loaded_profile: Some(profile(2)),
+                    queue_depth: 0,
+                },
+                WorkerView {
+                    id: 3,
+                    loaded_profile: Some(profile(2)),
+                    queue_depth: 0,
+                },
+                WorkerView {
+                    id: 1,
+                    loaded_profile: Some(profile_with(7, RenderMode::Static, Scale::X1)),
+                    queue_depth: 0,
+                },
+            ]),
+            &task,
+            5,
+        );
+
+        let order: Vec<_> = picked.iter().map(|c| c.drain_worker).collect();
+        assert_eq!(order, vec![Some(3), Some(5), Some(1)]);
     }
 
     #[test]

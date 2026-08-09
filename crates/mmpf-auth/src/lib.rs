@@ -271,9 +271,11 @@ impl DeliveryAuth {
             .await
             .map_err(|_| AuthFailure::Unavailable)?;
         let digest = credential_digest(registry_id, credential);
-        let Some(grant) = snapshot.credentials.get(&digest).filter(|grant| {
-            grant.authorization.enabled && constant_time_eq(&grant.credential_sha256, &digest)
-        }) else {
+        let Some(grant) = snapshot
+            .credentials
+            .get(&digest)
+            .filter(|grant| grant.authorization.enabled)
+        else {
             return Err(AuthFailure::InvalidCredential);
         };
 
@@ -327,17 +329,16 @@ impl DeliveryAuth {
     ) -> Result<Arc<RegistrySnapshot>, AuthUnavailable> {
         loop {
             let now = Instant::now();
-            if let Some(cached) = self.inner.cache.get(registry_id)
-                && cached.refresh_after > now
-            {
-                return Ok(cached.snapshot);
-            }
-            if !self.inner.cache.contains_key(registry_id)
-                && lock_unpoisoned(&self.inner.cold_retry_after)
+            match self.inner.cache.get(registry_id) {
+                Some(cached) if cached.refresh_after > now => return Ok(cached.snapshot),
+                Some(_) => {}
+                None if lock_unpoisoned(&self.inner.cold_retry_after)
                     .get(registry_id)
-                    .is_some_and(|retry_after| *retry_after > now)
-            {
-                return Err(AuthUnavailable);
+                    .is_some_and(|retry_after| *retry_after > now) =>
+                {
+                    return Err(AuthUnavailable);
+                }
+                None => {}
             }
 
             match self.inner.refreshes.begin(registry_id.to_string()) {
@@ -520,17 +521,21 @@ impl AuthorizedDelivery {
     /// Returns the verified query credential when the caller used
     /// `access_token`. Header credentials are never copied into generated URLs.
     pub fn propagated_access_token(&self) -> Option<&str> {
-        self.propagate_access_token
-            .then_some(self.presented_token.as_deref())
-            .flatten()
+        if self.propagate_access_token {
+            self.presented_token.as_deref()
+        } else {
+            None
+        }
     }
 
     /// Shares the verified query credential without copying its secret bytes.
     /// Header credentials are never converted into a URL credential.
     pub fn shared_propagated_access_token(&self) -> Option<Arc<str>> {
-        self.propagate_access_token
-            .then_some(self.presented_token.as_ref().map(Arc::clone))
-            .flatten()
+        if self.propagate_access_token {
+            self.presented_token.as_ref().map(Arc::clone)
+        } else {
+            None
+        }
     }
 }
 
@@ -672,7 +677,6 @@ struct RegistrySnapshot {
 }
 
 struct CredentialGrant {
-    credential_sha256: [u8; 32],
     authorization: AuthorizationGrant,
 }
 
@@ -720,7 +724,6 @@ impl RegistrySnapshot {
             credentials.insert(
                 digest,
                 CredentialGrant {
-                    credential_sha256: digest,
                     authorization: normalize_grant(
                         grant.principal_id,
                         grant.enabled,
@@ -957,15 +960,6 @@ fn decode_lower_hex(byte: u8) -> anyhow::Result<u8> {
     }
 }
 
-fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
-    left.iter()
-        .zip(right)
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        })
-        == 0
-}
-
 #[cfg(test)]
 fn encode_sha256(digest: [u8; 32]) -> String {
     encode_sha256_bytes(digest)
@@ -1011,7 +1005,7 @@ impl ObjectStores {
                 store.clone()
             } else {
                 let allow_http = (url.scheme() == "http")
-                    .then_some(("allow_http".to_string(), "true".to_string()));
+                    .then(|| ("allow_http".to_string(), "true".to_string()));
                 let options = self.options.iter().cloned().chain(allow_http);
                 let (store, _) = parse_url_opts(url, options)
                     .map_err(|_| anyhow::anyhow!("failed to configure auth object store"))?;

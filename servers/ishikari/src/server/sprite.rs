@@ -59,7 +59,7 @@ pub(crate) async fn serve_sprite(
 ) -> Result<Response<Body>, HttpError> {
     validate_style_key(&request.style_key)?;
     let upstream = resolve_sprite_url(&state, &request.style_key, request.variant.suffix())?;
-    let resource = route_sprite_bytes(&state, &request, &upstream).await?;
+    let resource = route_sprite_bytes(&state, &request, upstream).await?;
     Ok(resource.public_response(
         headers,
         resource.bytes().clone(),
@@ -102,21 +102,16 @@ fn resolve_sprite_url(
 async fn route_sprite_bytes(
     state: &AppState,
     request: &SpriteRequest,
-    upstream: &str,
+    upstream: String,
 ) -> Result<ProviderResource, HttpError> {
-    let provider_request = ProviderRequest::sprite(&request.style_key, request.variant, upstream);
+    let provider_request = ProviderRequest::sprite(&request.style_key, request.variant, &upstream);
     if let Some(resource) =
         crate::server::provider::route_peer_resource(&state.resource_resolver, &provider_request)
             .await?
     {
         return Ok(resource);
     }
-    fetch_sprite_bytes_local(
-        state,
-        provider_request.upstream_url().to_string(),
-        request.format,
-    )
-    .await
+    fetch_sprite_bytes_local(state, upstream, request.format).await
 }
 
 async fn fetch_sprite_bytes_local(

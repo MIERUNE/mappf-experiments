@@ -29,28 +29,30 @@ impl ResourceUrlPolicy {
         let Some(host) = url.host() else {
             return false;
         };
-        let host_label = host
-            .to_string()
-            .trim_matches(['[', ']'])
-            .to_ascii_lowercase();
         match host {
             url::Host::Ipv4(address) => {
-                !is_forbidden_address(IpAddr::V4(address)) || self.allows_private_host(&host_label)
+                !is_forbidden_address(IpAddr::V4(address))
+                    || self.allows_private_host(&address.to_string())
             }
             url::Host::Ipv6(address) => {
-                !is_forbidden_address(IpAddr::V6(address)) || self.allows_private_host(&host_label)
+                !is_forbidden_address(IpAddr::V6(address))
+                    || self.allows_private_host(&address.to_string())
             }
             url::Host::Domain(_) => true,
         }
     }
 
     fn allows_private_host(&self, host: &str) -> bool {
-        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        let host = host.trim_end_matches('.');
         self.private_hosts.iter().any(|pattern| {
             if let Some(suffix) = pattern.strip_prefix("*.") {
-                host != suffix && host.ends_with(&format!(".{suffix}"))
+                let host = host.as_bytes();
+                let suffix = suffix.as_bytes();
+                host.len() > suffix.len()
+                    && host[host.len() - suffix.len() - 1] == b'.'
+                    && host[host.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
             } else {
-                host == *pattern
+                host.eq_ignore_ascii_case(pattern)
             }
         })
     }

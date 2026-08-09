@@ -286,9 +286,18 @@ impl Membership {
     }
 }
 
-#[derive(Default)]
 struct StyleRevisionTracker {
     seen: BTreeMap<(String, usize), String>,
+    keys: [String; STYLE_REVISION_GOSSIP_SLOTS],
+}
+
+impl Default for StyleRevisionTracker {
+    fn default() -> Self {
+        Self {
+            seen: BTreeMap::new(),
+            keys: std::array::from_fn(style_revision_gossip_key),
+        }
+    }
 }
 
 struct StyleRevisionBatch {
@@ -302,6 +311,7 @@ impl StyleRevisionTracker {
         nodes: mmpf_cluster::LiveNodesRef<'_>,
         excluded_node_id: Option<&str>,
     ) -> StyleRevisionBatch {
+        let mut previous = std::mem::take(&mut self.seen);
         let mut current = BTreeMap::new();
         let mut observations = Vec::new();
         let mut invalid = 0;
@@ -309,16 +319,18 @@ impl StyleRevisionTracker {
             if excluded_node_id == Some(node.id()) {
                 continue;
             }
-            for slot in 0..STYLE_REVISION_GOSSIP_SLOTS {
-                let key = style_revision_gossip_key(slot);
-                let Some(value) = node.get(&key) else {
+            for (slot, key) in self.keys.iter().enumerate() {
+                let Some(value) = node.get(key) else {
                     continue;
                 };
                 let identity = (node.id().to_owned(), slot);
-                current.insert(identity.clone(), value.to_owned());
-                if self.seen.get(&identity).is_some_and(|seen| seen == value) {
+                if let Some((_, seen)) = previous.remove_entry(&identity)
+                    && seen == value
+                {
+                    current.insert(identity, seen);
                     continue;
                 }
+                current.insert(identity, value.to_owned());
                 match StyleRevisionObservation::decode(value) {
                     Some(observation) => observations.push(observation),
                     None => invalid += 1,

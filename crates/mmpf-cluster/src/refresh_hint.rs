@@ -22,6 +22,7 @@
 //! length, no empty or relative path segments, and no character that could turn
 //! a logical id into a URL, query, or authority.
 
+use std::array;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -32,7 +33,7 @@ use tokio::time::Instant;
 use crate::LiveNodesRef;
 
 const KEY_PREFIX: &str = "refresh-style-v1-";
-pub const STYLE_REFRESH_HINT_SLOTS: usize = 16;
+pub(crate) const STYLE_REFRESH_HINT_SLOTS: usize = 16;
 pub const MAX_STYLE_REFRESH_HINT_BYTES: usize = 1_024;
 const MAX_HINT_ID_BYTES: usize = 128;
 /// How long an accepted hint suppresses a repeat of the same `(hint_id,
@@ -138,19 +139,28 @@ impl std::fmt::Display for RefreshHintError {
 
 impl std::error::Error for RefreshHintError {}
 
-pub fn style_refresh_hint_key(slot: usize) -> String {
+pub(crate) fn style_refresh_hint_key(slot: usize) -> String {
     debug_assert!(slot < STYLE_REFRESH_HINT_SLOTS);
     format!("{KEY_PREFIX}{slot:02}")
 }
 
 /// Tracks the last value observed in every node/slot pair.
 ///
-/// Memory is bounded by live nodes times [`STYLE_REFRESH_HINT_SLOTS`]. The first
+/// Memory is bounded by live nodes times `STYLE_REFRESH_HINT_SLOTS`. The first
 /// snapshot is intentionally delivered so a pod joining just after a
 /// publication still receives the retained hints.
-#[derive(Default)]
 pub struct StyleRefreshHintTracker {
     seen: BTreeMap<(String, usize), String>,
+    keys: [String; STYLE_REFRESH_HINT_SLOTS],
+}
+
+impl Default for StyleRefreshHintTracker {
+    fn default() -> Self {
+        Self {
+            seen: BTreeMap::new(),
+            keys: array::from_fn(style_refresh_hint_key),
+        }
+    }
 }
 
 impl StyleRefreshHintTracker {
@@ -159,6 +169,7 @@ impl StyleRefreshHintTracker {
         nodes: LiveNodesRef<'_>,
         excluded_node_id: Option<&str>,
     ) -> RefreshHintBatch {
+        let mut previous = std::mem::take(&mut self.seen);
         let mut current = BTreeMap::new();
         let mut hints = Vec::new();
         let mut invalid = 0;
@@ -167,16 +178,18 @@ impl StyleRefreshHintTracker {
             if excluded_node_id == Some(node.id()) {
                 continue;
             }
-            for slot in 0..STYLE_REFRESH_HINT_SLOTS {
-                let key = style_refresh_hint_key(slot);
-                let Some(value) = node.get(&key) else {
+            for (slot, key) in self.keys.iter().enumerate() {
+                let Some(value) = node.get(key) else {
                     continue;
                 };
                 let identity = (node.id().to_string(), slot);
-                current.insert(identity.clone(), value.to_string());
-                if self.seen.get(&identity).is_some_and(|seen| seen == value) {
+                if let Some((_, seen)) = previous.remove_entry(&identity)
+                    && seen == value
+                {
+                    current.insert(identity, seen);
                     continue;
                 }
+                current.insert(identity, value.to_string());
                 match StyleRefreshHint::decode(value) {
                     Ok(hint) => hints.push(hint),
                     Err(_) => invalid += 1,
@@ -257,12 +270,14 @@ impl RefreshHintDedup {
 
         // Drop expired entries from the front before deciding, so a repeat after
         // the window is admitted rather than suppressed forever.
-        while let Some((expired, inserted_at)) = state.order.front() {
-            if now.duration_since(*inserted_at) < self.window {
+        while state
+            .order
+            .front()
+            .is_some_and(|(_, inserted_at)| now.duration_since(*inserted_at) >= self.window)
+        {
+            let Some((expired, _)) = state.order.pop_front() else {
                 break;
-            }
-            let expired = expired.clone();
-            state.order.pop_front();
+            };
             state.present.remove(&expired);
         }
 

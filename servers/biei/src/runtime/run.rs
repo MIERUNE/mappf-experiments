@@ -65,7 +65,10 @@ where
         tracing::info!("starting single-node runtime");
         (Runtime::spawn_single_node(&options)?, None)
     };
-    let ingress = runtime.http_ingress_with_auth(options.sla, auth);
+    // The client request deadline is intentionally larger than the routing SLA
+    // (`options.sla`), so a cold render's one-time resource I/O does not time out
+    // at the routing target. Routing still keys on `options.sla` via `costs`.
+    let ingress = runtime.http_ingress_with_auth(options.request_deadline, auth);
     let (shutdown, shutdown_task) = install_shutdown_handler(runtime.clone(), shutdown_requested);
     let shutdown_observer = shutdown.clone();
     let serve_result = if options.cluster {

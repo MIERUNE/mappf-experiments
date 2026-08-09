@@ -319,16 +319,16 @@ impl<'a> ProviderRequest<'a> {
         match self.resource {
             ProviderResource::Style { style_key } => format!(
                 "/_internal/provider/styles/{}/style.json",
-                provider_path_encode_segments(style_key)
+                path_percent_encode_segments(style_key)
             ),
             ProviderResource::Glyph { fontstack, range } => format!(
                 "/_internal/provider/fonts/{}/{}.pbf",
-                provider_path_encode(fontstack),
+                path_percent_encode(fontstack),
                 range
             ),
             ProviderResource::Sprite { style_key, variant } => format!(
                 "/_internal/provider/styles/{}/sprite{}",
-                provider_path_encode_segments(style_key),
+                path_percent_encode_segments(style_key),
                 variant.suffix()
             ),
         }
@@ -365,24 +365,34 @@ impl fmt::Display for ProviderLogicalIdentity<'_> {
     }
 }
 
-fn provider_path_encode(value: &str) -> String {
+pub fn path_percent_encode(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
+    push_provider_path_encoded(&mut encoded, value);
+    encoded
+}
+
+fn push_provider_path_encoded(encoded: &mut String, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b',') {
             encoded.push(byte as char);
         } else {
-            encoded.push_str(&format!("%{byte:02X}"));
+            encoded.push('%');
+            encoded.push(HEX[usize::from(byte >> 4)] as char);
+            encoded.push(HEX[usize::from(byte & 0x0f)] as char);
         }
     }
-    encoded
 }
 
-fn provider_path_encode_segments(value: &str) -> String {
-    value
-        .split('/')
-        .map(provider_path_encode)
-        .collect::<Vec<_>>()
-        .join("/")
+pub fn path_percent_encode_segments(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for (index, segment) in value.split('/').enumerate() {
+        if index != 0 {
+            encoded.push('/');
+        }
+        push_provider_path_encoded(&mut encoded, segment);
+    }
+    encoded
 }
 
 /// Bounded marker for authoritative provider negatives on the internal wire.

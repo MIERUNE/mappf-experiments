@@ -1,6 +1,6 @@
 //! Provider `Cache-Control` parsing and shared-cache policy normalization.
 
-use std::{sync::Arc, time::Duration};
+use std::{fmt::Write as _, sync::Arc, time::Duration};
 
 use mmpf_http::cache_control::{ParsedCacheControl as CacheControl, parse_values};
 
@@ -196,29 +196,28 @@ fn normalized_cache_control(resource: &'static str, control: &CacheControl) -> S
         .map(clamp)
         .or_else(|| control.max_age.map(clamp))
         .unwrap_or(default_fresh);
-    let mut directives = vec![
-        "public".to_string(),
-        format!("max-age={max_age}"),
-        format!("s-maxage={s_maxage}"),
-    ];
+    let mut directives = String::with_capacity(96);
+    write!(directives, "public, max-age={max_age}, s-maxage={s_maxage}")
+        .expect("writing to String cannot fail");
     if !(control.must_revalidate || control.proxy_revalidate)
         && let Some(swr) = control.stale_while_revalidate.map(clamp)
         && swr > 0
     {
-        directives.push(format!("stale-while-revalidate={swr}"));
+        write!(directives, ", stale-while-revalidate={swr}")
+            .expect("writing to String cannot fail");
     }
     if control.must_revalidate {
-        directives.push("must-revalidate".to_string());
+        directives.push_str(", must-revalidate");
     } else if control.proxy_revalidate {
-        directives.push("proxy-revalidate".to_string());
+        directives.push_str(", proxy-revalidate");
     }
     if control.no_transform {
-        directives.push("no-transform".to_string());
+        directives.push_str(", no-transform");
     }
     if control.immutable {
-        directives.push("immutable".to_string());
+        directives.push_str(", immutable");
     }
-    directives.join(", ")
+    directives
 }
 
 fn default_response_cache_control(resource: &'static str) -> &'static str {

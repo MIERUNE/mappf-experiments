@@ -68,9 +68,9 @@ impl ObjectStoreRegistry {
                 store
             }
         };
-        let source_label = redacted_source_label(url);
-        let path = ObjectPath::from_url_path(url.path())
-            .map_err(|_| anyhow::anyhow!("invalid object path for {source_label}"))?;
+        let path = ObjectPath::from_url_path(url.path()).map_err(|_| {
+            anyhow::anyhow!("invalid object path for {}", redacted_source_label(url))
+        })?;
         Ok((store, path))
     }
 
@@ -98,7 +98,7 @@ impl ObjectStoreRegistry {
         // URL scheme already states the intent, so enable it here instead of
         // requiring an ALLOW_HTTP env var.
         let allow_http =
-            (url.scheme() == "http").then_some(("allow_http".to_string(), "true".to_string()));
+            (url.scheme() == "http").then(|| ("allow_http".to_string(), "true".to_string()));
         let options = self.options.iter().cloned().chain(allow_http);
         let source_label = redacted_source_label(url);
         let (store, _path) = parse_url_opts(url, options)

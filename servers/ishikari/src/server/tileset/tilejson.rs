@@ -1,6 +1,6 @@
 //! TileJSON handler and response generation for tileset endpoints.
 
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap};
 
 use axum::{
     Extension,
@@ -27,34 +27,34 @@ pub(crate) struct TileJsonQuery {
     encoding: Option<String>,
 }
 
-#[derive(serde::Serialize, Debug, Clone)]
-pub(crate) struct TileJson {
-    pub tilejson: String,
+#[derive(serde::Serialize, Debug)]
+pub(crate) struct TileJson<'a> {
+    pub tilejson: &'static str,
     pub tiles: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub vector_layers: Vec<VectorLayer>,
+    #[serde(skip_serializing_if = "<[VectorLayer]>::is_empty")]
+    pub vector_layers: &'a [VectorLayer],
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub attribution: Option<String>,
+    pub attribution: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bounds: Option<[f64; 4]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub center: Option<(f64, f64, u8)>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    pub description: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maxzoom: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub minzoom: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub name: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
+    pub version: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tilestats: Option<Tilestats>,
+    pub tilestats: Option<&'a Tilestats>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub format: Option<String>,
+    pub format: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub encoding: Option<String>,
+    pub encoding: Option<Cow<'a, str>>,
     #[serde(flatten)]
     pub other: BTreeMap<String, serde_json::Value>,
 }
@@ -179,30 +179,28 @@ async fn serve_tilejson(
 }
 
 /// Converts PMTiles header and metadata into a TileJSON document.
-fn tilejson(
+fn tilejson<'a>(
     tileset_id: &TilesetId,
     base_url: &str,
-    data: &TilesetInfo,
+    data: &'a TilesetInfo,
     requested_encoding: Option<&str>,
     maxzoom_override: Option<u8>,
     token: Option<&PropagatedAccessToken>,
-) -> TileJson {
+) -> TileJson<'a> {
     let metadata = &data.metadata;
-    let format = data.header.tile_type.tilejson_format().map(str::to_string);
+    let format = data.header.tile_type.tilejson_format();
     let wants_mlt = requested_encoding.is_some_and(|encoding| encoding.eq_ignore_ascii_case("mlt"))
         && data.header.tile_type == TileType::Mvt;
     // A producer-declared encoding (e.g. a terrain `terrarium`/`mapbox` hint, which
     // the PMTiles header cannot express) wins; otherwise fall back to the header's
     // vector encoding (`mvt`/`mlt`). We must not clobber the metadata value.
     let encoding = if wants_mlt {
-        Some("mlt".to_string())
+        Some(Cow::Borrowed("mlt"))
     } else {
-        metadata.encoding().map(str::to_string).or_else(|| {
-            data.header
-                .tile_type
-                .tilejson_encoding()
-                .map(str::to_string)
-        })
+        metadata
+            .encoding()
+            .map(Cow::Borrowed)
+            .or_else(|| data.header.tile_type.tilejson_encoding().map(Cow::Borrowed))
     };
     let tile_suffix = if wants_mlt { ".mlt" } else { "" };
 
@@ -212,10 +210,10 @@ fn tilejson(
     }
 
     TileJson {
-        tilejson: "3.0.0".to_string(),
+        tilejson: "3.0.0",
         tiles: vec![tile_url],
-        vector_layers: metadata.vector_layers().to_vec(),
-        attribution: metadata.attribution.clone(),
+        vector_layers: metadata.vector_layers(),
+        attribution: metadata.attribution.as_deref(),
         bounds: Some([
             data.header.min_longitude,
             data.header.min_latitude,
@@ -227,12 +225,17 @@ fn tilejson(
             data.header.center_latitude,
             data.header.center_zoom,
         )),
-        description: metadata.description.clone(),
+        description: metadata.description.as_deref(),
         maxzoom: Some(maxzoom_override.unwrap_or(data.header.max_zoom)),
         minzoom: Some(data.header.min_zoom),
-        name: metadata.name.clone().or(Some(tileset_id.to_string())),
-        version: metadata.version.clone(),
-        tilestats: metadata.tilestats().cloned(),
+        name: Some(
+            metadata
+                .name
+                .as_deref()
+                .map_or_else(|| Cow::Owned(tileset_id.to_string()), Cow::Borrowed),
+        ),
+        version: metadata.version.as_deref(),
+        tilestats: metadata.tilestats(),
         format,
         encoding,
         other: metadata.other(),
@@ -287,16 +290,17 @@ mod tests {
     #[test]
     fn mlt_pmtiles_tilejson_declares_mlt_encoding() {
         let tileset_id = TilesetId::try_from("demo/mlt".to_string()).expect("valid tileset id");
+        let info = info(6, Metadata::default());
         let document = tilejson(
             &tileset_id,
             "https://ishikari.example",
-            &info(6, Metadata::default()),
+            &info,
             None,
             None,
             None,
         );
 
-        assert_eq!(document.format.as_deref(), Some("pbf"));
+        assert_eq!(document.format, Some("pbf"));
         assert_eq!(document.encoding.as_deref(), Some("mlt"));
         assert_eq!(
             document.tiles,
@@ -307,16 +311,17 @@ mod tests {
     #[test]
     fn metadata_encoding_takes_precedence_over_header_encoding() {
         let tileset_id = TilesetId::try_from("demo/mlt".to_string()).expect("valid tileset id");
+        let info = info(
+            6,
+            Metadata {
+                encoding: Some("terrarium".to_string()),
+                ..Metadata::default()
+            },
+        );
         let document = tilejson(
             &tileset_id,
             "https://ishikari.example",
-            &info(
-                6,
-                Metadata {
-                    encoding: Some("terrarium".to_string()),
-                    ..Metadata::default()
-                },
-            ),
+            &info,
             None,
             None,
             None,
@@ -328,16 +333,17 @@ mod tests {
     #[test]
     fn requested_mlt_encoding_rewrites_mvt_tiles_to_mlt_urls() {
         let tileset_id = TilesetId::try_from("demo/mvt".to_string()).expect("valid tileset id");
+        let info = info(1, Metadata::default());
         let document = tilejson(
             &tileset_id,
             "https://ishikari.example",
-            &info(1, Metadata::default()),
+            &info,
             Some("mlt"),
             None,
             None,
         );
 
-        assert_eq!(document.format.as_deref(), Some("pbf"));
+        assert_eq!(document.format, Some("pbf"));
         assert_eq!(document.encoding.as_deref(), Some("mlt"));
         assert_eq!(
             document.tiles,
@@ -348,16 +354,17 @@ mod tests {
     #[test]
     fn requested_mlt_encoding_is_ignored_for_raster_tilesets() {
         let tileset_id = TilesetId::try_from("demo/webp".to_string()).expect("valid tileset id");
+        let info = info(4, Metadata::default());
         let document = tilejson(
             &tileset_id,
             "https://ishikari.example",
-            &info(4, Metadata::default()),
+            &info,
             Some("mlt"),
             None,
             None,
         );
 
-        assert_eq!(document.format.as_deref(), Some("webp"));
+        assert_eq!(document.format, Some("webp"));
         assert_eq!(document.encoding.as_deref(), None);
         assert_eq!(
             document.tiles,

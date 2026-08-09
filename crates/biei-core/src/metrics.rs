@@ -4,8 +4,9 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-pub use mmpf_common::metrics::encode_metric_families;
-use mmpf_common::metrics::{counter_vec, histogram_vec_buckets, register_collectors};
+use mmpf_common::metrics::{
+    counter_vec, encode_metric_families, histogram_vec_buckets, register_collectors,
+};
 use prometheus::{HistogramVec, IntCounter, IntCounterVec, Registry, proto::MetricFamily};
 
 use crate::types::{
@@ -33,7 +34,7 @@ const REJECTION_REASONS: [RejectionReason; 9] = [
     RejectionReason::DeadlineExceeded,
 ];
 
-pub fn route_tier_label(tier: RouteTier) -> &'static str {
+fn route_tier_label(tier: RouteTier) -> &'static str {
     match tier {
         RouteTier::RenderCacheHit => "render_cache_hit",
         RouteTier::Tier1WarmTracking => "tier1_warm_tracking",
@@ -43,7 +44,7 @@ pub fn route_tier_label(tier: RouteTier) -> &'static str {
     }
 }
 
-pub fn rejection_reason_label(reason: RejectionReason) -> &'static str {
+fn rejection_reason_label(reason: RejectionReason) -> &'static str {
     match reason {
         RejectionReason::QueueFull => "queue_full",
         RejectionReason::NoCapacity => "no_capacity",
@@ -518,7 +519,7 @@ fn render_size_label(observation: &RenderObservation) -> &'static str {
     }
 }
 
-pub const LATENCY_BUCKETS: &[f64] = &[
+const LATENCY_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0,
 ];
 
@@ -535,7 +536,7 @@ const DEADLINE_STAGES: [DeadlineStage; 5] = [
     DeadlineStage::Render,
 ];
 
-pub fn deadline_stage_label(stage: DeadlineStage) -> &'static str {
+fn deadline_stage_label(stage: DeadlineStage) -> &'static str {
     match stage {
         DeadlineStage::AcquireRenderPermit => "acquire_render_permit",
         DeadlineStage::StyleSwap => "style_swap",

@@ -257,8 +257,7 @@ impl Error for WireError {}
 
 #[cfg(test)]
 fn encode_response_body(header: &OutcomeHeader, image_bytes: &[u8]) -> Result<Vec<u8>, WireError> {
-    let json = serde_json::to_vec(header).map_err(WireError::Encode)?;
-    let json_len: u32 = json.len().try_into().map_err(|_| WireError::TooLarge)?;
+    let (json, json_len) = encode_json_prefix(header)?;
     let mut out = Vec::with_capacity(4 + json.len() + image_bytes.len());
     out.extend_from_slice(&json_len.to_be_bytes());
     out.extend_from_slice(&json);
@@ -266,12 +265,17 @@ fn encode_response_body(header: &OutcomeHeader, image_bytes: &[u8]) -> Result<Ve
     Ok(out)
 }
 
+fn encode_json_prefix(header: &OutcomeHeader) -> Result<(Vec<u8>, u32), WireError> {
+    let json = serde_json::to_vec(header).map_err(WireError::Encode)?;
+    let json_len: u32 = json.len().try_into().map_err(|_| WireError::TooLarge)?;
+    Ok((json, json_len))
+}
+
 /// Encode only the length-prefixed metadata portion of a forward response.
 /// The HTTP adapter can chain this with an existing image `Bytes` value
 /// without copying the image into a second contiguous allocation.
 pub fn encode_response_header(header: &OutcomeHeader) -> Result<bytes::Bytes, WireError> {
-    let json = serde_json::to_vec(header).map_err(WireError::Encode)?;
-    let json_len: u32 = json.len().try_into().map_err(|_| WireError::TooLarge)?;
+    let (json, json_len) = encode_json_prefix(header)?;
     let mut out = Vec::with_capacity(4 + json.len());
     out.extend_from_slice(&json_len.to_be_bytes());
     out.extend_from_slice(&json);

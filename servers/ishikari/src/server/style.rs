@@ -106,24 +106,23 @@ async fn serve_style(
 ) -> Result<Response, HttpError> {
     validate_style_key(&style_key)?;
     let upstream = resolve_style_url(&state, &style_key)?;
-    let resource = route_style_bytes(&state, &style_key, &upstream).await?;
+    let resource = route_style_bytes(&state, &style_key, upstream).await?;
     let origin = get_origin(&headers);
-    let provider = state.provider.clone();
-    let transform_resource = resource.clone();
     let permit = state.admit_cpu_work("style_transform").await?;
-    let (body, validators) = tokio::task::spawn_blocking(move || {
+    let (resource, body, validators) = tokio::task::spawn_blocking(move || {
         // `spawn_blocking` cannot be cancelled once running. Keep admission in
         // the closure so a disconnected caller cannot release CPU capacity
         // while its transform still occupies a blocking worker.
         let _permit = permit;
-        transform_style(
-            &transform_resource,
+        let (body, validators) = transform_style(
+            &resource,
             &origin,
             &style_key,
-            &provider,
+            &state.provider,
             encoding.as_deref(),
             token.as_ref(),
-        )
+        )?;
+        Ok::<_, HttpError>((resource, body, validators))
     })
     .await
     .map_err(|error| {
@@ -179,15 +178,15 @@ fn resolve_style_url(state: &AppState, style_key: &str) -> Result<String, HttpEr
 async fn route_style_bytes(
     state: &AppState,
     style_key: &str,
-    upstream: &str,
+    upstream: String,
 ) -> Result<ProviderResource, HttpError> {
-    let request = ProviderRequest::style(style_key, upstream);
+    let request = ProviderRequest::style(style_key, &upstream);
     if let Some(resource) =
         crate::server::provider::route_peer_resource(&state.resource_resolver, &request).await?
     {
         return Ok(resource);
     }
-    fetch_style_bytes_local(state, request.upstream_url().to_string()).await
+    fetch_style_bytes_local(state, upstream).await
 }
 
 async fn fetch_style_bytes_local(
@@ -231,20 +230,22 @@ fn rewrite_style(
         // clients do not hit unconfigured endpoints that 404.
         if provider.has_glyph_provider() {
             let url = format!("{base_url}/fonts/{{fontstack}}/{{range}}.pbf");
-            object.insert(
-                "glyphs".to_string(),
-                Value::String(token.map_or(url.clone(), |token| token.append_to(&url))),
-            );
+            let url = match token {
+                Some(token) => token.append_to(&url),
+                None => url,
+            };
+            object.insert("glyphs".to_string(), Value::String(url));
         }
         if provider.has_sprite_provider(style_key) {
             let url = format!(
                 "{base_url}/styles/{}/sprite",
                 path_percent_encode_segments(style_key)
             );
-            object.insert(
-                "sprite".to_string(),
-                Value::String(token.map_or(url.clone(), |token| token.append_to(&url))),
-            );
+            let url = match token {
+                Some(token) => token.append_to(&url),
+                None => url,
+            };
+            object.insert("sprite".to_string(), Value::String(url));
         }
 
         if let Some(sources) = object.get_mut("sources").and_then(Value::as_object_mut) {
@@ -327,14 +328,14 @@ fn strip_tileset_ref(url: &str) -> Option<&str> {
 
 fn rewrite_tileset_ref_tilejson_url(url: &str, base_url: &str) -> Option<String> {
     let tileset_key = strip_tileset_ref(url)?;
-    TilesetId::try_new(tileset_key).ok()?;
+    TilesetId::validate(tileset_key).ok()?;
     Some(format!("{base_url}/tilesets/{tileset_key}"))
 }
 
 fn rewrite_tileset_ref_tile_url(url: &str, base_url: &str) -> Option<String> {
     let rest = strip_tileset_ref(url)?;
     let tileset_key = rest.strip_suffix("/{z}/{x}/{y}").unwrap_or(rest);
-    TilesetId::try_new(tileset_key).ok()?;
+    TilesetId::validate(tileset_key).ok()?;
     Some(format!(
         "{base_url}/tilesets/{tileset_key}/{{z}}/{{x}}/{{y}}"
     ))

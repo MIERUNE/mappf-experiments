@@ -97,7 +97,6 @@ pub(super) async fn generate_tile(
     // CPU-concurrency slot while doing no CPU work. Admission sheds with 503
     // under extreme overload rather than growing the queue without bound.
     let generation_permit = state.admit_cpu_work("terrain_generate").await?;
-    let metrics = state.metrics.clone();
     tokio::task::spawn_blocking(move || {
         // Keep the permit inside the blocking task. Dropping the HTTP future
         // cannot cancel spawn_blocking, so releasing it earlier would let
@@ -129,7 +128,7 @@ pub(super) async fn generate_tile(
         })?;
         let (tile, payload_len) = tile_from_generated_payload(product, payload)?;
         let generate_elapsed = cpu_started.elapsed();
-        metrics.record_terrain_generation(
+        state.metrics.record_terrain_generation(
             product.path(),
             fetch_elapsed,
             generate_elapsed,

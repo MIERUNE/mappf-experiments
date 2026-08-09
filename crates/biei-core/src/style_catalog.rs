@@ -18,11 +18,11 @@ use crate::types::{StyleId, StyleRevision};
 /// A style may change under a stable id, so a cached style is re-checked when its
 /// served freshness expires — but never more often than this. Without a floor a
 /// short or absent upstream policy would turn every render into a style fetch.
-pub const MIN_STYLE_REVALIDATE_INTERVAL: Duration = Duration::from_secs(10);
+const MIN_STYLE_REVALIDATE_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_REVALIDATION_GENERATIONS: usize = 4_096;
 const MAX_PENDING_STYLE_HINTS: usize = 4_096;
 pub const STYLE_REVISION_GOSSIP_SLOTS: usize = 16;
-pub const MAX_STYLE_REVISION_GOSSIP_BYTES: usize = 1_024;
+const MAX_STYLE_REVISION_GOSSIP_BYTES: usize = 1_024;
 const STYLE_REVISION_GOSSIP_KEY_PREFIX: &str = "observed-style-revision-v1-";
 
 /// Derives the revision version from style content.
@@ -78,12 +78,17 @@ fn normalize_credential_urls(value: &mut serde_json::Value) {
             let Ok(mut url) = url::Url::parse(value) else {
                 return;
             };
-            let retained = url
-                .query_pairs()
-                .filter(|(name, _)| name != "access_token")
-                .map(|(name, value)| (name.into_owned(), value.into_owned()))
-                .collect::<Vec<_>>();
-            if retained.len() == url.query_pairs().count() {
+            let mut removed = false;
+            let retained = url.query_pairs().filter_map(|(name, value)| {
+                if name == "access_token" {
+                    removed = true;
+                    None
+                } else {
+                    Some((name.into_owned(), value.into_owned()))
+                }
+            });
+            let retained = retained.collect::<Vec<_>>();
+            if !removed {
                 return;
             }
             url.query_pairs_mut().clear().extend_pairs(retained);
@@ -418,7 +423,7 @@ impl StyleCatalog {
     ///
     /// `served_freshness` is the upstream freshness for the fetched document;
     /// the next re-check is due after that, floored by
-    /// [`MIN_STYLE_REVALIDATE_INTERVAL`].
+    /// `MIN_STYLE_REVALIDATE_INTERVAL`.
     pub fn record_observed(
         &self,
         style_id: &StyleId,
@@ -566,7 +571,7 @@ impl StyleCatalog {
     }
 
     /// Pulls the next provider check forward to the earliest time allowed by
-    /// [`MIN_STYLE_REVALIDATE_INTERVAL`].
+    /// `MIN_STYLE_REVALIDATE_INTERVAL`.
     ///
     /// This does not perform I/O or change the active revision by itself. It is
     /// the bounded hook for an authenticated publisher refresh hint; the normal

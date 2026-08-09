@@ -305,16 +305,17 @@ async fn serve_derived_tile(
         },
     )?;
     let routing_key = derived_resource_key(&request.tileset_id, request.product);
-    let y_path = match request.format {
-        RequestedTileFormat::AsStored => request.y.to_string(),
-        RequestedTileFormat::Mlt => format!("{}.mlt", request.y),
-    };
     let internal_path = format!(
-        "/_internal/derived/{}/{}/{}/{}/{y_path}",
+        "/_internal/derived/{}/{}/{}/{}{}{}",
         path_percent_encode(request.tileset_id.as_ref()),
         request.product.path(),
         request.z,
         request.x,
+        request.y,
+        match request.format {
+            RequestedTileFormat::AsStored => "",
+            RequestedTileFormat::Mlt => ".mlt",
+        },
     );
     let routed = match state
         .resource_resolver

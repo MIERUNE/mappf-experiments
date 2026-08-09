@@ -350,7 +350,7 @@ where
 
     /// Creates a reader with explicit archive-bootstrap and leaf-directory
     /// cache weight ceilings supplied by the composition root.
-    pub fn with_index_cache_capacities(
+    pub(crate) fn with_index_cache_capacities(
         storage: S,
         archive_cache_max_bytes: u64,
         leaf_cache_max_bytes: u64,

@@ -144,7 +144,7 @@ impl ConditionalStore {
 
 /// Proves the write preconditions needed by Abashiri on one actual backend.
 ///
-/// By default the uniquely named probe remains below [`PROBE_PREFIX`] for an
+/// By default the uniquely named probe remains below `PROBE_PREFIX` for an
 /// object-lifecycle rule to expire. `cleanup` is an explicit diagnostic option,
 /// not a capability required of the production publisher identity.
 pub async fn check_backend<I, K, V>(

@@ -163,6 +163,7 @@ Map mode and pixel ratio are fixed when an `ImageRenderer` is built. A worker th
 
 ### 4.5 Deadlines
 
+- The per-request deadline is distinct from the routing SLA. The SLA is the latency target that sizes the BL soft queue limit and the tier thresholds; the request deadline is how long one request may run before it is abandoned. The deadline is intentionally the larger of the two (a fixed multiple of the SLA), because the first render of a cold style pays one-time resource I/O — glyphs, sprites, source TileJSON — that can approach the SLA, and tying the deadline to the SLA made that cold render time out at exactly the routing target. Keeping them separate gives cold renders headroom without loosening the routing queue limit.
 - Reject before admission when too little budget remains to do useful work.
 - Check the deadline at each worker stage.
 - A native render cannot be preempted. If it returns after the deadline, report timeout and retire that actor.

@@ -749,15 +749,17 @@ impl ModeledCluster {
                             }
                         },
                     )
-                    .or_insert((
-                        request.archive_len.min(u64::from(request.length)),
-                        if local {
-                            request.request_indices.clone()
-                        } else {
-                            Vec::new()
-                        },
-                        local,
-                    ));
+                    .or_insert_with(|| {
+                        (
+                            request.archive_len.min(u64::from(request.length)),
+                            if local {
+                                request.request_indices.clone()
+                            } else {
+                                Vec::new()
+                            },
+                            local,
+                        )
+                    });
             }
             owners.push(index_owner);
         }

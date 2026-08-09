@@ -1,6 +1,7 @@
 //! Origin transport and representation validation for provider resources.
 
 use std::{
+    borrow::Cow,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -155,7 +156,7 @@ async fn fetch_http_provider(
     }
 
     validate_content_type(
-        header_value(&headers, header::CONTENT_TYPE).as_deref(),
+        header_value(&headers, header::CONTENT_TYPE),
         accepted_content_types,
         resource,
     )?;
@@ -175,11 +176,11 @@ async fn fetch_http_provider(
     let validators = Validators::new(
         header_value(&headers, header::ETAG).map(Arc::from),
         header_value(&headers, header::LAST_MODIFIED)
-            .and_then(|value| httpdate::parse_http_date(&value).ok()),
+            .and_then(|value| httpdate::parse_http_date(value).ok()),
     );
     let content_encoding = joined_header_values(&headers, header::CONTENT_ENCODING)
         .filter(|value| !value.trim().eq_ignore_ascii_case("identity"))
-        .map(Arc::from);
+        .map(|value| Arc::from(value.as_ref()));
     let mut body = BytesMut::with_capacity(
         response.content_length().unwrap_or(0).min(max_bytes as u64) as usize,
     );
@@ -384,19 +385,15 @@ pub(super) fn revalidated_provider_resource(
     headers: Option<&HeaderMap>,
     response_delay: Duration,
 ) -> FetchedProviderResource {
-    let cache_control_values = headers
-        .map(|headers| {
-            headers
-                .get_all(header::CACHE_CONTROL)
-                .iter()
-                .filter_map(|value| value.to_str().ok())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let policy = if cache_control_values.is_empty() {
-        cache_policy(resource, Some(cached.cache_control.as_ref()))
-    } else {
-        cache_policy_values(resource, cache_control_values.iter().copied())
+    let mut cache_control_values = headers
+        .into_iter()
+        .flat_map(|headers| headers.get_all(header::CACHE_CONTROL).iter())
+        .filter_map(|value| value.to_str().ok());
+    let policy = match cache_control_values.next() {
+        Some(first) => {
+            cache_policy_values(resource, std::iter::once(first).chain(cache_control_values))
+        }
+        None => cache_policy(resource, Some(cached.cache_control.as_ref())),
     };
     let validators = Validators::new(
         headers
@@ -405,7 +402,7 @@ pub(super) fn revalidated_provider_resource(
             .or_else(|| cached.validators.etag_arc()),
         headers
             .and_then(|headers| header_value(headers, header::LAST_MODIFIED))
-            .and_then(|value| httpdate::parse_http_date(&value).ok())
+            .and_then(|value| httpdate::parse_http_date(value).ok())
             .or_else(|| cached.validators.last_modified()),
     );
     let content_encoding =
@@ -426,20 +423,28 @@ pub(super) fn revalidated_provider_resource(
     }
 }
 
-fn header_value(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
+fn header_value(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
 }
 
-fn joined_header_values(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
-    let values: Vec<&str> = headers
+fn joined_header_values(headers: &HeaderMap, name: header::HeaderName) -> Option<Cow<'_, str>> {
+    let mut values = headers
         .get_all(name)
         .iter()
-        .filter_map(|value| value.to_str().ok())
-        .collect();
-    (!values.is_empty()).then(|| values.join(", "))
+        .filter_map(|value| value.to_str().ok());
+    let first = values.next()?;
+    let Some(second) = values.next() else {
+        return Some(Cow::Borrowed(first));
+    };
+    let mut joined = String::with_capacity(first.len() + 2 + second.len());
+    joined.push_str(first);
+    joined.push_str(", ");
+    joined.push_str(second);
+    for value in values {
+        joined.push_str(", ");
+        joined.push_str(value);
+    }
+    Some(Cow::Owned(joined))
 }
 
 pub(super) fn corrected_initial_age(
@@ -455,7 +460,7 @@ pub(super) fn corrected_initial_age(
         .map(Duration::from_secs)
         .unwrap_or_default();
     let apparent_age = header_value(headers, header::DATE)
-        .and_then(|value| httpdate::parse_http_date(&value).ok())
+        .and_then(|value| httpdate::parse_http_date(value).ok())
         .and_then(|date| response_received.duration_since(date).ok())
         .unwrap_or_default();
     apparent_age.max(age_value.saturating_add(response_delay))

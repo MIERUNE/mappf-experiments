@@ -422,18 +422,19 @@ fn status_for_outcome(outcome: &OutcomeHeader) -> StatusCode {
     }
 }
 
-fn is_json_content_type(headers: &HeaderMap) -> bool {
+fn header_has_media_type(headers: &HeaderMap, expected: &str) -> bool {
     headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| media_type_eq(value, JSON_CONTENT_TYPE))
+        .is_some_and(|value| media_type_eq(value, expected))
+}
+
+fn is_json_content_type(headers: &HeaderMap) -> bool {
+    header_has_media_type(headers, JSON_CONTENT_TYPE)
 }
 
 fn is_biei_response_content_type(headers: &HeaderMap) -> bool {
-    headers
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| media_type_eq(value, BIEI_RESPONSE_CONTENT_TYPE))
+    header_has_media_type(headers, BIEI_RESPONSE_CONTENT_TYPE)
 }
 
 fn retryable_peer_status(status: StatusCode) -> bool {

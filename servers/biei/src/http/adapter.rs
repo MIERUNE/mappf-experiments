@@ -387,12 +387,14 @@ fn public_content_routes() -> Router<HttpServerState> {
     Router::new().fallback(public_render)
 }
 
-/// Operational and internal routes retained on the standalone listener. They
-/// remain explicit even though single-node deployments use one socket.
-fn standalone_operational_routes() -> Router<HttpServerState> {
+/// The cluster-internal operational surface: health, metrics, peer forwarding,
+/// and the advisory refresh receiver. Defined once and composed by both the
+/// standalone listener (which serves the public health paths on the same socket)
+/// and the cluster-mode internal listener (which adds the not-found fallbacks and
+/// the internal metrics layer), so the route set — including the refresh body
+/// limit — cannot drift between the two.
+fn internal_operational_routes() -> Router<HttpServerState> {
     Router::new()
-        .route(PUBLIC_LIVENESS_PATH, get(healthz))
-        .route(PUBLIC_READINESS_PATH, get(readyz))
         .route(INTERNAL_LIVENESS_PATH, get(healthz))
         .route(INTERNAL_READINESS_PATH, get(readyz))
         .route(INTERNAL_METRICS_PATH, get(metricsz))
@@ -401,6 +403,15 @@ fn standalone_operational_routes() -> Router<HttpServerState> {
             "/_internal/refresh/style",
             post(refresh_style).route_layer(DefaultBodyLimit::max(MAX_STYLE_REFRESH_HINT_BYTES)),
         )
+}
+
+/// Operational and internal routes retained on the standalone listener. They
+/// remain explicit even though single-node deployments use one socket.
+fn standalone_operational_routes() -> Router<HttpServerState> {
+    Router::new()
+        .route(PUBLIC_LIVENESS_PATH, get(healthz))
+        .route(PUBLIC_READINESS_PATH, get(readyz))
+        .merge(internal_operational_routes())
 }
 
 /// Force `no-store` onto public failures so a shared cache cannot retain them.
@@ -512,15 +523,7 @@ fn public_router(state: HttpServerState) -> Router {
 /// namespaced under `/_internal/*` (matching the sibling `ishikari` service) —
 /// top-level `/livez` `/readyz` live only on the public port.
 fn internal_router(state: HttpServerState) -> Router {
-    Router::new()
-        .route(INTERNAL_LIVENESS_PATH, get(healthz))
-        .route(INTERNAL_READINESS_PATH, get(readyz))
-        .route(INTERNAL_METRICS_PATH, get(metricsz))
-        .route("/_internal/forward", post(forwardz))
-        .route(
-            "/_internal/refresh/style",
-            post(refresh_style).route_layer(DefaultBodyLimit::max(MAX_STYLE_REFRESH_HINT_BYTES)),
-        )
+    internal_operational_routes()
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(

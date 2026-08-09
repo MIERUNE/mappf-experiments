@@ -39,10 +39,12 @@ enum DemEncoding {
 
 impl DemEncoding {
     fn from_str(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "terrarium" => Some(Self::Terrarium),
-            "terrainrgb" => Some(Self::TerrainRgb),
-            _ => None,
+        if s.eq_ignore_ascii_case("terrarium") {
+            Some(Self::Terrarium)
+        } else if s.eq_ignore_ascii_case("terrainrgb") {
+            Some(Self::TerrainRgb)
+        } else {
+            None
         }
     }
 

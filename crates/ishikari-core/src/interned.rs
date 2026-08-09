@@ -14,9 +14,14 @@ const MAX_TILESET_ID_LEN: usize = 256;
 pub struct TilesetId(ArcIntern<str>);
 
 impl TilesetId {
+    /// Validates a tileset id without interning it.
+    pub fn validate(value: &str) -> Result<()> {
+        validate_tileset_id(value)
+    }
+
     /// Creates a tileset id after validating it.
     pub fn try_new(value: &str) -> Result<Self> {
-        validate_tileset_id(value)?;
+        Self::validate(value)?;
         Ok(Self(ArcIntern::from(value)))
     }
 

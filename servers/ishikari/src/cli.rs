@@ -213,8 +213,8 @@ struct Cli {
 /// optionally filling unset settings from a configuration document.
 pub(crate) fn load() -> anyhow::Result<Options> {
     let mut cli = Cli::parse();
-    if let Some(path) = cli.config.clone() {
-        let file = ConfigFile::load(&path)?;
+    if let Some(path) = cli.config.as_deref() {
+        let file = ConfigFile::load(path)?;
         apply_config_file(&mut cli, file);
     }
     resolve(cli).map_err(anyhow::Error::msg)

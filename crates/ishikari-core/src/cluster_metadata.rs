@@ -23,7 +23,7 @@ pub const MARKED_FOR_DELETION_GRACE_PERIOD: Duration = Duration::from_secs(60 * 
 /// Nodes without a valid address are intentionally excluded from routing. The
 /// gossip endpoint and the internal HTTP endpoint need not share an address or
 /// port, so guessing from the gossip address could route to the wrong listener.
-pub fn peer_http_addr(http_advertise_addr: Option<&str>) -> Option<SocketAddr> {
+fn peer_http_addr(http_advertise_addr: Option<&str>) -> Option<SocketAddr> {
     http_advertise_addr.and_then(|value| value.parse().ok())
 }
 

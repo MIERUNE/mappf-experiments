@@ -134,8 +134,8 @@ struct Cli {
 
 pub(crate) fn load() -> anyhow::Result<Options> {
     let mut cli = Cli::parse();
-    if let Some(path) = cli.config.clone() {
-        let file = crate::config_file::ConfigFile::load(&path)?;
+    if let Some(path) = cli.config.as_deref() {
+        let file = crate::config_file::ConfigFile::load(path)?;
         apply_config_file(&mut cli, file);
     }
     resolve(cli)

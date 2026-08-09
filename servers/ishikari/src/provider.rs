@@ -117,28 +117,7 @@ fn validate_glyph_template(template: &str) -> Result<String, String> {
     Ok(template.to_string())
 }
 
-pub(crate) fn path_percent_encode(value: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b',') {
-            out.push(byte as char);
-        } else {
-            out.push('%');
-            out.push(HEX[(byte >> 4) as usize] as char);
-            out.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-    }
-    out
-}
-
-pub(crate) fn path_percent_encode_segments(value: &str) -> String {
-    value
-        .split('/')
-        .map(path_percent_encode)
-        .collect::<Vec<_>>()
-        .join("/")
-}
+pub(crate) use ishikari_core::storage::{path_percent_encode, path_percent_encode_segments};
 
 #[cfg(test)]
 mod tests {

@@ -543,7 +543,7 @@ impl WorkerPool {
     }
 }
 
-/// Result of [`WorkerPool::shutdown`]: how many worker tasks joined cleanly
+/// Result of `WorkerPool::shutdown`: how many worker tasks joined cleanly
 /// versus were still running at the deadline and had to be detached.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerShutdown {

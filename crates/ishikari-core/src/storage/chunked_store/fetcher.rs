@@ -665,9 +665,8 @@ fn build_template_source(
     let (object_store, sample_path) = registry
         .resolve(&url)
         .with_context(|| format!("failed to resolve {}", redacted_source_label(&url)))?;
-    let sample_parts = sample_path.as_ref().split('/').collect::<Vec<_>>();
-    let mut parts = Vec::with_capacity(sample_parts.len());
-    for segment in sample_parts {
+    let mut parts = Vec::new();
+    for segment in sample_path.as_ref().split('/') {
         if segment == namespace_marker {
             parts.push(TilesetPathPart::Namespace);
             continue;

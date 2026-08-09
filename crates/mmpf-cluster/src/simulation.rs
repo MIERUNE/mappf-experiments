@@ -36,7 +36,7 @@ pub struct SimulationTransportStats {
 /// The delay uses Tokio time, so simulations using a paused clock remain fully
 /// deterministic. Clones share the same channel registry and statistics.
 #[derive(Clone)]
-pub struct SimulationTransport {
+pub(crate) struct SimulationTransport {
     inner: ChannelTransport,
     hop_latency: Duration,
 }

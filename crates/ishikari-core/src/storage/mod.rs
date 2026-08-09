@@ -35,6 +35,7 @@ pub use peer::{Peer, PeerDirectory, PeerFuture, PeerSnapshotCache};
 #[doc(hidden)]
 pub use peer::{
     internal_peer_request_timeout, internal_resource_kind, internal_response_body_limit,
+    path_percent_encode, path_percent_encode_segments,
 };
 // The internal peer transport is injected by the `ishikari` server binary,
 // which owns the concrete (reqwest-based) implementation. These are the seam

@@ -3,6 +3,8 @@
 use axum::http::StatusCode;
 use serde::Deserialize;
 
+use ishikari_core::{interned::TilesetId, pmtiles::TileCoord};
+
 use super::HttpError;
 
 mod error;
@@ -56,6 +58,18 @@ pub(crate) fn parse_tile_coordinate<T: std::str::FromStr>(
             format!("tile {label} is out of range: {raw}"),
         )
     })
+}
+
+/// Parses a raw tileset id into its typed form, mapping validation failure to
+/// the standard bad-request tuple used by every tileset handler.
+pub(crate) fn parse_tileset_id(raw: String) -> Result<TilesetId, HttpError> {
+    TilesetId::try_from(raw).map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))
+}
+
+/// Parses a validated coordinate triple, mapping construction failure to the
+/// standard bad-request tuple.
+pub(crate) fn parse_tile_coord(z: u8, x: u32, y: u32) -> Result<TileCoord, HttpError> {
+    TileCoord::new(z, x, y).map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))
 }
 
 /// Every encoding a caller may name in `?encoding=`, in canonical spelling:

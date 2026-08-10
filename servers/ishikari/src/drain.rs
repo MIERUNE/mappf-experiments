@@ -37,7 +37,7 @@ impl DrainController {
 /// on its own schedule; rejecting public requests at SIGTERM would surface as
 /// client-visible `503`s while the LB is still sending traffic. Operational
 /// endpoints (`/_internal/healthz`, `/_internal/readyz`, `/_internal/metrics`,
-/// `/_internal/cluster`) stay available throughout.
+/// `/_internal/operations/v1/status`) stay available throughout.
 pub(crate) fn is_drainable_path(path: &str) -> bool {
     path.starts_with("/_internal/tiles/")
         || path.starts_with("/_internal/pmtiles/")

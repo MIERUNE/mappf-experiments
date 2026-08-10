@@ -30,6 +30,7 @@ clap = { version = "4.6", features = ["derive", "env"] }
 fast_hilbert = "2"
 fast-mvt = { version = "0.5", default-features = false, features = ["writer"] }
 futures-util = "0.3"
+http = "1"
 http-body-util = "0.1"
 humantime = "2"
 httpdate = "1"

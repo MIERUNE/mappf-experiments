@@ -25,8 +25,8 @@ spec:
           protocol: TCP
         - port: 7946
           protocol: UDP
-    # Abashiri may send only the advisory refresh hint over internal HTTP; it
-    # does not join the gossip cluster or receive peer-forwarding authority.
+    # Abashiri may send advisory refresh hints and read bounded operational
+    # status over internal HTTP. It does not join the gossip cluster.
     - from:
         - podSelector:
             matchLabels:

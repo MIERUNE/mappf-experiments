@@ -38,7 +38,7 @@ pub(crate) fn parse_static_path(
         }
         _ => {
             return Err(invalid(
-                "static path must be /{style_id}/static/[{overlay}/]{position}/{width}x{height}{@scale}.{format}",
+                "static path must be /styles/{namespace}/{style_id}/static/[{overlay}/]{position}/{width}x{height}{@scale}.{format}",
             ));
         }
     };
@@ -396,7 +396,7 @@ mod tests {
     fn catalog() -> StyleCatalog {
         let catalog = StyleCatalog::new();
         catalog.upsert_definition(
-            StyleId("voyager-gl-style".to_string()),
+            StyleId("default/voyager-gl-style".to_string()),
             StyleDefinition::new(
                 "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
                 1,
@@ -421,8 +421,10 @@ mod tests {
         task_id: TaskId,
         now: Instant,
     ) -> Result<InternalTask, IngressError> {
+        let path = path
+            .strip_prefix("/styles/")
+            .ok_or_else(|| invalid("static path must start with /styles/"))?;
         let parts: Vec<_> = path
-            .trim_start_matches('/')
             .trim_end_matches('/')
             .split('/')
             .filter(|part| !part.is_empty())
@@ -452,12 +454,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_static_path_with_single_segment_style_id() {
-        let task =
-            parse_static("/voyager-gl-style/static/none/139.767,35.681,12,0,0/512x384@2x.png")
-                .expect("static path parses");
+    fn parses_static_path_with_default_namespace() {
+        let task = parse_static(
+            "/styles/default/voyager-gl-style/static/none/139.767,35.681,12,0,0/512x384@2x.png",
+        )
+        .expect("static path parses");
 
-        assert_eq!(task.style.id.as_str(), "voyager-gl-style");
+        assert_eq!(task.style.id.as_str(), "default/voyager-gl-style");
         assert_eq!(task.pixel_ratio.to_scale(), Scale::X2);
         assert_eq!(task.output_format, ImageFormat::Png);
         assert!(matches!(
@@ -473,8 +476,10 @@ mod tests {
 
     #[test]
     fn parses_static_without_extension_as_png() {
-        let task = parse_static("/voyager-gl-style/static/none/139.767,35.681,12,0,0/512x384@2x")
-            .expect("static path without extension parses");
+        let task = parse_static(
+            "/styles/default/voyager-gl-style/static/none/139.767,35.681,12,0,0/512x384@2x",
+        )
+        .expect("static path without extension parses");
 
         assert_eq!(task.output_format, ImageFormat::Png);
         assert_eq!(task.pixel_ratio.to_scale(), Scale::X2);
@@ -482,8 +487,10 @@ mod tests {
 
     #[test]
     fn parses_static_jpg() {
-        let task = parse_static("/voyager-gl-style/static/none/139.767,35.681,12,0,0/512x384.jpg")
-            .expect("static jpg path parses");
+        let task = parse_static(
+            "/styles/default/voyager-gl-style/static/none/139.767,35.681,12,0,0/512x384.jpg",
+        )
+        .expect("static jpg path parses");
 
         assert_eq!(task.output_format, ImageFormat::Jpeg);
         assert_eq!(task.pixel_ratio.to_scale(), Scale::X1);
@@ -491,9 +498,10 @@ mod tests {
 
     #[test]
     fn parses_static_path_with_bbox_positioning() {
-        let task =
-            parse_static("/voyager-gl-style/static/none/[139.7,35.6,139.9,35.8]/512x384.png")
-                .expect("static bbox path parses");
+        let task = parse_static(
+            "/styles/default/voyager-gl-style/static/none/[139.7,35.6,139.9,35.8]/512x384.png",
+        )
+        .expect("static bbox path parses");
 
         assert_eq!(
             task.request,
@@ -516,8 +524,10 @@ mod tests {
 
     #[test]
     fn parses_static_bbox_without_overlay_segment() {
-        let task = parse_static("/voyager-gl-style/static/[139.7,35.6,139.9,35.8]/512x384.png")
-            .expect("static bbox path without overlay parses");
+        let task = parse_static(
+            "/styles/default/voyager-gl-style/static/[139.7,35.6,139.9,35.8]/512x384.png",
+        )
+        .expect("static bbox path without overlay parses");
 
         assert_eq!(
             task.request,
@@ -540,8 +550,10 @@ mod tests {
 
     #[test]
     fn parses_static_bbox_with_percent_encoded_brackets() {
-        let task = parse_static("/voyager-gl-style/static/%5B139.7,35.6,139.9,35.8%5D/512x384.png")
-            .expect("static bbox path with encoded brackets parses");
+        let task = parse_static(
+            "/styles/default/voyager-gl-style/static/%5B139.7,35.6,139.9,35.8%5D/512x384.png",
+        )
+        .expect("static bbox path with encoded brackets parses");
 
         assert!(matches!(
             task.request,
@@ -561,7 +573,7 @@ mod tests {
     fn parses_static_center_png_2x() {
         let now = Instant::now();
         let task = parse_static_with_options(
-            "/carto/voyager-gl-style/static/139.767,35.681,12,0,0/512x384@2x.png",
+            "/styles/carto/voyager-gl-style/static/139.767,35.681,12,0,0/512x384@2x.png",
             None,
             None,
             None,
@@ -599,7 +611,7 @@ mod tests {
     #[test]
     fn parses_auto_positioning_with_overlay() {
         let task = parse_static(
-            "/voyager-gl-style/static/path-2+f44(_p~iF~ps|U_ulLnnqC_mqNvxq%60@)/auto/512x384.png",
+            "/styles/default/voyager-gl-style/static/path-2+f44(_p~iF~ps|U_ulLnnqC_mqNvxq%60@)/auto/512x384.png",
         )
         .expect("auto with one overlay parses");
         assert!(matches!(
@@ -620,7 +632,7 @@ mod tests {
     #[test]
     fn parses_auto_positioning_with_padding_query() {
         let task = parse_static_with_options(
-            "/voyager-gl-style/static/path-2+f44(_p~iF~ps|U_ulLnnqC_mqNvxq%60@)/auto/512x384.png",
+            "/styles/default/voyager-gl-style/static/path-2+f44(_p~iF~ps|U_ulLnnqC_mqNvxq%60@)/auto/512x384.png",
             None,
             Some(Padding::all(40)),
             None,
@@ -637,15 +649,16 @@ mod tests {
 
     #[test]
     fn rejects_auto_positioning_without_overlays() {
-        let err = parse_static("/carto/voyager-gl-style/static/none/auto/256x256.webp")
+        let err = parse_static("/styles/carto/voyager-gl-style/static/none/auto/256x256.webp")
             .expect_err("auto with no overlays must be rejected");
         assert!(err.to_string().contains("auto positioning"));
     }
 
     #[test]
     fn parses_static_with_none_overlay() {
-        let task = parse_static("/carto/voyager-gl-style/static/none/139.7,35.6,12/256x256.webp")
-            .expect("static path parses");
+        let task =
+            parse_static("/styles/carto/voyager-gl-style/static/none/139.7,35.6,12/256x256.webp")
+                .expect("static path parses");
 
         assert_eq!(task.output_format, ImageFormat::Webp);
         assert_eq!(task.pixel_ratio.to_scale(), Scale::X1);
@@ -662,7 +675,7 @@ mod tests {
     #[test]
     fn parses_static_path_overlay() {
         let task = parse_static(
-            "/voyager-gl-style/static/path-5+f44-0.5(_p~iF~ps%7CU)/139.767,35.681,12/256x256.png",
+            "/styles/default/voyager-gl-style/static/path-5+f44-0.5(_p~iF~ps%7CU)/139.767,35.681,12/256x256.png",
         )
         .expect("path overlay parses");
 
@@ -674,8 +687,10 @@ mod tests {
 
     #[test]
     fn parses_static_pin_overlay() {
-        let task = parse_static("/voyager-gl-style/static/pin-s-a+9ed4bd(139,35)/auto/256x256.png")
-            .expect("pin overlay parses");
+        let task = parse_static(
+            "/styles/default/voyager-gl-style/static/pin-s-a+9ed4bd(139,35)/auto/256x256.png",
+        )
+        .expect("pin overlay parses");
 
         let RenderRequest::StaticImage { overlays, .. } = task.request else {
             panic!("expected static image request");
@@ -685,9 +700,10 @@ mod tests {
 
     #[test]
     fn parses_static_pin_overlay_with_two_digit_label() {
-        let task =
-            parse_static("/voyager-gl-style/static/pin-l-99+9ed4bd(139,35)/auto/256x256.png")
-                .expect("two-digit pin overlay parses");
+        let task = parse_static(
+            "/styles/default/voyager-gl-style/static/pin-l-99+9ed4bd(139,35)/auto/256x256.png",
+        )
+        .expect("two-digit pin overlay parses");
 
         let RenderRequest::StaticImage { overlays, .. } = task.request else {
             panic!("expected static image request");
@@ -700,15 +716,15 @@ mod tests {
 
     #[test]
     fn rejects_unknown_style() {
-        let err =
-            parse_static("/carto/unknown/static/auto/256x256.png").expect_err("style is unknown");
+        let err = parse_static("/styles/carto/unknown/static/auto/256x256.png")
+            .expect_err("style is unknown");
 
         assert!(matches!(err, IngressError::UnknownStyle(_)));
     }
 
     #[test]
     fn rejects_invalid_format_and_scale() {
-        let err = parse_static("/carto/voyager-gl-style/static/auto/256x256.gif")
+        let err = parse_static("/styles/carto/voyager-gl-style/static/auto/256x256.gif")
             .expect_err("format is invalid");
 
         assert!(err.to_string().contains("format"));
@@ -716,7 +732,7 @@ mod tests {
 
     #[test]
     fn rejects_static_dimension_over_limit() {
-        let err = parse_static("/carto/voyager-gl-style/static/auto/1921x256.png")
+        let err = parse_static("/styles/carto/voyager-gl-style/static/auto/1921x256.png")
             .expect_err("dimension is too large");
 
         assert!(err.to_string().contains("<= 1920"));
@@ -724,36 +740,39 @@ mod tests {
 
     #[test]
     fn rejects_static_lat_out_of_range() {
-        let err = parse_static("/voyager-gl-style/static/130,140,12,0/512x384.png")
+        let err = parse_static("/styles/default/voyager-gl-style/static/130,140,12,0/512x384.png")
             .expect_err("lat above 90 must be rejected");
         assert!(err.to_string().contains("lat"));
     }
 
     #[test]
     fn rejects_static_lon_out_of_range() {
-        let err = parse_static("/voyager-gl-style/static/250,35,12,0/512x384.png")
+        let err = parse_static("/styles/default/voyager-gl-style/static/250,35,12,0/512x384.png")
             .expect_err("lon above 180 must be rejected");
         assert!(err.to_string().contains("lon"));
     }
 
     #[test]
     fn rejects_static_zoom_out_of_range() {
-        let err = parse_static("/voyager-gl-style/static/139.7,35.6,30/512x384.png")
+        let err = parse_static("/styles/default/voyager-gl-style/static/139.7,35.6,30/512x384.png")
             .expect_err("zoom above 24 must be rejected");
         assert!(err.to_string().contains("zoom"));
     }
 
     #[test]
     fn rejects_static_pitch_out_of_range() {
-        let err = parse_static("/voyager-gl-style/static/139.7,35.6,12,0,90/512x384.png")
-            .expect_err("pitch above 85 must be rejected");
+        let err =
+            parse_static("/styles/default/voyager-gl-style/static/139.7,35.6,12,0,90/512x384.png")
+                .expect_err("pitch above 85 must be rejected");
         assert!(err.to_string().contains("pitch"));
     }
 
     #[test]
     fn rejects_non_finite_static_bearing() {
         for bearing in ["NaN", "inf", "-inf"] {
-            let path = format!("/voyager-gl-style/static/139.7,35.6,12,{bearing},0/512x384.png");
+            let path = format!(
+                "/styles/default/voyager-gl-style/static/139.7,35.6,12,{bearing},0/512x384.png"
+            );
             let err = parse_static(&path).expect_err("non-finite bearing must be rejected");
             assert!(err.to_string().contains("bearing"));
         }
@@ -761,8 +780,10 @@ mod tests {
 
     #[test]
     fn accepts_finite_periodic_static_bearing() {
-        let task = parse_static("/voyager-gl-style/static/139.7,35.6,12,-720,0/512x384.png")
-            .expect("finite periodic bearing remains valid");
+        let task = parse_static(
+            "/styles/default/voyager-gl-style/static/139.7,35.6,12,-720,0/512x384.png",
+        )
+        .expect("finite periodic bearing remains valid");
         assert!(matches!(
             task.request,
             RenderRequest::StaticImage {
@@ -777,22 +798,26 @@ mod tests {
 
     #[test]
     fn rejects_static_bbox_with_lat_out_of_range() {
-        let err = parse_static("/voyager-gl-style/static/[139.7,-95,139.9,35.8]/512x384.png")
-            .expect_err("bbox min_lat below -90 must be rejected");
+        let err = parse_static(
+            "/styles/default/voyager-gl-style/static/[139.7,-95,139.9,35.8]/512x384.png",
+        )
+        .expect_err("bbox min_lat below -90 must be rejected");
         assert!(err.to_string().contains("min_lat"));
     }
 
     #[test]
     fn rejects_static_bbox_with_swapped_bounds() {
-        let err = parse_static("/voyager-gl-style/static/[140.0,35.6,139.7,35.8]/512x384.png")
-            .expect_err("bbox min_lon > max_lon must be rejected");
+        let err = parse_static(
+            "/styles/default/voyager-gl-style/static/[140.0,35.6,139.7,35.8]/512x384.png",
+        )
+        .expect_err("bbox min_lon > max_lon must be rejected");
         assert!(err.to_string().contains("min_lon"));
     }
 
     #[test]
     fn parse_static_threads_before_layer_into_render_request() {
         let task = parse_static_with_options(
-            "/voyager-gl-style/static/-122,37,9/512x384.png",
+            "/styles/default/voyager-gl-style/static/-122,37,9/512x384.png",
             Some("labels".to_string()),
             None,
             None,
@@ -811,7 +836,7 @@ mod tests {
 
     #[test]
     fn parse_static_defaults_before_layer_to_none_when_query_absent() {
-        let task = parse_static("/voyager-gl-style/static/-122,37,9/512x384.png")
+        let task = parse_static("/styles/default/voyager-gl-style/static/-122,37,9/512x384.png")
             .expect("static URL parses");
 
         match task.request {
@@ -830,7 +855,7 @@ mod tests {
         .expect("valid addlayer query")
         .expect("addlayer present");
         let task = parse_static_with_options(
-            "/voyager-gl-style/static/none/139.7,35.6,12/256x256.webp",
+            "/styles/default/voyager-gl-style/static/none/139.7,35.6,12/256x256.webp",
             None,
             None,
             Some(addlayer),

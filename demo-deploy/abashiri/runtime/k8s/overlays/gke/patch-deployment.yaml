@@ -27,3 +27,5 @@ spec:
               value: "gs://mappf-experiment-abashiri-control/catalog/current.json"
             - name: ABASHIRI_STYLE_REFRESH_ENDPOINTS
               value: "http://biei-internal:9090/_internal/refresh/style,http://ishikari-internal:9090/_internal/refresh/style"
+            - name: ABASHIRI_OPERATIONAL_STATUS_ENDPOINTS
+              value: "biei=http://biei-internal:9090/_internal/operations/v1/status,ishikari=http://ishikari-internal:9090/_internal/operations/v1/status"

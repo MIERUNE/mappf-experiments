@@ -1,4 +1,7 @@
-use crate::http::error::{IngressError, invalid};
+use crate::http::{
+    error::{IngressError, invalid},
+    is_safe_token_byte,
+};
 use biei_core::types::Padding;
 
 /// Extract `before_layer=<id>` from a query string. Per the static image grammar this is
@@ -33,10 +36,7 @@ pub(crate) fn validate_before_layer(before_layer: Option<&str>) -> Result<(), In
     // Whitelist of style-spec-typical layer-id characters. Keeps mbgl's FFI
     // surface clean and rejects anything that could reach logs or downstream
     // string interpolation through the typed forwarded-request path.
-    if !value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
-    {
+    if !value.bytes().all(is_safe_token_byte) {
         return Err(invalid("before_layer contains an unsupported character"));
     }
     Ok(())

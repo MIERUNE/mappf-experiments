@@ -20,7 +20,6 @@ use crate::auth::DeliveryAuth;
 use crate::drain::{DrainController, DrainPermit};
 use crate::http::addlayer::parse_addlayer_from_query;
 use crate::http::error::IngressError;
-use crate::http::format::parse_scale_format;
 use crate::http::path::resolve_style_id;
 use crate::http::preview::{PREVIEW_STYLE_CHECK_TIMEOUT, build_preview_response_for_style};
 use crate::http::query::{parse_before_layer_from_query, parse_padding_from_query};
@@ -45,9 +44,9 @@ enum ParsedPublicPath<'a> {
 
 impl<'a> ParsedPublicPath<'a> {
     fn parse(path: &'a str) -> Result<Self, IngressError> {
-        let Some(path) = path.strip_prefix('/') else {
+        let Some(path) = path.strip_prefix("/styles/") else {
             return Err(crate::http::error::invalid(
-                "public path must start with exactly one `/`",
+                "public path must start with `/styles/`",
             ));
         };
         if path.is_empty() || path.starts_with('/') || path.ends_with('/') {
@@ -62,12 +61,9 @@ impl<'a> ParsedPublicPath<'a> {
             ));
         }
 
-        if let Some((last, style_parts)) = parts.split_last()
-            && *last == "preview"
-            && !style_parts.is_empty()
-        {
+        if let [namespace, style_id, "preview"] = parts.as_slice() {
             return Ok(Self::Preview {
-                style_id: resolve_style_id(style_parts)?,
+                style_id: resolve_style_id(&[namespace, style_id])?,
             });
         }
 
@@ -105,33 +101,19 @@ enum ParsedRenderKind {
 
 impl<'a> ParsedRenderPath<'a> {
     fn from_parts(parts: Vec<&'a str>) -> Result<Self, IngressError> {
-        // Classify from the suffix so a style id ending in `static` remains a
-        // valid tile style. Static-only query parsing still happens later.
-        let (style_id, kind) = match static_path_index(&parts) {
-            Some(static_index) => (
-                resolve_style_id(&parts[..static_index])?,
-                ParsedRenderKind::Static { static_index },
+        let (style_id, kind) = match parts.as_slice() {
+            [namespace, style_id, "static", ..] => (
+                resolve_style_id(&[namespace, style_id])?,
+                ParsedRenderKind::Static { static_index: 2 },
             ),
-            None => {
-                // At least one segment has to remain for the style id after
-                // `{z}/{x}/{y}`. Without the `> 0` filter a three-segment path
-                // left no style id and the request was reported by whichever
-                // coordinate failed to parse first — `/totally/bogus/path`
-                // answered "tile z must be an integer in 0..=255", naming the
-                // parse order instead of the shape the caller got wrong.
-                let suffix_index = parts
-                    .len()
-                    .checked_sub(3)
-                    .filter(|style_segments| *style_segments > 0)
-                    .ok_or_else(|| {
-                        crate::http::error::invalid(
-                            "tile path must be /{style_id}/{z}/{x}/{y}{@scale}.{format}",
-                        )
-                    })?;
-                (
-                    resolve_style_id(&parts[..suffix_index])?,
-                    ParsedRenderKind::Tile,
-                )
+            [namespace, style_id, "tiles", _, _, _] => (
+                resolve_style_id(&[namespace, style_id])?,
+                ParsedRenderKind::Tile,
+            ),
+            _ => {
+                return Err(crate::http::error::invalid(
+                    "render path must be /styles/{namespace}/{style_id}/static/... or /styles/{namespace}/{style_id}/tiles/{z}/{x}/{y}{@scale}.{format}",
+                ));
             }
         };
         Ok(Self {
@@ -400,29 +382,6 @@ fn parse_path_with_request_id(
     }
 }
 
-fn static_path_index(parts: &[&str]) -> Option<usize> {
-    // Static requests have either two suffix segments (position, size) or
-    // three (overlay, position, size). Style ids may contain any number of
-    // namespace segments, so classify from the suffix rather than fixed
-    // indices. The three-segment form is ambiguous with a tile request whose
-    // style id ends in `static`; a valid z/x/y suffix remains a tile.
-    let len = parts.len();
-    if len >= 4 && parts[len - 3] == "static" {
-        return Some(len - 3);
-    }
-    if len >= 5
-        && parts[len - 4] == "static"
-        && !looks_like_user_static_tile_path(parts[len - 3], parts[len - 2], parts[len - 1])
-    {
-        return Some(len - 4);
-    }
-    None
-}
-
-fn looks_like_user_static_tile_path(z: &str, x: &str, yfmt: &str) -> bool {
-    z.parse::<u8>().is_ok() && x.parse::<u32>().is_ok() && parse_scale_format(yfmt).is_ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,34 +425,34 @@ mod tests {
     #[test]
     fn parsed_public_path_preserves_endpoint_policy_and_style_identity() {
         let ParsedPublicPath::Render(tile) =
-            ParsedPublicPath::parse("/carto/static/8/227/100.png").expect("tile path")
+            ParsedPublicPath::parse("/styles/carto/static/tiles/8/227/100.png").expect("tile path")
         else {
             panic!("expected tile render path");
         };
         assert_eq!(tile.style_id.as_str(), "carto/static");
         assert_eq!(tile.response_policy(), PublicResponsePolicy::Tile);
 
-        let ParsedPublicPath::Render(static_image) =
-            ParsedPublicPath::parse("/carto/gl/voyager/static/none/139.767,35.681,11/320x240.png")
-                .expect("static path")
-        else {
+        let ParsedPublicPath::Render(static_image) = ParsedPublicPath::parse(
+            "/styles/carto/voyager/static/none/139.767,35.681,11/320x240.png",
+        )
+        .expect("static path") else {
             panic!("expected static render path");
         };
-        assert_eq!(static_image.style_id.as_str(), "carto/gl/voyager");
+        assert_eq!(static_image.style_id.as_str(), "carto/voyager");
         assert_eq!(static_image.response_policy(), PublicResponsePolicy::Static);
 
         let ParsedPublicPath::Preview { style_id } =
-            ParsedPublicPath::parse("/carto/gl/voyager/preview").expect("preview path")
+            ParsedPublicPath::parse("/styles/carto/voyager/preview").expect("preview path")
         else {
             panic!("expected preview path");
         };
-        assert_eq!(style_id.as_str(), "carto/gl/voyager");
+        assert_eq!(style_id.as_str(), "carto/voyager");
     }
 
     #[test]
     fn style_named_static_can_still_render_tiles() {
         let task = parse_path_with_request_id(
-            "/carto/static/8/227/100.png",
+            "/styles/carto/static/tiles/8/227/100.png",
             Some("addlayer=%7Bbad-json"),
             &catalog(),
             42,
@@ -516,26 +475,13 @@ mod tests {
     }
 
     #[test]
-    fn deeply_namespaced_style_can_render_static_images() {
-        let catalog = StyleCatalog::new();
-        catalog.upsert_definition(
-            StyleId("carto/gl/voyager-gl-style".to_string()),
-            StyleDefinition::new("https://styles.test/voyager/style.json", 1),
+    fn deeply_namespaced_style_is_rejected() {
+        assert!(
+            ParsedPublicPath::parse(
+                "/styles/carto/gl/voyager-gl-style/static/none/139.767,35.681,11,0,0/320x240.png"
+            )
+            .is_err()
         );
-
-        let task = parse_path_with_request_id(
-            "/carto/gl/voyager-gl-style/static/none/139.767,35.681,11,0,0/320x240.png",
-            None,
-            &catalog,
-            43,
-            RequestId::from_string("req-nested-static-style"),
-            Duration::from_secs(30),
-            Instant::now(),
-        )
-        .expect("static path with a deeply namespaced style parses");
-
-        assert_eq!(task.style.id.as_str(), "carto/gl/voyager-gl-style");
-        assert!(matches!(task.request, RenderRequest::StaticImage { .. }));
     }
 
     #[test]
@@ -571,7 +517,10 @@ mod tests {
         let ingress = runtime.http_ingress(Duration::from_secs(2));
         runtime.drain_controller().begin_draining();
 
-        for path in ["/../0/0/0.png", "/../voyager/preview"] {
+        for path in [
+            "/styles/../voyager/tiles/0/0/0.png",
+            "/styles/../voyager/preview",
+        ] {
             let response = ingress.handle_path(path, Instant::now()).await;
             assert_eq!(response.status, 400, "malformed style path {path}");
             assert!(
@@ -582,7 +531,7 @@ mod tests {
         }
 
         let response = ingress
-            .handle_path("/carto/0/0/0.png", Instant::now())
+            .handle_path("/styles/carto/basic/tiles/0/0/0.png", Instant::now())
             .await;
         assert_eq!(response.status, 503);
         assert!(
@@ -603,7 +552,10 @@ mod tests {
         runtime.drain_controller().begin_draining();
 
         let static_response = ingress
-            .handle_path("/carto/static/none/0,0,1,0,0/320x240.png", Instant::now())
+            .handle_path(
+                "/styles/carto/basic/static/none/0,0,1,0,0/320x240.png",
+                Instant::now(),
+            )
             .await;
         assert_eq!(static_response.status, 401);
         assert!(
@@ -613,7 +565,7 @@ mod tests {
         );
 
         let tile_response = ingress
-            .handle_path("/carto/0/0/0.png", Instant::now())
+            .handle_path("/styles/carto/basic/tiles/0/0/0.png", Instant::now())
             .await;
         assert_eq!(tile_response.status, 503);
         assert!(
@@ -670,7 +622,10 @@ mod tests {
         runtime.drain_controller().begin_draining();
 
         let anonymous = ingress
-            .handle_path("/carto/static/none/0,0,1,0,0/320x240.png", Instant::now())
+            .handle_path(
+                "/styles/carto/basic/static/none/0,0,1,0,0/320x240.png",
+                Instant::now(),
+            )
             .await;
         assert_eq!(
             anonymous.status, 503,
@@ -678,13 +633,16 @@ mod tests {
         );
 
         let private = ingress
-            .handle_path("/private/static/none/0,0,1,0,0/320x240.png", Instant::now())
+            .handle_path(
+                "/styles/private/basic/static/none/0,0,1,0,0/320x240.png",
+                Instant::now(),
+            )
             .await;
         assert_eq!(private.status, 403);
 
         let invalid = ingress
             .handle_public_path_with_request_id(
-                "/carto/static/none/0,0,1,0,0/320x240.png",
+                "/styles/carto/basic/static/none/0,0,1,0,0/320x240.png",
                 Some("access_token=public.wrong"),
                 &HeaderMap::new(),
                 None,
@@ -714,7 +672,7 @@ mod tests {
         // sheds the would-be render before starting native work and preserves
         // the typed cause through public response classification.
         let response = ingress
-            .handle_path("/carto/0/0/0.png", Instant::now())
+            .handle_path("/styles/carto/basic/tiles/0/0/0.png", Instant::now())
             .await;
         assert_eq!(response.status, 503);
         assert!(
@@ -747,28 +705,24 @@ mod tests {
         assert!((400..500).contains(&response.status));
     }
 
-    /// A tile path needs at least one segment for the style id on top of
-    /// `{z}/{x}/{y}`. Three segments left none, and `resolve_style_id` accepted an
-    /// empty component slice — so the request was reported by whichever
-    /// coordinate failed to parse first, naming Biei's internal parse order
-    /// instead of the shape the caller got wrong.
     #[test]
-    fn a_path_too_short_to_hold_a_style_id_names_the_tile_shape() {
-        for path in ["/totally/bogus/path", "/a/b/c", "/8/227/100.png"] {
+    fn noncanonical_render_paths_name_the_canonical_shape() {
+        for path in [
+            "/totally/bogus/path",
+            "/styles/default/basic/0/0/0.png",
+            "/styles/basic/tiles/0/0/0.png",
+        ] {
             let error = ParsedPublicPath::parse(path).expect_err(path);
             let message = error.to_string();
-            assert!(
-                message.contains("tile path must be"),
-                "{path} reported {message:?}"
-            );
+            assert!(message.contains("/styles/"), "{path} reported {message:?}");
         }
-        // One more segment is a legitimate tile path and still parses.
-        ParsedPublicPath::parse("/carto/8/227/100.png").expect("four segments parse");
+        ParsedPublicPath::parse("/styles/default/basic/tiles/8/227/100.png")
+            .expect("canonical tile path parses");
     }
 
     #[test]
     fn an_empty_style_id_is_refused_rather_than_joined_to_nothing() {
         let error = crate::http::path::resolve_style_id(&[]).expect_err("empty slice");
-        assert!(error.to_string().contains("must not be empty"), "{error}");
+        assert!(error.to_string().contains("namespace"), "{error}");
     }
 }

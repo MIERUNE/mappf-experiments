@@ -21,11 +21,17 @@ Performance claims must be supported by reproducible measurements on representat
 - Do not require Biei or other consumers to understand PMTiles archives directly.
 - Keep generic one-node Chitchat lifecycle and cluster-state inspection in `mmpf-cluster`. Keep Ishikari KV schemas, view decoding, and routing policy in Ishikari-owned crates.
 - Do not put attacker-controlled `style_id` or `tileset_id` values in metric labels.
-- Keep `/_internal/*`, including `/_internal/metrics`, on the cluster-internal listener (`ISKR_INTERNAL_HTTP_PORT`) only. Never route that port through a Service, Gateway, or Ingress, and keep the public listener returning 404 for those paths.
+- Keep `/_internal/*`, including `/_internal/metrics`, on the cluster-internal listener (`ISKR_INTERNAL_HTTP_PORT`) only. An internal-only Service may expose it to trusted peers and Abashiri; never route it through an external Gateway or Ingress, and keep the public listener returning 404 for those paths.
 - Keep the headless gossip Service gossip-only; do not publish public HTTP `8080` there.
 - Keep generic PMTiles v3 format decoding, bounded directory traversal, and archive-reader primitives in `mmpf-pmtiles`. Keep Ishikari's distributed PMTiles cache/orchestration in `crates/ishikari-core/src/pmtiles`, byte access and peer routing in `crates/ishikari-core/src/storage`, and HTTP/provider behavior in `servers/ishikari`.
 
 ## PMTiles Tile Delivery Contract
+
+### Local and clustered operation
+
+Local mode is the default when neither `--cluster` nor a gossip seed is supplied. It uses a process-local membership view, opens no Chitchat UDP socket, returns no routable peers, and skips gossip publication, watchers, shutdown propagation delay, and gossip-only statistics. Multiple local-mode replicas may sit behind an ordinary Service, but their caches and advisory refresh state are independent. Polling and object-store generation checks retain correctness; cache reuse and refresh acceleration may be duplicated across replicas.
+
+Cluster mode is explicit or implied by a non-empty seed list. It uses unicast UDP gossip plus the internal HTTP listener for HRW-selected peer reads. Seed discovery may use static addresses or DNS; a headless Kubernetes Service is convenient, not part of the application contract. The external load balancer requires no consistent hashing or session affinity. `--require-gossip-bootstrap` is rejected in local mode because no peer can satisfy it.
 
 ### Archive identity and HTTP behavior
 
@@ -57,6 +63,7 @@ Coalesce equivalent work when the avoided cost and observed overlap justify the 
 
 ## Provider Resource Caching
 
+- Public styles, previews, and sprites use the canonical `styles/{namespace}/{style_id}/...` grammar. Both identity segments are bounded and slash-free; the default namespace is explicit. Biei render paths, Abashiri object paths, refresh hints, and authorization all use the same `namespace/style_id` key.
 - Every peer in one protocol cluster must use equivalent provider catalog and URL-template configuration. The caller's HRW placement identity includes its resolved upstream URL, but the current internal request carries only logical style/glyph/sprite identity; a configuration-skewed peer can therefore resolve a different upstream. Mixed provider revisions are unsupported until the wire contract binds and validates a bounded configuration revision.
 - Style, glyph, and sprite fetches honor upstream `Cache-Control` in both the pod-local shared cache and the public response. The normalized policy and current age must survive an internal peer hop. HTTP `Age` and `Date` contribute to the entry's initial age only when the upstream declares explicit freshness (`max-age`/`s-maxage`), so an already-old response consumes that declared lifetime rather than restarting it at Ishikari. When Ishikari applies a default policy (no upstream freshness), the clock starts at fetch time, so a transported `Age` must not shorten or evict the defaulted entry. Repeated `Cache-Control` field lines are combined before directive parsing.
 - `no-store`, `no-cache`, and `private` responses do not enter Ishikari's shared provider cache. A successful uncacheable refresh invalidates any older stale entry for the same resource. Concurrent followers may reuse that successful representation ephemerally, without retaining it for later requests.
@@ -78,9 +85,11 @@ Cluster-internal provider responses must carry normalized cache policy and age m
 
 Do not move files only for aesthetics. Move modules when a new responsibility needs a clearer boundary.
 
-`servers/ishikari/src/server/provider_cache_policy.rs` owns upstream `Cache-Control` normalization and TTL selection. It consumes the allocation-free directive tokenizer and conservative duplicate delta-seconds handling from `mmpf-http`; service-specific policy does not move into the shared crate. `servers/ishikari/src/server/provider_body.rs` owns bounded representation decoding, JSON validation, and media-type checks. `servers/ishikari/src/server/upstream.rs` exposes a `ProviderFetcher` capability that owns admission, metrics, shared-cache and freshness state, per-key single-flight, and revalidation orchestration without depending on the complete HTTP `AppState`. Its child `server/upstream/fetch.rs` owns origin transport, conditional HTTP/object-store requests, bounded body collection, response metadata extraction, and representation validation. That child borrows the parent capability; it does not own a second cache, semaphore, or coordination layer.
+`servers/ishikari/src/server/provider_cache_policy.rs` owns upstream `Cache-Control` normalization and TTL selection. It consumes the allocation-free directive tokenizer and conservative duplicate delta-seconds handling from `mmpf-http`; service-specific policy does not move into the shared crate. `servers/ishikari/src/server/provider_body.rs` owns bounded representation decoding, JSON validation, and media-type checks. `servers/ishikari/src/server/upstream/mod.rs` exposes a `ProviderFetcher` capability that owns admission, metrics, shared-cache and freshness state, per-key single-flight, and revalidation orchestration without depending on the complete HTTP `AppState`. Its child `server/upstream/fetch.rs` owns origin transport, conditional HTTP/object-store requests, bounded body collection, response metadata extraction, and representation validation. That child borrows the parent capability; it does not own a second cache, semaphore, or coordination layer.
 
 Cancellation-safe single-flight election is the service-independent primitive in `mmpf-common`. Provider resources and the distributed PMTiles reader reuse it, while each owner defines its own key, cached-success path, transient error propagation, and negative-cache policy. `PeerSnapshotCache` remains in `ishikari-core::storage`: it coalesces concurrent Chitchat snapshot refreshes and gives normal routing reads a short-lived immutable peer snapshot without making membership a generic server concern.
+
+The optional `unstable-schemas` build feature derives the partial TOML configuration schema and an OpenAPI description of every representable public delivery route. CI generates and validates both artifacts. Schema dependencies and generation stay out of the ordinary served build; cluster-internal routes are excluded, and the slash-spanning style wildcard is explicitly omitted because OpenAPI cannot describe it without changing its meaning.
 
 The current workspace boundary is intentional:
 

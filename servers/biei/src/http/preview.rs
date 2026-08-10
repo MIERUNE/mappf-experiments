@@ -98,7 +98,7 @@ mod tests {
     fn catalog() -> StyleCatalog {
         let catalog = StyleCatalog::new();
         catalog.upsert_definition(
-            StyleId("voyager-gl-style".to_string()),
+            StyleId("default/voyager-gl-style".to_string()),
             StyleDefinition::new(
                 "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
                 1,
@@ -106,13 +106,6 @@ mod tests {
         );
         catalog.upsert_definition(
             StyleId("carto/voyager-gl-style".to_string()),
-            StyleDefinition::new(
-                "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
-                1,
-            ),
-        );
-        catalog.upsert_definition(
-            StyleId("carto/gl/voyager-gl-style".to_string()),
             StyleDefinition::new(
                 "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
                 1,
@@ -136,8 +129,14 @@ mod tests {
         C: FnOnce(StyleRevision) -> Fut,
         Fut: std::future::Future<Output = Result<(), StyleAvailabilityError>>,
     {
+        let Some(path) = path.strip_prefix("/styles/") else {
+            return IngressResponse::json(
+                400,
+                "invalid_preview_path",
+                "expected /styles/{namespace}/{style_id}/preview",
+            );
+        };
         let parts: Vec<_> = path
-            .trim_start_matches('/')
             .trim_end_matches('/')
             .split('/')
             .filter(|part| !part.is_empty())
@@ -146,14 +145,14 @@ mod tests {
             return IngressResponse::json(
                 400,
                 "invalid_preview_path",
-                "expected /{style_id}/preview",
+                "expected /styles/{namespace}/{style_id}/preview",
             );
         };
-        if *last != "preview" || style_segments.is_empty() {
+        if *last != "preview" || style_segments.len() != 2 {
             return IngressResponse::json(
                 400,
                 "invalid_preview_path",
-                "expected /{style_id}/preview",
+                "expected /styles/{namespace}/{style_id}/preview",
             );
         }
         let style_id = match crate::http::path::resolve_style_id(style_segments) {
@@ -185,7 +184,7 @@ mod tests {
     async fn preview_returns_html_for_known_style() {
         let response = build_preview_response(
             &catalog(),
-            "/carto/voyager-gl-style/preview",
+            "/styles/carto/voyager-gl-style/preview",
             style_available,
         )
         .await;
@@ -210,33 +209,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preview_supports_single_segment_style_id() {
-        let response =
-            build_preview_response(&catalog(), "/voyager-gl-style/preview", style_available).await;
+    async fn preview_supports_default_namespace() {
+        let response = build_preview_response(
+            &catalog(),
+            "/styles/default/voyager-gl-style/preview",
+            style_available,
+        )
+        .await;
         assert_eq!(response.status, 200);
         let body = std::str::from_utf8(&response.body).expect("html body");
-        assert!(body.contains("voyager-gl-style · biei preview"));
+        assert!(body.contains("default/voyager-gl-style · biei preview"));
     }
 
     #[tokio::test]
-    async fn preview_supports_deeply_namespaced_style_id() {
+    async fn preview_rejects_deeply_namespaced_style_id() {
         let response = build_preview_response(
             &catalog(),
-            "/carto/gl/voyager-gl-style/preview",
+            "/styles/carto/gl/voyager-gl-style/preview",
             style_available,
         )
         .await;
 
-        assert_eq!(response.status, 200);
-        let body = std::str::from_utf8(&response.body).expect("html body");
-        assert!(body.contains("carto/gl/voyager-gl-style · biei preview"));
-        assert!(body.contains(r#""carto/gl/voyager-gl-style""#));
+        assert_eq!(response.status, 400);
     }
 
     #[tokio::test]
     async fn preview_returns_404_for_unknown_style() {
         let response =
-            build_preview_response(&catalog(), "/unknown/style/preview", style_available).await;
+            build_preview_response(&catalog(), "/styles/unknown/style/preview", style_available)
+                .await;
 
         assert_eq!(response.status, 404);
         assert!(
@@ -248,9 +249,12 @@ mod tests {
 
     #[tokio::test]
     async fn preview_returns_404_when_template_style_missing_at_provider() {
-        let response =
-            build_preview_response(&template_catalog(), "/ghost-style/preview", style_missing)
-                .await;
+        let response = build_preview_response(
+            &template_catalog(),
+            "/styles/default/ghost-style/preview",
+            style_missing,
+        )
+        .await;
 
         assert_eq!(response.status, 404);
         assert!(
@@ -262,9 +266,12 @@ mod tests {
 
     #[tokio::test]
     async fn preview_serves_html_when_template_style_exists() {
-        let response =
-            build_preview_response(&template_catalog(), "/real-style/preview", style_available)
-                .await;
+        let response = build_preview_response(
+            &template_catalog(),
+            "/styles/default/real-style/preview",
+            style_available,
+        )
+        .await;
         assert_eq!(response.status, 200);
         let body = std::str::from_utf8(&response.body).expect("html body");
         assert!(body.contains("real-style · biei preview"));
@@ -274,7 +281,7 @@ mod tests {
     async fn preview_returns_503_when_style_check_is_transiently_unavailable() {
         let response = build_preview_response(
             &template_catalog(),
-            "/flaky-style/preview",
+            "/styles/default/flaky-style/preview",
             style_check_unavailable,
         )
         .await;
@@ -306,9 +313,12 @@ mod tests {
 
     #[tokio::test]
     async fn preview_rejects_path_traversal_segments() {
-        let response =
-            build_preview_response(&catalog(), "/../voyager-gl-style/preview", style_available)
-                .await;
+        let response = build_preview_response(
+            &catalog(),
+            "/../styles/default/voyager-gl-style/preview",
+            style_available,
+        )
+        .await;
         assert_eq!(response.status, 400);
     }
 }

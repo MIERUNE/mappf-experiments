@@ -23,6 +23,7 @@ use crate::server::{
     upstream::ProviderResource,
 };
 use ishikari_core::{interned::TilesetId, storage::ProviderRequest};
+use mmpf_http::style_key::StyleKey;
 
 const MAX_STYLE_BYTES: usize = 2 * 1024 * 1024;
 const STYLE_CONTENT_TYPES: &[&str] = &["application/json", "text/json", "application/octet-stream"];
@@ -342,30 +343,9 @@ fn rewrite_tileset_ref_tile_url(url: &str, base_url: &str) -> Option<String> {
 }
 
 pub(crate) fn validate_style_key(style_key: &str) -> Result<(), HttpError> {
-    if style_key.is_empty() || style_key.len() > 200 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "style_id length invalid".to_string(),
-        ));
-    }
-    for segment in style_key.split('/') {
-        if segment.is_empty() || segment == "." || segment == ".." {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "style_id segment invalid".to_string(),
-            ));
-        }
-        if !segment
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-        {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "style_id contains invalid characters".to_string(),
-            ));
-        }
-    }
-    Ok(())
+    StyleKey::parse(style_key)
+        .map(|_| ())
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))
 }
 
 #[cfg(test)]

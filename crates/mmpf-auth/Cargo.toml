@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
-http = "1"
+http.workspace = true
 mmpf-common.workspace = true
 moka.workspace = true
 object_store = { workspace = true, features = ["aws", "gcp", "http"] }

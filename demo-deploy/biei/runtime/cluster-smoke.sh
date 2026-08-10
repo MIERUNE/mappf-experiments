@@ -157,14 +157,14 @@ wait_for_metric \
 
 # Public and internal listener responsibilities must remain disjoint.
 expect_status "http://127.0.0.1:${NODE0_PUBLIC_PORT}/_internal/metrics" 404
-expect_status "http://127.0.0.1:${NODE0_INTERNAL_PORT}/smoke/style-0/static/0,0,1/64x64.png" 404
+expect_status "http://127.0.0.1:${NODE0_INTERNAL_PORT}/styles/smoke/style-0/static/0,0,1/64x64.png" 404
 
 # Each cold style receives an independent HRW placement. Try a bounded set and
 # require at least one node-0 ingress to complete through node 1.
 FORWARDED_STYLE=""
 for index in $(seq 0 15); do
   curl -g -fsS --show-error --max-time 30 \
-    "http://127.0.0.1:${NODE0_PUBLIC_PORT}/smoke/style-${index}/static/0,0,1/64x64.png" \
+    "http://127.0.0.1:${NODE0_PUBLIC_PORT}/styles/smoke/style-${index}/static/0,0,1/64x64.png" \
     --output "$WORK_DIR/render.png"
   metrics="$(curl -fsS --max-time 5 "http://127.0.0.1:${NODE0_INTERNAL_PORT}/_internal/metrics")"
   if grep -Eq 'biei_forwards_total\{outcome="success"\} [1-9][0-9]*' <<<"$metrics"; then
@@ -186,7 +186,7 @@ wait_for_metric \
 
 # Exercise another encoder through the now-warm peer node.
 curl -g -fsS --show-error --max-time 30 \
-  "http://127.0.0.1:${NODE1_PUBLIC_PORT}/smoke/${FORWARDED_STYLE}/static/0,0,1/64x64.webp" \
+  "http://127.0.0.1:${NODE1_PUBLIC_PORT}/styles/smoke/${FORWARDED_STYLE}/static/0,0,1/64x64.webp" \
   --output "$WORK_DIR/render.webp"
 test "$(od -An -tx1 -N4 "$WORK_DIR/render.webp" | tr -d ' \n')" = 52494646
 test "$(dd if="$WORK_DIR/render.webp" bs=1 skip=8 count=4 status=none | od -An -tx1 | tr -d ' \n')" = 57454250
@@ -195,7 +195,7 @@ test "$(dd if="$WORK_DIR/render.webp" bs=1 skip=8 count=4 status=none | od -An -
 # the style background, GeoJSON fill/stroke, camera bearing/pitch, and @2x
 # scaling must all affect real pixels in the production image.
 VISUAL_OVERLAY='geojson(%7B%22type%22%3A%22Feature%22%2C%22properties%22%3A%7B%22fill%22%3A%22%231a75ff%22%2C%22fill-opacity%22%3A1%2C%22stroke%22%3A%22%23ff3344%22%2C%22stroke-width%22%3A4%7D%2C%22geometry%22%3A%7B%22type%22%3A%22Polygon%22%2C%22coordinates%22%3A%5B%5B%5B-10%2C-10%5D%2C%5B10%2C-10%5D%2C%5B10%2C10%5D%2C%5B-10%2C10%5D%2C%5B-10%2C-10%5D%5D%5D%7D%7D)'
-VISUAL_BASE="http://127.0.0.1:${NODE0_PUBLIC_PORT}/smoke/visual/static"
+VISUAL_BASE="http://127.0.0.1:${NODE0_PUBLIC_PORT}/styles/smoke/visual/static"
 
 curl -g -fsS --show-error --max-time 30 \
   "${VISUAL_BASE}/0,0,2/128x128.png" \

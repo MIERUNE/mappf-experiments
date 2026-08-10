@@ -1,5 +1,8 @@
-use crate::http::error::{IngressError, invalid};
 use crate::http::parse_util::percent_decode_str;
+use crate::http::{
+    error::{IngressError, invalid},
+    is_safe_token_byte,
+};
 
 use biei_core::types::{AddLayer, AddLayerSource};
 
@@ -149,10 +152,7 @@ fn validate_and_rewrite_addlayer_json(
             "addlayer `id` must be 1..={MAX_ADDLAYER_STRING_LEN} bytes"
         )));
     }
-    if !id
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
-    {
+    if !id.bytes().all(is_safe_token_byte) {
         return Err(invalid("addlayer `id` may only contain [A-Za-z0-9-_.:]"));
     }
     if id.starts_with(ADDLAYER_BIEI_ID_PREFIX) {
@@ -283,10 +283,7 @@ fn validate_tileset_id(value: &str) -> Result<(), IngressError> {
                 "addlayer `source.url` tileset id must not contain `.` or `..` path segments",
             ));
         }
-        if !segment
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
-        {
+        if !segment.bytes().all(is_safe_token_byte) {
             return Err(invalid(
                 "addlayer `source.url` tileset id contains an unsupported character",
             ));

@@ -9,10 +9,11 @@ use std::{fmt::Display, sync::Arc};
 
 use anyhow::{Context as _, bail, ensure};
 use bytes::Bytes;
+use futures_util::stream::BoxStream;
 use object_store::{
-    Attribute, AttributeValue, Attributes, Error as ObjectStoreError, GetResult, ObjectStore,
-    ObjectStoreExt as _, PutMode, PutOptions, PutResult, UpdateVersion, parse_url_opts,
-    path::Path as ObjectPath,
+    Attribute, AttributeValue, Attributes, Error as ObjectStoreError, GetResult, ObjectMeta,
+    ObjectStore, ObjectStoreExt as _, PutMode, PutOptions, PutResult, UpdateVersion,
+    parse_url_opts, path::Path as ObjectPath,
 };
 use url::Url;
 
@@ -139,6 +140,13 @@ impl ConditionalStore {
 
     pub(crate) async fn read(&self, location: &ObjectPath) -> object_store::Result<Bytes> {
         self.store.get(location).await?.bytes().await
+    }
+
+    pub(crate) fn list(
+        &self,
+        prefix: &ObjectPath,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.store.list(Some(prefix))
     }
 }
 

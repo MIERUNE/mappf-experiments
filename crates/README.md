@@ -1,7 +1,9 @@
 # Library crates
 
+- `abashiri-core`: management and publishing domain logic — the mutation journal, conditional object-store writes, and backend capability probing shared by the Abashiri server
 - `biei-core`: render scheduling, node orchestration, cluster routing, and the cost model — the shared logic driven by both the Biei server and its simulator
 - `ishikari-core`: PMTiles resource resolution, tile/chunk caching, HRW routing, and membership — shared by the Ishikari server and its simulator
+- `mmpf-auth`: shared optional delivery-plane authentication for the serving servers (Biei, Ishikari)
 - `mmpf-cluster`: shared one-node Chitchat lifecycle and state inspection
 - `mmpf-common`: small service-independent configuration and runtime primitives
 - `mmpf-http`: shared HTTP request-correlation, header syntax, and operational paths

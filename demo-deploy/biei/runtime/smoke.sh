@@ -82,9 +82,9 @@ check "biei readyz"         200 "${biei}/readyz"
 check "biei livez"          200 "${biei}/livez"
 check "biei _internal blocked" 404 "${biei}/_internal/metrics"
 # Render paths (biei -> ishikari -> private GCS).
-check_type "biei static (bbox)" 200 "image/webp" "${biei}/${STYLE}/static/[139.6,35.6,139.9,35.8]/512x384.webp"
-check_type "biei tile"          200 "image/webp" "${biei}/${STYLE}/8/227/100.webp"
-check_type "biei preview"       200 "text/html" "${biei}/${MIERUNE_STYLE}/preview"
+check_type "biei static (bbox)" 200 "image/webp" "${biei}/styles/${STYLE}/static/[139.6,35.6,139.9,35.8]/512x384.webp"
+check_type "biei tile"          200 "image/webp" "${biei}/styles/${STYLE}/tiles/8/227/100.webp"
+check_type "biei preview"       200 "text/html" "${biei}/styles/${MIERUNE_STYLE}/preview"
 
 # addlayer is opt-in: its query syntax/tileset depend on the deployment.
 if [ -n "${BIEI_ADDLAYER_URL:-}" ]; then

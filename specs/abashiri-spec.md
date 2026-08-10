@@ -1,6 +1,6 @@
 # Abashiri management API
 
-Status: **experimental authenticated style retrieval/publication and advisory refresh notification implemented; production reconciliation, readiness, and backend qualification remain open.**
+Status: **experimental authenticated style retrieval/publication, background completion reconciliation, and advisory refresh notification implemented; production readiness and backend qualification remain open.**
 
 Abashiri is MMPF's separate management and publishing API. MMPF Console is a client of this API, not a second mutation path. Biei and Ishikari remain read-only delivery applications.
 
@@ -46,7 +46,7 @@ The initial trusted style catalog is one bounded startup JSON snapshot:
 }
 ```
 
-Duplicate logical entries, aliases that map multiple resources onto one object, and paths outside `styles/.../style.json` are rejected before listening. The snapshot is not prefix discovery and is not refreshed in this first slice; changing it requires a restart.
+Duplicate logical entries and aliases that map multiple resources onto one object are rejected before listening. A style location must use either `styles/{namespace}/{style_id}/style.json` or the flat `styles/{namespace}/{style_id}.json` form; both produce the same canonical delivery key. The snapshot is not prefix discovery and is not refreshed in this first slice; changing it requires a restart.
 
 ### 1.3 HTTP principles
 
@@ -79,7 +79,7 @@ Style ZIP downloads, embeddable HTML, WMTS generation, and arbitrary vendor-spec
 
 ### 1.6 Sprites: one bundle per style, addressed by content
 
-A style holds exactly one sprite bundle. The optional `{sprite_id}` segment exists so that styles do not break when a sprite is updated beneath them, which is the same reason [`resource-layout-sketch.md`](resource-layout-sketch.md) §5 derives a SHA-256 `sprite_id` over the whole bundle. Retrieval therefore maps directly onto `styles/{style_id}/sprites/{sprite_id}{@2x}.{json,png}`, and the accumulation of superseded bundle ids under `sprites/` is what makes both an `immutable` cache policy and an atomic style changeover possible.
+A style-management workflow initially owns one sprite bundle. The proposed `{sprite_id}` segment exists so that styles do not break when a sprite is updated beneath them, which is the same reason [`resource-layout-sketch.md`](resource-layout-sketch.md) §5 derives a SHA-256 `sprite_id` over the whole bundle. The intended retrieval path is `styles/{namespace}/{style_id}/sprites/{sprite_id}{@2x}.{json,png}`; Ishikari currently exposes only its provider-proxy `styles/{namespace}/{style_id}/sprite{@2x}.{json,png}` route, so the content-addressed route is not yet a delivery contract.
 
 The API may offer convenient per-icon mutations while retaining whole-bundle publication. Such a mutation is a bundle-level read-modify-write: read the bundle the style currently references, apply the icon change, rebuild, derive the new `sprite_id`, publish the new members create-only, conditionally repoint the style, and return the updated sprite document. Every published member stays immutable and create-only.
 
@@ -118,7 +118,7 @@ Lifecycle expiry is confined to `.abashiri-capability-check/`. The mutation jour
 
 Abashiri:
 
-- authenticates human administrators through OIDC and publishers through workload identity or narrow service credentials;
+- currently authenticates narrow publisher credentials through its object-store registry, and may later add human OIDC or workload-identity adapters;
 - authorizes and audits durable management mutations;
 - coordinates publication and conditionally updates durable current-state documents.
 
@@ -144,7 +144,21 @@ This introduces narrow reachability from Abashiri to the two internal listeners.
 
 Sensitive management responses use `Cache-Control: no-store`. The experimental server binds to loopback by default and exposes mutation routes only when auth, state storage, and the trusted catalog are all configured.
 
-### 4.1 Object-storage management authentication
+### 4.1 Deployment composition
+
+Biei and Ishikari are independently deployable delivery applications. Each starts, serves, scales, and recovers without Abashiri or Console, and neither discovers nor calls either management component. They expose bounded, versioned integration interfaces for optional consumers; Abashiri depends on those interfaces for delivery observation and advisory acceleration rather than depending on gossip internals or process implementation details. Abashiri absence, incompatibility, or failure cannot change delivery correctness.
+
+Both delivery services expose `GET /_internal/operations/v1/status` on their internal listener using the shared operational provenance envelope and service-owned payloads. The `/_internal` prefix identifies the listener trust boundary, while the versioned `operations` path keeps this consumer contract separate from deliberately unstable peer protocols. The response is current observation rather than cluster consensus, identifies local or clustered mode, caps each service's reported membership at 256 node identities in total, marks incomplete or truncated views, excludes raw gossip state and resource identities, and permits only a two-second private freshness window. Abashiri's configured adapter accepts at most eight named exact endpoint URLs, polls them in parallel with a one-second deadline and 128 KiB response bound, and single-flights a two-second local observation. Failed sources are returned as `unavailable`, or with a last-known-good snapshot marked `stale` for at most five minutes. Endpoint URLs and transport errors are not part of the management response. Delivery services do not register with Abashiri or push periodic state to it.
+
+MMPF Console is a dedicated Abashiri client. It never calls Biei, Ishikari, object storage, or cluster-internal listeners directly; Abashiri authenticates the user, authorizes the operation, and aggregates any delivery status exposed through configured service adapters. Service-owned status payloads remain untrusted display data: Console renders them through escaped text or typed components and never injects serialized status as HTML or JavaScript source. A Console failure therefore affects only the user interface, while an Abashiri failure affects management availability but not delivery.
+
+Hostname and path layout are deployment composition rather than named application profiles. A deployment may omit Abashiri and Console, expose management on a private origin, give Console and Abashiri different origins, colocate them on one management origin, or mount them alongside delivery routes. MMPF Console receives its API base URL and UI base path from runtime configuration. Abashiri receives its canonical public URL, external API mount path, and exact allowed Console origins from configuration; neither application hard-codes a MIERUNE hostname or infers security-sensitive URLs from untrusted forwarding headers.
+
+Same-origin Console/API deployment avoids credentialed CORS and is the simplest default, but it is not an architectural requirement. A cross-origin deployment uses an exact origin allowlist, credentialed CORS, and cookie attributes appropriate to the configured sites; wildcard CORS is never used with management sessions. OIDC redirects always use Abashiri's configured canonical public URL.
+
+When management shares an origin with delivery, the configured API and Console prefixes route before every delivery wildcard, bypass delivery CDN caching, and never fall through to Biei, Ishikari, or the Console SPA. Management responses remain `private, no-store`, and the host-only human session cookie is restricted to the external API mount path so map-resource requests do not carry it. A private deployment simply omits management routes from the public delivery Gateway. The checked-in GKE demo currently exposes Abashiri only inside the cluster and has no Console.
+
+### 4.2 Object-storage management authentication
 
 Abashiri's first built-in publisher adapter is a management-only bearer registry rooted at the configured `ABASHIRI_AUTH_ROOT`. The root contains one complete, revisioned `current.json`:
 
@@ -162,7 +176,7 @@ Abashiri's first built-in publisher adapter is a management-only bearer registry
         "subject": "publisher"
       },
       "accounts": ["example"],
-      "actions": ["style.read", "style.publish"]
+      "actions": ["operations.read", "style.read", "style.publish"]
     }
   ]
 }
@@ -174,7 +188,7 @@ The serving workload needs read-only access to this registry. Registry publicati
 
 The server loads a valid snapshot before listening, verifies subsequent requests from the in-memory snapshot, and refreshes at most once per 60 seconds under a single-flight lock. A due refresh that cannot read and validate object storage fails closed; it does not serve an indefinitely stale management grant. A credential disabled in the registry may therefore remain valid for up to 60 seconds while the cached snapshot is still fresh. This bounded revocation lag is part of the initial adapter's security contract, not an immediate-revocation guarantee. A five-second failure cooldown prevents rejected requests from amplifying an outage into one object-store read each. Running processes reject revision rollback and changed bytes at the same revision. Fresh-process anti-replay still depends on the configured object-store IAM, version-retention, and audit policy.
 
-This registry is not a delivery-auth registry. Its bearer credentials are accepted only by Abashiri, grant exact management actions on bounded account identities, and never authorize Biei or Ishikari. The initial transport is one `Authorization: Bearer` header. Query-string management credentials are intentionally unsupported. Human OIDC sessions and external workload-identity adapters remain separate decisions. The object-store adapter accepts only `workload` actors; a registry entry cannot self-identify a bearer credential as a human session.
+This registry is not a delivery-auth registry. Its bearer credentials are accepted only by Abashiri and never forwarded to or accepted by Biei or Ishikari. `style.read` and `style.publish` are checked together with the target account and therefore require at least one account grant. The global `operations.read` action authorizes the cross-service operational overview and may be the sole action on a credential with an empty account list; it is not made account-scoped by inventing a false resource boundary. The initial transport is one `Authorization: Bearer` header. Query-string management credentials are intentionally unsupported. Human OIDC sessions and external workload-identity adapters remain separate decisions. The object-store adapter accepts only `workload` actors; a registry entry cannot self-identify a bearer credential as a human session.
 
 ## 5. Audit invariant
 
@@ -189,11 +203,11 @@ Each accepted mutation uses one bounded idempotency key and follows this order:
 
 If state commits but the completion write fails, Abashiri returns an error and reconciliation completes the audit record. A retry with the same idempotency key first checks resource state for that mutation; if no state was written, it re-attempts the original conditional operation. Concurrent identical attempts that lose the conditional-write race re-read state and succeed only when its opaque mutation reference and content identity match. Orphaned intents for changes that never committed are retained as failed or abandoned attempts. Raw delivery tokens, private keys, and uploaded content bodies never enter audit records. Reusing an idempotency key with a different actor, target, action, or canonical input identity is rejected rather than treated as a retry.
 
-The initial `abashiri-core` journal implements the immutable intent and completion ordering in its private journal store. It stores only domain-separated digests of the idempotency key, canonical input, and committed state. A completion contains the committed object-version evidence and state digest, never the route's generic response: token creation and other operations may return a one-time secret that must not become audit data. A completed retry therefore returns a redacted completion proof; the route reconstructs a safe response from current state or applies its operation-specific one-time-secret policy.
+The initial `abashiri-core` journal implements the immutable intent and completion ordering in its private journal store. It stores only domain-separated digests of the idempotency key, canonical input, and committed state. A route may also persist a bounded non-secret state locator needed to find committed state after configuration changes; style publication records the already catalog-validated delivery path. A completion contains the committed object-version evidence and state digest, never the route's generic response: token creation and other operations may return a one-time secret that must not become audit data. A completed retry therefore returns a redacted completion proof; the route reconstructs a safe response from current state or applies its operation-specific one-time-secret policy. The journal identity needs create, read, and list for reconciliation, but never conditional replacement or deletion.
 
-The route-specific commit remains responsible for storing the intent's server-generated opaque reference in state and returning the existing result when that reference already committed. The reference is independent of the client idempotency key, so delivery-visible object metadata cannot be used to test guesses about that key. This binding makes recovery after "state committed, completion missing" idempotent. The initial style-publication core stores it as durable custom metadata on the conditionally written style object. It preserves the submitted style bytes, records the resolved object path in the idempotency identity, and recognizes an already committed object when a retry must reconstruct a missing completion. Intent existence alone is not treated as commit evidence. The object path is supplied by the trusted startup catalog; the core does not derive it from the external account or style identifier. Original create/update preconditions prevent an incomplete older mutation from overwriting newer state.
+The route-specific commit remains responsible for storing the intent's server-generated opaque reference in state and returning the existing result when that reference already committed. The reference is independent of the client idempotency key, so delivery-visible object metadata cannot be used to test guesses about that key. This binding makes recovery after "state committed, completion missing" idempotent. The initial style-publication core stores it as durable custom metadata on the conditionally written style object. It preserves the submitted style bytes, records the resolved object path in both the idempotency identity and new intent records, and recognizes an already committed object when a retry must reconstruct a missing completion. Intent existence alone is not treated as commit evidence. The object path is supplied by the trusted startup catalog; the core does not derive it from the external account or style identifier. Original create/update preconditions prevent an incomplete older mutation from overwriting newer state.
 
-Before production enablement, a reconciler must complete or classify unfinished intents that receive no client retry. The experimental route is safe under this gap because it never reports success before completion is durable, but an unretried interrupted mutation can otherwise remain incomplete indefinitely.
+The serving process runs a reconciliation scan immediately in the background and every five minutes thereafter. It streams intent locations rather than retaining the journal in memory, skips intents that already have a valid completion, and creates a completion only when current validated style state still carries that intent's opaque reference. It never replays a state write. Missing state remains retryable by the original client; state naming another intent is retained as superseded evidence. New intents use their persisted trusted state locator, while legacy intents without one fall back to the current catalog. Reconciliation failures are logged and retried by the next scan, and concurrent reconcilers converge through the journal's immutable create-only completion rule. The scan performs storage work proportional to retained journal history; a separate pending index is justified only when measured mutation volume makes that material.
 
 ## 6. Readiness and current HTTP contract
 
@@ -202,6 +216,7 @@ These HTTP endpoints exist:
 - `GET /livez`
 - `GET /readyz`
 - `GET /whoami` when object-storage management authentication is configured
+- `GET /operations/status` when authentication and at least one operational endpoint are configured
 - `GET /accounts/{account_id}/styles/{style_id}` when style publication is configured
 - `PUT /accounts/{account_id}/styles/{style_id}` when style publication is configured
 

@@ -17,7 +17,7 @@ use axum::extract::{DefaultBodyLimit, Extension, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use mmpf_cluster::{
     BootstrapReadinessGate, HintAdmission, MAX_STYLE_REFRESH_HINT_BYTES, RefreshHintDedup,
@@ -25,8 +25,8 @@ use mmpf_cluster::{
 };
 use mmpf_http::cors::public_distribution;
 use mmpf_http::operational::{
-    INTERNAL_LIVENESS_PATH, INTERNAL_METRICS_PATH, INTERNAL_READINESS_PATH, PUBLIC_LIVENESS_PATH,
-    PUBLIC_READINESS_PATH,
+    INTERNAL_LIVENESS_PATH, INTERNAL_METRICS_PATH, INTERNAL_READINESS_PATH, INTERNAL_STATUS_PATH,
+    OPERATIONAL_STATUS_CACHE_CONTROL, PUBLIC_LIVENESS_PATH, PUBLIC_READINESS_PATH,
 };
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -347,6 +347,8 @@ fn classify_path(scope: ListenerScope, path: &str) -> EndpointClassification {
                 fixed(RequestEndpoint::Ready)
             } else if path == INTERNAL_METRICS_PATH {
                 fixed(RequestEndpoint::Metrics)
+            } else if path == INTERNAL_STATUS_PATH {
+                fixed(RequestEndpoint::Status)
             } else if path == "/_internal/forward" {
                 fixed(RequestEndpoint::InternalForward)
             } else if path == "/_internal/refresh/style" {
@@ -362,6 +364,8 @@ fn classify_path(scope: ListenerScope, path: &str) -> EndpointClassification {
                 fixed(RequestEndpoint::Ready)
             } else if path == INTERNAL_METRICS_PATH {
                 fixed(RequestEndpoint::Metrics)
+            } else if path == INTERNAL_STATUS_PATH {
+                fixed(RequestEndpoint::Status)
             } else if path == "/_internal/forward" {
                 fixed(RequestEndpoint::InternalForward)
             } else if path == "/_internal/refresh/style" {
@@ -398,6 +402,7 @@ fn internal_operational_routes() -> Router<HttpServerState> {
         .route(INTERNAL_LIVENESS_PATH, get(healthz))
         .route(INTERNAL_READINESS_PATH, get(readyz))
         .route(INTERNAL_METRICS_PATH, get(metricsz))
+        .route(INTERNAL_STATUS_PATH, get(statusz))
         .route("/_internal/forward", post(forwardz))
         .route(
             "/_internal/refresh/style",
@@ -607,6 +612,18 @@ async fn metricsz(State(state): State<HttpServerState>) -> Response {
         })
 }
 
+async fn statusz(State(state): State<HttpServerState>) -> Response {
+    let Some(metrics) = state.metrics.as_ref() else {
+        return simple_response(StatusCode::NOT_FOUND, "status disabled");
+    };
+    let mut response = Json(metrics.operational_snapshot().await).into_response();
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static(OPERATIONAL_STATUS_CACHE_CONTROL),
+    );
+    response
+}
+
 async fn refresh_style(
     State(state): State<HttpServerState>,
     Json(hint): Json<StyleRefreshHint>,
@@ -639,13 +656,8 @@ async fn refresh_style(
         );
         return simple_response(StatusCode::ACCEPTED, "refresh accepted");
     }
-    // The transport envelope accepts the union of every service's identifier
-    // shape, so Biei's own rules still have to run before the id resolves a
-    // provider URL.
-    let Ok(style_id) = crate::http::path::resolve_style_id_str(&hint.style_id) else {
-        record("rejected_style_id");
-        return simple_response(StatusCode::BAD_REQUEST, "invalid refresh style id");
-    };
+    let style_id = crate::http::path::resolve_style_id_str(&hint.style_id)
+        .expect("the refresh envelope validates the shared style key");
     let catalog = ingress.style_catalog();
     if catalog.resolve_latest(&style_id).is_none() {
         record("unknown_style");
@@ -924,7 +936,7 @@ mod tests {
     #[tokio::test]
     async fn style_refresh_route_is_internal_and_validates_before_runtime_lookup() {
         let state = empty_state();
-        let valid = r#"{"schema_version":1,"hint_id":"mutation-42","style_id":"base"}"#;
+        let valid = r#"{"schema_version":1,"hint_id":"mutation-42","style_id":"default/base"}"#;
         let request = Request::builder()
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(valid))
@@ -1000,15 +1012,27 @@ mod tests {
             ),
             (
                 Public,
+                INTERNAL_STATUS_PATH,
+                StatusCode::NOT_FOUND,
+                NotFound,
+            ),
+            (
+                Public,
                 "/_internal/forward",
                 StatusCode::NOT_FOUND,
                 NotFound,
             ),
             (Public, "/metrics", StatusCode::NOT_FOUND, NotFound),
-            (Public, "/carto/voyager/0/0/0@2x.png", ok, Render),
+            (
+                Public,
+                "/styles/carto/voyager/tiles/0/0/0@2x.png",
+                ok,
+                Render,
+            ),
             (Internal, INTERNAL_LIVENESS_PATH, ok, Health),
             (Internal, INTERNAL_READINESS_PATH, ok, Ready),
             (Internal, INTERNAL_METRICS_PATH, ok, Metrics),
+            (Internal, INTERNAL_STATUS_PATH, ok, Status),
             (
                 Internal,
                 "/_internal/forward",
@@ -1030,6 +1054,7 @@ mod tests {
             (Standalone, INTERNAL_LIVENESS_PATH, ok, Health),
             (Standalone, INTERNAL_READINESS_PATH, ok, Ready),
             (Standalone, INTERNAL_METRICS_PATH, ok, Metrics),
+            (Standalone, INTERNAL_STATUS_PATH, ok, Status),
             (
                 Standalone,
                 "/_internal/forward",
@@ -1050,7 +1075,7 @@ mod tests {
             ),
             (
                 Standalone,
-                "/unknown-style/0/0/0.png",
+                "/styles/default/unknown-style/tiles/0/0/0.png",
                 StatusCode::NOT_FOUND,
                 NotFound,
             ),
@@ -1246,7 +1271,7 @@ mod tests {
         let content = route_through(
             router.clone(),
             Method::GET,
-            "/carto/voyager/0/0/0.png".parse().unwrap(),
+            "/styles/carto/voyager/tiles/0/0/0.png".parse().unwrap(),
             Request::builder().body(Body::empty()).unwrap(),
         )
         .await;
@@ -1259,6 +1284,7 @@ mod tests {
             PUBLIC_LIVENESS_PATH,
             INTERNAL_LIVENESS_PATH,
             INTERNAL_METRICS_PATH,
+            INTERNAL_STATUS_PATH,
         ] {
             let response = route_through(
                 router.clone(),
@@ -1284,7 +1310,7 @@ mod tests {
         let content = route_through(
             router.clone(),
             Method::GET,
-            "/carto/voyager/0/0/0.png".parse().unwrap(),
+            "/styles/carto/voyager/tiles/0/0/0.png".parse().unwrap(),
             Request::builder()
                 .header(axum::http::header::ORIGIN, origin)
                 .body(Body::empty())
@@ -1303,7 +1329,7 @@ mod tests {
         let preflight = route_through(
             router.clone(),
             Method::OPTIONS,
-            "/carto/voyager/0/0/0.png".parse().unwrap(),
+            "/styles/carto/voyager/tiles/0/0/0.png".parse().unwrap(),
             Request::builder()
                 .header(axum::http::header::ORIGIN, origin)
                 .header(axum::http::header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
@@ -1389,7 +1415,7 @@ mod tests {
         let public = handle(
             State(state.clone()),
             Method::GET,
-            "/carto/voyager/static/not-an-overlay/auto/256x256.png"
+            "/styles/carto/voyager/static/not-an-overlay/auto/256x256.png"
                 .parse()
                 .unwrap(),
             Request::builder().body(Body::empty()).unwrap(),
@@ -1453,6 +1479,51 @@ mod tests {
         assert!(body.contains("biei_renderer_replacements_total"));
         assert!(body.contains("# TYPE biei_tasks_completed_total counter"));
         assert!(body.contains(r#"scope="ingress"} 0"#));
+    }
+
+    #[tokio::test]
+    async fn status_endpoint_is_bounded_service_owned_json() {
+        let options =
+            crate::options::test_options("http://style-api.test/styles/{style_id}/style.json", 1);
+        let runtime = crate::runtime::Runtime::spawn_single_node(&options).expect("runtime");
+        let state = HttpServerState {
+            metrics: Some(HttpMetrics::new(
+                runtime.node(),
+                None,
+                None,
+                runtime.renderer_supervisor(),
+            )),
+            renderer_supervisor: Some(runtime.renderer_supervisor()),
+            ..empty_state()
+        };
+
+        let response = handle_internal(
+            State(state.clone()),
+            Method::GET,
+            INTERNAL_STATUS_PATH.parse().unwrap(),
+            Request::builder().body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_cache_control(&response, OPERATIONAL_STATUS_CACHE_CONTROL);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["schema_version"], 1);
+        assert_eq!(body["service"], "biei");
+        assert_eq!(body["status"]["mode"], "standalone");
+        assert_eq!(body["status"]["membership"]["complete"], true);
+        assert_eq!(body["status"]["membership"]["members_truncated"], false);
+        assert_eq!(body["status"]["renderer"]["total_slots"], 1);
+        assert!(body.to_string().find("style_id").is_none());
+
+        let public = handle_public(
+            State(state),
+            Method::GET,
+            INTERNAL_STATUS_PATH.parse().unwrap(),
+            Request::builder().body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(public.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1557,7 +1628,7 @@ mod tests {
         // A refusal, so the assertion is about method handling rather than about
         // reaching a renderer: the two responses must agree on everything but the
         // body.
-        let path = "/carto/voyager/static/139.7,35.6,11,0,0/64x64.png";
+        let path = "/styles/carto/voyager/static/139.7,35.6,11,0,0/64x64.png";
         let mut responses = Vec::new();
         for method in [Method::GET, Method::HEAD] {
             responses.push(
@@ -1642,8 +1713,8 @@ mod tests {
             .status()
         };
 
-        let first = post(state.clone(), hint("mutation-1", "base")).await;
-        let retry = post(state.clone(), hint("mutation-1", "base")).await;
+        let first = post(state.clone(), hint("mutation-1", "default/base")).await;
+        let retry = post(state.clone(), hint("mutation-1", "default/base")).await;
         assert_eq!(first, StatusCode::ACCEPTED);
         assert_eq!(
             retry, first,
@@ -1694,6 +1765,7 @@ mod tests {
             INTERNAL_LIVENESS_PATH,
             INTERNAL_READINESS_PATH,
             INTERNAL_METRICS_PATH,
+            INTERNAL_STATUS_PATH,
             "/_internal/forward",
         ] {
             let response = handle_public(
@@ -1707,9 +1779,9 @@ mod tests {
         }
         let public = public_metrics.render_prometheus().await;
         assert!(
-            public.contains(r#"biei_http_requests_total{endpoint="not_found",status="404"} 4"#)
+            public.contains(r#"biei_http_requests_total{endpoint="not_found",status="404"} 5"#)
         );
-        for endpoint in ["health", "ready", "metrics", "internal_forward"] {
+        for endpoint in ["health", "ready", "metrics", "status", "internal_forward"] {
             assert!(
                 !public.contains(&format!(
                     r#"biei_http_requests_total{{endpoint="{endpoint}""#
@@ -1737,6 +1809,7 @@ mod tests {
                 (Method::GET, INTERNAL_LIVENESS_PATH, StatusCode::OK),
                 (Method::GET, INTERNAL_READINESS_PATH, StatusCode::OK),
                 (Method::GET, INTERNAL_METRICS_PATH, StatusCode::OK),
+                (Method::GET, INTERNAL_STATUS_PATH, StatusCode::OK),
                 (Method::POST, "/_internal/forward", StatusCode::NOT_FOUND),
             ] {
                 let response = match scope {
@@ -1768,6 +1841,7 @@ mod tests {
                 r#"biei_http_requests_total{endpoint="health",status="200"} 1"#,
                 r#"biei_http_requests_total{endpoint="ready",status="200"} 1"#,
                 r#"biei_http_requests_total{endpoint="metrics",status="200"} 1"#,
+                r#"biei_http_requests_total{endpoint="status",status="200"} 1"#,
                 r#"biei_http_requests_total{endpoint="internal_forward",status="404"} 1"#,
             ] {
                 assert!(
@@ -1788,7 +1862,7 @@ mod tests {
         for (method, uri, status, code) in [
             (
                 Method::POST,
-                "/carto/voyager/0/0/0.png".parse().unwrap(),
+                "/styles/carto/voyager/tiles/0/0/0.png".parse().unwrap(),
                 StatusCode::METHOD_NOT_ALLOWED,
                 "method_not_allowed",
             ),
@@ -1948,7 +2022,7 @@ mod tests {
         for path in [
             "//_internal/0/0/0.png",
             "/carto//voyager/0/0/0.png",
-            "/carto/voyager/0/0/0.png/",
+            "/styles/carto/voyager/tiles/0/0/0.png/",
         ] {
             let response = handle_public(
                 State(state.clone()),
@@ -1960,13 +2034,11 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
         }
 
-        // Canonical paths, including arbitrary-depth style IDs, still parse and
-        // reach the deliberately draining admission gate.
+        // Canonical two-segment paths reach the deliberately draining gate.
         for path in [
-            "/carto/voyager/0/0/0.png",
-            "/org/team/carto/voyager/0/0/0.png",
-            "/org/team/carto/voyager/static/none/0,0,1/1x1.png",
-            "/org/team/carto/voyager/preview",
+            "/styles/carto/voyager/tiles/0/0/0.png",
+            "/styles/carto/voyager/static/none/0,0,1/1x1.png",
+            "/styles/carto/voyager/preview",
         ] {
             let response = handle_public(
                 State(state.clone()),
@@ -2053,7 +2125,9 @@ mod tests {
         let response = route_through(
             router,
             Method::GET,
-            "/org/team/carto/voyager/0/0/0.png".parse().unwrap(),
+            "/org/team/styles/carto/voyager/tiles/0/0/0.png"
+                .parse()
+                .unwrap(),
             Request::builder().body(Body::empty()).unwrap(),
         )
         .await;
@@ -2121,9 +2195,12 @@ mod tests {
             refresh_dedup: Arc::new(RefreshHintDedup::default()),
             renderer_supervisor: None,
         };
-        let uri: Uri = format!("/style/static/none/0,0,1/1x1?addlayer={}", "x".repeat(8192))
-            .parse()
-            .expect("valid oversized URI");
+        let uri: Uri = format!(
+            "/styles/default/style/static/none/0,0,1/1x1?addlayer={}",
+            "x".repeat(8192)
+        )
+        .parse()
+        .expect("valid oversized URI");
 
         let response = handle_public(
             State(state),
@@ -2220,7 +2297,9 @@ mod tests {
         let response = handle_internal(
             State(state),
             Method::GET,
-            "/carto/voyager-gl-style/0/0/0.png".parse().unwrap(),
+            "/styles/carto/voyager-gl-style/tiles/0/0/0.png"
+                .parse()
+                .unwrap(),
             Request::builder()
                 .header(REQUEST_ID_HEADER, "internal-request")
                 .body(Body::empty())

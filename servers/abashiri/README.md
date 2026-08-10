@@ -23,7 +23,7 @@ cargo run -p abashiri -- serve \
   --auth-root gs://example-control-plane/abashiri/auth/
 ```
 
-The root must contain `current.json` in the schema documented by [`../../specs/abashiri-spec.md`](../../specs/abashiri-spec.md#41-object-storage-management-authentication). Generate a registry digest without placing the raw credential in a command argument. Supply an independently generated credential with at least 256 bits of entropy:
+The root must contain `current.json` in the schema documented by [`../../specs/abashiri-spec.md`](../../specs/abashiri-spec.md#42-object-storage-management-authentication). Generate a registry digest without placing the raw credential in a command argument. Supply an independently generated credential with at least 256 bits of entropy:
 
 ```sh
 printf '%s' "$ABASHIRI_PUBLISH_TOKEN" |
@@ -41,7 +41,7 @@ cargo run -p abashiri -- check-storage \
 
 The command performs a probe below `.abashiri-capability-check/`. It requires create-only writes, a usable object version or ETag, stale-writer rejection on conditional replacement, and round-tripping of content type, cache policy, and custom metadata. By default it retains the small object for a bucket lifecycle rule to expire. This avoids an explicit cleanup requirement, but GCS still requires `storage.objects.delete` for the conditional replacement itself. Scope that permission to the published-state bucket; the append-only journal identity does not need it.
 
-Exercise the private journal through a real authenticated mutation. That path proves its create-only intent and completion writes without granting replacement or deletion. Run the full `check-storage` probe on the journal only if a future journal format introduces conditional replacement, using a separately scoped diagnostic identity.
+Exercise the private journal through a real authenticated mutation and reconciliation scan. The serving identity needs create and read for immutable intents/completions plus list to discover unfinished intents, but no replacement or deletion. Run the full `check-storage` probe on the journal only if a future journal format introduces conditional replacement, using a separately scoped diagnostic identity.
 
 Use `--cleanup` only where the probing identity already has delete permission:
 
@@ -62,7 +62,9 @@ cargo run -p abashiri -- serve \
   --journal-root gs://example-management-journal/abashiri/ \
   --style-catalog gs://example-management-catalog/abashiri/current.json \
   --style-refresh-endpoint http://biei:9090/_internal/refresh/style \
-  --style-refresh-endpoint http://ishikari:9090/_internal/refresh/style
+  --style-refresh-endpoint http://ishikari:9090/_internal/refresh/style \
+  --operational-status-endpoint biei=http://biei:9090/_internal/operations/v1/status \
+  --operational-status-endpoint ishikari=http://ishikari:9090/_internal/operations/v1/status
 ```
 
 The catalog maps management IDs to trusted delivery paths; request paths are never concatenated into object-store keys:
@@ -80,7 +82,11 @@ The catalog maps management IDs to trusted delivery paths; request paths are nev
 }
 ```
 
+The flat `styles/demo/basic.json` object path is also accepted. Both layouts publish and notify the same `demo/basic` delivery style.
+
 `GET /accounts/{account_id}/styles/{style_id}` requires the `style.read` action and returns the exact style plus an opaque `ETag`. `PUT` requires `style.publish`, one `Idempotency-Key`, and an explicit precondition:
+
+When named operational endpoints are configured, `GET /operations/status` requires the global `operations.read` action. Abashiri polls at most eight endpoints in parallel with a one-second request deadline, coalesces requests for two seconds, and returns partial results. A failed source may retain a last-known-good snapshot for at most five minutes, always marked `stale`; internal endpoint URLs and transport details are never returned.
 
 ```sh
 # Create only
@@ -101,6 +107,8 @@ curl -i -X PUT http://127.0.0.1:8080/accounts/example/styles/basic \
 ```
 
 Publication validates MapLibre style version 8, writes an immutable audit intent before state, conditionally commits exact style bytes, and records a durable completion before reporting success. The ETag encodes both backend ETag and object version so GCS generation-based replacement remains safe.
+
+When publication is enabled, a background reconciliation scan runs immediately and every five minutes. It completes a missing journal record only when the validated current style still names that intent; it never replays a state mutation, and absent or superseded state remains unchanged. New intents retain the trusted catalog-resolved object path so recovery does not depend on a later catalog mapping.
 
 Configured refresh endpoints receive the same advisory hint in parallel after the durable completion. The JSON response reports `refresh` as `delivered`, `partial_failure`, or `not_configured`. Notification failure never changes a committed mutation into an HTTP failure. Repeating the identical request with the same idempotency key retries notification without republishing the style; delivery polling remains the correctness fallback. When refresh endpoints are configured, every catalog delivery path is checked against the shared hint envelope before the server starts. Without a notifier, that transport-specific validation is not applied.
 

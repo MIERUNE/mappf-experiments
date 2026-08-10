@@ -98,7 +98,7 @@ check "readyz"          200 "${base}/readyz"
 check "livez"           200 "${base}/livez"
 # Internal surface must NOT be reachable through the Gateway.
 check "internal-metrics blocked" 404 "${base}/_internal/metrics"
-check "internal-cluster blocked" 404 "${base}/_internal/cluster"
+check "internal-status blocked" 404 "${base}/_internal/operations/v1/status"
 # Use a unique path so a pre-fix CDN entry cannot mask the current origin policy.
 missing_style="smoke-missing-${RANDOM:-0}-$$"
 check_header \

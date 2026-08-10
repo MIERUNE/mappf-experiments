@@ -9,24 +9,16 @@
 //!
 //! # Identifier envelope
 //!
-//! This is a *transport* envelope shared by every service, so its accepted
-//! style-id shape is deliberately the **union** of the participating services'
-//! own shapes, not the intersection. Each receiver re-validates against its own
-//! rules before acting: Ishikari through `validate_style_key` and Biei through
-//! its catalog lookup, which only resolves configured styles. An envelope
-//! narrower than a service's real identifiers would instead make some perfectly
-//! valid styles permanently unrefreshable — a silent availability hole, since
-//! the publisher's hint is rejected before any receiver ever sees it.
-//!
-//! What stays enforced here is only what is unsafe for *every* service: bounded
-//! length, no empty or relative path segments, and no character that could turn
-//! a logical id into a URL, query, or authority.
+//! The transport and all receivers share the canonical, bounded
+//! `namespace/style_id` identity from `mmpf-http`. Validating the same grammar
+//! before gossip publication prevents a hint that no receiver can apply.
 
 use std::array;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use mmpf_http::style_key::StyleKey;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
@@ -48,10 +40,6 @@ const HINT_DEDUP_WINDOW: Duration = Duration::from_secs(300);
 /// oldest-first, and evicting early only re-admits a retry, which is the
 /// pre-existing behavior rather than a new failure.
 const HINT_DEDUP_CAPACITY: usize = 1_024;
-/// The largest style id any participating service accepts (Biei's limit;
-/// Ishikari's own is 200). See the module note on the union envelope.
-const MAX_STYLE_ID_BYTES: usize = 512;
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StyleRefreshHint {
@@ -305,29 +293,15 @@ fn stable_slot(value: &str) -> usize {
 }
 
 fn validate_style_id(style_id: &str) -> Result<(), RefreshHintError> {
-    if style_id.is_empty() || style_id.len() > MAX_STYLE_ID_BYTES {
-        return Err(RefreshHintError::InvalidStyleId);
-    }
-    for segment in style_id.split('/') {
-        if segment.is_empty()
-            || segment == "."
-            || segment == ".."
-            // `:` and `@` are Biei revision/variant separators. They are inert
-            // here because a hint is never resolved as a URL by the transport,
-            // and every receiver re-parses the id under its own rules.
-            || !segment.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'@')
-            })
-        {
-            return Err(RefreshHintError::InvalidStyleId);
-        }
-    }
-    Ok(())
+    StyleKey::parse(style_id)
+        .map(|_| ())
+        .map_err(|_| RefreshHintError::InvalidStyleId)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mmpf_http::style_key::{MAX_LOCAL_STYLE_ID_BYTES, MAX_STYLE_NAMESPACE_BYTES};
     use std::{net::SocketAddr, time::Duration};
 
     use crate::{ClusterOwner, Config, GossipEndpoint};
@@ -366,36 +340,19 @@ mod tests {
                 "{style_id}"
             );
         }
-        assert!(StyleRefreshHint::new("hint", "a/b-c_1.2").is_ok());
+        assert!(StyleRefreshHint::new("hint", "a/b-c_1").is_ok());
         assert!(StyleRefreshHint::new("bad/id", "a").is_err());
-        assert!(StyleRefreshHint::new("hint", "a".repeat(MAX_STYLE_ID_BYTES + 1)).is_err());
+        assert!(StyleRefreshHint::new("hint", "default/basic/extra").is_err());
     }
 
-    /// The envelope must admit every id its receivers can legitimately serve.
-    /// A hint rejected here never reaches a receiver at all, so a too-narrow
-    /// envelope silently makes those styles unrefreshable rather than failing
-    /// loudly.
+    /// The envelope and both receivers share the canonical public identity.
     #[test]
-    fn envelope_admits_the_union_of_service_identifiers() {
-        // Biei accepts `:` and `@` in a style id (revision/variant separators)
-        // and ids up to 512 bytes; Ishikari accepts neither and stops at 200.
-        for style_id in [
-            "provider/style@variant",
-            "provider/style:v2",
-            "tenant/provider/style@2026-07-01",
-            "mierune/basic",
-        ] {
-            assert!(
-                StyleRefreshHint::new("hint", style_id).is_ok(),
-                "{style_id}"
-            );
-        }
+    fn envelope_accepts_the_maximal_canonical_style_key() {
         let longest = format!(
             "{}/{}",
-            "n".repeat(255),
-            "s".repeat(MAX_STYLE_ID_BYTES - 256)
+            "n".repeat(MAX_STYLE_NAMESPACE_BYTES),
+            "s".repeat(MAX_LOCAL_STYLE_ID_BYTES)
         );
-        assert_eq!(longest.len(), MAX_STYLE_ID_BYTES);
         assert!(StyleRefreshHint::new("hint", longest).is_ok());
     }
 
@@ -405,7 +362,11 @@ mod tests {
     fn a_maximal_hint_still_fits_the_gossip_value_budget() {
         let hint = StyleRefreshHint::new(
             "h".repeat(MAX_HINT_ID_BYTES),
-            "s".repeat(MAX_STYLE_ID_BYTES),
+            format!(
+                "{}/{}",
+                "n".repeat(MAX_STYLE_NAMESPACE_BYTES),
+                "s".repeat(MAX_LOCAL_STYLE_ID_BYTES)
+            ),
         )
         .expect("maximal ids are valid");
         let encoded = hint.encode().expect("maximal hint encodes");
@@ -467,7 +428,9 @@ mod tests {
     async fn capacity_is_bounded_and_evicts_oldest_first() {
         let dedup = RefreshHintDedup::new(Duration::from_secs(300), 4);
         let hints: Vec<_> = (0..5)
-            .map(|index| StyleRefreshHint::new(format!("mutation-{index}"), "s").unwrap())
+            .map(|index| {
+                StyleRefreshHint::new(format!("mutation-{index}"), "default/style").unwrap()
+            })
             .collect();
         for hint in &hints {
             assert_eq!(dedup.admit(hint), HintAdmission::Accepted);
@@ -489,7 +452,7 @@ mod tests {
 
     #[test]
     fn gossip_slot_and_key_are_stable() {
-        let hint = StyleRefreshHint::new("mutation-42", "a").unwrap();
+        let hint = StyleRefreshHint::new("mutation-42", "default/a").unwrap();
         assert_eq!(hint.gossip_key(), hint.gossip_key());
         assert!(hint.gossip_key().starts_with(KEY_PREFIX));
     }

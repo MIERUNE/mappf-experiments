@@ -3,7 +3,7 @@
 use std::{future::Future, net::SocketAddr, time::Duration};
 
 use crate::drain::{self, DrainController};
-use crate::{membership::ClusterView, request_id, server};
+use crate::{request_id, server};
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
@@ -17,9 +17,11 @@ use ishikari_core::metrics::NodeMetrics;
 use mmpf_cluster::MAX_STYLE_REFRESH_HINT_BYTES;
 use mmpf_http::cors::public_distribution;
 use mmpf_http::operational::{
-    INTERNAL_LIVENESS_PATH, INTERNAL_METRICS_PATH, INTERNAL_READINESS_PATH, PUBLIC_LIVENESS_PATH,
-    PUBLIC_READINESS_PATH,
+    INTERNAL_LIVENESS_PATH, INTERNAL_METRICS_PATH, INTERNAL_READINESS_PATH, INTERNAL_STATUS_PATH,
+    MAX_OPERATIONAL_MEMBERS, OPERATIONAL_STATUS_CACHE_CONTROL, OperationalSnapshot,
+    PUBLIC_LIVENESS_PATH, PUBLIC_READINESS_PATH,
 };
+use serde::Serialize;
 use tokio::net::TcpListener;
 use tracing::Instrument;
 
@@ -153,7 +155,7 @@ fn internal_router() -> Router<AppState> {
         .route(INTERNAL_LIVENESS_PATH, get(healthz))
         .route(INTERNAL_READINESS_PATH, get(readyz))
         .route(INTERNAL_METRICS_PATH, get(metrics_handler))
-        .route("/_internal/cluster", get(cluster_handler))
+        .route(INTERNAL_STATUS_PATH, get(status_handler))
         .route(
             "/_internal/tiles/{tileset_id}/{tile_id}",
             get(server::tileset::internal_tile_handler),
@@ -240,9 +242,83 @@ async fn not_found() -> (StatusCode, &'static str) {
     (StatusCode::NOT_FOUND, "not found\n")
 }
 
-/// Returns the current cluster membership snapshot.
-async fn cluster_handler(State(state): State<AppState>) -> Json<ClusterView> {
-    Json(state.membership.cluster_view().await)
+#[derive(Serialize)]
+struct IshikariOperationalStatus {
+    mode: &'static str,
+    draining: bool,
+    ready: bool,
+    cpu_work: IshikariCpuWorkStatus,
+    membership: IshikariMembershipStatus,
+}
+
+#[derive(Serialize)]
+struct IshikariCpuWorkStatus {
+    running: usize,
+    inflight: usize,
+    concurrency: usize,
+    max_inflight: usize,
+}
+
+#[derive(Serialize)]
+struct IshikariMembershipStatus {
+    cluster_id: String,
+    live_members: usize,
+    dead_members: usize,
+    live_member_ids: Vec<String>,
+    dead_member_ids: Vec<String>,
+    members_truncated: bool,
+}
+
+async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let membership = state.membership.snapshot().await;
+    let live_members = membership.live_ids.len();
+    let dead_members = membership.dead_ids.len();
+    let (live_member_ids, dead_member_ids) =
+        bounded_member_ids(membership.live_ids, membership.dead_ids);
+    let members_truncated = live_members.saturating_add(dead_members)
+        > live_member_ids.len().saturating_add(dead_member_ids.len());
+    let cpu_work = state.cpu_work_gate.snapshot();
+    let draining = state.drain.is_draining();
+    let snapshot = OperationalSnapshot::observed_now(
+        "ishikari",
+        state.membership.node_id(),
+        IshikariOperationalStatus {
+            mode: if state.membership.is_clustered() {
+                "clustered"
+            } else {
+                "local"
+            },
+            draining,
+            ready: !draining && state.is_gossip_bootstrap_ready().await,
+            cpu_work: IshikariCpuWorkStatus {
+                running: cpu_work.running,
+                inflight: cpu_work.inflight,
+                concurrency: cpu_work.concurrency,
+                max_inflight: cpu_work.max_inflight,
+            },
+            membership: IshikariMembershipStatus {
+                cluster_id: membership.cluster_id,
+                live_members,
+                dead_members,
+                live_member_ids,
+                dead_member_ids,
+                members_truncated,
+            },
+        },
+    );
+    (
+        [(header::CACHE_CONTROL, OPERATIONAL_STATUS_CACHE_CONTROL)],
+        Json(snapshot),
+    )
+}
+
+fn bounded_member_ids(
+    mut live_ids: Vec<String>,
+    mut dead_ids: Vec<String>,
+) -> (Vec<String>, Vec<String>) {
+    live_ids.truncate(MAX_OPERATIONAL_MEMBERS);
+    dead_ids.truncate(MAX_OPERATIONAL_MEMBERS.saturating_sub(live_ids.len()));
+    (live_ids, dead_ids)
 }
 
 /// Rejects new data and peer-forwarding requests with `503` while draining, so
@@ -327,7 +403,7 @@ async fn track_http_metrics(
 
 /// Serves the Prometheus exposition, refreshing point-in-time gauges first.
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let view = state.membership.cluster_view().await;
+    let view = state.membership.snapshot().await;
     // Moka updates weighted size through deferred maintenance. Flush once for
     // concurrent scrapes and run the independent caches in parallel.
     if let Some(_guard) = state.try_start_cache_maintenance() {

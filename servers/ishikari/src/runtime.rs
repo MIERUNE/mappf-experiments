@@ -7,7 +7,7 @@ use tracing::{info, warn};
 
 use crate::drain::DrainController;
 use crate::internal_transport::HttpInternalTransport;
-use crate::membership::Membership;
+use crate::membership::{Membership, MembershipConfig};
 use crate::options::Options;
 use crate::server::{
     AppState, ServerRuntimeConfig, run_http_server, tileset::mapterhorn::MapterhornResolver,
@@ -37,13 +37,10 @@ where
     let resolver_tuning = options.resolver_tuning;
     let cache_capacities = options.cache_capacities;
     info!(
+        clustered = options.clustered,
         http_listen_addr = %options.http_listen_addr,
         internal_listen_addr = %options.internal_listen_addr,
         http_port = options.http_listen_addr.port(),
-        gossip_bind = %options.membership.gossip_endpoint.listen_addr(),
-        gossip_advertise_addr = %options.membership.gossip_endpoint.advertise_addr(),
-        internal_http_advertise_addr = %options.membership.http_advertise_addr,
-        seed_nodes = ?options.membership.seed_nodes,
         require_gossip_bootstrap = options.require_gossip_bootstrap,
         tileset_source_count = options.tileset_source_inventory.source_count(),
         tileset_source_default = options.tileset_source_inventory.has_default(),
@@ -66,6 +63,17 @@ where
         anonymous_access_enabled = options.anonymous_registry.is_some(),
         "starting ishikari"
     );
+    if options.clustered {
+        info!(
+            gossip_bind = %options.membership.gossip_endpoint.listen_addr(),
+            gossip_advertise_addr = %options.membership.gossip_endpoint.advertise_addr(),
+            internal_http_advertise_addr = %options.membership.http_advertise_addr,
+            seed_nodes = ?options.membership.seed_nodes,
+            "starting Chitchat membership"
+        );
+    } else {
+        info!("using local membership; UDP gossip and peer routing are disabled");
+    }
 
     let mapterhorn = options
         .mapterhorn
@@ -74,8 +82,9 @@ where
 
     // Build fallible non-membership dependencies before opening the gossip socket.
     let internal_transport = Arc::new(HttpInternalTransport::new()?);
+    let clustered = options.clustered;
     let self_node_id = options.membership.node_id.clone();
-    let (membership, membership_owner) = Membership::spawn(options.membership).await?;
+    let (membership, membership_owner) = start_membership(clustered, options.membership).await?;
     let gossip_bootstrap_readiness =
         BootstrapReadinessGate::new(options.require_gossip_bootstrap, DEFAULT_BOOTSTRAP_GRACE);
     let metrics = NodeMetrics::new();
@@ -115,11 +124,13 @@ where
         }
     };
 
-    let stats_reporter = spawn_stats_reporter(
-        membership.clone(),
-        resource_resolver.clone(),
-        metrics.clone(),
-    );
+    let stats_reporter = clustered.then(|| {
+        spawn_stats_reporter(
+            membership.clone(),
+            resource_resolver.clone(),
+            metrics.clone(),
+        )
+    });
 
     let app_state = AppState::new(
         membership.clone(),
@@ -161,8 +172,10 @@ where
     )
     .await;
 
-    stats_reporter.abort();
-    let _ = stats_reporter.await;
+    if let Some(stats_reporter) = stats_reporter {
+        stats_reporter.abort();
+        let _ = stats_reporter.await;
+    }
     let membership_shutdown_result = shutdown_membership(membership_owner).await;
     serve_result?;
     membership_shutdown_result
@@ -177,13 +190,15 @@ where
     // Stop admitting new data/peer requests locally first, then announce
     // draining to peers before asking the HTTP listeners to finish in-flight work.
     drain.begin();
-    if !draining_publication_completes(membership.set_draining(true)).await {
-        warn!(
-            timeout_ms = DRAIN_PUBLICATION_TIMEOUT.as_millis(),
-            "timed out publishing draining membership state; continuing shutdown"
-        );
+    if membership.is_clustered() {
+        if !draining_publication_completes(membership.set_draining(true)).await {
+            warn!(
+                timeout_ms = DRAIN_PUBLICATION_TIMEOUT.as_millis(),
+                "timed out publishing draining membership state; continuing shutdown"
+            );
+        }
+        tokio::time::sleep(DRAINING_PROPAGATION_DELAY).await;
     }
-    tokio::time::sleep(DRAINING_PROPAGATION_DELAY).await;
 }
 
 async fn draining_publication_completes(publish: impl Future<Output = ()>) -> bool {
@@ -192,7 +207,10 @@ async fn draining_publication_completes(publish: impl Future<Output = ()>) -> bo
         .is_ok()
 }
 
-async fn shutdown_membership(owner: mmpf_cluster::ClusterOwner) -> Result<()> {
+async fn shutdown_membership(owner: Option<mmpf_cluster::ClusterOwner>) -> Result<()> {
+    let Some(owner) = owner else {
+        return Ok(());
+    };
     match tokio::time::timeout(MEMBERSHIP_SHUTDOWN_TIMEOUT, owner.shutdown()).await {
         Ok(result) => {
             result.context("failed to stop chitchat")?;
@@ -203,6 +221,18 @@ async fn shutdown_membership(owner: mmpf_cluster::ClusterOwner) -> Result<()> {
             "timed out stopping chitchat after {} ms",
             MEMBERSHIP_SHUTDOWN_TIMEOUT.as_millis()
         )),
+    }
+}
+
+async fn start_membership(
+    clustered: bool,
+    config: MembershipConfig,
+) -> Result<(Membership, Option<mmpf_cluster::ClusterOwner>)> {
+    if clustered {
+        let (membership, owner) = Membership::spawn_cluster(config).await?;
+        Ok((membership, Some(owner)))
+    } else {
+        Ok((Membership::local(config.node_id), None))
     }
 }
 
@@ -247,6 +277,24 @@ fn spawn_stats_reporter(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn local_runtime_membership_does_not_open_the_configured_udp_socket() {
+        let occupied = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = occupied.local_addr().unwrap();
+        let config = MembershipConfig {
+            node_id: "local-node".to_string(),
+            gossip_endpoint: mmpf_cluster::GossipEndpoint::standalone(address, address),
+            http_advertise_addr: "127.0.0.1:9090".parse().unwrap(),
+            seed_nodes: Vec::new(),
+            gossip_interval: Duration::from_millis(200),
+        };
+
+        let (membership, owner) = start_membership(false, config).await.unwrap();
+
+        assert!(!membership.is_clustered());
+        assert!(owner.is_none());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn draining_publication_timeout_is_bounded() {
         let started = tokio::time::Instant::now();
@@ -257,6 +305,18 @@ mod tests {
         );
         assert_eq!(started.elapsed(), DRAIN_PUBLICATION_TIMEOUT);
         assert!(draining_publication_completes(std::future::ready(())).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_shutdown_skips_gossip_publication_and_propagation_delay() {
+        let membership = Membership::local("local-node".to_string());
+        let drain = DrainController::new();
+        let started = tokio::time::Instant::now();
+
+        shutdown_signal(std::future::ready(()), membership, drain.clone()).await;
+
+        assert!(drain.is_draining());
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     #[test]

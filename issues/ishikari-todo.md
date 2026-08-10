@@ -66,10 +66,8 @@ The contract and evaluation dimensions live in [`../specs/isoline-and-hillshade-
 ## Product and operational contingencies
 
 - Before claiming that an existing map SDK application can point at MMPF unchanged, capture a delivery behavior matrix for styles, TileJSON, tiles, glyphs, and sprites. Abashiri's management contract says nothing about delivery behavior. Keep Ishikari's current canonical routes unless a concrete client justifies aliases and their additional authorization/cache surface.
-- Style sprite _retrieval_ at `…/{style_id}/{sprite_id}/sprite{@2x}.{format}` is Ishikari's surface, not Abashiri's; see [`../specs/abashiri-spec.md`](../specs/abashiri-spec.md) §1.6. The optional sprite id is an immutability token, so it maps onto the content-addressed bundle rather than conflicting with it.
 - Add a style-catalog admin/update endpoint only if dynamic registration becomes necessary.
-- Define provider style/version invalidation before supporting mutable logical identifiers.
-- Before adding a content-management publisher, define the style-scoped content-addressed sprite contract: the publisher writes the complete bundle, injects its SHA-256 `sprite_id` into the style, and publishes the lightweight style last. Ishikari must preserve that logical reference, while Biei must see a new `StyleRevision` or immutable style id.
+- **Content-addressed sprites:** Ishikari currently proxies provider sprites at `/styles/{namespace}/{style_id}/sprite{@2x}.{json,png}` with no immutable bundle id. Before adding the content publisher, implement the proposed `/styles/{namespace}/{style_id}/sprites/{sprite_id}{@2x}.{json,png}` delivery contract. The publisher writes the complete bundle, injects its SHA-256 `sprite_id` into the style, and publishes the lightweight style last. Ishikari preserves that logical reference, while Biei observes the resulting content-derived `StyleRevision`.
 - Decide whether external style assets must be mirrored or may be proxied before expanding provider behavior.
 - Revisit framed internal APIs or end-to-end timeout budgets only if the current HTTP and fixed per-hop contracts prove insufficient.
 - Shorten dead-node retention only after measuring state growth under Spot churn.

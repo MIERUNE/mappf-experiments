@@ -1,6 +1,6 @@
 # Authentication boundaries for Biei and Ishikari — design sketch
 
-Status: exploratory overall. Biei now has a disabled-by-default first slice for object-storage-backed authentication of static renders. It is implementation evidence, not yet a production or demo commitment. Open decisions are tracked in [`issues/auth-todo.md`](../issues/auth-todo.md).
+Status: **partly implemented, disabled by default.** Biei and Ishikari share the object-storage-backed delivery registry, Bearer and `access_token` transports, anonymous policy, namespace authorization, credential-partitioned caches, and the authenticated native-render E2E. Strong/private access, registry distribution beyond local refresh, and production enablement remain exploratory. Open decisions are tracked in [`../issues/auth-todo.md`](../issues/auth-todo.md).
 
 ## 1. Purpose
 
@@ -99,7 +99,7 @@ Namespace and action grants live in the token entry. The ordinary token format a
 
 The first design has no `namespace -> allowed registry IDs` table and no trusted registry-level `namespace_scopes` ceiling. Consequently, anyone allowed to write a registry can grant its tokens access to any namespace. Registry mutation therefore remains a centrally trusted management-plane capability; customer-delegated registry writers require a separately designed trusted scope ceiling before they are enabled.
 
-Authorization uses the service's existing parsed resource model. It does not require Biei to replace a deep style ID with a new universal `namespace/style_id` domain type, and authentication must not independently split or reinterpret an identifier that the router has already parsed. In particular, namespace checks use the same percent-decoded canonical path identity as the handler; a raw URI spelling such as `%66oo` must not become a different authorization namespace from `foo`.
+Authorization uses the service's existing parsed resource model. Styles have one canonical `namespace/style_id` identity shared by Biei, Ishikari, Abashiri, and refresh hints; both segments are slash-free. Authentication must use that already-validated identity rather than independently splitting the raw URI. In particular, namespace checks use the same percent-decoded canonical path identity as the handler; a raw URI spelling such as `%66oo` must not become a different authorization namespace from `foo`.
 
 It should not grow into an end-user directory, fine-grained RBAC system, or arbitrary policy language. If authorization requires remote relationships or unbounded claim sets, it no longer satisfies the delivery-path cost model.
 
@@ -243,6 +243,8 @@ One deployment may configure several named OIDC providers at the same time—for
 The management verifier should enforce an allowlisted issuer, an explicit management audience, short session validity, and bounded role/group mapping. MFA and account lifecycle remain the IdP's responsibility. An existing locally verifiable session may continue until its expiry during an IdP interruption; new login or refresh fails closed. Mutations produce an audit record containing actor, action, target, outcome, and request/trace identity. The durable ordering, idempotency, and reconciliation contract lives in [`abashiri-spec.md`](abashiri-spec.md#5-audit-invariant); cloud-provider audit logs identify the storage workload but do not replace the application record of the represented human or publisher.
 
 Management and publishing routes should use a distinct listener, hostname, or ingress policy where practical. They must not inherit the delivery CDN's shared cache rules, and sensitive responses should be `no-store`. OIDC is an identity mechanism, not a substitute for restricting unnecessary network exposure.
+
+Console is an Abashiri-only client, while Biei and Ishikari remain independently deployable and never depend on either management component. Their origins and mount paths are deployment configuration: Console and Abashiri may share an origin, use separate origins with an exact credentialed-CORS allowlist, remain private while delivery is public, or be mounted alongside delivery routes. When management and delivery share an origin, the management prefixes bypass delivery caching and route before delivery wildcards, API failures never fall through to the Console SPA, and the host-only session cookie is restricted to the configured API mount path so it is not attached to map-resource requests. Wildcard CORS is never combined with management-session credentials.
 
 The management API may create, rotate, disable, or scope delivery credentials, but possession of one of those delivery credentials never grants access back to the management API.
 
@@ -412,19 +414,7 @@ The extracted `mmpf-auth` crate remains limited to the stable verifier, registry
 
 Errors exposed to callers should remain coarse (`missing`, `invalid`, `forbidden`, or temporarily unavailable where appropriate). Detailed verifier or registry failures belong in bounded internal telemetry and must not reveal secret material.
 
-## 12. Suggested adoption order
-
-1. Define route classes and decide which current routes actually require delivery authentication.
-2. Add a local `StaticApiKeys` verifier, typed delivery principal, bounded metrics, and tests proving authentication happens before expensive work.
-3. Add edge request/egress limits and validate CDN log-based usage accounting.
-4. Carry the ordinary delivery token through the trusted Biei-to-Ishikari style path and enforce namespace requirements on Biei cache hits. Add a workload identity only as an additional transport identity, never as broader content authorization.
-5. Add portable OIDC management and workload publishing identity when a management/publishing API exists.
-6. Introduce a dynamic registry only when static distribution is an observed operational constraint.
-7. Add signed capabilities or a strong private-data tier only after their client, CDN, confidentiality, and revocation requirements are concrete.
-
-Each stage should have a deployable rollback and must preserve shared-cache behavior unless the security requirement explicitly calls for isolation.
-
-## 13. Acceptance criteria for the first delivery-auth change
+## 12. Regression and deployment acceptance
 
 Before enabling it in the demo or production-like deployment, tests and metrics should demonstrate that:
 

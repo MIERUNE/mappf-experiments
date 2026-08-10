@@ -1,40 +1,27 @@
 use crate::http::error::{IngressError, invalid};
 use biei_core::style_catalog::StyleCatalog;
 use biei_core::types::{StyleId, StyleRevision};
-
-const MAX_STYLE_ID_BYTES: usize = 512;
+use mmpf_http::style_key::StyleKey;
 
 pub(crate) struct ResolvedStyle {
     pub(crate) revision: StyleRevision,
 }
 
 pub(crate) fn resolve_style_id(components: &[&str]) -> Result<StyleId, IngressError> {
-    // An empty slice used to join to an empty id and pass every remaining check,
-    // because the per-component loop it would have failed never ran. Nothing
-    // wants a style with no name: the caller that could produce it was a render
-    // path with too few segments to hold both a style id and a coordinate.
-    if components.is_empty() {
-        return Err(invalid("style_id must not be empty"));
-    }
-    for component in components {
-        validate_path_component(component, "style_id")?;
-    }
-    let style_id = components.join("/");
-    if style_id.len() > MAX_STYLE_ID_BYTES {
-        return Err(invalid(format!(
-            "style_id must be at most {MAX_STYLE_ID_BYTES} bytes"
-        )));
-    }
-    Ok(StyleId(style_id))
+    let [namespace, style_id] = components else {
+        return Err(invalid("style key must be /{namespace}/{style_id}"));
+    };
+    let key =
+        StyleKey::from_segments(namespace, style_id).map_err(|error| invalid(error.to_string()))?;
+    Ok(StyleId(format!("{}/{}", key.namespace(), key.style_id())))
 }
 
 /// Validates an already-joined style id under the same rules as a request path.
 ///
-/// Advisory refresh hints arrive over a transport envelope that deliberately
-/// accepts the union of every service's identifier shape, so the id still has to
-/// clear Biei's own rules before it is used to resolve a provider URL.
+/// Advisory refresh hints use the same canonical identity as public paths.
 pub(crate) fn resolve_style_id_str(style_id: &str) -> Result<StyleId, IngressError> {
-    resolve_style_id(&style_id.split('/').collect::<Vec<_>>())
+    let key = StyleKey::parse(style_id).map_err(|error| invalid(error.to_string()))?;
+    Ok(StyleId(format!("{}/{}", key.namespace(), key.style_id())))
 }
 
 pub(crate) fn resolve_style(
@@ -52,32 +39,17 @@ pub(crate) fn resolve_style(
     })
 }
 
-fn validate_path_component(value: &str, name: &str) -> Result<(), IngressError> {
-    if value.is_empty() {
-        return Err(invalid(format!("{name} must not be empty")));
-    }
-    if value.contains("..") {
-        return Err(invalid(format!("{name} must not contain `..`")));
-    }
-    if !value.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'@')
-    }) {
-        return Err(invalid(format!("{name} contains an unsupported character")));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn accepts_namespaced_style_id_with_revision_separator() {
+    fn accepts_canonical_style_key() {
         assert_eq!(
-            resolve_style_id(&["provider", "style@variant"])
+            resolve_style_id(&["provider", "style_variant"])
                 .expect("safe style id")
                 .as_str(),
-            "provider/style@variant"
+            "provider/style_variant"
         );
     }
 
@@ -89,7 +61,13 @@ mod tests {
 
     #[test]
     fn rejects_oversized_style_id() {
-        let oversized = "a".repeat(MAX_STYLE_ID_BYTES + 1);
-        assert!(resolve_style_id(&[&oversized]).is_err());
+        let oversized = "a".repeat(mmpf_http::style_key::MAX_LOCAL_STYLE_ID_BYTES + 1);
+        assert!(resolve_style_id(&["provider", &oversized]).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_or_extra_segments() {
+        assert!(resolve_style_id(&["basic"]).is_err());
+        assert!(resolve_style_id(&["default", "basic", "extra"]).is_err());
     }
 }

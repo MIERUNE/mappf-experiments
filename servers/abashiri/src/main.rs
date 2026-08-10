@@ -2,6 +2,7 @@
 
 mod cli;
 mod notifier;
+mod operations;
 mod server;
 #[cfg(test)]
 mod test_http;
@@ -27,6 +28,7 @@ async fn run() -> anyhow::Result<()> {
                 journal_root,
                 style_catalog,
                 style_refresh_endpoints,
+                operational_status_endpoints,
             } = *args;
             let options: Vec<_> = std::env::vars().collect();
             let auth = if let Some(root) = auth_root {
@@ -81,7 +83,18 @@ async fn run() -> anyhow::Result<()> {
                     )
                 }
             };
-            server::serve(http_addr, auth, publishing).await
+            let operations = if operational_status_endpoints.is_empty() {
+                None
+            } else {
+                ensure!(
+                    auth.is_some(),
+                    "operational status aggregation requires --auth-root"
+                );
+                Some(operations::OperationalStatusClient::new(
+                    operational_status_endpoints,
+                )?)
+            };
+            server::serve(http_addr, auth, publishing, operations).await
         }
         cli::Command::CheckStorage { root, cleanup } => {
             let outcome =

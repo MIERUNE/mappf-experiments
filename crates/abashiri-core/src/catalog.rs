@@ -151,6 +151,30 @@ mod tests {
     }
 
     #[test]
+    fn resolves_flat_style_object_layout() {
+        let catalog = StyleCatalog::parse(
+            br#"{
+                "schema_version": 1,
+                "styles": [{
+                    "account_id": "example",
+                    "style_id": "basic",
+                    "object_path": "styles/delivery/basic.json"
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let location = catalog
+            .resolve(
+                &AccountId::try_new("example").unwrap(),
+                &LocalResourceId::try_new("basic").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(location.as_ref(), "styles/delivery/basic.json");
+        assert_eq!(location.delivery_style_id(), "delivery/basic");
+    }
+
+    #[test]
     fn rejects_aliases_duplicates_and_untrusted_paths() {
         for body in [
             br#"{"schema_version":1,"styles":[{"account_id":"a","style_id":"one","object_path":"styles/shared/style.json"},{"account_id":"b","style_id":"two","object_path":"styles/shared/style.json"}]}"#.as_slice(),

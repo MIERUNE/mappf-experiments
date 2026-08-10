@@ -19,15 +19,15 @@ To start a simple single-node server:
 
 ```sh
 cargo run -p biei -- \
-  --style-templates 'carto=https://basemaps.cartocdn.com/{style_id}/style.json'
-open http://localhost:8080/carto/gl/voyager-gl-style/static/139.767,35.681,11,0,0/640x360@2x.webp
+  --style-templates 'carto=https://basemaps.cartocdn.com/gl/{style_id}/style.json'
+open http://localhost:8080/styles/carto/voyager-gl-style/static/139.767,35.681,11,0,0/640x360@2x.webp
 ```
 
 To start a local three-node cluster for development:
 
 ```sh
 bash demo-deploy/biei/dev-cluster.sh
-open http://localhost:8080/carto/gl/voyager-gl-style/preview
+open http://localhost:8080/styles/carto/voyager-gl-style/preview
 ```
 
 The script builds `biei`, starts `NUM_NODES` processes on consecutive HTTP/gossip ports, prefixes logs by node, and stops all nodes on Ctrl-C.
@@ -36,33 +36,33 @@ Sample URLs against the default local cluster (`BASE_HTTP_PORT=8080`):
 
 ```text
 # tile rendering preview page
-http://localhost:8080/carto/gl/voyager-gl-style/preview
+http://localhost:8080/styles/carto/voyager-gl-style/preview
 
 # static center image around Tokyo
-http://localhost:8080/carto/gl/voyager-gl-style/static/139.767,35.681,11,0,0/640x360@2x.webp
+http://localhost:8080/styles/carto/voyager-gl-style/static/139.767,35.681,11,0,0/640x360@2x.webp
 
 # static bbox image
-http://localhost:8080/carto/gl/voyager-gl-style/static/[139.55,35.55,139.95,35.85]/640x360@2x.webp
+http://localhost:8080/styles/carto/voyager-gl-style/static/[139.55,35.55,139.95,35.85]/640x360@2x.webp
 
 # route-style overlay: blue pin, path, red pin
-http://localhost:8080/carto/gl/voyager-gl-style/static/path-5+1a75ff-0.8(g%7DwxEwfatY_q%40vaLgbC_vJ),pin-l-s+1a75ff(139.767,35.681),pin-l-g+fd3344(139.760,35.710)/auto/640x360@2x.webp
+http://localhost:8080/styles/carto/voyager-gl-style/static/path-5+1a75ff-0.8(g%7DwxEwfatY_q%40vaLgbC_vJ),pin-l-s+1a75ff(139.767,35.681),pin-l-g+fd3344(139.760,35.710)/auto/640x360@2x.webp
 
 # GeoJSON polygon overlay with auto fit
-http://localhost:8080/carto/gl/voyager-gl-style/static/geojson(%7B%22type%22%3A%22Feature%22%2C%22properties%22%3A%7B%22fill%22%3A%22%2345cf23%22%2C%22fill-opacity%22%3A0.35%2C%22stroke%22%3A%22%23333%22%2C%22stroke-width%22%3A2%7D%2C%22geometry%22%3A%7B%22type%22%3A%22Polygon%22%2C%22coordinates%22%3A%5B%5B%5B139.65%2C35.62%5D%2C%5B139.85%2C35.62%5D%2C%5B139.85%2C35.78%5D%2C%5B139.65%2C35.78%5D%2C%5B139.65%2C35.62%5D%5D%5D%7D%7D)/auto/640x360@2x.webp
+http://localhost:8080/styles/carto/voyager-gl-style/static/geojson(%7B%22type%22%3A%22Feature%22%2C%22properties%22%3A%7B%22fill%22%3A%22%2345cf23%22%2C%22fill-opacity%22%3A0.35%2C%22stroke%22%3A%22%23333%22%2C%22stroke-width%22%3A2%7D%2C%22geometry%22%3A%7B%22type%22%3A%22Polygon%22%2C%22coordinates%22%3A%5B%5B%5B139.65%2C35.62%5D%2C%5B139.85%2C35.62%5D%2C%5B139.85%2C35.78%5D%2C%5B139.65%2C35.78%5D%2C%5B139.65%2C35.62%5D%5D%5D%7D%7D)/auto/640x360@2x.webp
 
 # raster tile
-http://localhost:8080/carto/gl/dark-matter-gl-style/5/28/12@2x.webp
+http://localhost:8080/styles/carto/dark-matter-gl-style/tiles/5/28/12@2x.webp
 ```
 
 Override ports or providers with environment variables. If you change `BASE_HTTP_PORT`, replace `8080` in the sample URLs with that port.
 
 ```sh
 NUM_NODES=4 BASE_HTTP_PORT=18080 BASE_INTERNAL_PORT=19090 BASE_GOSSIP_PORT=17946 \
-STYLE_URL_TEMPLATE='carto=https://basemaps.cartocdn.com/{style_id}/style.json' \
+STYLE_URL_TEMPLATE='carto=https://basemaps.cartocdn.com/gl/{style_id}/style.json' \
 bash demo-deploy/biei/dev-cluster.sh
 ```
 
-Single-node mode is the default. Cluster mode is explicit and serves two HTTP listeners: a public port (`--http-bind`, default `:8080`) for render ingress plus top-level `/livez` `/readyz`, and a separate cluster-internal port (`--internal-port`, default `9090`) for `/_internal/*` (including metrics) and peer-to-peer forwarding. The internal port is never exposed publicly; peers forward to the advertised internal address, so `--internal-advertise-addr` points at the internal port. Cluster mode also requires an explicit routable gossip address via `--gossip-advertise-addr` (env `BIEI_GOSSIP_ADVERTISE_ADDR`); `--gossip-bind` remains the local UDP listener and may use a wildcard IP:
+Single-node mode is the default. Cluster mode is explicit and serves two HTTP listeners: a public port (`--http-bind`, default `:8080`) for render ingress plus top-level `/livez` `/readyz`, and a separate cluster-internal port (`--internal-port`, default `9090`) for `/_internal/*` (including Prometheus metrics, the bounded JSON status snapshot, and peer forwarding). The internal port is never exposed publicly; peers forward to the advertised internal address, so `--internal-advertise-addr` points at the internal port. Cluster mode also requires an explicit routable gossip address via `--gossip-advertise-addr` (env `BIEI_GOSSIP_ADVERTISE_ADDR`); `--gossip-bind` remains the local UDP listener and may use a wildcard IP:
 
 ```sh
 cargo run -p biei -- \
@@ -83,22 +83,21 @@ cargo run -p biei -- \
 
 ### Style templates
 
-`--style-templates` (env `BIEI_STYLE_TEMPLATES`) maps a request's style id to a `style.json` URL. It is a `;`-separated list of entries; each `<template>` must be an http(s) URL with `{style_id}` in its path. Placeholders in the authority, query, or fragment are rejected.
+`--style-templates` (env `BIEI_STYLE_TEMPLATES`) maps a canonical `namespace/style_id` to a `style.json` URL. It is a `;`-separated list of entries; each `<template>` must be an http(s) URL with `{style_id}` in its path. Placeholders in the authority, query, or fragment are rejected.
 
 **Single bare template** — every style id is substituted whole:
 
 ```sh
---style-templates 'https://basemaps.cartocdn.com/{style_id}/style.json'
-# request path          style id            -> resolved style.json
-# /gl/voyager-gl-style  gl/voyager-gl-style -> https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json
-# /positron             positron            -> https://basemaps.cartocdn.com/positron/style.json
+--style-templates 'https://styles.example.test/{style_id}/style.json'
+# style key       -> resolved style.json
+# default/basic   -> https://styles.example.test/default/basic/style.json
 ```
 
-**Multiple `namespace=<template>` entries** (+ optional `default=`) — the style id's **first path segment** picks the template. On a namespace match that segment is stripped, so only the rest fills `{style_id}`; the `default` (or a bare entry) is the catch-all and receives the whole id:
+**Multiple `namespace=<template>` entries** (+ optional `default=`) — the style namespace picks the template. On a namespace match it is stripped, so only the local id fills `{style_id}`; the `default` (or a bare entry) is the catch-all and receives the whole canonical key:
 
 ```sh
 --style-templates '
-  carto=https://basemaps.cartocdn.com/{style_id}/style.json;
+  carto=https://basemaps.cartocdn.com/gl/{style_id}/style.json;
   example=https://styles.example.test/{style_id}/style.json;
   default=https://basemaps.cartocdn.com/{style_id}/style.json'
 ```

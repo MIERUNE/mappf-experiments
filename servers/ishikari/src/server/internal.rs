@@ -11,12 +11,9 @@ use serde::Deserialize;
 use tracing::debug;
 
 use crate::server::{AppState, HttpError, bytes_response};
-use ishikari_core::{
-    interned::TilesetId,
-    storage::{ARCHIVE_GENERATION_HEADER, LeafBytesError},
-};
+use ishikari_core::storage::{ARCHIVE_GENERATION_HEADER, LeafBytesError};
 
-use super::tileset::tileset_error_response;
+use super::tileset::{parse_tileset_id, tileset_error_response};
 
 #[derive(Deserialize)]
 pub(crate) struct BootstrapQuery {
@@ -30,8 +27,7 @@ pub(crate) async fn internal_bootstrap_handler(
     Path(tileset_id): Path<String>,
     Query(query): Query<BootstrapQuery>,
 ) -> Result<Response<Body>, HttpError> {
-    let tileset_id = TilesetId::try_from(tileset_id)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let tileset_id = parse_tileset_id(tileset_id)?;
     let include_metadata = query.metadata;
     let transfer = state
         .resource_resolver
@@ -63,15 +59,7 @@ pub(crate) async fn internal_bootstrap_handler(
         );
     }
     let mut response = bytes_response(body_bytes, "application/octet-stream", None);
-    response.headers_mut().insert(
-        ARCHIVE_GENERATION_HEADER,
-        HeaderValue::from_str(&generation).map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "invalid archive generation".to_string(),
-            )
-        })?,
-    );
+    insert_generation_header(&mut response, &generation)?;
     Ok(response)
 }
 
@@ -80,8 +68,7 @@ pub(crate) async fn internal_leaf_handler(
     State(state): State<AppState>,
     Path((tileset_id, offset, length)): Path<(String, u64, usize)>,
 ) -> Result<Response<Body>, HttpError> {
-    let tileset_id = TilesetId::try_from(tileset_id)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let tileset_id = parse_tileset_id(tileset_id)?;
     let leaf = state
         .resource_resolver
         .load_leaf_bytes(tileset_id.clone(), offset, length)
@@ -98,16 +85,24 @@ pub(crate) async fn internal_leaf_handler(
         );
     }
     let mut response = bytes_response(leaf.value, "application/octet-stream", None);
+    insert_generation_header(&mut response, &leaf.generation.to_wire())?;
+    Ok(response)
+}
+
+fn insert_generation_header(
+    response: &mut Response<Body>,
+    generation: &str,
+) -> Result<(), HttpError> {
     response.headers_mut().insert(
         ARCHIVE_GENERATION_HEADER,
-        HeaderValue::from_str(&leaf.generation.to_wire()).map_err(|_| {
+        HeaderValue::from_str(generation).map_err(|_| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "invalid archive generation".to_string(),
             )
         })?,
     );
-    Ok(response)
+    Ok(())
 }
 
 fn leaf_error_response(error: &LeafBytesError) -> HttpError {

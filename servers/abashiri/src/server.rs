@@ -1,6 +1,6 @@
 //! Management-listener assembly.
 
-use std::{error::Error as _, net::SocketAddr, sync::Arc};
+use std::{error::Error as _, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Context as _;
 use axum::{
@@ -14,7 +14,7 @@ use axum::{
 use http_body_util::LengthLimitError;
 use serde::Serialize;
 use tokio::net::TcpListener;
-use tracing::{error, warn};
+use tracing::{debug, error, info, warn};
 
 use abashiri_core::{
     auth::{ManagementAction, ManagementAuthFailure, ObjectStoreManagementAuth},
@@ -33,11 +33,15 @@ use mmpf_http::request_id::{self, RequestId};
 use mmpf_http::serve::wait_for_shutdown_signal;
 
 use crate::notifier::StyleRefreshNotifier;
+use crate::operations::OperationalStatusClient;
+
+const RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone)]
 struct AppState {
     auth: Option<ObjectStoreManagementAuth>,
     publishing: Option<StylePublishing>,
+    operations: Option<OperationalStatusClient>,
 }
 
 #[derive(Clone)]
@@ -112,6 +116,7 @@ pub(crate) async fn serve(
     http_addr: SocketAddr,
     auth: Option<ObjectStoreManagementAuth>,
     publishing: Option<StylePublishing>,
+    operations: Option<OperationalStatusClient>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(http_addr)
         .await
@@ -121,14 +126,56 @@ pub(crate) async fn serve(
         .context("read management listener address")?;
     tracing::info!(%local_addr, "Abashiri management listener started");
 
-    axum::serve(listener, router(auth, publishing))
-        .with_graceful_shutdown(wait_for_shutdown_signal())
-        .await
-        .context("serve management listener")
+    let reconciler = publishing.clone().map(|publishing| {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(RECONCILIATION_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                match publishing
+                    .publisher
+                    .reconcile_unfinished(&publishing.catalog)
+                    .await
+                {
+                    Ok(report) if report.unfinished_intents() > 0 => {
+                        info!(?report, "reconciled unfinished mutation intents");
+                    }
+                    Ok(report) => {
+                        debug!(?report, "mutation reconciliation scan completed");
+                    }
+                    Err(error) => {
+                        warn!(error = %format_args!("{error:#}"), "mutation reconciliation scan failed");
+                    }
+                }
+            }
+        })
+    });
+    let result = axum::serve(
+        listener,
+        router_with_operations(auth, publishing, operations),
+    )
+    .with_graceful_shutdown(wait_for_shutdown_signal())
+    .await
+    .context("serve management listener");
+    if let Some(reconciler) = reconciler {
+        reconciler.abort();
+        let _ = reconciler.await;
+    }
+    result
 }
 
+#[cfg(test)]
 fn router(auth: Option<ObjectStoreManagementAuth>, publishing: Option<StylePublishing>) -> Router {
+    router_with_operations(auth, publishing, None)
+}
+
+fn router_with_operations(
+    auth: Option<ObjectStoreManagementAuth>,
+    publishing: Option<StylePublishing>,
+    operations: Option<OperationalStatusClient>,
+) -> Router {
     let publication_enabled = publishing.is_some();
+    let operations_enabled = operations.is_some();
     let mut router = Router::new()
         .route("/livez", get(health))
         .route("/readyz", get(health))
@@ -141,7 +188,14 @@ fn router(auth: Option<ObjectStoreManagementAuth>, publishing: Option<StylePubli
             get(get_style).put(publish_style),
         );
     }
-    router.with_state(AppState { auth, publishing })
+    if operations_enabled {
+        router = router.route("/operations/status", get(operations_status));
+    }
+    router.with_state(AppState {
+        auth,
+        publishing,
+        operations,
+    })
 }
 
 async fn health() -> Response {
@@ -205,6 +259,37 @@ async fn whoami(State(state): State<AppState>, headers: HeaderMap) -> Response {
         ),
         Err(failure) => auth_failure_response(failure, &request_id),
     }
+}
+
+async fn operations_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let request_id = inbound_request_id(&headers);
+    let Some(auth) = state.auth else {
+        return mutation_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication_unavailable",
+            "Management authentication is unavailable",
+            &request_id,
+        );
+    };
+    let principal = match auth.authenticate(&headers).await {
+        Ok(principal) => principal,
+        Err(failure) => return auth_failure_response(failure, &request_id),
+    };
+    if let Err(failure) = principal.authorize_action(ManagementAction::OperationsRead) {
+        return auth_failure_response(failure, &request_id);
+    }
+    let Some(operations) = state.operations else {
+        return mutation_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Resource not found",
+            &request_id,
+        );
+    };
+    with_request_id(
+        no_store((StatusCode::OK, Json(operations.overview().await)).into_response()),
+        &request_id,
+    )
 }
 
 struct AuthorizedStyle {
@@ -745,10 +830,15 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::operations::OperationalStatusEndpoint;
 
     const TOKEN: &str = "server-management-token-with-32-bytes";
 
     async fn management_auth() -> ObjectStoreManagementAuth {
+        management_auth_with_actions(vec!["style.read", "style.publish"]).await
+    }
+
+    async fn management_auth_with_actions(actions: Vec<&str>) -> ObjectStoreManagementAuth {
         let store = Arc::new(InMemory::new());
         let registry = json!({
             "schema_version": 1,
@@ -762,7 +852,7 @@ mod tests {
                     "subject": "publisher"
                 },
                 "accounts": ["example"],
-                "actions": ["style.read", "style.publish"]
+                "actions": actions
             }]
         });
         store
@@ -778,6 +868,37 @@ mod tests {
         );
         auth.prime().await.unwrap();
         auth
+    }
+
+    async fn operational_client() -> (OperationalStatusClient, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = crate::test_http::read_http_request(&mut stream).await;
+            let body = r#"{"schema_version":1,"service":"biei","observer_node_id":"biei-1","observed_at_unix_ms":1,"status":{"ready":true}}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let endpoint: OperationalStatusEndpoint = format!(
+            "renderer=http://{address}{}",
+            mmpf_http::operational::INTERNAL_STATUS_PATH
+        )
+        .parse()
+        .unwrap();
+        (
+            OperationalStatusClient::new(vec![endpoint]).unwrap(),
+            request,
+        )
     }
 
     fn style_publisher() -> StylePublisher {
@@ -957,6 +1078,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operational_status_requires_its_global_action_and_hides_endpoint_urls() {
+        let (operations, upstream_request) = operational_client().await;
+        let app = router_with_operations(
+            Some(management_auth_with_actions(vec!["operations.read"]).await),
+            None,
+            Some(operations),
+        );
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::get("/operations/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(
+                Request::get("/operations/status")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .header(request_id::HEADER, "operations-request-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            response.headers()[request_id::HEADER],
+            "operations-request-1"
+        );
+        let body = to_bytes(response.into_body(), 128 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["complete"], true);
+        assert_eq!(body["sources"][0]["source_id"], "renderer");
+        assert_eq!(body["sources"][0]["state"], "fresh");
+        assert!(!body.to_string().contains("127.0.0.1"));
+        assert!(
+            upstream_request
+                .await
+                .unwrap()
+                .starts_with("GET /_internal/operations/v1/status HTTP/1.1\r\n")
+        );
+    }
+
+    #[tokio::test]
     async fn style_route_exists_only_when_publication_is_configured() {
         let auth = management_auth().await;
         let response = router(Some(auth), None)
@@ -1119,10 +1289,11 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn refresh_hint_constraints_apply_only_when_notification_is_configured() {
-        let catalog = StyleCatalog::parse(
-            br#"{
+    #[test]
+    fn publication_catalog_requires_the_canonical_delivery_style_key() {
+        assert!(
+            StyleCatalog::parse(
+                br#"{
                 "schema_version": 1,
                 "styles": [{
                     "account_id": "example",
@@ -1130,28 +1301,9 @@ mod tests {
                     "object_path": "styles/delivery/bad name/style.json"
                 }]
             }"#,
-        )
-        .unwrap();
-        let app = router(
-            Some(management_auth().await),
-            Some(StylePublishing::new(catalog.clone(), style_publisher(), None).unwrap()),
+            )
+            .is_err()
         );
-        let response = app
-            .oneshot(style_request(
-                r#"{"version":8,"sources":{},"layers":[]}"#,
-                "style-without-refresh",
-                header::IF_NONE_MATCH,
-                "*",
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CREATED);
-
-        let notifier = StyleRefreshNotifier::new(vec![
-            Url::parse("http://127.0.0.1:9090/_internal/refresh/style").unwrap(),
-        ])
-        .unwrap();
-        assert!(StylePublishing::new(catalog, style_publisher(), Some(notifier)).is_err());
     }
 
     #[tokio::test]

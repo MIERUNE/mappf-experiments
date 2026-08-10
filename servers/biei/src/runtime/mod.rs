@@ -191,12 +191,8 @@ async fn spawn_cluster_node_with_catalog(
             membership
                 .spawn_style_state_watcher(
                     move |hint| {
-                        // The transport envelope spans every service's identifier
-                        // shape, so Biei still validates the id before resolving it.
-                        let Ok(style_id) = crate::http::path::resolve_style_id_str(&hint.style_id)
-                        else {
-                            return;
-                        };
+                        let style_id = crate::http::path::resolve_style_id_str(&hint.style_id)
+                            .expect("decoded refresh hints validate the shared style key");
                         if refresh_catalog.resolve_latest(&style_id).is_some() {
                             if refresh_catalog
                                 .request_revalidation_for_hint(&style_id, &hint.hint_id)
@@ -219,12 +215,11 @@ async fn spawn_cluster_node_with_catalog(
                         let style_id = observation.style_id.clone();
                         let version = observation.version;
                         if revision_catalog.apply_cluster_observation(&observation) {
-                            if let Ok(style_id) = crate::http::path::resolve_style_id_str(&style_id)
-                            {
-                                revision_node.invalidate_render_output_cache(&style_id);
-                            }
+                            let style_id = crate::http::path::resolve_style_id_str(&style_id)
+                                .expect("accepted observations match a validated pending hint");
+                            revision_node.invalidate_render_output_cache(&style_id);
                             tracing::info!(
-                                style_id,
+                                style_id = %style_id.as_str(),
                                 version,
                                 hint_id = %observation.hint_id,
                                 "adopted renderer-observed style revision from gossip"
@@ -525,7 +520,7 @@ mod tests {
 
         let response = ingress
             .handle_path(
-                "/carto/voyager/static/auto/256x256.png",
+                "/styles/carto/voyager/static/auto/256x256.png",
                 tokio::time::Instant::now(),
             )
             .await;

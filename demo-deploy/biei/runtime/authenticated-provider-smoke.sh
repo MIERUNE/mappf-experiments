@@ -26,6 +26,82 @@ if [[ "$HOST_ALIAS" == "host.docker.internal" ]]; then
   HOST_GATEWAY_ARGS=(--add-host host.docker.internal:host-gateway)
 fi
 
+# Diagnostics for a delivery-auth failure, printed only when the run fails.
+#
+# The render path is Biei -> Ishikari style -> rewritten source URL -> Ishikari
+# tileset. A `403` on the last hop means that request arrived without a
+# credential, because anonymous grants deliberately exclude the fixture
+# namespace. This walks the same hops from the host and shows where the token
+# stops being carried.
+#
+# `Host: ishikari:8080` is sent deliberately: Ishikari derives the absolute URLs
+# it embeds from the effective request origin, so only this Host reproduces the
+# exact strings Biei receives inside the container network.
+dump_delivery_auth_chain() {
+  local style_url="http://127.0.0.1:${ISHIKARI_PUBLIC_PORT}/styles/smoke/auth-style/style.json?access_token=public.broad"
+  local style_body source_url tileset_code
+
+  printf '\nDelivery-auth chain (host view, Host: ishikari:8080):\n'
+  style_body="$(curl -g -sS --max-time 10 -H 'Host: ishikari:8080' "$style_url" 2>&1)" || {
+    printf '  style fetch failed: %s\n' "$style_body"
+    return 0
+  }
+
+  # Show the effective origin, path, and credential state without writing the
+  # bearer value to CI logs.
+  printf '  style sources: '
+  printf '%s' "$style_body" | python3 -c 'import json,sys,urllib.parse
+try:
+    doc = json.load(sys.stdin)
+except Exception as error:
+    print(f"unparseable style JSON: {error}")
+    raise SystemExit(0)
+sources = doc.get("sources", {})
+if not sources:
+    print("no sources in style")
+for name, source in sources.items():
+    url = source.get("url") or source.get("tiles")
+    if not isinstance(url, str):
+        print(f"{name} -> non-scalar source URL")
+        continue
+    parsed = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    tokens = query.get("access_token", [])
+    expected_tokens = ["public.broad"]
+    keys = ",".join(sorted(query)) or "none"
+    print(
+        f"{name} -> {parsed.scheme}://{parsed.netloc}{parsed.path} "
+        f"query_keys={keys} token_present={bool(tokens)} "
+        f"token_matches_expected={tokens == expected_tokens}"
+    )' || true
+
+  source_url="$(printf '%s' "$style_body" | python3 -c 'import json,sys
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(0)
+for source in doc.get("sources", {}).values():
+    url = source.get("url")
+    if url:
+        print(url)
+        break' 2>/dev/null)"
+
+  if [[ -z "$source_url" ]]; then
+    printf '  no source url to probe\n'
+    return 0
+  fi
+
+  # Probe the embedded URL exactly as Biei would, rehosting only the authority
+  # so it is reachable from the host.
+  local probe="${source_url/http:\/\/ishikari:8080/http://127.0.0.1:${ISHIKARI_PUBLIC_PORT}}"
+  tileset_code="$(curl -g -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+    -H 'Host: ishikari:8080' "$probe" 2>/dev/null || echo 000)"
+  printf '  embedded source URL probed -> HTTP %s\n' "$tileset_code"
+  printf '  same URL with token stripped -> HTTP %s  (403 here confirms anonymous is refused)\n' \
+    "$(curl -g -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+      -H 'Host: ishikari:8080' "${probe%%\?*}" 2>/dev/null || echo 000)"
+}
+
 cleanup() {
   local status=$?
   trap - EXIT
@@ -39,6 +115,7 @@ cleanup() {
       printf '\nFixture server log:\n' >&2
       sed -n '1,200p' "$WORK_DIR/fixture-server.log" >&2 || true
     fi
+    dump_delivery_auth_chain >&2 || true
   fi
   if [[ -n "${CONTAINERS[*]-}" ]]; then
     docker rm -f ${CONTAINERS[@]+"${CONTAINERS[@]}"} >/dev/null 2>&1 || true
@@ -264,6 +341,7 @@ docker run -d \
   -e ISKR_ANONYMOUS_REGISTRY=public \
   -e ISKR_TILESET_SOURCES=/fixtures/tilesets \
   -e "ISKR_STYLE_TEMPLATES=smoke=http://${HOST_ALIAS}:${FIXTURE_PORT}/{style_id}.json;carto=http://${HOST_ALIAS}:${FIXTURE_PORT}/{style_id}.json" \
+  -e 'RUST_LOG=info,ishikari::server::auth=debug' \
   "$ISHIKARI_IMAGE" >/dev/null
 
 wait_for_status "http://127.0.0.1:${ISHIKARI_PUBLIC_PORT}/readyz" 200
@@ -292,21 +370,40 @@ docker run -d \
 
 wait_for_status "http://127.0.0.1:${BIEI_PUBLIC_PORT}/readyz" 200
 
-BIEI_BASE="http://127.0.0.1:${BIEI_PUBLIC_PORT}/smoke"
+BIEI_BASE="http://127.0.0.1:${BIEI_PUBLIC_PORT}/styles/smoke"
 ISHIKARI_BASE="http://127.0.0.1:${ISHIKARI_PUBLIC_PORT}"
 BROAD_QUERY="access_token=public.broad"
 WEAK_QUERY="access_token=public.style-only"
 
 expect_status "anonymous public Biei render" \
-  "http://127.0.0.1:${BIEI_PUBLIC_PORT}/carto/blank-style/static/0,0,0/256x256.png" 200
+  "http://127.0.0.1:${BIEI_PUBLIC_PORT}/styles/carto/blank-style/static/0,0,0/256x256.png" 200
 expect_status "anonymous protected Biei render" \
   "${BIEI_BASE}/auth-style/static/0,0,0/256x256.png" 403
 expect_status "invalid token never falls back to anonymous" \
-  "http://127.0.0.1:${BIEI_PUBLIC_PORT}/carto/blank-style/static/0,0,0/256x256.png?access_token=public.wrong" 401
+  "http://127.0.0.1:${BIEI_PUBLIC_PORT}/styles/carto/blank-style/static/0,0,0/256x256.png?access_token=public.wrong" 401
 expect_status "anonymous public Ishikari style" \
   "${ISHIKARI_BASE}/styles/carto/blank-style/style.json" 200
 expect_status "weaker token style access" \
   "${ISHIKARI_BASE}/styles/smoke/auth-style/style.json?${WEAK_QUERY}" 200
+expect_status "broad token direct tileset access" \
+  "${ISHIKARI_BASE}/tilesets/fixture/0/0/0?${BROAD_QUERY}" 200
+
+# Verify the provider rewrite before involving MapLibre. Never print the full
+# URL: it contains the credential this check is intended to trace.
+curl -g -fsS --show-error --max-time 10 \
+  "${ISHIKARI_BASE}/styles/smoke/auth-style/style.json?${BROAD_QUERY}" \
+  | python3 -c '
+import json
+import sys
+import urllib.parse
+
+source_url = json.load(sys.stdin)["sources"]["fixture"]["url"]
+parsed = urllib.parse.urlsplit(source_url)
+tokens = urllib.parse.parse_qs(parsed.query, keep_blank_values=True).get("access_token", [])
+if tokens != ["public.broad"]:
+    raise SystemExit("rewritten source is missing the expected access token")
+print(f"authenticated source rewrite: origin={parsed.scheme}://{parsed.netloc} path={parsed.path}")
+'
 
 curl -g -fsS --show-error --max-time 30 \
   "${BIEI_BASE}/auth-style/static/0,0,0/256x256.png?${BROAD_QUERY}" \

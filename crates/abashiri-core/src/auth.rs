@@ -36,6 +36,8 @@ const CREDENTIAL_DOMAIN: &[u8] = b"abashiri-object-store-credential-v1\0";
 /// Management action granted by an Abashiri authentication registry.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ManagementAction {
+    #[serde(rename = "operations.read")]
+    OperationsRead,
     #[serde(rename = "style.read")]
     StyleRead,
     #[serde(rename = "style.publish")]
@@ -45,6 +47,7 @@ pub enum ManagementAction {
 impl ManagementAction {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::OperationsRead => "operations.read",
             Self::StyleRead => "style.read",
             Self::StylePublish => "style.publish",
         }
@@ -86,8 +89,16 @@ impl AuthenticatedManagement {
             .accounts
             .binary_search_by(|candidate| candidate.as_str().cmp(account.as_str()))
             .is_ok();
-        let action_allowed = self.actions.binary_search(&action).is_ok();
-        if account_allowed && action_allowed {
+        if account_allowed && self.authorize_action(action).is_ok() {
+            Ok(())
+        } else {
+            Err(ManagementAuthFailure::Forbidden)
+        }
+    }
+
+    /// Authorizes an action whose resource is not account-scoped.
+    pub fn authorize_action(&self, action: ManagementAction) -> Result<(), ManagementAuthFailure> {
+        if self.actions.binary_search(&action).is_ok() {
             Ok(())
         } else {
             Err(ManagementAuthFailure::Forbidden)
@@ -351,12 +362,20 @@ impl RegistrySnapshot {
                 "management auth registry contains a duplicate credential digest"
             );
             ensure!(
-                !grant.accounts.is_empty() && grant.accounts.len() <= MAX_ACCOUNTS_PER_CREDENTIAL,
-                "management credential accounts must be non-empty and bounded"
-            );
-            ensure!(
                 !grant.actions.is_empty(),
                 "management credential actions must not be empty"
+            );
+            ensure!(
+                grant.accounts.len() <= MAX_ACCOUNTS_PER_CREDENTIAL,
+                "management credential accounts must be bounded"
+            );
+            let requires_account = grant
+                .actions
+                .iter()
+                .any(|action| !matches!(action, ManagementAction::OperationsRead));
+            ensure!(
+                !requires_account || !grant.accounts.is_empty(),
+                "account-scoped management actions require at least one account"
             );
             ensure!(
                 grant.actor.kind == ActorKind::Workload,
@@ -539,6 +558,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
+            principal.authorize_action(ManagementAction::OperationsRead),
+            Err(ManagementAuthFailure::Forbidden)
+        );
+        assert_eq!(
             principal.authorize(
                 &AccountId::try_new("other").unwrap(),
                 ManagementAction::StylePublish,
@@ -646,6 +669,36 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.to_string().contains("must represent workloads"));
+    }
+
+    #[test]
+    fn global_operations_action_does_not_require_a_fake_account() {
+        let body = json!({
+            "schema_version": 1,
+            "revision": 1,
+            "credentials": [{
+                "credential_sha256": credential_sha256(TOKEN).unwrap(),
+                "enabled": true,
+                "actor": {
+                    "kind": "workload",
+                    "issuer": "test",
+                    "subject": "observer"
+                },
+                "accounts": [],
+                "actions": ["operations.read"]
+            }]
+        });
+        assert!(RegistrySnapshot::parse(&serde_json::to_vec(&body).unwrap()).is_ok());
+
+        let mut account_scoped = body;
+        account_scoped["credentials"][0]["actions"] = json!(["style.read"]);
+        assert!(
+            RegistrySnapshot::parse(&serde_json::to_vec(&account_scoped).unwrap())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("require at least one account")
+        );
     }
 
     #[test]

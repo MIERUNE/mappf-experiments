@@ -10,17 +10,20 @@ use std::{borrow::Cow, sync::Arc};
 
 use anyhow::{Context as _, ensure};
 use bytes::Bytes;
+use futures_util::TryStreamExt as _;
 use object_store::{Attribute, AttributeValue, Attributes, ObjectStore, path::Path as ObjectPath};
 use serde_json::Value;
 use thiserror::Error;
 use url::Url;
 
-use mmpf_http::request_id::RequestId;
+use mmpf_http::{request_id::RequestId, style_key::StyleKey};
 
 use crate::{
+    catalog::StyleCatalog,
     mutation::{
-        AccountId, Actor, Execution, LocalResourceId, MutationAction, MutationJournal,
-        MutationRequest, ResourceKind, ResourceTarget, StateCommit, VersionEvidence, digest_hex,
+        AccountId, Actor, Execution, LocalResourceId, MutationAction, MutationIntent,
+        MutationJournal, MutationRequest, ResourceKind, ResourceTarget, StateCommit,
+        VersionEvidence, digest_hex,
     },
     storage::ConditionalStore,
 };
@@ -44,35 +47,42 @@ pub enum StylePublishConflict {
 
 /// Catalog-resolved object path for one mutable style document.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StyleObjectPath(ObjectPath);
+pub struct StyleObjectPath {
+    path: ObjectPath,
+    delivery_style_id: String,
+}
 
 impl StyleObjectPath {
     pub fn try_new(relative: &str) -> anyhow::Result<Self> {
         let path = ObjectPath::parse(relative).context("parse style object path")?;
-        ensure!(
-            path.as_ref().starts_with("styles/") && path.as_ref().ends_with("/style.json"),
-            "style object path must match styles/.../style.json"
-        );
-        ensure!(
-            path.parts().count() >= 3,
-            "style object path must contain a style id"
-        );
-        Ok(Self(path))
+        let style_path = path
+            .as_ref()
+            .strip_prefix("styles/")
+            .context("style object path must be under styles/")?;
+        let delivery_style_id = style_path
+            .strip_suffix("/style.json")
+            .or_else(|| style_path.strip_suffix(".json"))
+            .context(
+                "style object path must match styles/{namespace}/{style_id}/style.json or styles/{namespace}/{style_id}.json",
+            )?;
+        StyleKey::parse(delivery_style_id)
+            .context("style object path must contain a canonical style key")?;
+        let delivery_style_id = delivery_style_id.to_owned();
+        Ok(Self {
+            path,
+            delivery_style_id,
+        })
     }
 
     /// Logical delivery style ID addressed by Biei and Ishikari refresh hints.
     pub fn delivery_style_id(&self) -> &str {
-        self.0
-            .as_ref()
-            .strip_prefix("styles/")
-            .and_then(|path| path.strip_suffix("/style.json"))
-            .expect("validated style object path has the required envelope")
+        &self.delivery_style_id
     }
 }
 
 impl AsRef<str> for StyleObjectPath {
     fn as_ref(&self) -> &str {
-        self.0.as_ref()
+        self.path.as_ref()
     }
 }
 
@@ -166,6 +176,35 @@ pub struct StylePublisher {
     state: ConditionalStore,
 }
 
+/// Result of one sequential reconciliation scan over the durable journal.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StyleReconciliationReport {
+    scanned_intents: usize,
+    unfinished_intents: usize,
+    completed: usize,
+    already_completed: usize,
+    not_committed: usize,
+    superseded: usize,
+    unsupported: usize,
+    missing_catalog_entry: usize,
+}
+
+impl StyleReconciliationReport {
+    pub fn unfinished_intents(&self) -> usize {
+        self.unfinished_intents
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StyleReconciliationOutcome {
+    Completed,
+    AlreadyCompleted,
+    NotCommitted,
+    Superseded,
+    Unsupported,
+    MissingCatalogEntry,
+}
+
 impl StylePublisher {
     /// Configures independently authorized roots for public state and private audit data.
     pub fn from_urls<I, K, V>(
@@ -243,7 +282,8 @@ impl StylePublisher {
             request.target,
             &input_identity,
             request.request_id,
-        )?;
+        )?
+        .with_state_locator(request.location.as_ref())?;
         let location = request.location;
         let precondition = request.precondition;
         let body = request.body;
@@ -264,6 +304,86 @@ impl StylePublisher {
                 }
             })
             .await
+    }
+
+    /// Completes journal records for style state that already durably names an intent.
+    ///
+    /// The scan never replays a state mutation. An absent object, a catalog miss,
+    /// or state naming a newer intent is retained as an unfinished audit attempt.
+    pub async fn reconcile_unfinished(
+        &self,
+        catalog: &StyleCatalog,
+    ) -> anyhow::Result<StyleReconciliationReport> {
+        let mut report = StyleReconciliationReport::default();
+        let mut locations = self.journal.intent_locations()?;
+        while let Some(meta) = locations
+            .try_next()
+            .await
+            .context("list mutation journal intents")?
+        {
+            report.scanned_intents += 1;
+            let Some(intent) = self.journal.unfinished_intent(&meta.location).await? else {
+                continue;
+            };
+            report.unfinished_intents += 1;
+            match self.reconcile_style_intent(catalog, &intent).await? {
+                StyleReconciliationOutcome::Completed => report.completed += 1,
+                StyleReconciliationOutcome::AlreadyCompleted => report.already_completed += 1,
+                StyleReconciliationOutcome::NotCommitted => report.not_committed += 1,
+                StyleReconciliationOutcome::Superseded => report.superseded += 1,
+                StyleReconciliationOutcome::Unsupported => report.unsupported += 1,
+                StyleReconciliationOutcome::MissingCatalogEntry => {
+                    report.missing_catalog_entry += 1;
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    async fn reconcile_style_intent(
+        &self,
+        catalog: &StyleCatalog,
+        intent: &MutationIntent,
+    ) -> anyhow::Result<StyleReconciliationOutcome> {
+        if intent.action() != MutationAction::Publish
+            || intent.target().kind() != ResourceKind::Style
+        {
+            return Ok(StyleReconciliationOutcome::Unsupported);
+        }
+        let persisted_location = intent
+            .state_locator()
+            .map(StyleObjectPath::try_new)
+            .transpose()
+            .context("decode reconciled style state locator")?;
+        let location = match persisted_location
+            .as_ref()
+            .or_else(|| catalog.resolve(intent.target().account_id(), intent.target().local_id()))
+        {
+            Some(location) => location,
+            None => return Ok(StyleReconciliationOutcome::MissingCatalogEntry),
+        };
+        let Some(current) = self
+            .read_state_object(location, "style state during reconciliation")
+            .await?
+        else {
+            return Ok(StyleReconciliationOutcome::NotCommitted);
+        };
+        if !current
+            .attributes
+            .get(&mutation_attribute())
+            .is_some_and(|value| value.as_ref() == intent.state_reference())
+        {
+            return Ok(StyleReconciliationOutcome::Superseded);
+        }
+        let version = VersionEvidence::from_meta(&current.meta)
+            .context("read style version during reconciliation")?;
+        let (committed, _) = style_commit_from_current(current, location, version).await?;
+        Ok(
+            match self.journal.complete_intent(intent, committed).await? {
+                Execution::Committed(_) => StyleReconciliationOutcome::Completed,
+                Execution::AlreadyCompleted(_) => StyleReconciliationOutcome::AlreadyCompleted,
+            },
+        )
     }
 
     async fn commit_style(
@@ -399,6 +519,20 @@ async fn existing_style_commit(
     content_sha256: &str,
     version: VersionEvidence,
 ) -> anyhow::Result<StateCommit<PublishedStyle>> {
+    let (committed, observed_sha256) =
+        style_commit_from_current(current, location, version).await?;
+    ensure!(
+        observed_sha256 == content_sha256,
+        "style object for this mutation contains different content"
+    );
+    Ok(committed)
+}
+
+async fn style_commit_from_current(
+    current: object_store::GetResult,
+    location: &StyleObjectPath,
+    version: VersionEvidence,
+) -> anyhow::Result<(StateCommit<PublishedStyle>, String)> {
     ensure!(
         current
             .attributes
@@ -410,19 +544,18 @@ async fn existing_style_commit(
                 .is_some_and(|value| value.as_ref() == STYLE_CACHE_CONTROL),
         "style object for this mutation has invalid response attributes"
     );
+    ensure!(
+        current.meta.size <= MAX_STYLE_BYTES as u64,
+        "style object for this mutation is too large"
+    );
     let current_body = current
         .bytes()
         .await
         .context("collect current style object")?;
-    ensure!(
-        digest_hex(STYLE_DIGEST_DOMAIN, &current_body) == content_sha256,
-        "style object for this mutation contains different content"
-    );
-    Ok(style_commit(
-        location.clone(),
-        content_sha256.to_string(),
-        version,
-    ))
+    validate_style(&current_body).context("style object for this mutation is invalid")?;
+    let content_sha256 = digest_hex(STYLE_DIGEST_DOMAIN, &current_body);
+    let committed = style_commit(location.clone(), content_sha256.clone(), version);
+    Ok((committed, content_sha256))
 }
 
 fn style_commit_from_put(
@@ -546,6 +679,13 @@ mod tests {
         Actor::try_new(ActorKind::Workload, "test", "publisher").unwrap()
     }
 
+    fn catalog() -> StyleCatalog {
+        StyleCatalog::parse(
+            br#"{"schema_version":1,"styles":[{"account_id":"example","style_id":"basic","object_path":"styles/demo/basic/style.json"}]}"#,
+        )
+        .unwrap()
+    }
+
     fn request(
         key: &str,
         precondition: StylePrecondition,
@@ -573,6 +713,7 @@ mod tests {
             &style_input_identity(&request.location, &request.precondition, &request.body),
             request.request_id.clone(),
         )
+        .and_then(|mutation| mutation.with_state_locator(request.location.as_ref()))
         .unwrap()
     }
 
@@ -951,6 +1092,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconciliation_completes_state_committed_without_a_journal_completion() {
+        let publisher = publisher();
+        let initial = request(
+            "style-background-recovery",
+            StylePrecondition::MustNotExist,
+            br#"{"version":8,"name":"recover","sources":{},"layers":[]}"#,
+        );
+        let mutation = mutation_for(&initial);
+        let location = initial.location.clone();
+        let precondition = initial.precondition.clone();
+        let body = initial.body.clone();
+        let content_sha256 = initial.content_sha256.clone();
+        let publisher_ref = &publisher;
+        let interrupted: anyhow::Result<Execution<PublishedStyle>> = publisher
+            .journal
+            .execute(mutation, |intent| {
+                let mutation_reference = intent.state_reference().to_string();
+                async move {
+                    publisher_ref
+                        .commit_style(
+                            &mutation_reference,
+                            &location,
+                            &precondition,
+                            body,
+                            &content_sha256,
+                        )
+                        .await?;
+                    anyhow::bail!("simulated completion interruption")
+                }
+            })
+            .await;
+        assert!(interrupted.is_err());
+
+        // Recovery follows the path persisted with the intent, not a later
+        // catalog snapshot that may have removed or remapped this style.
+        let report = publisher
+            .reconcile_unfinished(&StyleCatalog::default())
+            .await
+            .unwrap();
+        assert_eq!(report.unfinished_intents, 1);
+        assert_eq!(report.completed, 1);
+        assert_eq!(
+            publisher
+                .reconcile_unfinished(&StyleCatalog::default())
+                .await
+                .unwrap()
+                .unfinished_intents,
+            0
+        );
+
+        let retry = publisher
+            .publish(request(
+                "style-background-recovery",
+                StylePrecondition::MustNotExist,
+                br#"{"version":8,"name":"recover","sources":{},"layers":[]}"#,
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(retry, Execution::AlreadyCompleted(_)));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_never_replays_state_that_was_not_committed() {
+        let publisher = publisher();
+        let initial = request(
+            "style-no-state",
+            StylePrecondition::MustNotExist,
+            br#"{"version":8,"name":"later","sources":{},"layers":[]}"#,
+        );
+        let mutation = mutation_for(&initial);
+        let interrupted: anyhow::Result<Execution<PublishedStyle>> = publisher
+            .journal
+            .execute(mutation, |_| async {
+                anyhow::bail!("simulated failure before state")
+            })
+            .await;
+        assert!(interrupted.is_err());
+
+        let report = publisher.reconcile_unfinished(&catalog()).await.unwrap();
+        assert_eq!(report.unfinished_intents, 1);
+        assert_eq!(report.not_committed, 1);
+        assert!(
+            publisher
+                .get(&StyleObjectPath::try_new("styles/demo/basic/style.json").unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let retry = publisher
+            .publish(request(
+                "style-no-state",
+                StylePrecondition::MustNotExist,
+                br#"{"version":8,"name":"later","sources":{},"layers":[]}"#,
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(retry, Execution::Committed(_)));
+    }
+
+    #[tokio::test]
     async fn incomplete_retry_does_not_overwrite_a_newer_mutation() {
         let publisher = publisher();
         let old_body = br#"{"version":8,"name":"old","sources":{},"layers":[]}"#;
@@ -1002,6 +1244,11 @@ mod tests {
             .await
             .unwrap();
 
+        let report = publisher.reconcile_unfinished(&catalog()).await.unwrap();
+        assert_eq!(report.unfinished_intents, 1);
+        assert_eq!(report.superseded, 1);
+        assert_eq!(report.completed, 0);
+
         let error = publisher
             .publish(request(
                 "style-incomplete",
@@ -1038,7 +1285,7 @@ mod tests {
                     actor(),
                     AccountId::try_new("example").unwrap(),
                     LocalResourceId::try_new("basic").unwrap(),
-                    StyleObjectPath::try_new("styles/basic/style.json").unwrap(),
+                    StyleObjectPath::try_new("styles/default/basic/style.json").unwrap(),
                     StylePrecondition::MustNotExist,
                     body,
                     RequestId::new_random(),
@@ -1054,7 +1301,7 @@ mod tests {
                 actor(),
                 AccountId::try_new("example").unwrap(),
                 LocalResourceId::try_new("basic").unwrap(),
-                StyleObjectPath::try_new("styles/basic/style.json").unwrap(),
+                StyleObjectPath::try_new("styles/default/basic/style.json").unwrap(),
                 StylePrecondition::MustNotExist,
                 oversized,
                 RequestId::new_random(),
@@ -1065,13 +1312,21 @@ mod tests {
 
     #[test]
     fn style_object_path_stays_under_style_documents() {
-        let path = StyleObjectPath::try_new("styles/demo/basic/style.json").unwrap();
-        assert_eq!(path.delivery_style_id(), "demo/basic");
+        for (object_path, expected_id) in [
+            ("styles/demo/basic/style.json", "demo/basic"),
+            ("styles/demo/basic.json", "demo/basic"),
+        ] {
+            let path = StyleObjectPath::try_new(object_path).unwrap();
+            assert_eq!(path.as_ref(), object_path);
+            assert_eq!(path.delivery_style_id(), expected_id);
+        }
         for invalid in [
             "basic/style.json",
             "styles/style.json",
-            "styles/basic/sprite.json",
-            "../styles/basic/style.json",
+            "styles/basic/sprite.png",
+            "styles/demo/team/basic/style.json",
+            "styles/demo/team/basic.json",
+            "../styles/default/basic/style.json",
         ] {
             assert!(StyleObjectPath::try_new(invalid).is_err(), "{invalid}");
         }

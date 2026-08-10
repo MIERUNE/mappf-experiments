@@ -188,19 +188,19 @@ Dynamic dispatch remains intentional. These traits are used as `dyn` objects, so
 
 ### 7.1 Routes
 
-The public API supports namespaced style identifiers and both static-image and tile requests. Render routes accept a variable-length style path. Classification is suffix-aware and validates a possible `z/x/y` tile suffix, rather than treating an arbitrary segment named `static` as sufficient evidence of a static route.
+The public API uses one canonical style identity, `{namespace}/{style_id}`. Both parts are bounded slash-free segments; a style in the default namespace is written explicitly as `default/{style_id}`. The fixed identity makes the resource kind an unambiguous third segment.
 
 Representative shapes:
 
 ```text
-/{namespace}/{style_id}/preview
-/{style_path...}/static/[{overlay}/]{position}/{width}x{height}{@2x}[.{format}]
-/{style_path...}/{z}/{x}/{y}{@2x}[.{format}]
+/styles/{namespace}/{style_id}/preview
+/styles/{namespace}/{style_id}/static/[{overlay}/]{position}/{width}x{height}{@2x}[.{format}]
+/styles/{namespace}/{style_id}/tiles/{z}/{x}/{y}{@2x}[.{format}]
 ```
 
 The format suffix may be omitted. PNG, WebP, and JPEG are supported according to the current parser and encoder implementation. Static-only query parameters must not be parsed on the tile route.
 
-A tile path must carry at least one segment for the style id in addition to `{z}/{x}/{y}`, and an empty style id is unrepresentable rather than merely unreachable. A path too short to hold both is refused by naming the shape it should have had, not by whichever coordinate happened to fail parsing first.
+Single-segment and deeper style identities are rejected at the public boundary. This keeps Biei, Ishikari, Abashiri publication paths, refresh hints, authorization namespaces, and edge dispatch on one grammar.
 
 `GET` and `HEAD` are both served on every public route; other methods are refused. `HEAD` runs the identical pipeline and drops only the body, so content type and length, cache policy, and request id describe the `GET` it stands in for. This costs a full render, so a health check belongs on `/livez` rather than on a render URL.
 
@@ -250,7 +250,7 @@ Direct HTTP(S) URLs are rejected. The tileset catalog resolves the id to a TileJ
 | Limit                           | Value / rule                 |
 | ------------------------------- | ---------------------------- |
 | public URI path and query       | 8192 bytes                   |
-| style id                        | 512 bytes                    |
+| style namespace / local id     | 64 / 128 bytes               |
 | static width                    | 1920 logical pixels          |
 | static height                   | 1280 logical pixels          |
 | scale                           | 1x or 2x                     |
@@ -500,7 +500,10 @@ Cluster mode uses separate public and internal listeners:
 | internal | `/_internal/healthz` | same liveness decision as `/livez` |
 | internal | `/_internal/readyz` | same readiness decision as `/readyz` |
 | internal | `/_internal/metrics` | Prometheus text exposition |
+| internal | `/_internal/operations/v1/status` | bounded versioned JSON snapshot of renderer and projected membership state |
 | internal | `/_internal/forward` | peer forwarding inside the network trust boundary |
+
+The status snapshot identifies the observing node and observation time, reports renderer slots and aggregated worker state, and marks incomplete or truncated membership projections explicitly. It never includes style identities, provider URLs, advertised addresses, or raw gossip key-values. It is an optional integration interface; Biei does not discover or depend on its consumers.
 
 `external_degraded` remains ready/live so the endpoint stays eligible for the cache-hit and healthy-peer-routing paths, while local native render admission requires an available slot (per-slot, not whole-pod `full`). The output-cache lookup must therefore precede that admission gate. An `internal_unrecoverable` renderer fails both probes. Health reachability and permission to create native work are deliberately separate predicates. Gossip also publishes the latter predicate so healthy entry nodes stop selecting a degraded peer after the bounded publish/view-cache convergence delay; a stale selection is still safe because the destination rechecks admission and returns a retryable capacity rejection on a cache miss.
 
@@ -584,6 +587,7 @@ End-to-end request latency already includes queueing and must not be interpreted
 
 ### Operator-facing settings
 
+- optional versioned TOML configuration through `--config` / `BIEI_CONFIG`; explicit flags and environment variables win, unknown fields fail startup, and the current document intentionally covers only settings without built-in defaults;
 - public bind address and internal listener port;
 - internal advertised address and gossip bind address;
 - explicit `--cluster` intent and gossip seeds;
@@ -602,6 +606,8 @@ End-to-end request latency already includes queueing and must not be interpreted
 Hidden `--debug-renderer-slots`, `--debug-render-permits`, `--debug-native-render-permits`, and `--mln-regular-permits` overrides exist for experiments. Drain grace, HTTP shutdown grace, retry policy, and the low-priority FileSource lane are code-owned constants. A hidden `--disable-mln-file-sources` escape hatch exists for comparison and recovery, not as a normal deployment mode.
 
 In cluster mode, wildcard advertise addresses are invalid. A seed node is represented by `--cluster` with an empty seed list, not by inferring cluster intent from unrelated options.
+
+With the optional `unstable-schemas` build feature, `biei gen-schemas config` derives a JSON Schema from the parsed TOML type. Schema generation is a build/CI tool and is not linked into the ordinary served binary. The configuration document remains a partial interface; the completion trigger and exclusions are tracked in [`../issues/refactor.md`](../issues/refactor.md) item 115.
 
 ### Internal constants
 

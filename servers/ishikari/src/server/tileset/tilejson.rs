@@ -20,7 +20,7 @@ use ishikari_core::{
     storage::TilesetInfo,
 };
 
-use super::error::tileset_error_response;
+use super::{error::tileset_error_response, parse_tileset_id};
 
 #[derive(Deserialize)]
 pub(crate) struct TileJsonQuery {
@@ -142,8 +142,7 @@ async fn serve_tilejson(
     query: TileJsonQuery,
     token: Option<PropagatedAccessToken>,
 ) -> Result<Response, HttpError> {
-    let tileset_id = TilesetId::try_from(tileset_id)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let tileset_id = parse_tileset_id(tileset_id)?;
     let base_url = get_origin(&headers);
     let data = state
         .resource_resolver

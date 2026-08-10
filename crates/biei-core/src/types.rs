@@ -256,9 +256,10 @@ impl From<String> for NodeId {
     }
 }
 
-/// Cluster-wide stable style identifier(version 無視)。static image URL の
-/// `{username}/{style_id}` 部分。HRW input / metrics label / wire 上の
-/// style identity はすべてこの型。
+/// Cluster-wide stable `namespace/style_id` identity (ignoring version).
+///
+/// HTTP and management boundaries validate the two slash-free segments before
+/// constructing this wire-level representation.
 #[derive(Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
 pub struct StyleId(pub String);
 
@@ -271,14 +272,16 @@ impl StyleId {
         self.0.as_bytes()
     }
 
-    /// The authorization namespace: the first `/`-separated segment.
-    ///
-    /// Biei style ids are arbitrary-depth (`{namespace}/…/{id}`), so the coarsest
-    /// scope a future authorizer can grant is the leading segment; finer scopes
-    /// are longer prefixes of [`as_str`](Self::as_str). Returns the whole id when
-    /// it has no `/`. See `specs/auth-sketch.md` §8.3.
+    /// The authorization namespace from the canonical external identity.
     pub fn namespace(&self) -> &str {
         self.0.split_once('/').map_or(self.0.as_str(), |(ns, _)| ns)
+    }
+
+    /// The namespace-local style id from the canonical external identity.
+    pub fn local_id(&self) -> &str {
+        self.0
+            .split_once('/')
+            .map_or(self.0.as_str(), |(_, local_id)| local_id)
     }
 }
 

@@ -7,8 +7,10 @@
 use biei_core::gossip::GossipBus;
 use biei_core::metrics::NodeMetrics;
 use mmpf_common::metrics::{counter_vec, encode_metric_families, gauge_vec, register_collectors};
+use mmpf_http::operational::{MAX_OPERATIONAL_MEMBERS, OperationalSnapshot};
 use prometheus::core::Collector;
 use prometheus::{IntCounterVec, Registry, proto::MetricFamily};
+use serde::Serialize;
 
 struct WorkerGaugeSample {
     worker: String,
@@ -32,6 +34,42 @@ struct RuntimeGauges {
     renderer_replacements_succeeded: u64,
     renderer_replacements_exhausted: u64,
     renderer_replacements_failed: u64,
+}
+
+#[derive(Serialize)]
+pub(crate) struct BieiOperationalStatus {
+    mode: &'static str,
+    draining: bool,
+    native_render_permits_inuse: usize,
+    renderer: BieiRendererStatus,
+    membership: BieiMembershipStatus,
+}
+
+#[derive(Serialize)]
+struct BieiRendererStatus {
+    health: &'static str,
+    total_slots: usize,
+    available_slots: usize,
+    orphaned_threads: usize,
+}
+
+#[derive(Serialize)]
+struct BieiMembershipStatus {
+    live_members: usize,
+    observed_states: usize,
+    complete: bool,
+    members_truncated: bool,
+    members: Vec<BieiMemberStatus>,
+}
+
+#[derive(Serialize)]
+struct BieiMemberStatus {
+    node_id: String,
+    state_observed: bool,
+    accepts_new_renders: bool,
+    workers: usize,
+    loaded_workers: usize,
+    queued_tasks: usize,
 }
 
 #[derive(Clone)]
@@ -94,15 +132,120 @@ impl HttpMetrics {
     /// The vocabulary is fixed and mutually exclusive — exactly one call per
     /// request, so the labels sum to the hints received: `rejected` (envelope
     /// validation), `disabled` (no ingress), `suppressed` (duplicate inside the
-    /// dedup window), `rejected_style_id` (accepted by the shared envelope but
-    /// refused by Biei's stricter id rules), `unknown_style`, `publish_failed`
-    /// (applied locally, gossip publish failed), `accepted`.
+    /// dedup window), `unknown_style`, `publish_failed` (applied locally, gossip
+    /// publish failed), `accepted`.
     ///
     /// Fence-capacity exhaustion is deliberately not a label here: it is a
     /// degradation of an `accepted` hint rather than an outcome of its own, and
     /// it already emits `warn!`, which production logging retains.
     pub(crate) fn record_style_refresh_hint(&self, outcome: &'static str) {
         self.style_refresh_hints.with_label_values(&[outcome]).inc();
+    }
+
+    /// Returns a bounded service-owned status payload for optional management
+    /// consumers. Style identities and raw gossip key-values stay out of this
+    /// contract; Prometheus remains the interface for historical measurements.
+    pub(crate) async fn operational_snapshot(&self) -> OperationalSnapshot<BieiOperationalStatus> {
+        let observer_node_id = self.node.id().as_str().to_string();
+        let renderer = self.renderer_supervisor.snapshot();
+        let (mode, membership) = match &self.membership {
+            Some(membership) => {
+                let view = membership.view().await;
+                let live_members = view.members.len();
+                let observed_states = view
+                    .members
+                    .iter()
+                    .filter(|node_id| {
+                        view.states
+                            .get(node_id)
+                            .is_some_and(|state| !state.workers.is_empty())
+                    })
+                    .count();
+                let mut members = view
+                    .members
+                    .iter()
+                    .map(|node_id| match view.states.get(node_id) {
+                        Some(state) => BieiMemberStatus {
+                            node_id: node_id.as_str().to_string(),
+                            state_observed: !state.workers.is_empty(),
+                            accepts_new_renders: state.accepts_new_renders,
+                            workers: state.workers.len(),
+                            loaded_workers: state
+                                .workers
+                                .iter()
+                                .filter(|worker| worker.loaded_profile.is_some())
+                                .count(),
+                            queued_tasks: state.workers.iter().fold(0, |queued, worker| {
+                                queued.saturating_add(worker.queue_depth)
+                            }),
+                        },
+                        None => BieiMemberStatus {
+                            node_id: node_id.as_str().to_string(),
+                            state_observed: false,
+                            accepts_new_renders: false,
+                            workers: 0,
+                            loaded_workers: 0,
+                            queued_tasks: 0,
+                        },
+                    })
+                    .collect::<Vec<_>>();
+                members.sort_unstable_by(|left, right| left.node_id.cmp(&right.node_id));
+                members.truncate(MAX_OPERATIONAL_MEMBERS);
+                (
+                    "clustered",
+                    BieiMembershipStatus {
+                        live_members,
+                        observed_states,
+                        complete: observed_states == live_members,
+                        members_truncated: live_members > members.len(),
+                        members,
+                    },
+                )
+            }
+            None => {
+                let workers = self.node.worker_snapshot();
+                let member = BieiMemberStatus {
+                    node_id: observer_node_id.clone(),
+                    state_observed: true,
+                    accepts_new_renders: self.renderer_supervisor.can_start_render(),
+                    workers: workers.len(),
+                    loaded_workers: workers
+                        .iter()
+                        .filter(|worker| worker.loaded_profile.is_some())
+                        .count(),
+                    queued_tasks: workers.iter().fold(0, |queued, worker| {
+                        queued.saturating_add(worker.queue_depth)
+                    }),
+                };
+                (
+                    "standalone",
+                    BieiMembershipStatus {
+                        live_members: 1,
+                        observed_states: 1,
+                        complete: true,
+                        members_truncated: false,
+                        members: vec![member],
+                    },
+                )
+            }
+        };
+
+        OperationalSnapshot::observed_now(
+            "biei",
+            observer_node_id,
+            BieiOperationalStatus {
+                mode,
+                draining: self.drain.as_ref().is_some_and(|drain| drain.is_draining()),
+                native_render_permits_inuse: self.node.native_render_permits_inuse(),
+                renderer: BieiRendererStatus {
+                    health: renderer.health.as_str(),
+                    total_slots: renderer.total_slots,
+                    available_slots: renderer.available_slots,
+                    orphaned_threads: renderer.orphaned_threads,
+                },
+                membership,
+            },
+        )
     }
 
     pub(crate) async fn render_prometheus(&self) -> String {
@@ -170,6 +313,7 @@ pub(crate) enum RequestEndpoint {
     Health,
     Ready,
     Metrics,
+    Status,
     InternalForward,
     StyleRefresh,
     Render,
@@ -182,6 +326,7 @@ impl RequestEndpoint {
             RequestEndpoint::Health => "health",
             RequestEndpoint::Ready => "ready",
             RequestEndpoint::Metrics => "metrics",
+            RequestEndpoint::Status => "status",
             RequestEndpoint::InternalForward => "internal_forward",
             RequestEndpoint::StyleRefresh => "style_refresh",
             RequestEndpoint::Render => "render",

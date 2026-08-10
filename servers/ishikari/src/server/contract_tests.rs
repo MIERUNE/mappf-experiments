@@ -157,7 +157,7 @@ async fn spawn_upstream() -> (
     let glyph_component_requests = Arc::new(AtomicUsize::new(0));
     let router = Router::new()
         .route(
-            "/styles/base/style.json",
+            "/styles/base/style/style.json",
             get(|| async {
                 let mut headers = HeaderMap::new();
                 headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
@@ -183,7 +183,7 @@ async fn spawn_upstream() -> (
             }),
         )
         .route(
-            "/styles/revalidated/style.json",
+            "/styles/revalidated/style/style.json",
             get({
                 let requests = Arc::clone(&revalidated_requests);
                 move |headers: HeaderMap| {
@@ -236,7 +236,7 @@ async fn spawn_upstream() -> (
             }),
         )
         .route(
-            "/styles/uncached/style.json",
+            "/styles/uncached/style/style.json",
             get({
                 let requests = Arc::clone(&uncached_requests);
                 move || {
@@ -256,7 +256,7 @@ async fn spawn_upstream() -> (
             }),
         )
         .route(
-            "/styles/invalid/style.json",
+            "/styles/invalid/style/style.json",
             get({
                 let requests = Arc::clone(&invalid_requests);
                 move || {
@@ -279,7 +279,7 @@ async fn spawn_upstream() -> (
             // TTL but no `Cache-Control`: it must still be cached under the
             // default policy (age is charged only against explicit upstream
             // freshness), so a second request is served without a re-fetch.
-            "/styles/aged/style.json",
+            "/styles/aged/style/style.json",
             get({
                 let requests = Arc::clone(&aged_requests);
                 move || {
@@ -298,11 +298,11 @@ async fn spawn_upstream() -> (
             }),
         )
         .route(
-            "/styles/base/sprite.json",
+            "/styles/base/style/sprite.json",
             get(|| async { ([(header::CONTENT_TYPE, "application/json")], "{}") }),
         )
         .route(
-            "/styles/base/sprite.png",
+            "/styles/base/style/sprite.png",
             get(|| async {
                 (
                     [(header::CONTENT_TYPE, "image/png")],
@@ -311,11 +311,11 @@ async fn spawn_upstream() -> (
             }),
         )
         .route(
-            "/styles/origin-style/style.json",
+            "/styles/origin-style/style/style.json",
             get(|| async { StatusCode::NOT_FOUND }),
         )
         .route(
-            "/styles/origin-sprite/sprite.png",
+            "/styles/origin-sprite/style/sprite.png",
             get(|| async { StatusCode::GONE }),
         )
         .route(
@@ -323,7 +323,7 @@ async fn spawn_upstream() -> (
             get(|| async { StatusCode::NOT_FOUND }),
         )
         .route(
-            "/styles/{fallback}/style.json",
+            "/styles/{fallback}/style/style.json",
             get({
                 let requests = Arc::clone(&fallback_requests);
                 move || {
@@ -499,7 +499,7 @@ impl Harness {
 #[tokio::test]
 async fn style_refresh_is_internal_bounded_and_validated() {
     let harness = harness("style-refresh-contract").await;
-    let valid = r#"{"schema_version":1,"hint_id":"mutation-42","style_id":"base"}"#;
+    let valid = r#"{"schema_version":1,"hint_id":"mutation-42","style_id":"base/style"}"#;
 
     assert_eq!(
         harness
@@ -567,7 +567,7 @@ impl PeerDirectory for StaticPeerDirectory {
 async fn spawn_provider_peer() -> SocketAddr {
     let router = Router::new()
         .route(
-            "/_internal/provider/styles/marked-404/style.json",
+            "/_internal/provider/styles/marked-404/style/style.json",
             get(|| async {
                 (
                     StatusCode::NOT_FOUND,
@@ -580,7 +580,7 @@ async fn spawn_provider_peer() -> SocketAddr {
             }),
         )
         .route(
-            "/_internal/provider/styles/marked-410/style.json",
+            "/_internal/provider/styles/marked-410/style/style.json",
             get(|| async {
                 (
                     StatusCode::GONE,
@@ -593,15 +593,15 @@ async fn spawn_provider_peer() -> SocketAddr {
             }),
         )
         .route(
-            "/_internal/provider/styles/unmarked-404/style.json",
+            "/_internal/provider/styles/unmarked-404/style/style.json",
             get(|| async { StatusCode::NOT_FOUND }),
         )
         .route(
-            "/_internal/provider/styles/unmarked-410/style.json",
+            "/_internal/provider/styles/unmarked-410/style/style.json",
             get(|| async { StatusCode::GONE }),
         )
         .route(
-            "/_internal/provider/styles/mismatched-404/style.json",
+            "/_internal/provider/styles/mismatched-404/style/style.json",
             get(|| async {
                 (
                     StatusCode::NOT_FOUND,
@@ -614,7 +614,7 @@ async fn spawn_provider_peer() -> SocketAddr {
             }),
         )
         .route(
-            "/_internal/provider/styles/mismatched-410/style.json",
+            "/_internal/provider/styles/mismatched-410/style/style.json",
             get(|| async {
                 (
                     StatusCode::GONE,
@@ -627,7 +627,7 @@ async fn spawn_provider_peer() -> SocketAddr {
             }),
         )
         .route(
-            "/_internal/provider/styles/unknown-marker/style.json",
+            "/_internal/provider/styles/unknown-marker/style/style.json",
             get(|| async {
                 (
                     StatusCode::NOT_FOUND,
@@ -637,7 +637,7 @@ async fn spawn_provider_peer() -> SocketAddr {
             }),
         )
         .route(
-            "/_internal/provider/styles/remote-retry/style.json",
+            "/_internal/provider/styles/remote-retry/style/style.json",
             get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
         );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -755,7 +755,7 @@ async fn harness_config(
 
     // Membership still backs operational state. Provider-route contract tests
     // can inject a fixed remote owner into the resolver independently.
-    let (membership, membership_owner) = Membership::spawn(MembershipConfig {
+    let (membership, membership_owner) = Membership::spawn_cluster(MembershipConfig {
         node_id: "contract-node".to_string(),
         gossip_endpoint: mmpf_cluster::GossipEndpoint::standalone(
             "127.0.0.1:0".parse().expect("addr"),
@@ -861,8 +861,8 @@ async fn remote_provider_negatives_require_an_exact_private_marker() {
     let harness = harness_with_provider_peer("provider-negative", Some(provider_peer)).await;
 
     for (path, expected_status) in [
-        ("/styles/marked-404/style.json", StatusCode::NOT_FOUND),
-        ("/styles/marked-410/style.json", StatusCode::GONE),
+        ("/styles/marked-404/style/style.json", StatusCode::NOT_FOUND),
+        ("/styles/marked-410/style/style.json", StatusCode::GONE),
     ] {
         let (status, _, _) = harness.get(&harness.public, path).await;
         assert_eq!(status, expected_status, "path: {path}");
@@ -874,11 +874,11 @@ async fn remote_provider_negatives_require_an_exact_private_marker() {
     }
 
     for path in [
-        "/styles/unmarked-404/style.json",
-        "/styles/unmarked-410/style.json",
-        "/styles/mismatched-404/style.json",
-        "/styles/mismatched-410/style.json",
-        "/styles/unknown-marker/style.json",
+        "/styles/unmarked-404/style/style.json",
+        "/styles/unmarked-410/style/style.json",
+        "/styles/mismatched-404/style/style.json",
+        "/styles/mismatched-410/style/style.json",
+        "/styles/unknown-marker/style/style.json",
     ] {
         let expected_fallbacks = harness.fallback_upstream_requests.load(Ordering::Relaxed) + 1;
         let (status, _, body) = harness.get(&harness.public, path).await;
@@ -897,7 +897,7 @@ async fn remote_provider_negatives_require_an_exact_private_marker() {
 
     let expected_fallbacks = harness.fallback_upstream_requests.load(Ordering::Relaxed) + 1;
     let (status, _, body) = harness
-        .get(&harness.public, "/styles/remote-retry/style.json")
+        .get(&harness.public, "/styles/remote-retry/style/style.json")
         .await;
     assert_eq!(
         status,
@@ -919,7 +919,7 @@ async fn delivery_auth_is_optional_and_covers_only_public_content_routes() {
     let harness = harness_with_auth("delivery-auth-boundary").await;
 
     let (status, headers, _) = harness
-        .get(&harness.public, "/styles/base/style.json")
+        .get(&harness.public, "/styles/base/style/style.json")
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(headers[header::WWW_AUTHENTICATE], "Bearer");
@@ -934,7 +934,7 @@ async fn delivery_auth_is_optional_and_covers_only_public_content_routes() {
         harness
             .get(
                 &harness.internal,
-                "/_internal/provider/styles/base/style.json"
+                "/_internal/provider/styles/base/style/style.json"
             )
             .await
             .0,
@@ -945,7 +945,7 @@ async fn delivery_auth_is_optional_and_covers_only_public_content_routes() {
     let (status, _, _) = harness
         .get_with(
             &harness.public,
-            "/styles/base/style.json?access_token=public.secret",
+            "/styles/base/style/style.json?access_token=public.secret",
             &[(header::AUTHORIZATION, "Bearer public.secret")],
         )
         .await;
@@ -974,7 +974,7 @@ async fn distribution_cors_precedes_auth_and_excludes_operational_routes() {
     let (status, headers, _) = harness
         .get_with(
             &harness.public,
-            "/styles/base/style.json",
+            "/styles/base/style/style.json",
             std::slice::from_ref(&origin),
         )
         .await;
@@ -985,7 +985,7 @@ async fn distribution_cors_precedes_auth_and_excludes_operational_routes() {
     let (status, headers, _) = harness
         .get_with(
             &harness.public,
-            "/styles/base/style.json?access_token=public.secret",
+            "/styles/base/style/style.json?access_token=public.secret",
             std::slice::from_ref(&origin),
         )
         .await;
@@ -996,7 +996,7 @@ async fn distribution_cors_precedes_auth_and_excludes_operational_routes() {
         .request_with(
             &harness.public,
             Method::OPTIONS,
-            "/styles/base/style.json",
+            "/styles/base/style/style.json",
             &[
                 origin.clone(),
                 (header::ACCESS_CONTROL_REQUEST_METHOD, "GET"),
@@ -1028,7 +1028,7 @@ async fn distribution_cors_precedes_auth_and_excludes_operational_routes() {
     let (status, headers, _) = harness
         .get_with(
             &harness.internal,
-            "/_internal/provider/styles/base/style.json",
+            "/_internal/provider/styles/base/style/style.json",
             &[origin],
         )
         .await;
@@ -1062,7 +1062,7 @@ async fn anonymous_delivery_policy_is_scoped_and_never_masks_invalid_tokens() {
     let harness = harness_with_anonymous_auth("delivery-auth-anonymous").await;
 
     let (status, _, style_body) = harness
-        .get(&harness.public, "/styles/base/style.json")
+        .get(&harness.public, "/styles/base/style/style.json")
         .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -1088,7 +1088,7 @@ async fn anonymous_delivery_policy_is_scoped_and_never_masks_invalid_tokens() {
     let (status, headers, _) = harness
         .get(
             &harness.public,
-            "/styles/base/style.json?access_token=public.wrong",
+            "/styles/base/style/style.json?access_token=public.wrong",
         )
         .await;
     assert_eq!(
@@ -1109,7 +1109,7 @@ async fn delivery_auth_uses_the_percent_decoded_namespace_identity() {
         harness
             .get(
                 &harness.public,
-                "/styles/%62ase/style.json?access_token=public.secret",
+                "/styles/%62ase/style/style.json?access_token=public.secret",
             )
             .await
             .0,
@@ -1119,7 +1119,7 @@ async fn delivery_auth_uses_the_percent_decoded_namespace_identity() {
     let (status, headers, _) = harness
         .get(
             &harness.public,
-            "/styles/%62ase/style.json?access_token=public.encoded-alias",
+            "/styles/%62ase/style/style.json?access_token=public.encoded-alias",
         )
         .await;
     assert_eq!(
@@ -1139,7 +1139,7 @@ async fn verified_query_tokens_propagate_only_to_generated_ishikari_urls() {
     let (status, _, body) = harness
         .get(
             &harness.public,
-            "/styles/base/style.json?access_token=public.secret",
+            "/styles/base/style/style.json?access_token=public.secret",
         )
         .await;
     assert_eq!(status, StatusCode::OK);
@@ -1175,7 +1175,7 @@ async fn verified_query_tokens_propagate_only_to_generated_ishikari_urls() {
     let (status, _, body) = harness
         .get_with(
             &harness.public,
-            "/styles/base/style.json",
+            "/styles/base/style/style.json",
             &[(header::AUTHORIZATION, "Bearer public.secret")],
         )
         .await;
@@ -1207,7 +1207,7 @@ async fn warmed_resource_cache_never_bypasses_current_token_namespace_grants() {
     let (status, _, style_body) = harness
         .get(
             &harness.public,
-            "/styles/base/style.json?access_token=public.style-only",
+            "/styles/base/style/style.json?access_token=public.style-only",
         )
         .await;
     assert_eq!(
@@ -1250,7 +1250,7 @@ async fn internal_provider_handlers_mark_only_fetcher_negatives() {
 
     for (path, expected_status, expected_marker) in [
         (
-            "/_internal/provider/styles/origin-style/style.json",
+            "/_internal/provider/styles/origin-style/style/style.json",
             StatusCode::NOT_FOUND,
             InternalProviderNegative::NotFound,
         ),
@@ -1260,7 +1260,7 @@ async fn internal_provider_handlers_mark_only_fetcher_negatives() {
             InternalProviderNegative::NotFound,
         ),
         (
-            "/_internal/provider/styles/origin-sprite/sprite.png",
+            "/_internal/provider/styles/origin-sprite/style/sprite.png",
             StatusCode::GONE,
             InternalProviderNegative::Gone,
         ),
@@ -1287,7 +1287,7 @@ async fn internal_provider_handlers_mark_only_fetcher_negatives() {
     );
 
     let (status, headers, _) = harness
-        .get(&harness.public, "/styles/origin-style/style.json")
+        .get(&harness.public, "/styles/origin-style/style/style.json")
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(
@@ -1301,7 +1301,7 @@ async fn internal_provider_handlers_mark_only_fetcher_negatives() {
 #[tokio::test]
 async fn concurrent_uncacheable_requests_share_the_leader_body() {
     let harness = harness("uncacheable-singleflight").await;
-    let path = "/styles/uncached/style.json";
+    let path = "/styles/uncached/style/style.json";
     let (first, second, third) = tokio::join!(
         harness.get(&harness.public, path),
         harness.get(&harness.public, path),
@@ -1329,7 +1329,7 @@ async fn concurrent_uncacheable_requests_share_the_leader_body() {
 #[tokio::test]
 async fn transported_age_without_explicit_freshness_still_caches() {
     let harness = harness("aged-default").await;
-    let path = "/styles/aged/style.json";
+    let path = "/styles/aged/style/style.json";
 
     let (status, _, _) = harness.get(&harness.public, path).await;
     assert_eq!(status, StatusCode::OK);
@@ -1349,7 +1349,7 @@ async fn transported_age_without_explicit_freshness_still_caches() {
 #[tokio::test]
 async fn stale_provider_revalidation_reuses_bytes_on_origin_304() {
     let harness = harness("provider-revalidation").await;
-    let path = "/styles/revalidated/style.json";
+    let path = "/styles/revalidated/style/style.json";
 
     let (status, initial_headers, initial_body) = harness.get(&harness.public, path).await;
     assert_eq!(status, StatusCode::OK);
@@ -1412,7 +1412,7 @@ async fn stale_provider_revalidation_reuses_bytes_on_origin_304() {
 #[tokio::test]
 async fn invalid_style_json_never_enters_the_provider_cache() {
     let harness = harness("invalid-style").await;
-    let path = "/styles/invalid/style.json";
+    let path = "/styles/invalid/style/style.json";
     assert_eq!(
         harness.get(&harness.public, path).await.0,
         StatusCode::BAD_GATEWAY
@@ -1435,7 +1435,7 @@ async fn public_provider_responses_carry_cache_policy_and_age() {
 
     // Style: upstream policy is honored and normalized, body is rewritten JSON.
     let (status, headers, body) = harness
-        .get(&harness.public, "/styles/base/style.json")
+        .get(&harness.public, "/styles/base/style/style.json")
         .await;
     assert_eq!(
         status,
@@ -1459,7 +1459,7 @@ async fn public_provider_responses_carry_cache_policy_and_age() {
 
     // A repeat request is served from the provider cache with the same policy.
     let (status, headers, _) = harness
-        .get(&harness.public, "/styles/base/style.json")
+        .get(&harness.public, "/styles/base/style/style.json")
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
@@ -1483,14 +1483,14 @@ async fn public_provider_responses_carry_cache_policy_and_age() {
     assert_eq!(body.as_ref(), b"glyph-bytes");
 
     let (status, headers, _) = harness
-        .get(&harness.public, "/styles/base/sprite.json")
+        .get(&harness.public, "/styles/base/style/sprite.json")
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers[header::CACHE_CONTROL], cache::SPRITE);
     assert_eq!(headers[header::CONTENT_TYPE], "application/json");
 
     let (status, headers, _) = harness
-        .get(&harness.public, "/styles/base/sprite.png")
+        .get(&harness.public, "/styles/base/style/sprite.png")
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers[header::CACHE_CONTROL], cache::SPRITE);
@@ -1602,7 +1602,7 @@ async fn internal_provider_responses_carry_typed_metadata_not_public_headers() {
     let (status, headers, _) = harness
         .get(
             &harness.internal,
-            "/_internal/provider/styles/base/style.json",
+            "/_internal/provider/styles/base/style/style.json",
         )
         .await;
     assert_eq!(status, StatusCode::OK);
@@ -1682,7 +1682,7 @@ async fn conditional_requests_return_304_with_cache_metadata() {
     let (status, headers, _) = harness
         .get_with(
             &harness.public,
-            "/styles/base/sprite.json",
+            "/styles/base/style/sprite.json",
             &[(header::IF_NONE_MATCH, "*")],
         )
         .await;
@@ -1692,7 +1692,7 @@ async fn conditional_requests_return_304_with_cache_metadata() {
     // Style: the derived ETag identifies the rewritten body, is stable across
     // requests, and round-trips through If-None-Match.
     let (status, headers, _) = harness
-        .get(&harness.public, "/styles/base/style.json")
+        .get(&harness.public, "/styles/base/style/style.json")
         .await;
     assert_eq!(status, StatusCode::OK);
     let style_etag = headers[header::ETAG].to_str().expect("etag").to_owned();
@@ -1703,7 +1703,7 @@ async fn conditional_requests_return_304_with_cache_metadata() {
     );
 
     let (status, headers, _) = harness
-        .get(&harness.public, "/styles/base/style.json")
+        .get(&harness.public, "/styles/base/style/style.json")
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers[header::ETAG], style_etag.as_str());
@@ -1711,7 +1711,7 @@ async fn conditional_requests_return_304_with_cache_metadata() {
     let (status, headers, body) = harness
         .get_with(
             &harness.public,
-            "/styles/base/style.json",
+            "/styles/base/style/style.json",
             &[(header::IF_NONE_MATCH, style_etag.as_str())],
         )
         .await;
@@ -1729,7 +1729,7 @@ async fn conditional_requests_return_304_with_cache_metadata() {
 #[tokio::test]
 async fn rewritten_styles_vary_with_the_effective_origin() {
     let harness = harness("style-origin").await;
-    let path = "/styles/base/style.json";
+    let path = "/styles/base/style/style.json";
     let forwarded_proto = header::HeaderName::from_static("x-forwarded-proto");
 
     let (status, first_headers, first_body) = harness
@@ -2039,9 +2039,9 @@ async fn internal_paths_are_not_exposed_on_the_public_router() {
 
     for path in [
         "/_internal/metrics",
+        "/_internal/operations/v1/status",
         "/_internal/healthz",
-        "/_internal/cluster",
-        "/_internal/provider/styles/base/style.json",
+        "/_internal/provider/styles/base/style/style.json",
         "/_internal/provider/fonts/TestFont/0-255.pbf",
         "/_internal/tiles/demo/0",
         "/_internal/refresh/style",
@@ -2051,4 +2051,49 @@ async fn internal_paths_are_not_exposed_on_the_public_router() {
     }
 
     harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn operational_status_is_internal_bounded_and_versioned() {
+    let harness = harness("operational-status").await;
+
+    let (status, headers, body) = harness
+        .get(&harness.internal, "/_internal/operations/v1/status")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers[header::CACHE_CONTROL],
+        "private, max-age=2, must-revalidate"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["schema_version"], 1);
+    assert_eq!(body["service"], "ishikari");
+    assert_eq!(body["status"]["mode"], "clustered");
+    assert_eq!(body["status"]["membership"]["live_members"], 1);
+    assert_eq!(body["status"]["membership"]["members_truncated"], false);
+    assert_eq!(body["status"]["draining"], false);
+    assert!(body["status"]["cpu_work"]["concurrency"].as_u64().unwrap() > 0);
+    assert!(body.get("key_values").is_none());
+
+    assert_eq!(
+        harness
+            .get(&harness.public, "/_internal/operations/v1/status")
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+
+    harness.cleanup().await;
+}
+
+#[test]
+fn operational_member_lists_share_one_bound_and_prefer_live_nodes() {
+    let limit = mmpf_http::operational::MAX_OPERATIONAL_MEMBERS;
+    let live = (0..limit).map(|index| format!("live-{index}")).collect();
+    let dead = vec!["dead-0".to_string()];
+
+    let (live, dead) = super::bounded_member_ids(live, dead);
+
+    assert_eq!(live.len(), limit);
+    assert!(dead.is_empty());
 }

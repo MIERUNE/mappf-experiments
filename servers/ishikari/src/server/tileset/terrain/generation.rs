@@ -5,13 +5,14 @@ use bytes::Bytes;
 use flate2::{Compression as GzLevel, write::GzEncoder};
 use ishikari_core::{
     interned::TilesetId,
-    pmtiles::{TileCoord, TileData, TileId, TileType},
+    pmtiles::{TileData, TileId, TileType},
     storage::{ArchiveGeneration, ResolvedTile},
 };
 use mmpf_terrain::{contours, hillshade};
 use tokio::task::JoinSet;
 use tracing::debug;
 
+use crate::server::tileset::parse_tile_coord;
 use crate::server::{AppState, HttpError};
 
 use super::{
@@ -297,10 +298,7 @@ async fn load_decoded_dem(
     x: u32,
     y: u32,
 ) -> Result<Option<Arc<dem::DemTile>>, HttpError> {
-    let tile_id = TileId::from(
-        TileCoord::new(z, x, y).map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?,
-    )
-    .value();
+    let tile_id = TileId::from(parse_tile_coord(z, x, y)?).value();
     let state = state.clone();
     let Some(raw) = fetch_source_tile(&state, tileset_id.clone(), tile_id, z, x, y).await? else {
         return Ok(None);

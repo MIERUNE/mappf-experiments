@@ -18,7 +18,7 @@ use crate::server::{
 };
 use ishikari_core::{interned::TilesetId, pmtiles::TileType, storage::TilesetInfo};
 
-use super::error::tileset_error_response;
+use super::{error::tileset_error_response, parse_tileset_id};
 
 // 6.x (prerelease) bundles @maplibre/mlt >= 1.1.9, whose MLT decoder handles
 // the non-nullable struct fields ishikari emits; 5.x ships the broken 1.1.8.
@@ -118,8 +118,7 @@ async fn serve_preview(
     query: PreviewQuery,
     token: Option<PropagatedAccessToken>,
 ) -> Result<([(header::HeaderName, &'static str); 1], Html<String>), HttpError> {
-    let tileset_id = TilesetId::try_from(tileset_id)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let tileset_id = parse_tileset_id(tileset_id)?;
     let info = state
         .resource_resolver
         .load_tileset_info(tileset_id.clone())
@@ -228,8 +227,7 @@ async fn serve_preview_style(
     query: PreviewQuery,
     token: Option<PropagatedAccessToken>,
 ) -> Result<Response, HttpError> {
-    let tileset_id = TilesetId::try_from(tileset_id)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let tileset_id = parse_tileset_id(tileset_id)?;
     let base_url = get_origin(&headers);
     let info = state
         .resource_resolver

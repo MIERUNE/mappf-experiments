@@ -19,6 +19,7 @@ use std::{
 use anyhow::{Context as _, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
+use futures_util::{StreamExt as _, TryStreamExt as _, future, stream::BoxStream};
 use object_store::{
     Error as ObjectStoreError, ObjectMeta, ObjectStore, PutResult, UpdateVersion,
     path::Path as ObjectPath,
@@ -36,6 +37,7 @@ const SCHEMA_VERSION: u32 = 2;
 const MAX_ACCOUNT_ID_LEN: usize = 64;
 const MAX_LOCAL_ID_LEN: usize = 128;
 const MAX_PRINCIPAL_PART_LEN: usize = 256;
+const MAX_STATE_LOCATOR_LEN: usize = 1_024;
 const MAX_VERSION_PART_LEN: usize = 1_024;
 const VERSION_ETAG_PREFIX: &str = "abashiri-v1.";
 
@@ -165,6 +167,14 @@ impl ResourceTarget {
     pub fn account_id(&self) -> &AccountId {
         &self.account_id
     }
+
+    pub(crate) fn kind(&self) -> ResourceKind {
+        self.kind
+    }
+
+    pub(crate) fn local_id(&self) -> &LocalResourceId {
+        &self.local_id
+    }
 }
 
 /// Coarse operation recorded independently from its resource family.
@@ -187,6 +197,7 @@ pub struct MutationRequest {
     target: ResourceTarget,
     input_sha256: String,
     request_id: RequestId,
+    state_locator: Option<String>,
 }
 
 impl MutationRequest {
@@ -209,7 +220,19 @@ impl MutationRequest {
             target,
             input_sha256: digest_hex(b"abashiri-mutation-input-v1\0", canonical_input),
             request_id,
+            state_locator: None,
         })
+    }
+
+    /// Records a bounded, route-defined state locator for background recovery.
+    pub(crate) fn with_state_locator(
+        mut self,
+        value: impl Into<String>,
+    ) -> Result<Self, IdentityError> {
+        let value = value.into();
+        validate_bounded_text("state locator", &value, MAX_STATE_LOCATOR_LEN)?;
+        self.state_locator = Some(value);
+        Ok(self)
     }
 }
 
@@ -238,6 +261,8 @@ pub struct MutationIntent {
     input_sha256: String,
     first_request_id: RequestId,
     created_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state_locator: Option<String>,
 }
 
 impl MutationIntent {
@@ -250,6 +275,14 @@ impl MutationIntent {
         &self.target
     }
 
+    pub(crate) fn action(&self) -> MutationAction {
+        self.action
+    }
+
+    pub(crate) fn state_locator(&self) -> Option<&str> {
+        self.state_locator.as_deref()
+    }
+
     fn matches_request(&self, request: &MutationRequest) -> bool {
         self.schema_version == SCHEMA_VERSION
             && self.key_sha256 == request.key_sha256
@@ -257,6 +290,10 @@ impl MutationIntent {
             && self.action == request.action
             && self.target == request.target
             && self.input_sha256 == request.input_sha256
+            && self
+                .state_locator
+                .as_ref()
+                .is_none_or(|stored| Some(stored) == request.state_locator.as_ref())
     }
 }
 
@@ -452,6 +489,15 @@ impl MutationJournal {
         }
 
         let committed = commit(&intent).await.context("commit mutation state")?;
+        self.record_completion(&intent, committed).await
+    }
+
+    async fn record_completion<T>(
+        &self,
+        intent: &MutationIntent,
+        committed: StateCommit<T>,
+    ) -> anyhow::Result<Execution<T>> {
+        let paths = MutationPaths::for_intent(&self.store, intent)?;
         let completion = MutationCompletion {
             schema_version: SCHEMA_VERSION,
             key_sha256: intent.key_sha256.clone(),
@@ -484,6 +530,58 @@ impl MutationJournal {
         }
     }
 
+    /// Lists durable intent objects without retaining the complete journal in memory.
+    pub(crate) fn intent_locations(
+        &self,
+    ) -> anyhow::Result<BoxStream<'static, object_store::Result<ObjectMeta>>> {
+        let prefix = self.store.location("journal")?;
+        Ok(self
+            .store
+            .list(&prefix)
+            .try_filter(|meta| future::ready(meta.location.as_ref().ends_with("/intent.json")))
+            .boxed())
+    }
+
+    /// Reads an intent only when its completion is still absent.
+    pub(crate) async fn unfinished_intent(
+        &self,
+        location: &ObjectPath,
+    ) -> anyhow::Result<Option<MutationIntent>> {
+        let intent = self.read_required::<MutationIntent>(location).await?;
+        ensure!(
+            intent.schema_version == SCHEMA_VERSION,
+            "stored mutation intent has an unsupported schema version"
+        );
+        let paths = MutationPaths::for_intent(&self.store, &intent)?;
+        ensure!(
+            paths.intent == *location,
+            "stored mutation intent does not match its journal location"
+        );
+        match self
+            .read_optional::<MutationCompletion>(&paths.completion)
+            .await?
+        {
+            Some(completion) => {
+                ensure!(
+                    completion.schema_version == SCHEMA_VERSION
+                        && completion.key_sha256 == intent.key_sha256,
+                    "stored mutation completion does not match its intent"
+                );
+                Ok(None)
+            }
+            None => Ok(Some(intent)),
+        }
+    }
+
+    /// Completes an existing durable intent from independently verified state.
+    pub(crate) async fn complete_intent<T>(
+        &self,
+        intent: &MutationIntent,
+        committed: StateCommit<T>,
+    ) -> anyhow::Result<Execution<T>> {
+        self.record_completion(intent, committed).await
+    }
+
     async fn ensure_intent(
         &self,
         location: &ObjectPath,
@@ -499,6 +597,7 @@ impl MutationJournal {
             input_sha256: request.input_sha256.clone(),
             first_request_id: request.request_id.clone(),
             created_at_unix_ms: unix_time_ms()?,
+            state_locator: request.state_locator.clone(),
         };
         let body = serde_json::to_vec(&intent).context("encode mutation intent")?;
 
@@ -542,11 +641,23 @@ struct MutationPaths {
 
 impl MutationPaths {
     fn new(store: &ConditionalStore, request: &MutationRequest) -> anyhow::Result<Self> {
-        let base = format!(
-            "journal/{}/mutations/{}",
+        Self::from_parts(
+            store,
             request.target.account_id.as_str(),
-            request.key_sha256
-        );
+            &request.key_sha256,
+        )
+    }
+
+    fn for_intent(store: &ConditionalStore, intent: &MutationIntent) -> anyhow::Result<Self> {
+        Self::from_parts(store, intent.target.account_id.as_str(), &intent.key_sha256)
+    }
+
+    fn from_parts(
+        store: &ConditionalStore,
+        account_id: &str,
+        key_sha256: &str,
+    ) -> anyhow::Result<Self> {
+        let base = format!("journal/{account_id}/mutations/{key_sha256}");
         Ok(Self {
             intent: store.location(&format!("{base}/intent.json"))?,
             completion: store.location(&format!("{base}/completion.json"))?,

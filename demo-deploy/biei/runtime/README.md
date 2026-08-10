@@ -20,7 +20,7 @@ docker build -f demo-deploy/biei/runtime/Dockerfile -t biei:dev .
 kubectl apply -k demo-deploy/biei/runtime/k8s/overlays/local
 kubectl -n biei-demo rollout status deploy/biei
 
-curl 'http://localhost:8080/carto/voyager-gl-style/static/139.767,35.681,11/512x384.webp' -o tokyo.webp
+curl 'http://localhost:8080/styles/carto/voyager-gl-style/static/139.767,35.681,11/512x384.webp' -o tokyo.webp
 ```
 
 If your local Kubernetes has no LoadBalancer controller, port-forward instead:
@@ -31,7 +31,7 @@ kubectl -n biei-demo port-forward svc/biei 8080:8080
 
 ## GKE
 
-Build and push the image, then deploy the overlay. The shared Gateway (`demo-gw` in namespace `map-demo`) must already exist. The GKE overlay points all style and tileset resolution at the in-cluster `ishikari` Service, so deploy Ishikari's GKE overlay first. Public namespaces such as `/carto/*`, `/mierune/*`, and `/ishikari/*` are style-id prefixes under Ishikari's backing store.
+Build and push the image, then deploy the overlay. The shared Gateway (`demo-gw` in namespace `map-demo`) must already exist. The GKE overlay points all style and tileset resolution at the in-cluster `ishikari` Service, so deploy Ishikari's GKE overlay first. Public styles use `/styles/{namespace}/{style_id}/...`; `carto`, `mierune`, and `ishikari` are example namespaces under Ishikari's backing store.
 
 ```sh
 BUILD_ID="$(gcloud builds submit \
@@ -112,13 +112,13 @@ bash demo-deploy/biei/runtime/check-hpa.sh
 
 kubectl -n map-demo port-forward deploy/biei 8080:8080
 
-curl 'http://localhost:8080/carto/voyager-gl-style/static/[139.6,35.6,139.9,35.8]/512x384.webp?padding=20' -o bbox.webp
-curl 'http://localhost:8080/carto/voyager-gl-style/8/227/100.webp' -o tile.webp
+curl 'http://localhost:8080/styles/carto/voyager-gl-style/static/[139.6,35.6,139.9,35.8]/512x384.webp?padding=20' -o bbox.webp
+curl 'http://localhost:8080/styles/carto/voyager-gl-style/tiles/8/227/100.webp' -o tile.webp
 
 # In the GKE overlay, all styles are fetched through Ishikari. The requested
 # style id must exist under Ishikari's STYLE_TEMPLATES backing store, for
 # example styles/mierune/jp_mierune_streets/style.json for the URL below.
-curl 'http://localhost:8080/mierune/jp_mierune_streets/static/139.767,35.681,11/512x384.webp' -o ishikari.webp
+curl 'http://localhost:8080/styles/mierune/jp_mierune_streets/static/139.767,35.681,11/512x384.webp' -o ishikari.webp
 
 # Readiness/liveness are top-level on the public port. A slot loss correlated
 # with an active FileSource retry stays eligible for cache hits and routing

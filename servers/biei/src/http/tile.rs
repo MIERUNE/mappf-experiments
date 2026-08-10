@@ -88,7 +88,7 @@ mod tests {
     fn catalog() -> StyleCatalog {
         let catalog = StyleCatalog::new();
         catalog.upsert_definition(
-            StyleId("voyager-gl-style".to_string()),
+            StyleId("default/voyager-gl-style".to_string()),
             StyleDefinition::new(
                 "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
                 1,
@@ -101,28 +101,24 @@ mod tests {
                 1,
             ),
         );
-        catalog.upsert_definition(
-            StyleId("carto/gl/voyager-gl-style".to_string()),
-            StyleDefinition::new(
-                "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
-                1,
-            ),
-        );
         catalog
     }
 
     fn parse_tile(path: &str) -> Result<InternalTask, IngressError> {
+        let path = path
+            .strip_prefix("/styles/")
+            .ok_or_else(|| invalid("tile path must start with /styles/"))?;
         let parts: Vec<_> = path
-            .trim_start_matches('/')
             .trim_end_matches('/')
             .split('/')
             .filter(|part| !part.is_empty())
             .collect();
-        let suffix_index = parts
-            .len()
-            .checked_sub(3)
-            .ok_or_else(|| invalid("tile path must be /{style_id}/{z}/{x}/{y}{@scale}.{format}"))?;
-        let style_id = crate::http::path::resolve_style_id(&parts[..suffix_index])?;
+        let [namespace, style_id, "tiles", _, _, _] = parts.as_slice() else {
+            return Err(invalid(
+                "tile path must be /styles/{namespace}/{style_id}/tiles/{z}/{x}/{y}{@scale}.{format}",
+            ));
+        };
+        let style_id = crate::http::path::resolve_style_id(&[namespace, style_id])?;
         parse_tile_path(
             &parts,
             style_id,
@@ -136,7 +132,8 @@ mod tests {
 
     #[test]
     fn parses_tile_webp_2x() {
-        let task = parse_tile("/carto/voyager-gl-style/1/1/0@2x.webp").expect("tile path parses");
+        let task = parse_tile("/styles/carto/voyager-gl-style/tiles/1/1/0@2x.webp")
+            .expect("tile path parses");
 
         assert_eq!(task.output_format, ImageFormat::Webp);
         assert_eq!(task.pixel_ratio.to_scale(), Scale::X2);
@@ -153,7 +150,7 @@ mod tests {
 
     #[test]
     fn parses_tile_without_extension_as_png() {
-        let task = parse_tile("/carto/voyager-gl-style/1/1/0@2x")
+        let task = parse_tile("/styles/carto/voyager-gl-style/tiles/1/1/0@2x")
             .expect("tile path without extension parses");
 
         assert_eq!(task.output_format, ImageFormat::Png);
@@ -171,7 +168,8 @@ mod tests {
 
     #[test]
     fn parses_tile_jpeg_alias() {
-        let task = parse_tile("/carto/voyager-gl-style/1/1/0.jpeg").expect("tile jpeg path parses");
+        let task = parse_tile("/styles/carto/voyager-gl-style/tiles/1/1/0.jpeg")
+            .expect("tile jpeg path parses");
 
         assert_eq!(task.output_format, ImageFormat::Jpeg);
         assert_eq!(task.pixel_ratio.to_scale(), Scale::X1);
@@ -179,29 +177,25 @@ mod tests {
 
     #[test]
     fn rejects_tile_coordinates_out_of_range() {
-        let err =
-            parse_tile("/carto/voyager-gl-style/1/2/0.png").expect_err("x is out of range for z");
+        let err = parse_tile("/styles/carto/voyager-gl-style/tiles/1/2/0.png")
+            .expect_err("x is out of range for z");
 
         assert!(err.to_string().contains("out of range"));
     }
 
     #[test]
-    fn parses_tile_with_single_segment_style_id() {
-        let task =
-            parse_tile("/voyager-gl-style/2/3/1@2x.webp").expect("single-segment style tile path");
+    fn parses_tile_with_default_namespace() {
+        let task = parse_tile("/styles/default/voyager-gl-style/tiles/2/3/1@2x.webp")
+            .expect("default namespace tile path");
 
-        assert_eq!(task.style.id.as_str(), "voyager-gl-style");
+        assert_eq!(task.style.id.as_str(), "default/voyager-gl-style");
         assert_eq!(task.output_format, ImageFormat::Webp);
         assert_eq!(task.pixel_ratio.to_scale(), Scale::X2);
         assert!(matches!(task.request, RenderRequest::Tile { z: 2, .. }));
     }
 
     #[test]
-    fn parses_tile_with_deeply_namespaced_style_id() {
-        let task = parse_tile("/carto/gl/voyager-gl-style/2/3/1@2x.webp")
-            .expect("deeply namespaced style tile path");
-
-        assert_eq!(task.style.id.as_str(), "carto/gl/voyager-gl-style");
-        assert!(matches!(task.request, RenderRequest::Tile { z: 2, .. }));
+    fn rejects_deeply_namespaced_style_id() {
+        assert!(parse_tile("/styles/carto/gl/voyager-gl-style/tiles/2/3/1@2x.webp").is_err());
     }
 }

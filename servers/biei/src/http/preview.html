@@ -77,7 +77,7 @@
 <script src="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.js"></script>
 <script>
   const stylePath = {{style_path_json}};
-  const tileUrl = location.origin + '/' + stylePath + '/{z}/{x}/{y}@2x.webp';
+  const tileUrl = location.origin + '/styles/' + stylePath + '/tiles/{z}/{x}/{y}@2x.webp';
   const map = new maplibregl.Map({
     container: 'map',
     style: {

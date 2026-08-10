@@ -14,19 +14,19 @@ use tracing::debug;
 use crate::server::{AppState, HttpError, cache};
 use ishikari_core::{
     interned::{ResourceRoutingKey, TilesetId},
-    pmtiles::{MLT_CONTENT_TYPE, TileCoord, TileData, TileId},
+    pmtiles::{MLT_CONTENT_TYPE, TileData, TileId},
     storage::{
         ARCHIVE_GENERATION_HEADER, ArchivePresence, InternalTileSource, TILE_SOURCE_HEADER,
         TileSource,
     },
 };
 
-use super::TileRepresentationQuery;
 use super::error::tileset_error_response;
 use super::mapterhorn::Resolved;
 use super::mlt::{
     Representation, RequestedTileFormat, is_mlt_tile, mlt_response_bytes, negotiate_format,
 };
+use super::{TileRepresentationQuery, parse_tile_coord, parse_tileset_id};
 
 /// Parses the numeric tile `y` (after extension stripping).
 fn parse_y(y: &str) -> Result<u32, HttpError> {
@@ -171,12 +171,8 @@ async fn serve_tile(
     representation: Representation,
     headers: &HeaderMap,
 ) -> Result<Response<Body>, HttpError> {
-    let tileset_id = TilesetId::try_from(tileset_id)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    let tile_id = TileId::from(
-        TileCoord::new(z, x, y).map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?,
-    )
-    .value();
+    let tileset_id = parse_tileset_id(tileset_id)?;
+    let tile_id = TileId::from(parse_tile_coord(z, x, y)?).value();
     // Mapterhorn composite resolution rewrites z>12 onto the detail archive
     // (or 404s when that region has no detail data); other tilesets pass through.
     let Some(tileset_id) = resolve_archive(&state, tileset_id, z, x, y).await? else {
@@ -360,8 +356,7 @@ pub(crate) async fn internal_tile_handler(
     State(state): State<AppState>,
     Path((tileset_id, tile_id)): Path<(String, u64)>,
 ) -> Result<Response<Body>, HttpError> {
-    let tileset_id = TilesetId::try_from(tileset_id)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let tileset_id = parse_tileset_id(tileset_id)?;
     let (tile, source) = state
         .resource_resolver
         .load_tile_by_id_with_source(tileset_id, tile_id)

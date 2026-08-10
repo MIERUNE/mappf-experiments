@@ -15,6 +15,8 @@ CPU-heavy DEM decode, terrain generation, and MLT transcoding share one bounded 
 
 Ishikari also validates one aggregate ceiling for its byte-weighted material caches. The defaults allocate 1 GiB in total: 256 MiB each for tile and chunk data, with the remaining 512 MiB assigned to resource, PMTiles index, provider, MLT, derived-tile, and decoded-DEM caches. Override `ISKR_CACHE_WEIGHT_BUDGET_BYTES` only when the process has additional RSS headroom; Moka cache weights do not include every allocation made by the process. Separately, startup verifies that the configured chunk size, fetch width, and backend concurrency fit `ISKR_BACKEND_ACTIVE_BODY_BUDGET_BYTES` (128 MiB by default) without arithmetic overflow.
 
+Ishikari starts in true local mode unless `--cluster` or at least one `--gossip-seeds` value is supplied. Local mode opens no Chitchat UDP socket, advertises no peer, and performs all storage reads and cache work in-process; independent replicas behind an ordinary Service therefore work without cross-pod UDP but do not share cache placement or refresh hints. Cluster mode requires routable UDP gossip and internal HTTP between pods, but the external load balancer still needs no affinity or consistent hashing because Ishikari performs HRW placement and peer fallback itself. `--require-gossip-bootstrap` is valid only in cluster mode.
+
 LICENSE: MIT OR Apache-2.0
 
 ## Demo
@@ -38,13 +40,13 @@ open http://localhost:8080/tilesets/v4/preview
 Ishikari can proxy MapLibre style JSON, glyph PBFs, and sprite assets from upstream templates:
 
 ```bash
-ISKR_STYLE_TEMPLATES='carto=https://basemaps.cartocdn.com/{style_id}/style.json;default=https://styles.example/{style_id}/style.json' \
+ISKR_STYLE_TEMPLATES='carto=https://basemaps.cartocdn.com/gl/{style_id}/style.json;default=https://styles.example/{style_id}/style.json' \
 ISKR_GLYPH_URL_TEMPLATE='https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf' \
 ISKR_SPRITE_TEMPLATES='carto=https://basemaps.cartocdn.com/{style_id}/sprite' \
 cargo run -p ishikari -- --tileset-sources data
 ```
 
-The style endpoint rewrites provider-relative `/{tileset_key}` sources to Ishikari TileJSON URLs and points `glyphs` and `sprite` back to Ishikari. Style, glyph, and sprite upstream fetches use bounded in-process caching and single-flight coordination to absorb cold concurrent renders. Stale provider entries revalidate conditionally, so an unchanged HTTP or object-store origin can refresh freshness without sending the body again.
+Style delivery uses exactly `/styles/{namespace}/{style_id}/...`; both identity segments are slash-free, and `default/{style_id}` is the explicit default namespace. The style endpoint rewrites provider-relative `/{tileset_key}` sources to Ishikari TileJSON URLs and points `glyphs` and `sprite` back to Ishikari. Style, glyph, and sprite upstream fetches use bounded in-process caching and single-flight coordination to absorb cold concurrent renders. Stale provider entries revalidate conditionally, so an unchanged HTTP or object-store origin can refresh freshness without sending the body again.
 
 For a comma-separated glyph request such as `/fonts/Primary,Fallback/0-255.pbf`, Ishikari resolves and caches `Primary/0-255.pbf` and `Fallback/0-255.pbf` independently, then caches the merged PBF under the ordered composite key. The first font wins when both components contain the same glyph ID. Single-font requests remain byte-for-byte passthrough. A stack is limited to eight distinct fonts to bound provider fan-out; `ISKR_GLYPH_URL_TEMPLATE` must therefore resolve individual font names rather than require a pre-composed object.
 
@@ -93,6 +95,8 @@ PMTiles containing native MLT tiles are served as stored. Stored MVT tiles can a
 ## Observability
 
 Prometheus metrics are exposed only on the internal listener at `/_internal/metrics`. In addition to bounded route/status counters, Ishikari reports end-to-end HTTP latency by route and status class, object-store range fetch duration, size, admission queue delay, and concurrency saturation; chunk batching and waiter fan-in; weighted cache bytes; and peer-routing outcomes. `ISKR_BACKEND_FETCH_CONCURRENCY` bounds range fetches across all tilesets in a process and defaults to 32. `ISKR_BACKEND_FETCH_MAX_INFLIGHT` bounds active plus permit-waiting fetch groups and defaults to four times that concurrency; excess distinct work is shed with 503 while callers joining an admitted group still coalesce. `ISKR_CHUNK_FETCH_MERGE_WINDOW_MS` controls how long nearby missing chunks are collected before dispatch (10 ms by default; 0 removes the intentional wait while preserving pending/inflight sharing). CPU-heavy DEM decode, terrain generation, and MLT transcoding expose admission, queue delay, current saturation, and shed counts. Derived terrain cold-generation metrics separate source fetch/decode time from product generation time and record compressed output size per fixed product.
+
+`/_internal/operations/v1/status` exposes a bounded, versioned JSON snapshot for optional management consumers with a two-second private freshness window. It reports local or clustered mode, observer time, membership counts and at most 256 node identities in total, drain/readiness state, and CPU-work saturation without exposing raw gossip key-values, tileset ids, backend paths, or credentials. Ishikari remains fully functional when no consumer is configured.
 
 ## Simulator
 

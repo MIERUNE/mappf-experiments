@@ -316,20 +316,20 @@ fn parse_fontstack(fontstack: &str) -> Result<ParsedFontstack, HttpError> {
     })
 }
 
+fn invalid_range() -> HttpError {
+    (StatusCode::BAD_REQUEST, "glyph range invalid".to_string())
+}
+
 fn validate_range(range: &str) -> Result<GlyphRange, HttpError> {
     let (start, end) = range
         .strip_suffix(".pbf")
         .unwrap_or(range)
         .split_once('-')
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "glyph range invalid".to_string()))?;
-    let start = start
-        .parse::<u32>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "glyph range invalid".to_string()))?;
-    let end = end
-        .parse::<u32>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "glyph range invalid".to_string()))?;
+        .ok_or_else(invalid_range)?;
+    let start = start.parse::<u32>().map_err(|_| invalid_range())?;
+    let end = end.parse::<u32>().map_err(|_| invalid_range())?;
     if end > MAX_UNICODE_CODEPOINT || start % 256 != 0 || start.checked_add(255) != Some(end) {
-        return Err((StatusCode::BAD_REQUEST, "glyph range invalid".to_string()));
+        return Err(invalid_range());
     }
     Ok(GlyphRange {
         start,

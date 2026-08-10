@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 use clap::{Args, Parser, Subcommand};
 use url::Url;
 
+use crate::operations::OperationalStatusEndpoint;
+
 #[derive(Debug, Parser)]
 #[command(about = "MMPF management and publishing API")]
 struct Cli {
@@ -68,6 +70,14 @@ pub(crate) struct ServeArgs {
         value_delimiter = ','
     )]
     pub(crate) style_refresh_endpoints: Vec<Url>,
+    /// Named Biei or Ishikari operational status endpoint. Repeat as
+    /// `<source-id>=<url>` to aggregate independently deployed services.
+    #[arg(
+        long = "operational-status-endpoint",
+        env = "ABASHIRI_OPERATIONAL_STATUS_ENDPOINTS",
+        value_delimiter = ','
+    )]
+    pub(crate) operational_status_endpoints: Vec<OperationalStatusEndpoint>,
 }
 
 pub(crate) fn load() -> Command {
@@ -92,6 +102,7 @@ mod tests {
         assert!(args.journal_root.is_none());
         assert!(args.style_catalog.is_none());
         assert!(args.style_refresh_endpoints.is_empty());
+        assert!(args.operational_status_endpoints.is_empty());
     }
 
     #[test]
@@ -127,6 +138,8 @@ mod tests {
             "http://biei:9090/_internal/refresh/style",
             "--style-refresh-endpoint",
             "http://ishikari:9090/_internal/refresh/style",
+            "--operational-status-endpoint",
+            "renderer=http://biei:9090/_internal/operations/v1/status",
         ])
         .unwrap();
         let Command::Serve(args) = cli.command else {
@@ -145,6 +158,7 @@ mod tests {
             "gs://example-control/catalog/current.json"
         );
         assert_eq!(args.style_refresh_endpoints.len(), 2);
+        assert_eq!(args.operational_status_endpoints.len(), 1);
     }
 
     #[test]

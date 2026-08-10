@@ -1,12 +1,13 @@
 use axum::http::{HeaderMap, StatusCode};
 use ishikari_core::{
     interned::{ResourceRoutingKey, TilesetId},
-    pmtiles::{TileCoord, TileId},
+    pmtiles::TileId,
 };
 
 use crate::server::{AppState, HttpError};
 
 use super::super::mlt::{RequestedTileFormat, negotiate_format};
+use super::super::{parse_tile_coord, parse_tileset_id};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum DerivedProduct {
@@ -86,10 +87,7 @@ pub(super) fn parse_derived_tile_request(
     let y = y
         .parse::<u32>()
         .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid tile y: {y}")))?;
-    let tile_id = TileId::from(
-        TileCoord::new(z, x, y).map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?,
-    )
-    .value();
+    let tile_id = TileId::from(parse_tile_coord(z, x, y)?).value();
     Ok(DerivedTileRequest {
         tileset_id,
         product,
@@ -123,8 +121,7 @@ pub(super) fn validated_mapterhorn(
     state: &AppState,
     value: String,
 ) -> Result<TilesetId, HttpError> {
-    let tileset_id =
-        TilesetId::try_from(value).map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let tileset_id = parse_tileset_id(value)?;
     match state.mapterhorn() {
         Some(resolver) if resolver.matches(&tileset_id) => Ok(tileset_id),
         _ => Err((

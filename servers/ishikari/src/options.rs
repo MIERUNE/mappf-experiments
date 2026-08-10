@@ -166,6 +166,8 @@ pub(crate) struct Options {
     pub(crate) http_listen_addr: SocketAddr,
     /// Cluster-internal listener (metrics and peer forwarding).
     pub(crate) internal_listen_addr: SocketAddr,
+    /// Whether the runtime should open Chitchat and participate in peer routing.
+    pub(crate) clustered: bool,
     pub(crate) membership: MembershipConfig,
     /// Require one initial peer observation before reporting ready. The server
     /// applies a bounded fail-open grace and latches success permanently.
@@ -347,6 +349,12 @@ impl Options {
         // A seed node can participate without joining another seed, so the
         // explicit cluster flag also activates advertise-address validation.
         let clustered = input.cluster || !seed_nodes.is_empty();
+        if input.require_gossip_bootstrap && !clustered {
+            return Err(
+                "--require-gossip-bootstrap requires --cluster or at least one gossip seed"
+                    .to_string(),
+            );
+        }
         let gossip_endpoint = if clustered {
             GossipEndpoint::clustered(input.gossip_bind, gossip_advertise_addr).map_err(
                 |error| {
@@ -400,6 +408,7 @@ impl Options {
             anonymous_registry: input.anonymous_registry,
             http_listen_addr,
             internal_listen_addr,
+            clustered,
             membership: MembershipConfig {
                 node_id: input.node_id,
                 gossip_endpoint,
@@ -533,6 +542,7 @@ mod tests {
 
         let options = Options::resolve(input).expect("single-node options resolve");
 
+        assert!(!options.clustered);
         assert_eq!(
             options.internal_listen_addr,
             "0.0.0.0:9090".parse().unwrap()
@@ -644,11 +654,28 @@ mod tests {
     #[test]
     fn gossip_bootstrap_requirement_is_explicit() {
         let mut input = input();
+        input.cluster = true;
+        input.gossip_bind = "127.0.0.1:7946".parse().unwrap();
+        input.gossip_advertise_addr = Some("127.0.0.1:7946".parse().unwrap());
+        input.internal_http_advertise_addr = Some("127.0.0.1:9090".parse().unwrap());
         input.require_gossip_bootstrap = true;
 
         let options = Options::resolve(input).expect("options resolve");
 
+        assert!(options.clustered);
         assert!(options.require_gossip_bootstrap);
+    }
+
+    #[test]
+    fn local_mode_rejects_a_gossip_bootstrap_wait() {
+        let mut input = input();
+        input.require_gossip_bootstrap = true;
+
+        let error = match Options::resolve(input) {
+            Ok(_) => panic!("local bootstrap requirement must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("requires --cluster"));
     }
 
     #[test]

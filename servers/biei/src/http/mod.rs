@@ -19,6 +19,10 @@ pub(crate) use mmpf_http::request_id::HEADER as REQUEST_ID_HEADER;
 
 use biei_core::types::RequestId;
 
+pub(crate) fn is_safe_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+}
+
 pub(crate) fn request_id_from_headers(headers: &HeaderMap) -> Option<RequestId> {
     headers
         .get(REQUEST_ID_HEADER)

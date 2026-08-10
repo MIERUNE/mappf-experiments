@@ -12,7 +12,7 @@ GOSSIP_HOST="${GOSSIP_HOST:-127.0.0.1}"
 ADVERTISE_HOST="${ADVERTISE_HOST:-127.0.0.1}"
 GOSSIP_ADVERTISE_HOST="${GOSSIP_ADVERTISE_HOST:-$ADVERTISE_HOST}"
 if [[ -z "${STYLE_URL_TEMPLATE:-}" ]]; then
-  STYLE_URL_TEMPLATE='carto=https://basemaps.cartocdn.com/{style_id}/style.json'
+  STYLE_URL_TEMPLATE='carto=https://basemaps.cartocdn.com/gl/{style_id}/style.json'
 fi
 if [[ -z "${TILESET_URL_TEMPLATE:-}" ]]; then
   TILESET_URL_TEMPLATE='https://tileset-provider.example.test/tilesets/{tileset_id}/tileset.json'
@@ -145,7 +145,7 @@ cat <<EOF
 biei dev cluster started.
   nodes:       ${NUM_NODES}
   first node:  http://${HTTP_HOST}:${BASE_HTTP_PORT}
-  preview:     http://${HTTP_HOST}:${BASE_HTTP_PORT}/carto/gl/voyager-gl-style/preview
+  preview:     http://${HTTP_HOST}:${BASE_HTTP_PORT}/styles/carto/voyager-gl-style/preview
   live:        http://${HTTP_HOST}:${BASE_HTTP_PORT}/livez
   ready:       http://${HTTP_HOST}:${BASE_HTTP_PORT}/readyz
   metrics:     http://${HTTP_HOST}:${BASE_INTERNAL_PORT}/_internal/metrics

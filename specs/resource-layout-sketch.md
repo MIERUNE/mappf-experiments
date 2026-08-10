@@ -1,6 +1,6 @@
 # Content object-storage layout — design sketch
 
-Status: **partly adopted.** The PMTiles source-template rules in §3 are implemented and belong to Ishikari's serving contract. The publisher, style, sprite, and glyph layout remains a proposal. [`ishikari-spec.md`](ishikari-spec.md) and [`biei-spec.md`](biei-spec.md) remain authoritative for runtime behavior.
+Status: **partly adopted.** The PMTiles source-template rules in §3 and the two style-object layouts in §2 are implemented. Abashiri conditionally publishes those style objects, and Ishikari serves them through the canonical `namespace/style_id` identity. Sprite and glyph publishing conventions remain proposals. [`abashiri-spec.md`](abashiri-spec.md), [`ishikari-spec.md`](ishikari-spec.md), and [`biei-spec.md`](biei-spec.md) remain authoritative for runtime behavior.
 
 ## 1. Boundary and invariants
 
@@ -12,7 +12,7 @@ Object storage is a write/read seam, not a runtime dependency between services:
 
 Content-addressed sprite bundles are immutable. A PMTiles tileset id is a logical pointer that may be conditionally replaced; each observed object generation remains an immutable snapshot and is part of every archive-derived cache key. Ishikari periodically re-observes the logical pointer, but has no client-visible version field or version path component. Publishers should still prefer a new opaque tileset id when immutable URLs are practical.
 
-Styles are small coordination objects, and unlike archives and sprite bundles they are **mutable in place**: Abashiri may add, change, and delete a style under a stable id. Short HTTP freshness still does not by itself invalidate Biei's loaded style state, so the revision Biei acts on is derived from the **style content** rather than from the id or from cache expiry. Equal content is an equal revision, so an expired TTL causes a re-check and not a rebuild; changed content is a new revision and is already treated as cold cluster-wide. Biei honours the served freshness with a floor of ten seconds between re-checks. The obligations and the open questions are in [`../issues/biei-todo.md`](../issues/biei-todo.md).
+Styles are small coordination objects, and unlike archives and sprite bundles they are **mutable in place**: Abashiri currently creates and conditionally replaces a style under a stable id. Deletion remains a future lifecycle decision. Short HTTP freshness does not by itself invalidate Biei's loaded style state, so the revision Biei acts on is derived from the **style content** rather than from the id or from cache expiry. Equal content is an equal revision, so an expired TTL causes a re-check and not a rebuild; changed content is a new revision and is already treated as cold cluster-wide. Biei honours the served freshness with a floor of ten seconds between re-checks. The obligations and the open questions are in [`../issues/biei-todo.md`](../issues/biei-todo.md).
 
 Styles and PMTiles therefore use different change protocols: styles are small content-derived revisions with advisory cluster refresh, while PMTiles use object-store generations and periodic bootstrap revalidation. Sprite bundles keep the immutable content-addressed rule.
 
@@ -22,12 +22,14 @@ The logical tileset identifier is either `tileset_id` or `namespace/tileset_id`.
 
 ```text
 tilesets/{namespace}/{tileset_id}.pmtiles
-styles/{style_id}/style.json
-styles/{style_id}/sprites/{sprite_id}{@2x}.{json,png}
+styles/{namespace}/{style_id}/style.json
+styles/{namespace}/{style_id}/sprites/{sprite_id}{@2x}.{json,png}
 fonts/{font_name}/{range}.pbf
 ```
 
-For a flat tileset id, the optional namespace path segment is omitted. There is no literal `default` segment. These are conventions rather than identifiers baked into Ishikari's domain model; deployments can choose another object path through the source templates below.
+Abashiri and Ishikari also support the equivalent flat style object `styles/{namespace}/{style_id}.json`; the choice is a storage-layout concern and does not change the public `namespace/style_id` identity.
+
+For a flat tileset id, the optional namespace path segment is omitted. There is no literal `default` segment in the tileset convention. Styles deliberately differ: their public identity is always exactly `namespace/style_id`, so an unnamespaced style uses the explicit `default` namespace. These are conventions rather than identifiers baked into Ishikari's tileset domain model; deployments can choose another tileset object path through the source templates below.
 
 TileJSON remains derived from the PMTiles header and metadata. Storing a second TileJSON object would create another source of truth without adding useful information.
 
@@ -67,10 +69,10 @@ Provider-catalog and URL-template configuration must be equivalent across peers 
 The management publisher should build the complete MapLibre sprite bundle, derive a lowercase hexadecimal SHA-256 `sprite_id` from a deterministic framing of every member name and byte sequence, and publish:
 
 ```text
-styles/{style_id}/sprites/{sprite_id}.json
-styles/{style_id}/sprites/{sprite_id}.png
-styles/{style_id}/sprites/{sprite_id}@2x.json
-styles/{style_id}/sprites/{sprite_id}@2x.png
+styles/{namespace}/{style_id}/sprites/{sprite_id}.json
+styles/{namespace}/{style_id}/sprites/{sprite_id}.png
+styles/{namespace}/{style_id}/sprites/{sprite_id}@2x.json
+styles/{namespace}/{style_id}/sprites/{sprite_id}@2x.png
 ```
 
 The path needs no `/sha256/` discriminator: the validated `sprite_id` shape and the publishing contract already identify the algorithm. Hashing the complete bundle, rather than each file independently, gives the style one atomic logical sprite identity. The canonical framing must be specified before two independent publishers are supported.
@@ -81,7 +83,7 @@ MapLibre's sprite protocol requires the paired JSON index and PNG image. WebP is
 
 ## 6. Publishing and cache identity
 
-The first writer should be a trusted operator CLI using cloud or workload identity and the repository's existing `object_store` adapters. Immutable puts must use create-only semantics or an equivalent precondition. If a backend cannot enforce that safely, the publisher must refuse publication rather than fall back to last-write-wins.
+Abashiri is the implemented style writer. It uses management authentication, a trusted catalog, conditional object-store writes, and a separate append-only mutation journal. Future PMTiles, sprite, and glyph publishers use cloud or workload identity and the repository's existing `object_store` adapters. Immutable puts use create-only semantics or an equivalent precondition; a backend that cannot enforce the required operation must be rejected rather than used with last-write-wins.
 
 The publisher must also set explicit `Cache-Control` object metadata. An authenticated object-store transport may synthesize `private, max-age=0` when metadata is absent; Ishikari cannot safely distinguish that transport default from an intentional private policy and therefore must not override it. The current recommended policies are:
 
@@ -98,7 +100,7 @@ Multi-object publication order is:
 2. Verify their expected identities and required members.
 3. Publish the referencing style last.
 
-A future stable style pointer requires explicit compare-and-swap, rollback, freshness, and Biei `StyleRevision` semantics. It must not be inferred merely from a short cache TTL. Content identifiers, authorization capability epochs, and policy revisions remain independent axes.
+The stable style pointer already uses compare-and-swap publication, short freshness, advisory refresh, and Biei's content-derived `StyleRevision`. A future delete or rollback workflow must preserve those invariants and the durable mutation evidence rather than inferring activation from a short cache TTL. Content identifiers, authorization capability epochs, and policy revisions remain independent axes.
 
 ## 7. Authorization and portability
 

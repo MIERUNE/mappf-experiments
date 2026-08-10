@@ -52,23 +52,23 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: clippy,rustfmt,llvm-tools-preview
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2
+        uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2
         with:
           tool: cargo-llvm-cov@0.8.6
       - name: Configure sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.16.0
       # rust-cache intentionally excludes workspace artifacts; sccache handles
       # content-identical workspace compilation after Cargo's freshness check.
       - name: Cache Cargo dependencies and build outputs
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: . -> target
           key: ishikari
@@ -131,7 +131,7 @@ jobs:
           )
           PY
       - name: Upload schema artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ishikari-schemas
           path: |

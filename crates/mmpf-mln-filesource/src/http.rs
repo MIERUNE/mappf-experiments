@@ -93,6 +93,30 @@ pub fn redacted_url_str(raw: &str) -> String {
         .unwrap_or_else(|_| "invalid resource URL".to_string())
 }
 
+/// Sorted, deduplicated query parameter *names* for one resource URL.
+///
+/// [`redacted_url`] drops the query wholesale, which is right for a value that
+/// may hold a delivery credential but leaves a log unable to answer the question
+/// that matters when a provider refuses a request: did the credential travel at
+/// all? Names alone answer it without recording a secret — a parameter named
+/// `access_token` is not itself sensitive, its value is.
+pub fn redacted_query_keys(raw: &str) -> String {
+    let Ok(url) = url::Url::parse(raw) else {
+        return "invalid resource URL".to_string();
+    };
+    let mut keys: Vec<_> = url
+        .query_pairs()
+        .map(|(key, _)| key.into_owned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if keys.is_empty() {
+        return "none".to_string();
+    }
+    keys.dedup();
+    keys.join(",")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,6 +159,29 @@ mod tests {
             url::Url::parse(&format!("http://{address}/resource")).expect("test URL"),
             server,
         )
+    }
+
+    /// A refused provider request must be diagnosable without logging the
+    /// credential: names travel, values never do.
+    #[test]
+    fn query_keys_report_credential_presence_without_its_value() {
+        assert_eq!(
+            redacted_query_keys("http://provider.test/tilesets/x?access_token=secret"),
+            "access_token"
+        );
+        assert_eq!(
+            redacted_query_keys("http://provider.test/tilesets/x"),
+            "none"
+        );
+        // Sorted and deduplicated so the field is stable across requests.
+        assert_eq!(
+            redacted_query_keys("http://provider.test/x?b=2&a=1&a=3"),
+            "a,b"
+        );
+        // The secret must never appear.
+        let rendered = redacted_query_keys("http://provider.test/x?access_token=topsecret");
+        assert!(!rendered.contains("topsecret"), "{rendered}");
+        assert_eq!(redacted_query_keys("not a url"), "invalid resource URL");
     }
 
     #[test]

@@ -66,7 +66,7 @@ use singleflight::{
 #[cfg(test)]
 use maplibre_native::file_source::Usage;
 
-use crate::http::{redacted_url_str, reqwest_error_label};
+use crate::http::{redacted_query_keys, redacted_url_str, reqwest_error_label};
 use mmpf_common::sync::lock_unpoisoned;
 
 /// TCP connect timeout for upstream resource fetches.
@@ -639,6 +639,10 @@ impl NetworkFileSource {
                 kind = kind_label(request.kind),
                 status,
                 resource_url = redacted_url_str(&request.url),
+                // Names only, never values: a provider refusal is usually either
+                // "wrong resource" or "no credential travelled", and the second
+                // is indistinguishable from the first once the query is dropped.
+                query_keys = redacted_query_keys(&request.url),
                 "resource provider returned a non-success status"
             );
             let mapped = response_from_http(status, &headers, Vec::new(), request.kind, prior);

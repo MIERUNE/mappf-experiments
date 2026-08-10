@@ -346,6 +346,10 @@ docker run -d \
 
 wait_for_status "http://127.0.0.1:${ISHIKARI_PUBLIC_PORT}/readyz" 200
 
+# Biei owns the MapLibre FileSource, so a provider refusal on a style source is
+# only visible from this container. Its non-success log reports the redacted URL
+# plus query parameter names, which separates "wrong resource" from "no
+# credential travelled" without recording the credential itself.
 BIEI_CONTAINER="${PREFIX}-biei"
 CONTAINERS+=("$BIEI_CONTAINER")
 docker run -d \
@@ -366,6 +370,7 @@ docker run -d \
   -e BIEI_MLN_RESOURCE_PRIVATE_HOSTS=ishikari \
   -e BIEI_RENDER_OUTPUT_CACHE_BYTES=16777216 \
   -e BIEI_MLN_RESOURCE_CACHE_BYTES=16777216 \
+  -e 'RUST_LOG=info,mmpf_mln_filesource::source=debug' \
   "$BIEI_IMAGE" >/dev/null
 
 wait_for_status "http://127.0.0.1:${BIEI_PUBLIC_PORT}/readyz" 200

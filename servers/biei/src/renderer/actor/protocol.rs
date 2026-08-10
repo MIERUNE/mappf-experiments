@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use biei_core::types::{
-    ImageFormat, InternalTask, PixelRatio, RenderRequest, RendererError, StyleRevision, TaskId,
-    WorkerId,
+    CredentialCachePartition, ImageFormat, InternalTask, PixelRatio, RenderRequest, RendererError,
+    StyleRevision, TaskId, WorkerId,
 };
 use mmpf_common::sync::lock_unpoisoned;
 use tokio::sync::oneshot;
@@ -35,13 +35,30 @@ pub(crate) struct RendererActorConfig {
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedStyle {
     pub revision: StyleRevision,
+    pub authorization_partition: Option<CredentialCachePartition>,
     pub style_json: Arc<str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RendererProfileIdentity {
+    revision: StyleRevision,
+    authorization_partition: Option<CredentialCachePartition>,
+}
+
+impl ResolvedStyle {
+    pub(crate) fn identity(&self) -> RendererProfileIdentity {
+        RendererProfileIdentity {
+            revision: self.revision.clone(),
+            authorization_partition: self.authorization_partition,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct RenderTaskView {
     pub id: TaskId,
     pub style: StyleRevision,
+    pub(crate) authorization_partition: Option<CredentialCachePartition>,
     pub request: RenderRequest,
     pub pixel_ratio: PixelRatio,
     pub output_format: ImageFormat,
@@ -53,11 +70,22 @@ impl From<&InternalTask> for RenderTaskView {
         Self {
             id: task.id,
             style: task.style.clone(),
+            authorization_partition: task
+                .authorization
+                .as_ref()
+                .map(|authorization| authorization.cache_partition),
             request: task.request.clone(),
             pixel_ratio: task.pixel_ratio,
             output_format: task.output_format,
             deadline: task.deadline,
         }
+    }
+}
+
+impl RenderTaskView {
+    fn matches_profile(&self, profile: &RendererProfileIdentity) -> bool {
+        self.style == profile.revision
+            && self.authorization_partition == profile.authorization_partition
     }
 }
 
@@ -313,16 +341,16 @@ fn run_actor<B>(rx: mpsc::Receiver<RenderCmd>, mut backend: B)
 where
     B: BlockingRenderBackend,
 {
-    let mut loaded: Option<StyleRevision> = None;
+    let mut loaded: Option<RendererProfileIdentity> = None;
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
             RenderCmd::LoadProfile { style, task, reply } => {
-                let revision = style.revision.clone();
+                let identity = style.identity();
                 let result =
                     catch_backend_unwind("load_profile", || backend.load_profile(&style, &task));
                 if result.is_ok() {
-                    loaded = Some(revision);
+                    loaded = Some(identity);
                 } else {
                     loaded = None;
                     reset_backend_after_error(&mut backend);
@@ -330,7 +358,10 @@ where
                 let _ = reply.send(result);
             }
             RenderCmd::Render { task, reply } => {
-                let result = if loaded.as_ref() == Some(&task.style) {
+                let result = if loaded
+                    .as_ref()
+                    .is_some_and(|profile| task.matches_profile(profile))
+                {
                     catch_backend_unwind("render", || backend.render(&task))
                 } else {
                     Err(RendererError::StyleNotReady {
@@ -535,6 +566,7 @@ mod tests {
     fn resolved_style() -> ResolvedStyle {
         ResolvedStyle {
             revision: revision(),
+            authorization_partition: None,
             style_json: Arc::from(r#"{"version":8,"sources":{},"layers":[]}"#),
         }
     }
@@ -543,6 +575,7 @@ mod tests {
         RenderTaskView {
             id: 7,
             style,
+            authorization_partition: None,
             request: RenderRequest::StaticImage {
                 positioning: Positioning::Center {
                     lon: 139.767,
@@ -628,6 +661,53 @@ mod tests {
             .expect_err("style must be loaded first");
 
         assert!(matches!(err, RendererError::StyleNotReady { .. }));
+    }
+
+    #[tokio::test]
+    async fn actor_loaded_profile_is_partitioned_by_credential() {
+        let actor = RendererActor::spawn_with_backend(
+            RendererActorConfig {
+                worker_id: 17,
+                ambient_cache_path: None,
+            },
+            FakeBackend,
+        )
+        .expect("actor spawns");
+        let revision = revision();
+        let first_partition = CredentialCachePartition::from_digest([1; 32]);
+        let second_partition = CredentialCachePartition::from_digest([2; 32]);
+        let mut first_style = resolved_style();
+        first_style.authorization_partition = Some(first_partition);
+        let mut first_task = task_view(revision.clone());
+        first_task.authorization_partition = Some(first_partition);
+
+        actor
+            .load_profile(first_style, first_task.clone())
+            .await
+            .expect("first credential profile loads");
+        actor
+            .render(first_task)
+            .await
+            .expect("matching credential profile renders");
+
+        let mut second_task = task_view(revision);
+        second_task.authorization_partition = Some(second_partition);
+        let error = actor
+            .render(second_task.clone())
+            .await
+            .expect_err("same revision under another credential is not warm");
+        assert!(matches!(error, RendererError::StyleNotReady { .. }));
+
+        let mut second_style = resolved_style();
+        second_style.authorization_partition = Some(second_partition);
+        actor
+            .load_profile(second_style, second_task.clone())
+            .await
+            .expect("second credential profile loads");
+        actor
+            .render(second_task)
+            .await
+            .expect("reloaded credential profile renders");
     }
 
     #[tokio::test]

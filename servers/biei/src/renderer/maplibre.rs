@@ -150,6 +150,7 @@ impl Renderer for MapLibreRenderer {
             .load_profile(
                 ResolvedStyle {
                     revision: prepared.revision,
+                    authorization_partition: prepared.authorization_partition,
                     style_json: prepared.style_json,
                 },
                 RenderTaskView::from(task),

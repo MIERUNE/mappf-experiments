@@ -12,7 +12,8 @@ mod protocol;
 mod supervisor;
 
 pub(crate) use protocol::{
-    BlockingRenderBackend, RenderTaskView, RendererActor, RendererActorConfig, ResolvedStyle,
+    BlockingRenderBackend, RenderTaskView, RendererActor, RendererActorConfig,
+    RendererProfileIdentity, ResolvedStyle,
 };
 pub(crate) use supervisor::RendererActorSupervisor;
 #[cfg(test)]
@@ -78,6 +79,7 @@ mod tests {
                 id: StyleId("carto/voyager".to_string()),
                 version: 1,
             },
+            authorization_partition: None,
             style_json: Arc::from(r#"{"version":8,"sources":{},"layers":[]}"#),
         }
     }
@@ -86,6 +88,7 @@ mod tests {
         RenderTaskView {
             id: 7,
             style,
+            authorization_partition: None,
             request: RenderRequest::StaticImage {
                 positioning: Positioning::Center {
                     lon: 139.767,

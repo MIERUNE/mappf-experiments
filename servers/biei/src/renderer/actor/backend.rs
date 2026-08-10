@@ -2,12 +2,12 @@
 
 use std::path::PathBuf;
 
-use biei_core::types::{PixelRatio, RenderRequest, RendererError, StyleRevision};
+use biei_core::types::{PixelRatio, RenderRequest, RendererError};
 
 use super::addlayer::{AddLayerSourceCache, render_static_with_overlays_and_addlayer};
 use super::camera::{auto_padding_for_overlays, padding_to_edge_insets};
 use super::encode::encode_image;
-use super::{BlockingRenderBackend, RenderTaskView, ResolvedStyle};
+use super::{BlockingRenderBackend, RenderTaskView, RendererProfileIdentity, ResolvedStyle};
 use crate::renderer::RendererOutput;
 use crate::renderer::overlay::{OverlaySlotPool, build_overlay_geojson, populate_static_slots};
 
@@ -20,7 +20,7 @@ pub(super) struct MapLibreNativeBackend {
 enum ActiveRenderer {
     Static {
         key: RendererKey,
-        loaded_style: Option<StyleRevision>,
+        loaded_profile: Option<RendererProfileIdentity>,
         renderer: maplibre_native::ImageRenderer<maplibre_native::Static>,
         /// Pre-allocated overlay slots (style-setup-time fixed). Per-request
         /// overlay rendering only updates each slot's GeoJSON source via
@@ -34,7 +34,7 @@ enum ActiveRenderer {
     },
     Tile {
         key: RendererKey,
-        loaded_style: Option<StyleRevision>,
+        loaded_profile: Option<RendererProfileIdentity>,
         renderer: maplibre_native::ImageRenderer<maplibre_native::Tile>,
     },
 }
@@ -112,14 +112,14 @@ impl MapLibreNativeBackend {
                 })?;
             self.active_renderer = Some(ActiveRenderer::Static {
                 key,
-                loaded_style: Some(style.revision.clone()),
+                loaded_profile: Some(style.identity()),
                 renderer,
                 slots,
                 addlayer_sources: AddLayerSourceCache::new(),
             });
         }
         let Some(ActiveRenderer::Static {
-            loaded_style,
+            loaded_profile,
             renderer,
             slots,
             addlayer_sources,
@@ -128,9 +128,10 @@ impl MapLibreNativeBackend {
         else {
             unreachable!("static renderer was inserted")
         };
-        if loaded_style.as_ref() != Some(&style.revision) {
+        let profile_identity = style.identity();
+        if loaded_profile.as_ref() != Some(&profile_identity) {
             load_style_json(renderer, &style)?;
-            *loaded_style = Some(style.revision.clone());
+            *loaded_profile = Some(profile_identity);
             *slots = populate_static_slots(renderer).map_err(|err| RendererError::SetupFailed {
                 style_id: style.revision.id.clone(),
                 source: err.to_string(),
@@ -157,21 +158,22 @@ impl MapLibreNativeBackend {
             load_style_json(&mut renderer, &style)?;
             self.active_renderer = Some(ActiveRenderer::Tile {
                 key,
-                loaded_style: Some(style.revision.clone()),
+                loaded_profile: Some(style.identity()),
                 renderer,
             });
         }
         let Some(ActiveRenderer::Tile {
-            loaded_style,
+            loaded_profile,
             renderer,
             ..
         }) = self.active_renderer.as_mut()
         else {
             unreachable!("tile renderer was inserted")
         };
-        if loaded_style.as_ref() != Some(&style.revision) {
+        let profile_identity = style.identity();
+        if loaded_profile.as_ref() != Some(&profile_identity) {
             load_style_json(renderer, &style)?;
-            *loaded_style = Some(style.revision.clone());
+            *loaded_profile = Some(profile_identity);
         }
         renderer.set_map_size(size);
         Ok(renderer)
@@ -196,9 +198,9 @@ impl MapLibreNativeBackend {
     fn reset_loaded_state(&mut self) {
         self.loaded_style = None;
         match self.active_renderer.as_mut() {
-            Some(ActiveRenderer::Static { loaded_style, .. })
-            | Some(ActiveRenderer::Tile { loaded_style, .. }) => {
-                *loaded_style = None;
+            Some(ActiveRenderer::Static { loaded_profile, .. })
+            | Some(ActiveRenderer::Tile { loaded_profile, .. }) => {
+                *loaded_profile = None;
             }
             None => {}
         }

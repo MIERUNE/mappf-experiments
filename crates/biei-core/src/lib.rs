@@ -14,6 +14,7 @@ mod render_cache;
 pub mod renderer;
 pub mod style_catalog;
 pub mod types;
+pub mod warm_plan;
 pub mod wire;
 pub(crate) mod worker;
 pub(crate) mod worker_pool;

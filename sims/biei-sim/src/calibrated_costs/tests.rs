@@ -176,7 +176,7 @@ fn base_costs() -> CostConfig {
             Duration::from_millis(400),
         ),
         hop_latency: Duration::from_millis(5),
-        sla: Duration::from_millis(1_000),
+        sla: Duration::from_secs(1),
     }
 }
 

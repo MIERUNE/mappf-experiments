@@ -235,7 +235,10 @@ impl HttpMetrics {
             observer_node_id,
             BieiOperationalStatus {
                 mode,
-                draining: self.drain.as_ref().is_some_and(|drain| drain.is_draining()),
+                draining: self
+                    .drain
+                    .as_ref()
+                    .is_some_and(crate::drain::DrainController::is_draining),
                 native_render_permits_inuse: self.node.native_render_permits_inuse(),
                 renderer: BieiRendererStatus {
                     health: renderer.health.as_str(),
@@ -259,11 +262,8 @@ impl HttpMetrics {
                 WorkerGaugeSample {
                     worker: worker.id.to_string(),
                     render_mode: profile
-                        .map(|profile| profile.render_mode.as_gossip_value())
-                        .unwrap_or("none"),
-                    scale: profile
-                        .map(|profile| profile.scale.as_gossip_value())
-                        .unwrap_or("none"),
+                        .map_or("none", |profile| profile.render_mode.as_gossip_value()),
+                    scale: profile.map_or("none", |profile| profile.scale.as_gossip_value()),
                     queue_depth: worker.queue_depth as i64,
                     loaded: worker.loaded_profile.is_some(),
                 }
@@ -279,7 +279,10 @@ impl HttpMetrics {
             workers,
             membership_live,
             native_render_permits_inuse: self.node.native_render_permits_inuse() as i64,
-            draining: self.drain.as_ref().is_some_and(|drain| drain.is_draining()),
+            draining: self
+                .drain
+                .as_ref()
+                .is_some_and(crate::drain::DrainController::is_draining),
             renderer_total: renderer.total_slots as i64,
             renderer_available: renderer.available_slots as i64,
             renderer_orphaned: renderer.orphaned_threads as i64,

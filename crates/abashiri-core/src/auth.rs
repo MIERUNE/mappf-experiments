@@ -29,7 +29,7 @@ const MAX_CREDENTIALS: usize = 10_000;
 const MAX_ACCOUNTS_PER_CREDENTIAL: usize = 256;
 const MIN_CREDENTIAL_BYTES: usize = 32;
 const MAX_CREDENTIAL_BYTES: usize = 4_096;
-const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const REFRESH_INTERVAL: Duration = Duration::from_mins(1);
 const REFRESH_FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
 const CREDENTIAL_DOMAIN: &[u8] = b"abashiri-object-store-credential-v1\0";
 

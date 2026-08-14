@@ -24,7 +24,7 @@ const MAX_RESPONSE_BYTES: usize = 128 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const FRESHNESS: Duration = Duration::from_secs(2);
-const MAX_STALE_AGE: Duration = Duration::from_secs(5 * 60);
+const MAX_STALE_AGE: Duration = Duration::from_mins(5);
 
 /// Named delivery-service endpoint, parsed from `<source-id>=<url>`.
 #[derive(Clone, Debug)]

@@ -585,7 +585,7 @@ mod tests {
             render_resource_cost: CostRange::fixed(Duration::ZERO),
             first_render_resource_cost: CostRange::fixed(Duration::ZERO),
             hop_latency: Duration::ZERO,
-            sla: Duration::from_millis(1_000),
+            sla: Duration::from_secs(1),
         };
         config.workload.duration = Duration::from_millis(300);
         config.workload.warmup = Duration::ZERO;

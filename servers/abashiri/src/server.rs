@@ -35,7 +35,7 @@ use mmpf_http::serve::wait_for_shutdown_signal;
 use crate::notifier::StyleRefreshNotifier;
 use crate::operations::OperationalStatusClient;
 
-const RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const RECONCILIATION_INTERVAL: Duration = Duration::from_mins(5);
 
 #[derive(Clone)]
 struct AppState {
@@ -248,7 +248,7 @@ async fn whoami(State(state): State<AppState>, headers: HeaderMap) -> Response {
                             .actions()
                             .iter()
                             .copied()
-                            .map(|action| action.as_str())
+                            .map(abashiri_core::auth::ManagementAction::as_str)
                             .collect(),
                         registry_revision: principal.registry_revision(),
                     }),
@@ -494,7 +494,7 @@ async fn publish_style(
         Err(error)
             if error
                 .source()
-                .is_some_and(|source| source.is::<LengthLimitError>()) =>
+                .is_some_and(<dyn std::error::Error + 'static>::is::<LengthLimitError>) =>
         {
             return mutation_error(
                 StatusCode::PAYLOAD_TOO_LARGE,

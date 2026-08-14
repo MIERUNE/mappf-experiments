@@ -310,7 +310,7 @@ impl Default for SimConfig {
                 render_resource_cost: CostRange::fixed(Duration::from_millis(165)),
                 first_render_resource_cost: CostRange::fixed(Duration::from_millis(480)),
                 hop_latency: Duration::from_millis(5),
-                sla: Duration::from_millis(1000),
+                sla: Duration::from_secs(1),
             },
             workload: WorkloadConfig {
                 duration: Duration::from_secs(30),

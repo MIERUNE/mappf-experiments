@@ -194,12 +194,13 @@ struct ClusterObservedStyle {
 }
 
 fn read_unpoisoned<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
-    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn write_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
     lock.write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -918,7 +919,7 @@ mod tests {
     fn a_longer_served_freshness_extends_beyond_the_floor() {
         let catalog = StyleCatalog::new();
         let style_id = StyleId("basic".to_string());
-        let long = Duration::from_secs(3600);
+        let long = Duration::from_hours(1);
         catalog.record_observed(&style_id, style_content_version("{}"), long);
         let due = read_unpoisoned(&catalog.inner).observed[&style_id].revalidate_after;
         assert!(
@@ -1109,7 +1110,7 @@ mod tests {
     #[test]
     fn fence_exhaustion_is_reported_and_still_keeps_an_inflight_fetch_due() {
         let catalog = StyleCatalog::new();
-        let long_ttl = Duration::from_secs(3_600);
+        let long_ttl = Duration::from_hours(1);
 
         // Fill the fence map with observed, hinted styles.
         for index in 0..MAX_REVALIDATION_GENERATIONS {
@@ -1159,7 +1160,7 @@ mod tests {
     #[test]
     fn a_hint_for_another_style_does_not_shorten_an_intact_fence() {
         let catalog = StyleCatalog::new();
-        let long_ttl = Duration::from_secs(3_600);
+        let long_ttl = Duration::from_hours(1);
         let mine = StyleId("mine".to_string());
         let theirs = StyleId("theirs".to_string());
         catalog.record_observed(&mine, style_content_version("{}"), long_ttl);
@@ -1197,7 +1198,7 @@ mod tests {
     #[test]
     fn without_any_hint_a_completion_takes_the_full_freshness_window() {
         let catalog = StyleCatalog::new();
-        let long_ttl = Duration::from_secs(3_600);
+        let long_ttl = Duration::from_hours(1);
         let style_id = StyleId("quiet".to_string());
         let fence = catalog.revalidation_fence(&style_id);
         assert_eq!(fence.generation, None);
@@ -1231,7 +1232,7 @@ mod tests {
         catalog.record_observed_for_generation(
             &style_id,
             style_content_version("{}"),
-            Duration::from_secs(3_600),
+            Duration::from_hours(1),
             fence,
         );
 
@@ -1242,7 +1243,7 @@ mod tests {
             observed.revalidate_after >= observed.last_observed_at + MIN_STYLE_REVALIDATE_INTERVAL
         );
         assert!(
-            observed.revalidate_after < observed.last_observed_at + Duration::from_secs(3_600),
+            observed.revalidate_after < observed.last_observed_at + Duration::from_hours(1),
             "the stale provider TTL must not erase the newer hint"
         );
     }
@@ -1254,7 +1255,7 @@ mod tests {
         catalog.record_observed(
             &style_id,
             style_content_version("{}"),
-            Duration::from_secs(3_600),
+            Duration::from_hours(1),
         );
         let first_observation = read_unpoisoned(&catalog.inner).observed[&style_id];
 
@@ -1290,7 +1291,7 @@ mod tests {
         catalog.record_observed_for_generation(
             &style_id,
             style_content_version("{}"),
-            Duration::from_secs(3_600),
+            Duration::from_hours(1),
             fence,
         );
         assert!(!catalog.has_pending_revalidation(&style_id));
@@ -1301,7 +1302,7 @@ mod tests {
         let style_id = StyleId("demo/basic".to_owned());
         let old = style_content_version(r#"{"version":8,"layers":[]}"#);
         let new = style_content_version(r#"{"version":8,"name":"new","layers":[]}"#);
-        let long = Duration::from_secs(3_600);
+        let long = Duration::from_hours(1);
 
         let renderer = StyleCatalog::new();
         renderer.set_url_template("https://styles.test/{style_id}/style.json");
@@ -1348,7 +1349,7 @@ mod tests {
         let new = style_content_version(r#"{"version":8,"name":"new"}"#);
         let ingress = StyleCatalog::new();
         ingress.set_url_template("https://styles.test/{style_id}/style.json");
-        ingress.record_observed(&style_id, old, Duration::from_secs(3_600));
+        ingress.record_observed(&style_id, old, Duration::from_hours(1));
         ingress.request_revalidation_for_hint(&style_id, "mutation-new");
 
         let stale = StyleRevisionObservation::new("mutation-old".to_owned(), &style_id, old);

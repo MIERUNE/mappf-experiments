@@ -47,7 +47,7 @@ impl NodeRegistry {
             .read()
             .expect("registry poisoned")
             .get(id)
-            .and_then(|w| w.upgrade())
+            .and_then(std::sync::Weak::upgrade)
             .map(|e| e.node.clone())
     }
 

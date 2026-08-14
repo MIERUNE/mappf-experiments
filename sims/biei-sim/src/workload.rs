@@ -290,7 +290,7 @@ pub(crate) async fn run_workload(
             // are not modelled, so all generated styles use the initial
             // catalog version.
             let style_revision = StyleRevision {
-                id: StyleId(format!("style-{}", style)),
+                id: StyleId(format!("style-{style}")),
                 version: 1,
             };
             let task = TaskSpec {

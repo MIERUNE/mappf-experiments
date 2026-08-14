@@ -566,7 +566,7 @@ async fn healthz(State(state): State<HttpServerState>) -> Response {
     if state
         .renderer_supervisor
         .as_ref()
-        .is_none_or(|supervisor| supervisor.is_livable())
+        .is_none_or(crate::renderer::actor::RendererActorSupervisor::is_livable)
     {
         simple_response(StatusCode::OK, "ok")
     } else {
@@ -583,7 +583,7 @@ async fn readyz(State(state): State<HttpServerState>) -> Response {
         && state
             .renderer_supervisor
             .as_ref()
-            .is_none_or(|supervisor| supervisor.is_ready());
+            .is_none_or(crate::renderer::actor::RendererActorSupervisor::is_ready);
     let ready = ready
         && match &state.membership {
             Some(membership) => membership.is_ready().await,

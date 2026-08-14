@@ -199,9 +199,7 @@ fn resolve(cli: Cli) -> anyhow::Result<Options> {
 }
 
 fn default_cores() -> usize {
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
+    std::thread::available_parallelism().map_or(1, usize::from)
 }
 
 fn auto_node_id() -> String {

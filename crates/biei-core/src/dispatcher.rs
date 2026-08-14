@@ -238,8 +238,7 @@ impl Dispatcher {
                     id != &target_id
                         && view
                             .state(id)
-                            .map(|node| node.has_capacity(self.bl_capacity))
-                            .unwrap_or(false)
+                            .is_some_and(|node| node.has_capacity(self.bl_capacity))
                 })
                 .into_iter()
                 .take(DEFAULT_FORWARD_CANDIDATES.saturating_sub(1)),
@@ -254,8 +253,7 @@ impl Dispatcher {
         let tier2_candidates =
             top_hrw_candidates(view.members(), &profile, DEFAULT_FORWARD_CANDIDATES, |id| {
                 view.state(id)
-                    .map(|n| n.has_capacity(self.bl_capacity))
-                    .unwrap_or(false)
+                    .is_some_and(|n| n.has_capacity(self.bl_capacity))
             });
         if !tier2_candidates.is_empty() {
             return self.materialize_candidates(task, RouteTier::Tier2HrwBl, tier2_candidates);
@@ -278,8 +276,7 @@ impl Dispatcher {
         let tier4_candidates =
             top_hrw_candidates(view.members(), &profile, DEFAULT_FORWARD_CANDIDATES, |id| {
                 view.state(id)
-                    .map(|n| n.has_admission_capacity(self.queue_capacity))
-                    .unwrap_or(false)
+                    .is_some_and(|n| n.has_admission_capacity(self.queue_capacity))
             });
         if !tier4_candidates.is_empty() {
             return self.materialize_candidates(task, RouteTier::Tier4Overflow, tier4_candidates);
@@ -538,7 +535,7 @@ mod tests {
 
     fn rev(id: u32) -> StyleRevision {
         StyleRevision {
-            id: StyleId(format!("style-{}", id)),
+            id: StyleId(format!("style-{id}")),
             version: 0,
         }
     }

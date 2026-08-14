@@ -929,7 +929,7 @@ mod tests {
                 },
                 costs: test_costs(),
                 gossip: GossipConfig {
-                    publish_interval: Duration::from_secs(60),
+                    publish_interval: Duration::from_mins(1),
                 },
                 queue_limits: QueueLimits { soft: 1, hard: 2 },
                 render_permits: 1,

@@ -5,6 +5,8 @@ pub mod content_type;
 #[cfg(feature = "serve")]
 pub mod cors;
 pub mod operational;
+pub mod percent;
+pub use percent::{percent_decode, percent_decode_form};
 pub mod request_id;
 #[cfg(feature = "serve")]
 pub mod serve;

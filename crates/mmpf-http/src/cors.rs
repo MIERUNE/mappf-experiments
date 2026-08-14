@@ -38,5 +38,5 @@ pub fn public_distribution() -> CorsLayer {
             LAST_MODIFIED,
             HeaderName::from_static("x-request-id"),
         ])
-        .max_age(Duration::from_secs(3600))
+        .max_age(Duration::from_hours(1))
 }

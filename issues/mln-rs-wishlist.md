@@ -62,6 +62,24 @@ biei registers request-local marker images with `style.add_image` and removes th
 
 This is an improvement, not a blocker. A small image introspection/removal result API would make the lifecycle explicit without requiring downstream code to infer presence from its own bookkeeping.
 
+### 5. Typed request context from the render into the file source (conditional)
+
+`ResourceRequest` carries no indication of which render caused it, so a custom `TokioFileSource` cannot attribute provider I/O to a render, cannot give speculative work its own admission lane, and cannot forward the render's `X-Request-Id` to the provider — the receiving service already accepts and spans on that header, so only the sending side is missing.
+
+A typed registration hook would be enough, and is preferable to an untyped `Option<Arc<dyn Any>>`:
+
+```rust
+register_tokio_file_source_with_context(source, || current_render_context())
+```
+
+The adapter would capture a small `RenderResourceContext` before `Handle::spawn` and pass it to the async source explicitly, so nothing depends on thread-local state surviving an async hop, and no cache key or URL changes.
+
+**Measured: adapter-side capture cannot work.** A temporary probe inside the binding, at the pre-spawn boundary in `Adapter::request`, reported `<unnamed>` on all four requests across two simultaneously rendering slots; `biei-renderer-{worker_id}` never appeared. The engine issues resource loads from its own threads, so no thread reachable from a `TokioFileSource` carries the identity of the render that caused the request. Rust thread-locals work fine on engine-created threads — there is simply no Biei render identity present on them to capture.
+
+This therefore needs an **engine change as well as a binding change**: `ResourceRequest` has to receive the context while MapLibre still knows which render initiated the load, because the Rust adapter cannot reconstruct what the engine already discarded. A typed registration hook is the right shape on the Rust side, but it only becomes useful once the engine carries the context down to resource loading.
+
+Scope note: this would serve diagnostics, latency attribution, and a speculative-work lane. It would **not** settle wedge detection. FileSource activity proves I/O progress, but the absence of activity proves nothing — tile parsing, symbol layout, shader compilation, rasterization, and encoding all run for seconds without any resource request. Timeout recovery must therefore be handled independently, by quarantining the slot and accepting a late completion from the same warm actor.
+
 ## Notes
 
 Priorities follow current biei blockers and measured maintenance cost, not a historical stage number. When something lands upstream, delete its item here.

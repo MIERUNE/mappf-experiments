@@ -177,6 +177,10 @@ impl Renderer for MapLibreRenderer {
         let _ = self.replace_retiring_actor();
     }
 
+    fn is_available(&self) -> bool {
+        !self.retiring && self.actor.is_alive()
+    }
+
     fn repair_if_needed(&mut self) -> Result<bool, RendererError> {
         if self.retiring {
             self.replace_retiring_actor()?;
@@ -395,7 +399,7 @@ mod tests {
                     server_count.fetch_add(1, Ordering::SeqCst);
                     let body = body
                         .read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .clone();
                     ([(axum::http::header::CACHE_CONTROL, "max-age=0")], body)
                 }
@@ -643,7 +647,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(15)).await;
         *body
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = second_body.to_string();
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = second_body.to_string();
         assert!(
             catalog
                 .request_revalidation(&bootstrap.id)

@@ -522,9 +522,13 @@ mod tests {
         }
 
         fn render(&mut self, _task: &RenderTaskView) -> Result<RendererOutput, RendererError> {
-            Err(RendererError::RenderFailed(
-                "test render failure".to_string(),
+            Err(RendererError::NativeRenderFailed(
+                "test native resource failure".to_string(),
             ))
+        }
+
+        fn error_invalidates_loaded_state(&self, err: &RendererError) -> bool {
+            !matches!(err, RendererError::RenderFailed(_))
         }
 
         fn reset(&mut self) {
@@ -758,7 +762,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_resets_loaded_state_after_render_failure() {
+    async fn actor_resets_loaded_state_after_native_render_failure() {
         let resets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let actor = RendererActor::spawn_with_backend(
             RendererActorConfig {
@@ -782,7 +786,7 @@ mod tests {
             .render(task.clone())
             .await
             .expect_err("render failure is returned");
-        assert!(matches!(err, RendererError::RenderFailed(_)));
+        assert!(matches!(err, RendererError::NativeRenderFailed(_)));
         assert_eq!(resets.load(std::sync::atomic::Ordering::Acquire), 1);
 
         let err = actor

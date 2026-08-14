@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::time::Instant;
@@ -14,7 +15,7 @@ use crate::types::{
 };
 use crate::worker_pool::WorkerCompletion;
 
-const RENDERER_REPAIR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+pub(crate) const RENDERER_REPAIR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Debug)]
 // `Process` is the hot path sent on every render; boxing it to shrink the rare
@@ -26,7 +27,7 @@ pub(crate) enum WorkerCmd {
         prepared_profile: Option<PreparedProfile>,
         route_tier: RouteTier,
         admitted_at_overflow: bool,
-        respond_to: oneshot::Sender<TaskOutcome>,
+        respond_to: oneshot::Sender<WorkerReply>,
         completion: WorkerCompletion,
     },
     /// Graceful shutdown: drain any `Process` commands already queued ahead of
@@ -34,6 +35,18 @@ pub(crate) enum WorkerCmd {
     /// exit the loop. Unlike closing the channel, this works while other
     /// `Sender` clones remain alive behind the shared `Node`.
     Retire,
+}
+
+#[derive(Debug)]
+pub(crate) enum WorkerReply {
+    Outcome(TaskOutcome),
+    /// The selected renderer became unavailable while this command waited in
+    /// its queue. No stage has started, so the pool may safely select another
+    /// worker without duplicating native work.
+    Redispatch {
+        task: Box<InternalTask>,
+        prepared_profile: Option<PreparedProfile>,
+    },
 }
 
 #[derive(Debug)]
@@ -101,10 +114,15 @@ pub(crate) async fn worker_loop(
     node_id: NodeId,
     mut rx: mpsc::Receiver<WorkerCmd>,
     mut renderer: BoxRenderer,
-    render_permits: Arc<Semaphore>,
-    native_render_permits: Arc<Semaphore>,
-    source_cache_capacity: usize,
+    runtime: WorkerRuntime,
 ) {
+    let WorkerRuntime {
+        render_permits,
+        native_render_permits,
+        source_cache_capacity,
+        available,
+        repair_interval,
+    } = runtime;
     // The worker's view of warm state is style revision + render mode + scale.
     // Static/Tile and @1x/@2x intentionally use separate warm workers.
     // Credential-sensitive prepared styles stay local to a worker and are not
@@ -113,7 +131,21 @@ pub(crate) async fn worker_loop(
     let mut current_profile: Option<(WorkerProfile, Option<CredentialCachePartition>)> = None;
     let mut cache = SourceCache::new(source_cache_capacity);
 
-    let mut repair_tick = tokio::time::interval(RENDERER_REPAIR_INTERVAL);
+    // Publish the renderer's real readiness before accepting anything. Native
+    // actor creation (GL context, thread spawn) is most likely to fail exactly at
+    // startup, and the slot's flag optimistically starts `true`, so without this a
+    // born-dead actor advertises itself until the first repair runs.
+    sync_availability(&mut renderer, id, &available);
+
+    // The first tick is deliberately one period out rather than immediate.
+    // `interval` fires immediately, and `select!` may leave that ready tick
+    // unconsumed until after a render, where it then observes a retired renderer
+    // and hides the slot as a side effect — making the timeout path's own hide
+    // untestable and the behaviour dependent on branch selection.
+    let mut repair_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + repair_interval,
+        repair_interval,
+    );
     repair_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
@@ -123,9 +155,7 @@ pub(crate) async fn worker_loop(
                 None => break,
             },
             _ = repair_tick.tick() => {
-                if let Err(error) = renderer.repair_if_needed() {
-                    tracing::debug!(worker_id = id, %error, "renderer actor is not repairable yet");
-                }
+                sync_availability(&mut renderer, id, &available);
                 continue;
             }
         };
@@ -138,6 +168,21 @@ pub(crate) async fn worker_loop(
                 respond_to,
                 completion,
             } => {
+                // A preceding command may have retired this renderer after the
+                // current command was already queued. Repair if possible; if
+                // not, return the untouched command to the pool instead of
+                // answering it with `renderer_dead`.
+                if !renderer.is_available() {
+                    sync_availability(&mut renderer, id, &available);
+                }
+                if !available.load(Ordering::Acquire) {
+                    drop(completion);
+                    let _ = respond_to.send(WorkerReply::Redispatch {
+                        task: Box::new(task),
+                        prepared_profile,
+                    });
+                    continue;
+                }
                 let had_source = task.has_source();
                 let outcome = match run_stages(
                     &mut renderer,
@@ -165,8 +210,16 @@ pub(crate) async fn worker_loop(
                     Err(StageFailure::RendererError { at, err }) => {
                         let _ = at;
                         if matches!(err, RendererError::Timeout) {
+                            // Queue accounting is finalized immediately after
+                            // this branch. Hide the slot first so it cannot look
+                            // like an idle fresh worker before repair completes.
+                            available.store(false, Ordering::Release);
                             renderer.retire_after_current();
                         }
+                        // Keep the pool-side selector synchronized with the
+                        // renderer/supervisor result even when an immediate
+                        // replacement succeeded inside `retire_after_current`.
+                        sync_availability(&mut renderer, id, &available);
                         if renderer_error_invalidates_warm_state(&err) {
                             current_profile = None;
                             cache.clear();
@@ -182,11 +235,36 @@ pub(crate) async fn worker_loop(
                 // the request future (and therefore the response receiver)
                 // was dropped after dispatch.
                 completion.finish(&outcome);
-                let _ = respond_to.send(outcome);
+                let _ = respond_to.send(WorkerReply::Outcome(outcome));
             }
             WorkerCmd::Retire => break,
         }
     }
+}
+
+/// Attempt repair and republish the slot's availability from the renderer's own
+/// answer. A failed repair is not fatal — the next tick retries — but the slot
+/// stays hidden until one succeeds. Shared by the startup and periodic paths so
+/// the two cannot drift.
+fn sync_availability(renderer: &mut BoxRenderer, id: WorkerId, available: &AtomicBool) {
+    match renderer.repair_if_needed() {
+        Ok(_) => available.store(renderer.is_available(), Ordering::Release),
+        Err(error) => {
+            available.store(false, Ordering::Release);
+            tracing::debug!(worker_id = id, %error, "renderer actor is not repairable yet");
+        }
+    }
+}
+
+pub(crate) struct WorkerRuntime {
+    pub(crate) render_permits: Arc<Semaphore>,
+    pub(crate) native_render_permits: Arc<Semaphore>,
+    pub(crate) source_cache_capacity: usize,
+    pub(crate) available: Arc<AtomicBool>,
+    /// How often an unavailable renderer is retried. Injected so a test can push
+    /// the periodic retry out of the way and observe only the immediate hide that
+    /// the timeout path performs.
+    pub(crate) repair_interval: std::time::Duration,
 }
 
 fn renderer_error_invalidates_warm_state(err: &RendererError) -> bool {

@@ -165,9 +165,22 @@ impl Node {
             render_permits,
             native_render_permits,
             source_cache_capacity,
+            repair_interval: None,
         });
         let metrics = Arc::new(NodeMetrics::default());
-        let render_output_cache = RenderOutputCache::new(render_output_cache_capacity_bytes);
+        let weak_metrics = Arc::downgrade(&metrics);
+        let render_output_cache = RenderOutputCache::new_observed(
+            render_output_cache_capacity_bytes,
+            Arc::new(move |cause| {
+                if let Some(metrics) = weak_metrics.upgrade() {
+                    metrics.record_render_output_cache_removal(cause);
+                }
+            }),
+        );
+        let observed_render_output_cache = render_output_cache.clone();
+        metrics.set_render_output_cache_stats_source(Box::new(move || {
+            observed_render_output_cache.stats()
+        }));
         let snapshotter = pool.snapshotter();
         let dispatcher = Dispatcher::new(DispatcherSpawn {
             node_id: id.clone(),
@@ -237,6 +250,7 @@ impl Node {
             .draining
             .load(std::sync::atomic::Ordering::Relaxed)
             && (self.inner.render_admission)()
+            && self.inner.pool.has_available_worker()
     }
 
     /// Gracefully stop this node within `deadline`.
@@ -1620,7 +1634,7 @@ mod tests {
                 sla: Duration::from_secs(1),
             },
             gossip: GossipConfig {
-                publish_interval: Duration::from_secs(60),
+                publish_interval: Duration::from_mins(1),
             },
             queue_limits: QueueLimits {
                 soft: 1,
@@ -1683,7 +1697,7 @@ mod tests {
         catalog.record_observed(
             &StyleId("cached/style".to_string()),
             1,
-            Duration::from_secs(3_600),
+            Duration::from_hours(1),
         );
         catalog
     }

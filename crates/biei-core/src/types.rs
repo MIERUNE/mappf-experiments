@@ -976,6 +976,7 @@ impl FailureKind {
             RendererError::SetupFailed { .. } => Self::Other,
             RendererError::StyleNotReady { .. } => Self::StyleNotReady,
             RendererError::SourceFetchFailed { .. } => Self::SourceUnavailable,
+            RendererError::NativeRenderFailed(_) => Self::SourceUnavailable,
             RendererError::RenderFailed(_) => Self::Other,
         }
     }
@@ -1186,6 +1187,10 @@ pub enum RendererError {
         hash: SourceHash,
         source: String,
     },
+    /// MapLibre Native completed a still render with an error. The native
+    /// renderer must be discarded before reuse because failed resource state
+    /// (notably glyph requests) can remain cached inside the Map instance.
+    NativeRenderFailed(String),
     RenderFailed(String),
     Timeout,
     ActorDead,
@@ -1210,6 +1215,9 @@ impl std::fmt::Display for RendererError {
             }
             RendererError::SourceFetchFailed { hash, source } => {
                 write!(f, "source fetch failed for {hash}: {source}")
+            }
+            RendererError::NativeRenderFailed(source) => {
+                write!(f, "native render failed: {source}")
             }
             RendererError::RenderFailed(source) => write!(f, "render failed: {source}"),
             RendererError::Timeout => write!(f, "render timeout"),
@@ -1316,13 +1324,10 @@ pub fn encode_worker_kvs(
         ),
         None => (String::new(), String::new(), String::new()),
     };
-    out.insert(format!("worker.{}.style", worker_id), style_value);
-    out.insert(format!("worker.{}.mode", worker_id), mode_value);
-    out.insert(format!("worker.{}.scale", worker_id), scale_value);
-    out.insert(
-        format!("worker.{}.queue", worker_id),
-        queue_depth.to_string(),
-    );
+    out.insert(format!("worker.{worker_id}.style"), style_value);
+    out.insert(format!("worker.{worker_id}.mode"), mode_value);
+    out.insert(format!("worker.{worker_id}.scale"), scale_value);
+    out.insert(format!("worker.{worker_id}.queue"), queue_depth.to_string());
 }
 
 #[cfg(test)]
@@ -1350,6 +1355,16 @@ mod tests {
                 source: "overlay slot collision".to_string(),
             }),
             FailureKind::Other,
+        );
+    }
+
+    #[test]
+    fn native_resource_failure_is_retryable_upstream_failure() {
+        assert_eq!(
+            FailureKind::from_renderer_error(&RendererError::NativeRenderFailed(
+                "glyph provider returned 503".to_string(),
+            )),
+            FailureKind::SourceUnavailable,
         );
     }
 

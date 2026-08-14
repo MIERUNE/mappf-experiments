@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use moka::notification::RemovalCause;
 use moka::sync::Cache;
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -20,7 +21,7 @@ use mmpf_common::sync::lock_unpoisoned;
 // Rendered output freshness is independent from the style revision: base
 // tiles and other referenced resources may change at stable URLs. Keep the
 // cache useful for burst coalescing without serving such output indefinitely.
-const RENDER_OUTPUT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const RENDER_OUTPUT_CACHE_TTL: Duration = Duration::from_mins(5);
 const RENDER_FLIGHT_SHARDS: usize = 16;
 const _: () = assert!(RENDER_FLIGHT_SHARDS.is_power_of_two());
 type RenderFlightMap = Mutex<HashMap<Arc<RenderCacheKey>, watch::Sender<u64>>>;
@@ -98,15 +99,36 @@ pub(crate) struct RenderFlightLeader {
 }
 
 impl RenderOutputCache {
+    #[cfg(test)]
     pub(crate) fn new(max_capacity_bytes: u64) -> Self {
-        Self::with_ttl(max_capacity_bytes, RENDER_OUTPUT_CACHE_TTL)
+        Self::with_ttl_and_observer(max_capacity_bytes, RENDER_OUTPUT_CACHE_TTL, None)
     }
 
+    #[cfg(test)]
     fn with_ttl(max_capacity_bytes: u64, ttl: Duration) -> Self {
+        Self::with_ttl_and_observer(max_capacity_bytes, ttl, None)
+    }
+
+    pub(crate) fn new_observed(
+        max_capacity_bytes: u64,
+        removal_observer: Arc<dyn Fn(RemovalCause) + Send + Sync>,
+    ) -> Self {
+        Self::with_ttl_and_observer(
+            max_capacity_bytes,
+            RENDER_OUTPUT_CACHE_TTL,
+            Some(removal_observer),
+        )
+    }
+
+    fn with_ttl_and_observer(
+        max_capacity_bytes: u64,
+        ttl: Duration,
+        removal_observer: Option<Arc<dyn Fn(RemovalCause) + Send + Sync>>,
+    ) -> Self {
         if max_capacity_bytes == 0 {
             return Self { inner: None };
         }
-        let cache = Cache::builder()
+        let mut builder = Cache::builder()
             .max_capacity(max_capacity_bytes)
             .time_to_live(ttl)
             .support_invalidation_closures()
@@ -116,8 +138,11 @@ impl RenderOutputCache {
                         .saturating_add(output.estimated_size_bytes())
                         .clamp(1, u32::MAX as usize) as u32
                 },
-            )
-            .build();
+            );
+        if let Some(observer) = removal_observer {
+            builder = builder.eviction_listener(move |_key, _output, cause| observer(cause));
+        }
+        let cache = builder.build();
         Self {
             inner: Some(Arc::new(RenderOutputCacheInner {
                 cache,
@@ -128,6 +153,12 @@ impl RenderOutputCache {
                 mutation_gate: Mutex::new(()),
             })),
         }
+    }
+
+    pub(crate) fn stats(&self) -> (u64, u64) {
+        self.inner.as_ref().map_or((0, 0), |inner| {
+            (inner.cache.entry_count(), inner.cache.weighted_size())
+        })
     }
 
     /// Removes completed renders for one style and fences renders that began

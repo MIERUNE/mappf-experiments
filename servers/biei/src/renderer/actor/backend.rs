@@ -9,6 +9,7 @@ use super::camera::{auto_padding_for_overlays, padding_to_edge_insets};
 use super::encode::encode_image;
 use super::{BlockingRenderBackend, RenderTaskView, RendererProfileIdentity, ResolvedStyle};
 use crate::renderer::RendererOutput;
+use crate::renderer::overlay::StaticRenderError;
 use crate::renderer::overlay::{OverlaySlotPool, build_overlay_geojson, populate_static_slots};
 
 pub(super) struct MapLibreNativeBackend {
@@ -194,17 +195,6 @@ impl MapLibreNativeBackend {
         }
         Ok(())
     }
-
-    fn reset_loaded_state(&mut self) {
-        self.loaded_style = None;
-        match self.active_renderer.as_mut() {
-            Some(ActiveRenderer::Static { loaded_profile, .. })
-            | Some(ActiveRenderer::Tile { loaded_profile, .. }) => {
-                *loaded_profile = None;
-            }
-            None => {}
-        }
-    }
 }
 
 impl BlockingRenderBackend for MapLibreNativeBackend {
@@ -225,6 +215,7 @@ impl BlockingRenderBackend for MapLibreNativeBackend {
                 self.ensure_tile_renderer(key, size)?
                     .render_tile(z, x, y)
                     .map(|image| (image, None))
+                    .map_err(StaticRenderError::Native)
             }
             RenderRequest::StaticImage {
                 positioning:
@@ -348,7 +339,13 @@ impl BlockingRenderBackend for MapLibreNativeBackend {
                 )
             }
         }
-        .map_err(|err| RendererError::RenderFailed(err.to_string()))?;
+        .map_err(|err| match err {
+            StaticRenderError::Native(maplibre_native::RenderingError::Native(source)) => {
+                RendererError::NativeRenderFailed(source)
+            }
+            StaticRenderError::Native(other) => RendererError::RenderFailed(other.to_string()),
+            StaticRenderError::Setup(source) => RendererError::RenderFailed(source),
+        })?;
 
         Ok(RendererOutput {
             output: encode_image(&image, task.output_format)?,
@@ -361,7 +358,11 @@ impl BlockingRenderBackend for MapLibreNativeBackend {
     }
 
     fn reset(&mut self) {
-        self.reset_loaded_state();
+        self.loaded_style = None;
+        // Reloading JSON into the same Map is insufficient after a native
+        // resource error: GlyphManager retains a non-null failed request that
+        // suppresses a later fetch of the same range. Drop the Map entirely.
+        self.active_renderer = None;
     }
 }
 

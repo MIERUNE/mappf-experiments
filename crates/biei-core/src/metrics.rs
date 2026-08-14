@@ -7,7 +7,10 @@ use std::time::Duration;
 use mmpf_common::metrics::{
     counter_vec, encode_metric_families, histogram_vec_buckets, register_collectors,
 };
-use prometheus::{HistogramVec, IntCounter, IntCounterVec, Registry, proto::MetricFamily};
+use moka::notification::RemovalCause;
+use prometheus::{
+    HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry, proto::MetricFamily,
+};
 
 use crate::types::{
     DeadlineStage, FailureKind, ImageFormat, RejectionReason, RenderMode, RenderObservation,
@@ -75,6 +78,9 @@ pub struct NodeMetrics {
     cold_starts: IntCounterVec,
     source_cache: IntCounterVec,
     render_output_cache: IntCounterVec,
+    render_output_cache_entries: IntGauge,
+    render_output_cache_bytes: IntGauge,
+    render_output_cache_stats: OnceLock<Box<dyn Fn() -> (u64, u64) + Send + Sync>>,
     forwards: IntCounterVec,
     admission_overflow: IntCounterVec,
     deadline_exceeded: IntCounterVec,
@@ -171,9 +177,19 @@ impl NodeMetrics {
         );
         let render_output_cache = counter_vec(
             "biei_render_output_cache_total",
-            "Rendered image cache lookups and insertions.",
+            "Rendered image cache lookups, insertions, and removals.",
             &["outcome"],
         );
+        let render_output_cache_entries = IntGauge::new(
+            "biei_render_output_cache_entries",
+            "Current number of node-local rendered image cache entries.",
+        )
+        .expect("valid render output cache entries gauge");
+        let render_output_cache_bytes = IntGauge::new(
+            "biei_render_output_cache_bytes",
+            "Current weighted byte size of the node-local rendered image cache.",
+        )
+        .expect("valid render output cache bytes gauge");
         let forwards = counter_vec(
             "biei_forwards_total",
             "Internal forward attempts by outcome.",
@@ -213,6 +229,8 @@ impl NodeMetrics {
                 Box::new(cold_starts.clone()),
                 Box::new(source_cache.clone()),
                 Box::new(render_output_cache.clone()),
+                Box::new(render_output_cache_entries.clone()),
+                Box::new(render_output_cache_bytes.clone()),
                 Box::new(forwards.clone()),
                 Box::new(admission_overflow.clone()),
                 Box::new(deadline_exceeded.clone()),
@@ -238,6 +256,9 @@ impl NodeMetrics {
             cold_starts,
             source_cache,
             render_output_cache,
+            render_output_cache_entries,
+            render_output_cache_bytes,
+            render_output_cache_stats: OnceLock::new(),
             forwards,
             admission_overflow,
             deadline_exceeded,
@@ -304,6 +325,23 @@ impl NodeMetrics {
             .inc();
     }
 
+    pub(crate) fn record_render_output_cache_removal(&self, cause: RemovalCause) {
+        let outcome = match cause {
+            RemovalCause::Expired => "remove_expired",
+            RemovalCause::Explicit => "remove_explicit",
+            RemovalCause::Replaced => "remove_replaced",
+            RemovalCause::Size => "remove_size",
+        };
+        self.render_output_cache.with_label_values(&[outcome]).inc();
+    }
+
+    pub(crate) fn set_render_output_cache_stats_source(
+        &self,
+        source: Box<dyn Fn() -> (u64, u64) + Send + Sync>,
+    ) {
+        let _ = self.render_output_cache_stats.set(source);
+    }
+
     pub fn record_profile_prepare(&self, duration: Duration, succeeded: bool) {
         self.profile_prepare_duration
             .with_label_values(&[if succeeded { "success" } else { "failure" }])
@@ -320,6 +358,13 @@ impl NodeMetrics {
     }
 
     pub fn gather(&self) -> Vec<MetricFamily> {
+        if let Some(source) = self.render_output_cache_stats.get() {
+            let (entries, bytes) = source();
+            self.render_output_cache_entries
+                .set(entries.min(i64::MAX as u64) as i64);
+            self.render_output_cache_bytes
+                .set(bytes.min(i64::MAX as u64) as i64);
+        }
         // Node-scoped metrics plus any injected process-global families (e.g.
         // the Rust FileSource metrics), empty until a source is installed.
         let mut families = self.registry.gather();
@@ -461,7 +506,16 @@ impl NodeMetrics {
         for outcome in ["success", "failure"] {
             self.profile_prepare_duration.with_label_values(&[outcome]);
         }
-        for outcome in ["hit", "miss", "coalesced", "insert"] {
+        for outcome in [
+            "hit",
+            "miss",
+            "coalesced",
+            "insert",
+            "remove_expired",
+            "remove_explicit",
+            "remove_replaced",
+            "remove_size",
+        ] {
             self.render_output_cache
                 .with_label_values(&[outcome])
                 .inc_by(0);
@@ -748,6 +802,18 @@ mod tests {
         assert!(
             rendered.contains("biei_native_render_duration_seconds_count{scope=\"ingress\"} 0")
         );
+    }
+
+    #[test]
+    fn render_cache_occupancy_and_removals_are_observable() {
+        let metrics = NodeMetrics::default();
+        metrics.set_render_output_cache_stats_source(Box::new(|| (3, 4_096)));
+        metrics.record_render_output_cache_removal(RemovalCause::Size);
+
+        let rendered = metrics.render_prometheus();
+        assert!(rendered.contains("biei_render_output_cache_entries 3"));
+        assert!(rendered.contains("biei_render_output_cache_bytes 4096"));
+        assert!(rendered.contains("biei_render_output_cache_total{outcome=\"remove_size\"} 1"));
     }
 
     #[test]

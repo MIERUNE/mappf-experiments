@@ -3,7 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use crate::renderer::overlay::{OverlaySlotPool, render_static_with_overlays};
+use crate::renderer::overlay::{OverlaySlotPool, StaticRenderError, render_static_with_overlays};
 use biei_core::types::{AddLayer, AddLayerSource, StaticOverlay, TaskId};
 
 /// Wrap `render_static_with_overlays` with optional request-local
@@ -28,12 +28,12 @@ pub(super) fn render_static_with_overlays_and_addlayer(
     before_layer: Option<&str>,
     addlayer: Option<&AddLayer>,
     task_id: TaskId,
-) -> Result<(maplibre_native::Image, Option<Duration>), maplibre_native::RenderingError> {
+) -> Result<(maplibre_native::Image, Option<Duration>), StaticRenderError> {
     let installed_addlayer = if let Some(layer) = addlayer {
         let mut style = renderer.style();
         match install_addlayer(&mut style, addlayer_sources, layer, before_layer, task_id) {
             Ok(installed) => Some(installed),
-            Err(e) => return Err(maplibre_native::RenderingError::Native(e.to_string())),
+            Err(e) => return Err(StaticRenderError::Setup(e.to_string())),
         }
     } else {
         None

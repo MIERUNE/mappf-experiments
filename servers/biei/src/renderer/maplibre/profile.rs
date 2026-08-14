@@ -55,9 +55,9 @@ pub(crate) struct MapLibreProfilePreparer {
 }
 
 const STYLE_JSON_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
-const STYLE_JSON_CACHE_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
+const STYLE_JSON_CACHE_IDLE_TTL: Duration = Duration::from_hours(1);
 const TILESET_JSON_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024;
-const TILESET_JSON_CACHE_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
+const TILESET_JSON_CACHE_IDLE_TTL: Duration = Duration::from_mins(30);
 // Absolute freshness bound. Idle TTL alone lets continuous traffic renew a hot
 // entry forever, so an upstream style/TileJSON edit would never become visible.
 // `time_to_live` caps an entry's age from insertion regardless of access, so a
@@ -65,8 +65,8 @@ const TILESET_JSON_CACHE_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 // entries sooner for capacity). Refetch flows through the same single-flight
 // path, and a failed refetch fails/negative-caches rather than silently serving
 // the stale value.
-const STYLE_JSON_CACHE_MAX_AGE: Duration = Duration::from_secs(60 * 60);
-const TILESET_JSON_CACHE_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+const STYLE_JSON_CACHE_MAX_AGE: Duration = Duration::from_hours(1);
+const TILESET_JSON_CACHE_MAX_AGE: Duration = Duration::from_hours(1);
 const JSON_NEGATIVE_CACHE_MAX_ENTRIES: u64 = 4096;
 // Short on purpose: the negative cache only needs to absorb repeated requests
 // for the same definitively-bad style or TileJSON within a burst (§7.5 spray

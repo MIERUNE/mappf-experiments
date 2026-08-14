@@ -5,7 +5,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -16,7 +16,7 @@ use crate::types::{
     InternalTask, NodeId, NodeKvs, ProcessError, RouteTier, TaskOutcome, TaskResult, WorkerId,
     WorkerProfile, WorkerView, encode_worker_kvs,
 };
-use crate::worker::{WorkerCmd, worker_loop};
+use crate::worker::{WorkerCmd, WorkerReply, WorkerRuntime, worker_loop};
 use mmpf_common::sync::lock_unpoisoned;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -55,6 +55,10 @@ struct PickContext<'a> {
 pub(crate) struct WorkerHandle {
     pub tx: mpsc::Sender<WorkerCmd>,
     pub queue_depth: Arc<AtomicUsize>,
+    /// False while the renderer behind this slot is retired and has not yet
+    /// been repaired. Queue depth alone cannot represent that state: a timed
+    /// out command drops its reservation before the periodic repair tick.
+    available: Arc<AtomicBool>,
     /// Retained so a graceful shutdown can await the worker task. `None` after it
     /// has been joined (or its join timed out and the handle was detached).
     /// Interior-mutable so `WorkerPool::shutdown(&self, ..)` works through the
@@ -280,6 +284,9 @@ pub(crate) struct WorkerPoolSpawn {
     pub render_permits: usize,
     pub native_render_permits: usize,
     pub source_cache_capacity: usize,
+    /// Overrides the renderer repair cadence. `None` uses the production interval;
+    /// a test sets it long so only the immediate hide is observable.
+    pub repair_interval: Option<std::time::Duration>,
 }
 
 impl WorkerPool {
@@ -292,35 +299,46 @@ impl WorkerPool {
             render_permits,
             native_render_permits,
             source_cache_capacity,
+            repair_interval,
         } = spec;
         let n = renderers.len();
         let render_permits = render_permits.max(1).min(n.max(1));
         let native_render_permits = native_render_permits.max(1).min(render_permits);
         let permit_sem = Arc::new(Semaphore::new(render_permits));
         let native_render_permit_sem = Arc::new(Semaphore::new(native_render_permits));
+        let repair_interval = repair_interval.unwrap_or(crate::worker::RENDERER_REPAIR_INTERVAL);
         let mut workers = Vec::with_capacity(n);
         for (i, renderer) in renderers.into_iter().enumerate() {
             let (tx, rx) = mpsc::channel(1024);
             let queue_depth = Arc::new(AtomicUsize::new(0));
+            // Initialize synchronously: the spawned worker future is not
+            // guaranteed to run before the pool becomes reachable.
+            let available = Arc::new(AtomicBool::new(renderer.is_available()));
             let id = i as WorkerId;
             let worker_node_id = node_id.clone();
             let worker_permits = permit_sem.clone();
             let worker_native_render_permits = native_render_permit_sem.clone();
+            let worker_available = available.clone();
             let join = tokio::spawn(async move {
                 worker_loop(
                     id,
                     worker_node_id,
                     rx,
                     renderer,
-                    worker_permits,
-                    worker_native_render_permits,
-                    source_cache_capacity,
+                    WorkerRuntime {
+                        render_permits: worker_permits,
+                        native_render_permits: worker_native_render_permits,
+                        source_cache_capacity,
+                        available: worker_available,
+                        repair_interval,
+                    },
                 )
                 .await;
             });
             workers.push(WorkerHandle {
                 tx,
                 queue_depth,
+                available,
                 join: Mutex::new(Some(join)),
             });
         }
@@ -355,6 +373,12 @@ impl WorkerPool {
             queue_depths: self.workers.iter().map(|w| w.queue_depth.clone()).collect(),
             state: self.state.clone(),
         }
+    }
+
+    pub(crate) fn has_available_worker(&self) -> bool {
+        self.workers
+            .iter()
+            .any(|worker| worker.available.load(Ordering::Acquire))
     }
 
     fn queue_at(&self, idx: usize) -> usize {
@@ -393,6 +417,9 @@ impl WorkerPool {
 
         (0..self.workers.len())
             .filter_map(|idx| {
+                if !self.workers[idx].available.load(Ordering::Acquire) {
+                    return None;
+                }
                 let queue_depth = self.queue_at(idx);
                 (queue_depth < self.queue_capacity)
                     .then(|| (idx, pick_score(&ctx, idx, queue_depth)))
@@ -406,6 +433,9 @@ impl WorkerPool {
     /// already at the hard limit.
     fn try_reserve(&self, idx: usize) -> Option<usize> {
         let w = &self.workers[idx];
+        if !w.available.load(Ordering::Acquire) {
+            return None;
+        }
         let mut current = w.queue_depth.load(Ordering::Acquire);
         loop {
             if current >= self.queue_capacity {
@@ -417,7 +447,15 @@ impl WorkerPool {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(current),
+                Ok(_) => {
+                    // Close the race with a timeout that retires the renderer
+                    // between the availability check and this reservation.
+                    if w.available.load(Ordering::Acquire) {
+                        return Some(current);
+                    }
+                    w.queue_depth.fetch_sub(1, Ordering::AcqRel);
+                    return None;
+                }
                 Err(actual) => current = actual,
             }
         }
@@ -449,67 +487,80 @@ impl WorkerPool {
         route_tier: RouteTier,
         worker_hint: Option<WorkerId>,
     ) -> Result<TaskOutcome, ProcessError> {
-        let addlayer_source_id = prepared_profile
-            .as_ref()
-            .and_then(|prepared| prepared.addlayer_source.as_ref())
-            .map(|source| source.stable_source_id());
-        // Reserve a worker before committing any predicted profile/source
-        // state. A hint intentionally targets one worker (e.g. an eviction
-        // target), so it is honored exactly with no fallback. Otherwise select
-        // the best worker with current capacity and rescan only after a lost
-        // check-and-reserve race.
-        let (idx, pre_admit_depth) = match worker_hint {
-            Some(wid) if (wid as usize) < self.workers.len() => {
-                let idx = wid as usize;
-                match self.try_reserve(idx) {
-                    Some(depth) => (idx, depth),
+        let mut task = task;
+        let mut prepared_profile = prepared_profile;
+        let mut worker_hint = worker_hint;
+        loop {
+            let addlayer_source_id = prepared_profile
+                .as_ref()
+                .and_then(|prepared| prepared.addlayer_source.as_ref())
+                .map(super::types::AddLayerSource::stable_source_id);
+            // Reserve a worker before committing any predicted profile/source
+            // state. A caller-provided hint is honored on the first attempt;
+            // redispatch after a renderer retirement selects any healthy slot.
+            let (idx, pre_admit_depth) = match worker_hint {
+                Some(wid) if (wid as usize) < self.workers.len() => {
+                    let idx = wid as usize;
+                    match self.try_reserve(idx) {
+                        Some(depth) => (idx, depth),
+                        None => return Err(ProcessError::QueueFull(Box::new(task))),
+                    }
+                }
+                _ => match self.reserve_best_available(&task, addlayer_source_id.as_deref()) {
+                    Some(reserved) => reserved,
                     None => return Err(ProcessError::QueueFull(Box::new(task))),
+                },
+            };
+            let w = &self.workers[idx];
+            let admitted_at_overflow = pre_admit_depth >= self.bl_capacity;
+            let task_profile = task.worker_profile();
+            let dispatch_generation = {
+                let mut s = lock_unpoisoned(&self.state);
+                let generation = s.mark_loaded(idx, task_profile);
+                if let Some(source_id) = addlayer_source_id {
+                    s.mark_addlayer_source(idx, source_id);
+                }
+                generation
+            };
+            // Move completion accounting into the command. The caller future may
+            // be cancelled after `send`, while the worker must still execute the
+            // non-cancellable native render and remain visible to admission/drain.
+            let completion = WorkerCompletion::new(
+                w.queue_depth.clone(),
+                self.state.clone(),
+                idx,
+                dispatch_generation,
+            );
+            let (tx, rx) = oneshot::channel();
+            if let Err(err) =
+                w.tx.send(WorkerCmd::Process {
+                    task,
+                    prepared_profile,
+                    route_tier,
+                    admitted_at_overflow,
+                    respond_to: tx,
+                    completion,
+                })
+                .await
+            {
+                // We only ever send `Process` here; recover its task on send failure.
+                if let WorkerCmd::Process { task: returned, .. } = err.0 {
+                    return Err(ProcessError::QueueFull(Box::new(returned)));
+                }
+                unreachable!("worker send failure returns the Process command we sent");
+            }
+            match rx.await.map_err(|_| ProcessError::QueueDisconnected)? {
+                WorkerReply::Outcome(outcome) => return Ok(outcome),
+                WorkerReply::Redispatch {
+                    task: returned,
+                    prepared_profile: returned_profile,
+                } => {
+                    task = *returned;
+                    prepared_profile = returned_profile;
+                    worker_hint = None;
                 }
             }
-            _ => match self.reserve_best_available(&task, addlayer_source_id.as_deref()) {
-                Some(reserved) => reserved,
-                None => return Err(ProcessError::QueueFull(Box::new(task))),
-            },
-        };
-        let w = &self.workers[idx];
-        let admitted_at_overflow = pre_admit_depth >= self.bl_capacity;
-        let task_profile = task.worker_profile();
-        let dispatch_generation = {
-            let mut s = lock_unpoisoned(&self.state);
-            let generation = s.mark_loaded(idx, task_profile);
-            if let Some(source_id) = addlayer_source_id {
-                s.mark_addlayer_source(idx, source_id);
-            }
-            generation
-        };
-        // Move completion accounting into the command. The caller future may
-        // be cancelled after `send`, while the worker must still execute the
-        // non-cancellable native render and remain visible to admission/drain.
-        let completion = WorkerCompletion::new(
-            w.queue_depth.clone(),
-            self.state.clone(),
-            idx,
-            dispatch_generation,
-        );
-        let (tx, rx) = oneshot::channel();
-        if let Err(err) =
-            w.tx.send(WorkerCmd::Process {
-                task,
-                prepared_profile,
-                route_tier,
-                admitted_at_overflow,
-                respond_to: tx,
-                completion,
-            })
-            .await
-        {
-            // We only ever send `Process` here; recover its task on send failure.
-            if let WorkerCmd::Process { task, .. } = err.0 {
-                return Err(ProcessError::QueueFull(Box::new(task)));
-            }
-            unreachable!("worker send failure returns the Process command we sent");
         }
-        rx.await.map_err(|_| ProcessError::QueueDisconnected)
     }
 
     /// Gracefully stop every worker within `deadline` and report the outcome.
@@ -614,6 +665,7 @@ fn pick_score(ctx: &PickContext<'_>, idx: usize, queue_depth: usize) -> PickScor
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     use tokio::time::Instant;
@@ -635,6 +687,16 @@ mod tests {
     struct SlowRenderer {
         delay: Duration,
         retire_count: Arc<AtomicUsize>,
+    }
+
+    /// Times out on its first render, then reports itself dead until an
+    /// autonomous repair succeeds — the production sequence after a
+    /// non-cancellable native render overruns its deadline.
+    struct DyingRenderer {
+        delay: Duration,
+        renders: Arc<AtomicUsize>,
+        retired: Arc<AtomicBool>,
+        repaired: Arc<AtomicBool>,
     }
 
     struct CountingRenderer {
@@ -732,6 +794,54 @@ mod tests {
 
         fn retire_after_current(&mut self) {
             self.retire_count.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Renderer for DyingRenderer {
+        async fn setup_profile(
+            &mut self,
+            _task: &InternalTask,
+            _prepared: Option<PreparedProfile>,
+        ) -> Result<(), RendererError> {
+            if self.retired.load(Ordering::Acquire) && !self.repaired.load(Ordering::Acquire) {
+                return Err(RendererError::ActorDead);
+            }
+            Ok(())
+        }
+
+        async fn ensure_source(&mut self, _hash: SourceHash) -> Result<(), RendererError> {
+            Ok(())
+        }
+
+        async fn render(&mut self, task: &InternalTask) -> Result<RendererOutput, RendererError> {
+            if self.retired.load(Ordering::Acquire) && !self.repaired.load(Ordering::Acquire) {
+                return Err(RendererError::ActorDead);
+            }
+            if self.renders.fetch_add(1, Ordering::AcqRel) == 0 {
+                // Overrun the caller's deadline exactly once.
+                tokio::time::sleep(self.delay).await;
+            }
+            Ok(RenderOutput {
+                bytes: bytes::Bytes::new(),
+                format: task.output_format,
+            }
+            .into())
+        }
+
+        fn retire_after_current(&mut self) {
+            self.retired.store(true, Ordering::Release);
+        }
+
+        fn repair_if_needed(&mut self) -> Result<bool, RendererError> {
+            if self.retired.load(Ordering::Acquire) && !self.repaired.load(Ordering::Acquire) {
+                return Err(RendererError::ActorDead);
+            }
+            Ok(false)
+        }
+
+        fn is_available(&self) -> bool {
+            !self.retired.load(Ordering::Acquire) || self.repaired.load(Ordering::Acquire)
         }
     }
 
@@ -884,6 +994,68 @@ mod tests {
         }
     }
 
+    /// A renderer whose actor is already dead when the worker starts must not
+    /// advertise the slot as available. Native actor creation (GL context, thread
+    /// spawn) is most likely to fail exactly at startup, and until the first
+    /// repair runs the pool would otherwise route work to a slot that can only
+    /// answer `renderer_dead`.
+    #[tokio::test(start_paused = true)]
+    async fn a_renderer_born_unavailable_never_advertises_its_slot() {
+        let repair_count = Arc::new(AtomicUsize::new(0));
+        let pool = WorkerPool::spawn(WorkerPoolSpawn {
+            node_id: NodeId::from_index(0),
+            renderers: vec![Box::new(BornDeadRenderer {
+                repair_count: repair_count.clone(),
+            })],
+            bl_capacity: 1,
+            queue_capacity: 1,
+            render_permits: 1,
+            native_render_permits: 1,
+            source_cache_capacity: 1,
+            // Long enough that the periodic path cannot be what saves this.
+            repair_interval: Some(Duration::from_secs(3600)),
+        });
+        assert!(
+            !pool.workers[0].available.load(Ordering::Acquire),
+            "a slot backed by a dead actor must not be advertised before its worker future runs"
+        );
+        pool.shutdown(Instant::now() + Duration::from_secs(5)).await;
+    }
+
+    /// Dead from construction and unrepairable, so only a startup availability
+    /// sync — not a repair success — can hide the slot.
+    struct BornDeadRenderer {
+        repair_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Renderer for BornDeadRenderer {
+        async fn setup_profile(
+            &mut self,
+            _task: &InternalTask,
+            _prepared: Option<PreparedProfile>,
+        ) -> Result<(), RendererError> {
+            Err(RendererError::ActorDead)
+        }
+
+        async fn ensure_source(&mut self, _hash: SourceHash) -> Result<(), RendererError> {
+            Ok(())
+        }
+
+        async fn render(&mut self, _task: &InternalTask) -> Result<RendererOutput, RendererError> {
+            Err(RendererError::ActorDead)
+        }
+
+        fn is_available(&self) -> bool {
+            false
+        }
+
+        fn repair_if_needed(&mut self) -> Result<bool, RendererError> {
+            self.repair_count.fetch_add(1, Ordering::AcqRel);
+            Err(RendererError::ActorDead)
+        }
+    }
+
     #[tokio::test]
     async fn idle_worker_runs_autonomous_renderer_repair() {
         let repair_count = Arc::new(AtomicUsize::new(0));
@@ -897,6 +1069,10 @@ mod tests {
             render_permits: 1,
             native_render_permits: 1,
             source_cache_capacity: 1,
+            // A short explicit cadence: the property under test is that an idle
+            // worker repairs on its own, not how soon the first attempt happens.
+            // Depending on the production interval made this race its own timeout.
+            repair_interval: Some(Duration::from_millis(10)),
         });
 
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -924,6 +1100,7 @@ mod tests {
             render_permits: 1,
             native_render_permits: 1,
             source_cache_capacity: 1,
+            repair_interval: None,
         }));
 
         let caller_pool = pool.clone();
@@ -974,6 +1151,7 @@ mod tests {
             render_permits: 1,
             native_render_permits: 1,
             source_cache_capacity: 1,
+            repair_interval: None,
         });
 
         let outcome = pool
@@ -1004,6 +1182,7 @@ mod tests {
             render_permits: 1,
             native_render_permits: 1,
             source_cache_capacity: 1,
+            repair_interval: None,
         });
 
         // Fill worker 0 to the hard queue limit.
@@ -1036,6 +1215,7 @@ mod tests {
             render_permits: 1,
             native_render_permits: 1,
             source_cache_capacity: 1,
+            repair_interval: None,
         });
         let mut task = make_task(1, 1);
         task.request = RenderRequest::StaticImage {
@@ -1093,7 +1273,7 @@ mod tests {
 
     fn rev(id: u32) -> StyleRevision {
         StyleRevision {
-            id: StyleId(format!("style-{}", id)),
+            id: StyleId(format!("style-{id}")),
             version: 0,
         }
     }
@@ -1333,6 +1513,7 @@ mod tests {
             render_permits: 1,
             native_render_permits: 1,
             source_cache_capacity: 1,
+            repair_interval: None,
         });
         pool.workers[0].queue_depth.store(1, Ordering::Release);
 
@@ -1356,6 +1537,7 @@ mod tests {
             render_permits: 1,
             native_render_permits: 1,
             source_cache_capacity: 1,
+            repair_interval: None,
         });
 
         let task = make_task(1, 1);
@@ -1388,6 +1570,7 @@ mod tests {
             render_permits: 1,
             native_render_permits: 1,
             source_cache_capacity: 1,
+            repair_interval: None,
         });
 
         for _ in 0..2 {
@@ -1418,6 +1601,7 @@ mod tests {
             render_permits: 1,
             native_render_permits: 1,
             source_cache_capacity: 1,
+            repair_interval: None,
         });
 
         for partition in [[1; 32], [1; 32], [2; 32]] {
@@ -1455,6 +1639,7 @@ mod tests {
             render_permits: 1,
             native_render_permits: 1,
             source_cache_capacity: 1,
+            repair_interval: None,
         });
 
         let mut task = make_task(1, 1);
@@ -1491,6 +1676,7 @@ mod tests {
             render_permits: 1,
             native_render_permits: 1,
             source_cache_capacity: 1,
+            repair_interval: None,
         });
 
         let mut task = make_task(1, 1);
@@ -1505,6 +1691,157 @@ mod tests {
         };
         assert_eq!(error, RendererError::Timeout.to_string());
         assert_eq!(retire_count.load(Ordering::Acquire), 1);
+        assert!(
+            pool.has_available_worker(),
+            "an immediately usable renderer must be republished after retirement"
+        );
+        pool.shutdown(Instant::now() + Duration::from_secs(5)).await;
+    }
+
+    /// After one slot's render overruns its deadline, later requests must not keep
+    /// selecting that slot and answering `renderer_dead`.
+    ///
+    /// A native render cannot be cancelled, so detaching and replacing the actor is
+    /// correct; what must not happen is the pool continuing to route new work to the
+    /// detached slot while a healthy slot sits idle. Observed in the live demo: one
+    /// heavy cold request returned `504 render_timeout`, and the requests behind it
+    /// received `500 renderer_dead`.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_slot_stops_attracting_new_work() {
+        let renders = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicBool::new(false));
+        let repaired = Arc::new(AtomicBool::new(false));
+        let pool = WorkerPool::spawn(WorkerPoolSpawn {
+            node_id: NodeId::from_index(0),
+            renderers: vec![
+                Box::new(DyingRenderer {
+                    delay: Duration::from_millis(50),
+                    renders: renders.clone(),
+                    retired: retired.clone(),
+                    repaired: repaired.clone(),
+                }),
+                Box::new(NoopRenderer),
+            ],
+            bl_capacity: 4,
+            queue_capacity: 4,
+            render_permits: 2,
+            native_render_permits: 2,
+            source_cache_capacity: 2,
+            // Push the periodic retry beyond the test so the only thing that can hide
+            // the slot is the immediate store on the timeout path. With the production
+            // 1s cadence this test is not a guard: a paused-clock runtime advances
+            // virtual time while the caller awaits the worker's reply, fires the tick
+            // first, and passes even with the immediate hide deleted.
+            repair_interval: Some(Duration::from_secs(3600)),
+        });
+
+        // Pin the first request to slot 0 and let it overrun its deadline.
+        let mut first = make_task(1, 1);
+        first.deadline = Instant::now() + Duration::from_millis(1);
+        let outcome = pool
+            .process(first, None, RouteTier::Tier2HrwBl, Some(0))
+            .await
+            .expect("the overrunning render yields an outcome");
+        assert!(
+            matches!(outcome.result, crate::types::TaskResult::Failed { .. }),
+            "first request should fail on the deadline"
+        );
+        assert!(
+            retired.load(Ordering::Acquire),
+            "the slot should be retired"
+        );
+        // Hidden *immediately*, on the same code path that observed the timeout —
+        // not eventually by the periodic repair tick. The tick runs once a second,
+        // and in production every request admitted inside that window is answered
+        // by the detached actor with `renderer_dead`. Asserting before any time
+        // advances is what distinguishes the two mechanisms: virtual time in this
+        // runtime jumps freely, so a test that only checks later outcomes passes
+        // even with the immediate hide deleted.
+        assert!(
+            !pool.workers[0].available.load(Ordering::Acquire),
+            "the timed-out slot must be hidden before the repair tick can run"
+        );
+
+        // Subsequent requests choose a slot on their own. None may be answered by
+        // the detached slot while a healthy one exists.
+        let mut dead_answers = 0;
+        for id in 2..=6 {
+            let mut task = make_task(id, 1);
+            task.deadline = Instant::now() + Duration::from_secs(5);
+            let outcome = pool
+                .process(task, None, RouteTier::Tier2HrwBl, None)
+                .await
+                .expect("a later request yields an outcome");
+            if let crate::types::TaskResult::Failed { error, .. } = &outcome.result
+                && error == &RendererError::ActorDead.to_string()
+            {
+                dead_answers += 1;
+            }
+        }
+        assert_eq!(
+            dead_answers, 0,
+            "requests were routed to the detached slot instead of the healthy one"
+        );
+
+        pool.shutdown(Instant::now() + Duration::from_secs(5)).await;
+    }
+
+    /// A command may already be in a slot's channel when the command ahead of
+    /// it retires the renderer. Because the queued command has not started any
+    /// stage, it must move to a healthy slot instead of inheriting
+    /// `renderer_dead` from the slot it originally reserved.
+    #[tokio::test(start_paused = true)]
+    async fn work_queued_behind_a_timeout_is_redispatched_before_starting() {
+        let renders = Arc::new(AtomicUsize::new(0));
+        let retired = Arc::new(AtomicBool::new(false));
+        let repaired = Arc::new(AtomicBool::new(false));
+        let pool = WorkerPool::spawn(WorkerPoolSpawn {
+            node_id: NodeId::from_index(0),
+            renderers: vec![
+                Box::new(DyingRenderer {
+                    delay: Duration::from_millis(50),
+                    renders,
+                    retired: retired.clone(),
+                    repaired,
+                }),
+                Box::new(NoopRenderer),
+            ],
+            bl_capacity: 4,
+            queue_capacity: 4,
+            render_permits: 2,
+            native_render_permits: 2,
+            source_cache_capacity: 2,
+            repair_interval: Some(Duration::from_secs(3600)),
+        });
+
+        let mut first = make_task(1, 1);
+        first.deadline = Instant::now() + Duration::from_millis(1);
+        let mut queued = make_task(2, 1);
+        queued.deadline = Instant::now() + Duration::from_secs(5);
+
+        // Both commands are intentionally pinned to slot 0 on initial
+        // admission. After the first retires it, redispatch ignores that stale
+        // hint and selects slot 1.
+        let (first, queued) = tokio::join!(
+            pool.process(first, None, RouteTier::Tier2HrwBl, Some(0)),
+            pool.process(queued, None, RouteTier::Tier2HrwBl, Some(0)),
+        );
+
+        let first = first.expect("the overrunning render yields an outcome");
+        assert!(matches!(
+            first.result,
+            crate::types::TaskResult::Failed {
+                kind: crate::types::FailureKind::RenderTimeout,
+                ..
+            }
+        ));
+        let queued = queued.expect("the queued command is redispatched");
+        assert!(matches!(
+            queued.result,
+            crate::types::TaskResult::Completed { .. }
+        ));
+        assert!(retired.load(Ordering::Acquire));
+
         pool.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 
@@ -1529,6 +1866,7 @@ mod tests {
             render_permits: 1,
             native_render_permits: 1,
             source_cache_capacity: 1,
+            repair_interval: None,
         });
 
         let task_a = make_task(1, 1);
@@ -1565,6 +1903,7 @@ mod tests {
             render_permits: 2,
             native_render_permits: 1,
             source_cache_capacity: 1,
+            repair_interval: None,
         });
 
         let task_a = make_task(1, 1);

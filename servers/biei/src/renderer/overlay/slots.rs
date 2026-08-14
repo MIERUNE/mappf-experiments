@@ -54,6 +54,15 @@ pub(crate) struct OverlaySlotPool {
     has_data: bool,
 }
 
+/// Separates request-local overlay setup failures from errors reported by the
+/// native still-render callback. Only the latter can represent a failed MLN
+/// resource request and require discarding the native renderer.
+#[derive(Debug)]
+pub(crate) enum StaticRenderError {
+    Setup(String),
+    Native(maplibre_native::RenderingError),
+}
+
 pub(crate) fn render_static_with_overlays(
     renderer: &mut maplibre_native::ImageRenderer<maplibre_native::Static>,
     slots: &mut OverlaySlotPool,
@@ -61,14 +70,14 @@ pub(crate) fn render_static_with_overlays(
     overlays: &[StaticOverlay],
     prepared_geojson: Option<&maplibre_native::GeoJson>,
     before_layer: Option<&str>,
-) -> Result<maplibre_native::Image, maplibre_native::RenderingError> {
+) -> Result<maplibre_native::Image, StaticRenderError> {
     // `style()` borrows the renderer mutably, so wrap the slot-update phase
     // in its own scope. The borrow has to end before `render_static`.
     let registered_images = {
         let mut style = renderer.style();
         if let Err(err) = assign_slots(&mut style, slots, overlays, prepared_geojson, before_layer)
         {
-            return Err(maplibre_native::RenderingError::Native(err.to_string()));
+            return Err(StaticRenderError::Setup(err.to_string()));
         }
         pin_image_ids(overlays)
     };
@@ -79,7 +88,7 @@ pub(crate) fn render_static_with_overlays(
             style.remove_image(image_id);
         }
     }
-    result
+    result.map_err(StaticRenderError::Native)
 }
 
 /// Install the shared overlay source on a freshly loaded style and return

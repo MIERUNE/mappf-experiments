@@ -113,6 +113,14 @@ pub trait Renderer: Send + Sync {
     /// renderer slot.
     fn retire_after_current(&mut self) {}
 
+    /// Whether this renderer can accept another task right now. A timeout may
+    /// leave a non-cancellable native actor detached while replacement is
+    /// temporarily unavailable; the worker pool must not infer readiness from
+    /// an empty queue in that state.
+    fn is_available(&self) -> bool {
+        true
+    }
+
     /// Attempt to restore an actor that could not be replaced at timeout time.
     /// Called periodically even when no requests are admitted, so readiness
     /// recovery never depends on a new task reaching the worker.

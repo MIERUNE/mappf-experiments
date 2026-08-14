@@ -11,7 +11,9 @@ mod slots;
 
 pub(crate) use features::build_overlay_geojson;
 pub(crate) use pin::{configure_pin_label_font_path, pin_auto_padding_inset};
-pub(crate) use slots::{OverlaySlotPool, populate_static_slots, render_static_with_overlays};
+pub(crate) use slots::{
+    OverlaySlotPool, StaticRenderError, populate_static_slots, render_static_with_overlays,
+};
 
 pub(super) const OVERLAY_SOURCE_ID: &str = "biei-overlays-src";
 pub(super) const OVERLAY_IDX_PROPERTY: &str = "__biei_overlay_idx";

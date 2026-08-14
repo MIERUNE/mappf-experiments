@@ -49,9 +49,18 @@ fn path_stroke_properties_include_set_fields_with_hash_prefixed_color() {
         coordinates: vec![],
     };
     let v = path_stroke_properties(&path);
-    assert_eq!(v.get("stroke").and_then(|v| v.as_str()), Some("#f44"));
-    assert_eq!(v.get("stroke-width").and_then(|v| v.as_f64()), Some(3.0));
-    assert_eq!(v.get("stroke-opacity").and_then(|v| v.as_f64()), Some(0.5));
+    assert_eq!(
+        v.get("stroke").and_then(serde_json::Value::as_str),
+        Some("#f44")
+    );
+    assert_eq!(
+        v.get("stroke-width").and_then(serde_json::Value::as_f64),
+        Some(3.0)
+    );
+    assert_eq!(
+        v.get("stroke-opacity").and_then(serde_json::Value::as_f64),
+        Some(0.5)
+    );
 }
 
 #[test]
@@ -73,8 +82,14 @@ fn path_fill_properties_include_set_fields_with_hash_prefixed_color() {
         coordinates: vec![],
     };
     let v = path_fill_properties(&path);
-    assert_eq!(v.get("fill").and_then(|v| v.as_str()), Some("#00ffcc"));
-    assert_eq!(v.get("fill-opacity").and_then(|v| v.as_f64()), Some(0.5));
+    assert_eq!(
+        v.get("fill").and_then(serde_json::Value::as_str),
+        Some("#00ffcc")
+    );
+    assert_eq!(
+        v.get("fill-opacity").and_then(serde_json::Value::as_f64),
+        Some(0.5)
+    );
 }
 
 #[test]

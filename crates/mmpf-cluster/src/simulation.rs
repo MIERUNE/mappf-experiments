@@ -507,7 +507,7 @@ mod tests {
             seed_nodes: context.seed_nodes,
             gossip_interval: Duration::from_millis(20),
             failure_detector_config: FailureDetectorConfig::default(),
-            marked_for_deletion_grace_period: Duration::from_secs(60),
+            marked_for_deletion_grace_period: Duration::from_mins(1),
             initial_key_values: Vec::new(),
         }
     }

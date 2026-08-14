@@ -51,7 +51,8 @@ impl Membership {
             .inspect(|state| {
                 project_peers(
                     state
-                        .live_nodes()
+                        .live_logical_nodes()
+                        .into_iter()
                         .map(|node| (node.id(), node.get(HTTP_ADVERTISE_ADDR_KEY))),
                 )
             })

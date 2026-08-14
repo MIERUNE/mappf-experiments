@@ -1,7 +1,7 @@
 //! One-node Chitchat lifecycle and borrowed cluster-state inspection.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     error::Error,
     fmt,
     net::SocketAddr,
@@ -156,7 +156,7 @@ impl Default for FailureDetectorConfig {
             sampling_window_size: 1_000,
             max_interval: Duration::from_secs(10),
             initial_interval: Duration::from_secs(5),
-            dead_node_grace_period: Duration::from_secs(24 * 60 * 60),
+            dead_node_grace_period: Duration::from_hours(24),
         }
     }
 }
@@ -260,7 +260,11 @@ impl ClusterOwner {
             failure_detector_config: config.failure_detector_config.into_chitchat(),
             marked_for_deletion_grace_period: config.marked_for_deletion_grace_period,
             catchup_callback: None,
-            extra_liveness_predicate: Some(Box::new(is_not_draining)),
+            // Preserve raw failure-detector-live incarnations in Chitchat's
+            // watcher. MMPF must choose the newest logical incarnation before
+            // applying the draining predicate; filtering here can discard a
+            // draining newest incarnation and expose its older predecessor.
+            extra_liveness_predicate: None,
         };
         let handle = spawn_chitchat(chitchat_config, initial_key_values, transport).await?;
         Ok(Self {
@@ -350,11 +354,16 @@ impl Cluster {
 
     /// Returns whether another non-draining live node is present.
     ///
-    /// This reads raw Chitchat membership and does not project service-specific
-    /// metadata or populate any routing cache.
+    /// This projects only logical-node identity and drain state; it does not
+    /// parse service-specific metadata or populate any routing cache.
     pub async fn has_other_live_node(&self, self_node_id: &str) -> bool {
-        self.inspect(|state| state.live_nodes().any(|node| node.id() != self_node_id))
-            .await
+        self.inspect(|state| {
+            state
+                .live_logical_nodes()
+                .into_iter()
+                .any(|node| node.id() != self_node_id)
+        })
+        .await
     }
 
     /// Subscribes to live-node changes for low-frequency diagnostics.
@@ -391,6 +400,11 @@ impl StateRef<'_> {
 
     /// Returns nodes currently considered live by Chitchat's failure detector
     /// and the configured non-draining liveness predicate.
+    ///
+    /// Prefer [`StateRef::live_logical_nodes`] for anything that reduces
+    /// identities to a logical node id. This iterator yields **incarnations**, and
+    /// it drops draining ones before any such reduction can run, which inverts the
+    /// required order — see that method for why that resurrects stale incarnations.
     pub fn live_nodes(&self) -> impl Iterator<Item = NodeRef<'_>> + '_ {
         self.chitchat.live_nodes().filter_map(|id| {
             self.chitchat
@@ -398,6 +412,39 @@ impl StateRef<'_> {
                 .filter(|state| is_not_draining(state))
                 .map(|state| NodeRef { id, state })
         })
+    }
+
+    /// One entry per logical node: the newest failure-detector-live incarnation,
+    /// excluding nodes whose newest incarnation is draining. Sorted by node id.
+    ///
+    /// The order of operations is the whole point, and is why this lives here
+    /// rather than in each service:
+    ///
+    /// ```text
+    /// failure-detector-live incarnations
+    ///   -> newest generation per logical node
+    ///   -> apply the draining predicate
+    ///   -> caller parses service-specific metadata
+    /// ```
+    ///
+    /// Filtering draining nodes *first* — as [`StateRef::live_nodes`] does — lets a
+    /// lingering older incarnation survive the reduction when the newest one is
+    /// draining, so the logical node stays routable through a stale incarnation and
+    /// drain never completes from a peer's point of view. Reducing first means the
+    /// predicate is applied to the incarnation that actually represents the node.
+    pub fn live_logical_nodes(&self) -> Vec<NodeRef<'_>> {
+        reduce_live_logical_nodes(self.chitchat.live_nodes().filter_map(|id| {
+            let state = self.chitchat.node_state(id)?;
+            Some((
+                id.node_id.as_ref(),
+                id.generation_id,
+                is_not_draining(state),
+                NodeRef { id, state },
+            ))
+        }))
+        .into_iter()
+        .map(|(_, node)| node)
+        .collect()
     }
 
     pub fn dead_node_ids(&self) -> impl Iterator<Item = &str> + '_ {
@@ -455,6 +502,24 @@ pub struct LiveNodesRef<'a> {
 }
 
 impl LiveNodesRef<'_> {
+    /// Returns one non-draining entry per logical node, keeping the newest
+    /// incarnation before applying the draining predicate. Sorted by node id.
+    pub fn live_logical_nodes(&self) -> Vec<NodeRef<'_>> {
+        reduce_live_logical_nodes(self.nodes.iter().map(|(id, state)| {
+            (
+                id.node_id.as_ref(),
+                id.generation_id,
+                is_not_draining(state),
+                NodeRef { id, state },
+            )
+        }))
+        .into_iter()
+        .map(|(_, node)| node)
+        .collect()
+    }
+
+    /// Returns non-draining live incarnations without reducing logical ids.
+    /// Prefer [`Self::live_logical_nodes`] for routing and retained event state.
     pub fn nodes(&self) -> impl Iterator<Item = NodeRef<'_>> + '_ {
         self.nodes
             .iter()
@@ -471,6 +536,70 @@ fn generation_id_at(now: SystemTime) -> Result<u64> {
     u64::try_from(milliseconds).context("unix epoch milliseconds exceed u64")
 }
 
+/// Reduces incarnations to one entry per logical node, then applies liveness,
+/// then sorts. Separated from [`StateRef::live_logical_nodes`] so the *ordering* is
+/// testable without a running Chitchat instance — the order is the contract, and a
+/// test that only covers the reduction would not notice it being inverted.
+///
+/// `live` is the predicate for the incarnation, evaluated **after** reduction: a
+/// logical node whose newest incarnation is not live is dropped entirely, rather
+/// than falling back to an older incarnation that still claims to be live.
+fn reduce_live_logical_nodes<K, T>(
+    observed: impl IntoIterator<Item = (K, u64, bool, T)>,
+) -> Vec<(K, T)>
+where
+    K: Eq + std::hash::Hash + Ord,
+{
+    let newest = newest_per_logical_node(
+        observed
+            .into_iter()
+            .map(|(key, generation, live, value)| (key, generation, (live, value))),
+    );
+    let mut retained: Vec<(K, T)> = newest
+        .into_iter()
+        .filter_map(|(key, (live, value))| live.then_some((key, value)))
+        .collect();
+    // Chitchat's live set is a `HashSet`, so iteration order is arbitrary and HRW
+    // ties fall back to member order; sort for a stable projection.
+    retained.sort_by(|left, right| left.0.cmp(&right.0));
+    retained
+}
+
+/// Reduces incarnations of one logical node to the newest, keyed by logical id.
+///
+/// MMPF assigns each process incarnation a restart generation, and two
+/// incarnations of one logical node can be live at the same time briefly after a
+/// restart. Any projection that collapses identities to a logical id must reduce
+/// rather than accumulate, or the same node occupies two routing slots and an
+/// arbitrary incarnation supplies its state and advertise address.
+///
+/// Kept in the shared cluster crate because Biei, Ishikari, and their simulators
+/// all consume the resulting logical-node projection.
+fn newest_per_logical_node<K, T>(observed: impl IntoIterator<Item = (K, u64, T)>) -> HashMap<K, T>
+where
+    K: Eq + std::hash::Hash,
+{
+    let mut newest: HashMap<K, (u64, Option<T>)> = HashMap::new();
+    for (key, generation, value) in observed {
+        match newest.get_mut(&key) {
+            Some((seen, _)) if *seen > generation => continue,
+            // A generation collision provides no safe ordering evidence. Omit
+            // the logical node until membership converges rather than route to
+            // an iteration-order-dependent incarnation.
+            Some((seen, retained)) if *seen == generation => {
+                *retained = None;
+                continue;
+            }
+            _ => {}
+        }
+        newest.insert(key, (generation, Some(value)));
+    }
+    newest
+        .into_iter()
+        .filter_map(|(key, (_, value))| Some((key, value?)))
+        .collect()
+}
+
 fn is_not_draining(state: &NodeState) -> bool {
     state.get(DRAINING_KEY) == Some("false")
 }
@@ -478,6 +607,69 @@ fn is_not_draining(state: &NodeState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two incarnations of one logical node can be live at once after a restart.
+    /// Collapsing them would give one node two routing slots and let an arbitrary
+    /// incarnation supply the value.
+    #[test]
+    fn newest_incarnation_wins_regardless_of_visit_order() {
+        for order in [[(1u64, "old"), (2, "new")], [(2, "new"), (1, "old")]] {
+            let observed: Vec<_> = order
+                .iter()
+                .map(|(generation, value)| ("a", *generation, *value))
+                .collect();
+
+            let reduced = newest_per_logical_node(observed);
+
+            assert_eq!(reduced.len(), 1, "order {order:?}");
+            assert_eq!(reduced["a"], "new", "order {order:?}");
+        }
+    }
+
+    #[test]
+    fn equal_generation_collision_fails_closed() {
+        let reduced = newest_per_logical_node([("a", 2u64, "first"), ("a", 2, "second")]);
+        assert!(!reduced.contains_key("a"));
+    }
+
+    /// The High-severity ordering contract: when the newest incarnation is
+    /// draining, the logical node must disappear. Applying the liveness predicate
+    /// before reducing would let the older, still-"live" incarnation survive and
+    /// keep the node routable, so drain would never complete for peers.
+    #[test]
+    fn a_draining_newest_incarnation_removes_the_node_entirely() {
+        for order in [
+            [(1u64, true, "old"), (2, false, "new")],
+            [(2, false, "new"), (1, true, "old")],
+        ] {
+            let observed: Vec<_> = order
+                .iter()
+                .map(|(generation, live, value)| ("a", *generation, *live, *value))
+                .collect();
+
+            let retained = reduce_live_logical_nodes(observed);
+
+            assert!(
+                retained.is_empty(),
+                "a node whose newest incarnation is draining must not stay routable \
+                 through an older incarnation (order {order:?}, got {retained:?})"
+            );
+        }
+    }
+
+    /// The converse: a draining *older* incarnation must not hide a live newest one.
+    #[test]
+    fn a_draining_older_incarnation_does_not_hide_the_newest() {
+        let retained =
+            reduce_live_logical_nodes([("a", 1u64, false, "old"), ("a", 2, true, "new")]);
+        assert_eq!(retained, vec![("a", "new")]);
+    }
+
+    #[test]
+    fn distinct_logical_nodes_are_all_retained() {
+        let reduced = newest_per_logical_node([("a", 1u64, "a1"), ("b", 1, "b1"), ("c", 2, "c2")]);
+        assert_eq!(reduced.len(), 3);
+    }
 
     #[test]
     fn standalone_endpoints_allow_wildcards_and_port_zero() {
@@ -513,10 +705,7 @@ mod tests {
         assert_eq!(config.sampling_window_size, 1_000);
         assert_eq!(config.max_interval, Duration::from_secs(10));
         assert_eq!(config.initial_interval, Duration::from_secs(5));
-        assert_eq!(
-            config.dead_node_grace_period,
-            Duration::from_secs(24 * 60 * 60)
-        );
+        assert_eq!(config.dead_node_grace_period, Duration::from_hours(24));
     }
 
     #[test]
@@ -548,7 +737,7 @@ mod tests {
             seed_nodes: Vec::new(),
             gossip_interval: Duration::from_millis(20),
             failure_detector_config: FailureDetectorConfig::default(),
-            marked_for_deletion_grace_period: Duration::from_secs(60),
+            marked_for_deletion_grace_period: Duration::from_mins(1),
             initial_key_values: vec![("http-port".to_string(), "8080".to_string())],
         }
     }

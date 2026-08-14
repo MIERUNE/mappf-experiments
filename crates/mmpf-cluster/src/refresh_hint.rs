@@ -35,7 +35,7 @@ const MAX_HINT_ID_BYTES: usize = 128;
 /// is a retry by construction — a lost response, a proxy retry, or a fan-out to
 /// several pods — never a second intentional refresh. The window only has to
 /// outlive a publisher's retry sequence.
-const HINT_DEDUP_WINDOW: Duration = Duration::from_secs(300);
+const HINT_DEDUP_WINDOW: Duration = Duration::from_mins(5);
 /// Bounded so a noisy or hostile publisher cannot grow this map. Eviction is
 /// oldest-first, and evicting early only re-admits a retry, which is the
 /// pre-existing behavior rather than a new failure.
@@ -162,7 +162,7 @@ impl StyleRefreshHintTracker {
         let mut hints = Vec::new();
         let mut invalid = 0;
 
-        for node in nodes.nodes() {
+        for node in nodes.live_logical_nodes() {
             if excluded_node_id == Some(node.id()) {
                 continue;
             }
@@ -206,12 +206,11 @@ pub enum HintAdmission {
 
 /// Bounded, time-limited suppression of repeated refresh hints.
 ///
-/// The gossip path already ignores an unchanged slot value, so this exists for
-/// the HTTP receiver, where every retry would otherwise perform another
-/// invalidation. That matters because each invalidation discards concurrent
-/// in-flight work: under load a retrying publisher can keep a style perpetually
-/// re-fetching, and the fixed gossip ring bounds retained metadata, not event
-/// frequency or origin traffic.
+/// HTTP and gossip receivers share one instance per process. The slot tracker
+/// suppresses unchanged gossip values, while this also catches the same hint
+/// arriving through both transports or through more than one peer. Without it,
+/// every duplicate can invalidate concurrent in-flight work and keep a hot style
+/// re-fetching.
 ///
 /// Suppression is per process. Two pods each admit the same hint once, which is
 /// correct — each has its own caches to invalidate.
@@ -254,7 +253,7 @@ impl RefreshHintDedup {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Drop expired entries from the front before deciding, so a repeat after
         // the window is admitted rather than suppressed forever.
@@ -286,8 +285,8 @@ impl RefreshHintDedup {
 fn stable_slot(value: &str) -> usize {
     // FNV-1a is sufficient here: this chooses a bounded retention slot, not a
     // security boundary or ownership assignment.
-    let hash = value.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    let hash = value.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
     });
     hash as usize % STYLE_REFRESH_HINT_SLOTS
 }
@@ -426,7 +425,7 @@ mod tests {
     /// re-admits a retry, which is no worse than having no dedup at all.
     #[tokio::test(start_paused = true)]
     async fn capacity_is_bounded_and_evicts_oldest_first() {
-        let dedup = RefreshHintDedup::new(Duration::from_secs(300), 4);
+        let dedup = RefreshHintDedup::new(Duration::from_mins(5), 4);
         let hints: Vec<_> = (0..5)
             .map(|index| {
                 StyleRefreshHint::new(format!("mutation-{index}"), "default/style").unwrap()
@@ -466,7 +465,7 @@ mod tests {
             GossipEndpoint::standalone(addr, addr),
             Vec::new(),
             Duration::from_millis(50),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         ))
         .await
         .unwrap();

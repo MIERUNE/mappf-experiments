@@ -39,8 +39,8 @@ enum MembershipBackend {
 pub(crate) struct Membership {
     backend: MembershipBackend,
     self_node_id: Arc<str>,
-    /// Suppresses repeated HTTP refresh hints. Without it every publisher retry
-    /// performs another invalidation, and each invalidation discards concurrent
+    /// Suppresses refresh hints repeated through HTTP, gossip, or both. Without
+    /// it every duplicate performs another invalidation and discards concurrent
     /// in-flight provider work.
     refresh_dedup: Arc<RefreshHintDedup>,
 }
@@ -96,10 +96,8 @@ impl Membership {
         matches!(self.backend, MembershipBackend::Cluster { .. })
     }
 
-    /// Records a hint and reports whether this process has already applied it.
-    ///
-    /// The gossip receiver needs no equivalent: an unchanged slot value is
-    /// already ignored there.
+    /// Records a hint and reports whether this process has already applied it,
+    /// regardless of whether it arrived through HTTP or gossip.
     pub(crate) fn admit_style_refresh(&self, hint: &StyleRefreshHint) -> HintAdmission {
         self.refresh_dedup.admit(hint)
     }
@@ -123,6 +121,7 @@ impl Membership {
         };
         let mut live_nodes = handle.live_nodes_watcher().await;
         let self_node_id = Arc::clone(&self.self_node_id);
+        let refresh_dedup = Arc::clone(&self.refresh_dedup);
         tokio::spawn(async move {
             let mut tracker = StyleRefreshHintTracker::default();
             loop {
@@ -135,7 +134,9 @@ impl Membership {
                     );
                 }
                 for hint in batch.hints {
-                    apply(hint);
+                    if refresh_dedup.admit(&hint) == HintAdmission::Accepted {
+                        apply(hint);
+                    }
                 }
                 if live_nodes.changed().await.is_err() {
                     break;
@@ -156,11 +157,11 @@ impl Membership {
             MembershipBackend::Cluster { handle, .. } => {
                 handle
                     .inspect(|state| {
-                        let mut live_ids: Vec<_> = state
-                            .live_nodes()
+                        let live_ids: Vec<_> = state
+                            .live_logical_nodes()
+                            .into_iter()
                             .map(|node| node.id().to_string())
                             .collect();
-                        live_ids.sort();
 
                         let mut dead_ids: Vec<_> =
                             state.dead_node_ids().map(str::to_string).collect();
@@ -211,7 +212,8 @@ impl Membership {
             .inspect(|state| {
                 project_peers(
                     state
-                        .live_nodes()
+                        .live_logical_nodes()
+                        .into_iter()
                         .map(|node| (node.id(), node.get(HTTP_ADVERTISE_ADDR_KEY))),
                 )
             })
@@ -238,7 +240,8 @@ impl Membership {
                 let peers = live_nodes.inspect(|state| {
                     project_peers(
                         state
-                            .nodes()
+                            .live_logical_nodes()
+                            .into_iter()
                             .map(|node| (node.id(), node.get(HTTP_ADVERTISE_ADDR_KEY))),
                     )
                 });
@@ -313,5 +316,20 @@ mod tests {
             .publish_style_refresh(&StyleRefreshHint::new("hint", "default/style").unwrap())
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn http_and_gossip_share_the_refresh_dedup_window() {
+        let membership = Membership::local("local-node".to_string());
+        let hint = StyleRefreshHint::new("mutation-1", "default/style").unwrap();
+
+        assert_eq!(
+            membership.admit_style_refresh(&hint),
+            HintAdmission::Accepted
+        );
+        assert_eq!(
+            membership.refresh_dedup.admit(&hint),
+            HintAdmission::Duplicate
+        );
     }
 }

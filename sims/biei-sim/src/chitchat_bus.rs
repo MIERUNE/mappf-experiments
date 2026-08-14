@@ -110,7 +110,7 @@ fn cluster_config(context: SimulatedNodeContext, gossip_interval: Duration) -> C
         context.gossip_endpoint,
         context.seed_nodes,
         gossip_interval,
-        Duration::from_secs(3_600),
+        Duration::from_hours(1),
     )
 }
 
@@ -144,7 +144,7 @@ impl ChitchatGossipBus {
                 .handle
                 .inspect(|state| {
                     let mut out: HashMap<NodeId, NodeStateView> = HashMap::new();
-                    for node in state.live_nodes() {
+                    for node in state.live_logical_nodes() {
                         let node_id = NodeId::from(node.id());
                         if !active_members.contains(&node_id) {
                             continue;

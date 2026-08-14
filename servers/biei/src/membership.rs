@@ -31,7 +31,7 @@ use mmpf_common::sync::{lock_unpoisoned, wait_for_change};
 const CLUSTER_ID: &str = "biei-production-v3";
 const KV_ADVERTISE_ADDR: &str = "advertise-addr";
 
-const MARKED_FOR_DELETION_GRACE_PERIOD: Duration = Duration::from_secs(300);
+const MARKED_FOR_DELETION_GRACE_PERIOD: Duration = Duration::from_mins(5);
 const PEER_ADDRESS_CACHE_TTL: Duration = Duration::from_millis(100);
 
 /// Runtime configuration for one production membership node.
@@ -51,9 +51,9 @@ pub(crate) struct Membership {
 struct MembershipInner {
     self_node_id: NodeId,
     handle: Cluster,
-    /// Suppresses repeated HTTP refresh hints. Each hint pulls the next provider
-    /// check forward and invalidates in-flight fetch fences, so a retry sequence
-    /// must not be applied more than once.
+    /// Suppresses refresh hints repeated through HTTP, gossip, or both. Each hint
+    /// pulls the next provider check forward and invalidates in-flight fetch
+    /// fences, so a retry sequence must not be applied more than once.
     refresh_dedup: Arc<RefreshHintDedup>,
     peer_addresses: Mutex<PeerAddressCacheState>,
     peer_addresses_changed: Notify,
@@ -263,13 +263,17 @@ impl Membership {
         self.inner
             .handle
             .inspect(|state| {
-                state
-                    .live_nodes()
-                    .filter_map(|node| {
-                        let address = node.get(KV_ADVERTISE_ADDR)?.parse().ok()?;
-                        Some((NodeId::from(node.id()), address))
-                    })
-                    .collect()
+                // Reduce by generation like the state projection does. Collecting
+                // straight into a map keyed by logical id would let a departed
+                // incarnation's advertise address win, and the dispatcher would
+                // then forward to a dead endpoint while reading the newest node's
+                // state — the two views must describe the same incarnation.
+                peer_addresses_from(
+                    state
+                        .live_logical_nodes()
+                        .into_iter()
+                        .map(|node| (NodeId::from(node.id()), node.get(KV_ADVERTISE_ADDR))),
+                )
             })
             .await
     }
@@ -315,7 +319,7 @@ impl StyleRevisionTracker {
         let mut current = BTreeMap::new();
         let mut observations = Vec::new();
         let mut invalid = 0;
-        for node in nodes.nodes() {
+        for node in nodes.live_logical_nodes() {
             if excluded_node_id == Some(node.id()) {
                 continue;
             }
@@ -345,6 +349,26 @@ impl StyleRevisionTracker {
     }
 }
 
+/// Parses and reduces advertise addresses, keeping the newest incarnation's.
+///
+/// Parsing lives here rather than at the call site so this function is what the
+/// tests exercise. Reducing only inside a shared primitive was not enough: a call
+/// site could still collect straight into a map keyed by logical id and pass every
+/// test, because the tests would be examining the primitive rather than the path
+/// the process actually takes.
+fn peer_addresses_from<'a>(
+    observed: impl IntoIterator<Item = (NodeId, Option<&'a str>)>,
+) -> HashMap<NodeId, SocketAddr> {
+    // Input is already one entry per logical node, carrying the newest live
+    // incarnation's address. Parsing here means an unusable address omits the node
+    // rather than falling back to some other incarnation's endpoint: the caller
+    // declines to forward instead of forwarding somewhere stale.
+    observed
+        .into_iter()
+        .filter_map(|(node_id, raw)| Some((node_id, raw?.parse().ok()?)))
+        .collect()
+}
+
 #[async_trait]
 impl GossipBus for Membership {
     async fn set(&self, key: String, value: String) {
@@ -369,9 +393,14 @@ impl GossipBus for Membership {
         self.inner
             .handle
             .inspect(|state| {
+                // `live_logical_nodes` already reduced incarnations to the newest
+                // per node and *then* applied the draining predicate. Doing it in
+                // that order matters: filtering draining nodes first would let a
+                // lingering older incarnation of a draining node survive and keep
+                // the node routable.
                 let mut members = Vec::new();
                 let mut states = HashMap::new();
-                for node in state.live_nodes() {
+                for node in state.live_logical_nodes() {
                     let node_id = NodeId::from(node.id());
                     members.push(node_id.clone());
                     states.insert(
@@ -386,5 +415,30 @@ impl GossipBus for Membership {
                 }
             })
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reduction itself lives in `mmpf-cluster` and is tested there. What is
+    /// biei's to guarantee is the parse step: an unusable address must omit the
+    /// node so the caller declines to forward, never fall back to another value.
+    #[test]
+    fn an_unusable_address_omits_the_node() {
+        let usable = "10.0.0.2:9090";
+        for raw in [None, Some("not-an-address"), Some("")] {
+            let addresses = peer_addresses_from([(NodeId::from("a"), raw)]);
+            assert!(
+                !addresses.contains_key(&NodeId::from("a")),
+                "address {raw:?} must not resolve"
+            );
+        }
+        let addresses = peer_addresses_from([(NodeId::from("a"), Some(usable))]);
+        assert_eq!(
+            addresses[&NodeId::from("a")],
+            usable.parse::<SocketAddr>().unwrap()
+        );
     }
 }

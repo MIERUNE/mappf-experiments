@@ -8,31 +8,30 @@ use std::time::Duration;
 use maplibre_native::file_source::{ErrorReason, Response};
 
 /// Network-I/O timeout per fetch attempt (connect + headers + body). Admission
-/// waits deliberately do not consume this budget.
-pub(super) const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// waits deliberately do not consume this budget. This must stay well below
+/// the renderer SLA so one stalled resource cannot consume the whole request.
+pub(super) const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Backoff ladder for transient failures; later retries stay on the last
-/// entry (plus deterministic per-URL jitter). Transient failures retry for as
-/// long as MapLibre keeps the request alive, bounded by `RETRY_WINDOW`: mbgl's
-/// Still mode never completes a render whose resources ended in a hard error,
-/// so an early final error wedges the renderer thread on an unfinishable wait.
-/// Definitive answers still return immediately, and mbgl cancellation aborts
-/// the request task.
-pub(super) const RETRY_BACKOFF: [Duration; 5] = [
-    Duration::from_millis(100),
-    Duration::from_millis(300),
-    Duration::from_secs(1),
-    Duration::from_secs(3),
-    Duration::from_secs(10),
-];
+/// One short retry absorbs an ordinary connection race without holding a
+/// native still render through a provider incident. MapLibre completes still
+/// renders with an error when a required resource ends in error, so returning
+/// the final response is both safe and preferable to a long retry loop.
+pub(super) const RETRY_BACKOFF: [Duration; 1] = [Duration::from_millis(100)];
 
-/// Cap on a single retry delay, including server-requested `Retry-After`.
-pub(super) const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// Initial request plus one retry. A render fans out to many resources, so a
+/// larger per-resource attempt count would also multiply provider load.
+pub(super) const MAX_ATTEMPTS: usize = 2;
 
-/// Upper bound on total retry time per request. Renders abandoned by their
-/// callers stay pending inside mbgl, so this keeps their background fetch
-/// churn finite while still riding out realistic upstream incidents.
-pub(super) const RETRY_WINDOW: Duration = Duration::from_secs(600);
+/// Absolute cap on a server-requested delay. The tighter effective limit is
+/// computed from the time left in `RETRY_WINDOW`, including one complete next
+/// attempt; a fast 429 can therefore honor a few seconds without letting an
+/// already-slow request overrun the render budget.
+pub(super) const MAX_RETRY_DELAY: Duration = Duration::from_secs(3);
+
+/// Deadline for admitting another retry. The attempt cap normally ends the
+/// sequence first; this rejects long `Retry-After` values rather than sleeping
+/// inside a render. Local admission waits remain outside network-I/O budgets.
+pub(super) const RETRY_WINDOW: Duration = Duration::from_secs(5);
 
 /// Counts only time spent performing network I/O. Admission waits are kept
 /// outside `run`, so a cold burst cannot consume an attempt's timeout before
@@ -72,4 +71,17 @@ pub(super) fn retry_delay(url: &str, retry_index: usize) -> Duration {
     url.hash(&mut hasher);
     retry_index.hash(&mut hasher);
     base + Duration::from_millis(hasher.finish() % 50)
+}
+
+pub(super) fn retry_fits_budget(
+    attempts_completed: usize,
+    elapsed: Duration,
+    delay: Duration,
+) -> bool {
+    attempts_completed < MAX_ATTEMPTS
+        && delay <= MAX_RETRY_DELAY
+        && elapsed
+            .saturating_add(delay)
+            .saturating_add(REQUEST_TIMEOUT)
+            <= RETRY_WINDOW
 }

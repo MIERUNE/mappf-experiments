@@ -54,10 +54,10 @@ use response::{
 #[cfg(test)]
 use response::{has_cache_directive, parse_max_age, parse_retry_after};
 #[cfg(test)]
-use retry::RETRY_BACKOFF;
+use retry::{MAX_ATTEMPTS, RETRY_BACKOFF};
 use retry::{
     MAX_RETRY_DELAY, NetworkAttemptBudget, REQUEST_TIMEOUT, RETRY_WINDOW, request_timeout_response,
-    retry_delay,
+    retry_delay, retry_fits_budget,
 };
 use singleflight::{
     FLIGHT_SHARDS, Flight, FlightKey, FlightLeader, FlightMap, FlightRequestSemantics,
@@ -96,7 +96,7 @@ const NEGATIVE_CACHE_CAPACITY: u64 = 4_096;
 /// A fresh Database hit has already satisfied the render, so its paired
 /// background refresh must not keep one Tokio task parked for an arbitrarily
 /// long upstream freshness lifetime.
-const MAX_REFRESH_DEFERRAL: Duration = Duration::from_secs(300);
+const MAX_REFRESH_DEFERRAL: Duration = Duration::from_mins(5);
 /// A normal cache miss is not provider-failure evidence. Promote only an
 /// attempt that has spent this long in actual network I/O (after admission),
 /// which still precedes the default render SLA and the per-attempt timeout.
@@ -448,13 +448,10 @@ impl NetworkFileSource {
         }
     }
 
-    /// Fetches until a definitive answer. Transient failures (transport, 5xx,
-    /// 408/429) retry with capped backoff for as long as MapLibre keeps the
-    /// request alive: mbgl's Still mode never completes a render whose
-    /// resources ended in a hard error, so an early final error would wedge
-    /// the renderer thread on an unfinishable wait. `RETRY_WINDOW` bounds the
-    /// churn from requests whose render was abandoned long ago; mbgl
-    /// cancellation aborts the task at any await point.
+    /// Performs at most one short retry for transient failures (transport,
+    /// 5xx, 408/429), then returns the final error to MapLibre. Still renders
+    /// complete on required-resource errors; keeping the callback pending past
+    /// the renderer SLA would only turn an upstream failure into a wedged slot.
     async fn fetch_with_retries(
         &self,
         request: &ResourceRequest,
@@ -511,9 +508,8 @@ impl NetworkFileSource {
 
             let delay = retry
                 .delay
-                .unwrap_or_else(|| retry_delay(&request.url, attempt_index))
-                .min(MAX_RETRY_DELAY);
-            if retry_started.elapsed().saturating_add(delay) > RETRY_WINDOW {
+                .unwrap_or_else(|| retry_delay(&request.url, attempt_index));
+            if !retry_fits_budget(attempt_index + 1, retry_started.elapsed(), delay) {
                 return self.finish_fetch(resource_key, attempt);
             }
             fs_metrics()
@@ -939,7 +935,7 @@ impl TokioFileSource for NetworkFileSource {
             self.negative_cache.invalidate(&negative_key);
         }
 
-        // The reqwest client applies REQUEST_TIMEOUT to each actual HTTP
+        // NetworkAttemptBudget applies REQUEST_TIMEOUT to each actual HTTP
         // attempt. Do not include semaphore/single-flight admission time: a
         // cold burst must not turn queued requests into synthetic network
         // timeouts before they ever reach the provider.

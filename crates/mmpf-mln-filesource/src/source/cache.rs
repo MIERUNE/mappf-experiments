@@ -356,7 +356,7 @@ mod tests {
         cache.store(
             fresh.clone(),
             Response::data(b"fresh".to_vec())
-                .with_expires(SystemTime::now() + std::time::Duration::from_secs(60)),
+                .with_expires(SystemTime::now() + std::time::Duration::from_mins(1)),
         );
         cache.store(
             expired.clone(),

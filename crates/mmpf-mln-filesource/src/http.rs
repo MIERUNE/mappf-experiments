@@ -88,9 +88,10 @@ pub fn redacted_url(url: &url::Url) -> String {
 }
 
 pub fn redacted_url_str(raw: &str) -> String {
-    url::Url::parse(raw)
-        .map(|url| redacted_url(&url))
-        .unwrap_or_else(|_| "invalid resource URL".to_string())
+    url::Url::parse(raw).map_or_else(
+        |_| "invalid resource URL".to_string(),
+        |url| redacted_url(&url),
+    )
 }
 
 /// Sorted, deduplicated query parameter *names* for one resource URL.

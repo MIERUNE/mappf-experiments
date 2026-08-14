@@ -18,16 +18,16 @@ use crate::http::reqwest_error_label;
 // absolute expiry, not the original freshness lifetime, so give a successfully
 // revalidated entry a short bounded lifetime instead of revalidating it on
 // every subsequent resource lookup.
-const REVALIDATED_FALLBACK_TTL: Duration = Duration::from_secs(60);
+const REVALIDATED_FALLBACK_TTL: Duration = Duration::from_mins(1);
 
 // RFC 9111 §4.2.2 heuristic freshness: a cacheable response with no explicit
 // expiry must not be fresh forever (that would serve a stale glyph/tile on
 // every render). Fresh for a fraction of its age since `Last-Modified`, clamped,
 // or a short default; after that it becomes a strictly-revalidated `Revalidate`.
 const HEURISTIC_FRESHNESS_DIVISOR: u32 = 10;
-const MIN_HEURISTIC_FRESHNESS: Duration = Duration::from_secs(60);
-const MAX_HEURISTIC_FRESHNESS: Duration = Duration::from_secs(3600);
-const DEFAULT_HEURISTIC_FRESHNESS: Duration = Duration::from_secs(300);
+const MIN_HEURISTIC_FRESHNESS: Duration = Duration::from_mins(1);
+const MAX_HEURISTIC_FRESHNESS: Duration = Duration::from_hours(1);
+const DEFAULT_HEURISTIC_FRESHNESS: Duration = Duration::from_mins(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CachePolicy {
@@ -285,11 +285,10 @@ fn with_cache_metadata(
 fn heuristic_expires(headers: &reqwest::header::HeaderMap, now: SystemTime) -> Option<SystemTime> {
     let ttl = header_date(headers, LAST_MODIFIED)
         .and_then(|modified| now.duration_since(modified).ok())
-        .map(|age| {
+        .map_or(DEFAULT_HEURISTIC_FRESHNESS, |age| {
             (age / HEURISTIC_FRESHNESS_DIVISOR)
                 .clamp(MIN_HEURISTIC_FRESHNESS, MAX_HEURISTIC_FRESHNESS)
-        })
-        .unwrap_or(DEFAULT_HEURISTIC_FRESHNESS);
+        });
     now.checked_add(ttl)
 }
 
@@ -403,7 +402,7 @@ mod tests {
     #[test]
     fn heuristic_freshness_scales_with_last_modified_and_clamps_to_max() {
         // Modified ~100h ago → 10% = ~10h, clamped to MAX_HEURISTIC_FRESHNESS.
-        let modified = SystemTime::now() - Duration::from_secs(360_000);
+        let modified = SystemTime::now() - Duration::from_hours(100);
         let mut headers = HeaderMap::new();
         headers.insert(
             LAST_MODIFIED,

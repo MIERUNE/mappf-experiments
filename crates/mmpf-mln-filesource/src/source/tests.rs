@@ -378,11 +378,11 @@ fn not_modified_without_body_or_validator_is_rejected() {
 
 #[test]
 fn refresh_wait_honors_expiry_and_minimum_update_interval() {
-    let expiry_wait = refresh_deferral(SystemTime::now() + Duration::from_secs(60), Duration::ZERO);
+    let expiry_wait = refresh_deferral(SystemTime::now() + Duration::from_mins(1), Duration::ZERO);
     assert!(!expiry_wait.capped);
     let expiry_wait = expiry_wait.wait;
     assert!(expiry_wait > Duration::from_secs(59));
-    assert!(expiry_wait <= Duration::from_secs(60));
+    assert!(expiry_wait <= Duration::from_mins(1));
 
     assert_eq!(
         refresh_deferral(
@@ -398,10 +398,7 @@ fn refresh_wait_honors_expiry_and_minimum_update_interval() {
 
 #[test]
 fn refresh_wait_is_bounded_for_long_lived_fresh_entries() {
-    let deferral = refresh_deferral(
-        SystemTime::now() + Duration::from_secs(24 * 60 * 60),
-        Duration::ZERO,
-    );
+    let deferral = refresh_deferral(SystemTime::now() + Duration::from_hours(24), Duration::ZERO);
 
     assert_eq!(deferral.wait, MAX_REFRESH_DEFERRAL);
     assert!(deferral.capped);
@@ -442,13 +439,13 @@ fn maps_200_with_cache_metadata() {
     assert_eq!(response.etag.as_deref(), Some("\"abc\""));
     assert!(response.must_revalidate);
     let expires = response.expires.expect("expires derived from max-age");
-    let lower = SystemTime::now() + Duration::from_secs(3000);
+    let lower = SystemTime::now() + Duration::from_mins(50);
     assert!(expires > lower, "expires should be ~1h out");
 }
 
 #[test]
 fn replacement_response_does_not_inherit_old_validators_or_freshness() {
-    let old_expiry = SystemTime::now() + Duration::from_secs(3600);
+    let old_expiry = SystemTime::now() + Duration::from_hours(1);
     let response = response_from_http(
         200,
         &HeaderMap::new(),
@@ -577,7 +574,7 @@ fn extreme_cache_durations_do_not_panic_or_overflow() {
     let expires = response
         .expires
         .expect("bounded heuristic expiry, no overflow");
-    assert!(expires > now && expires <= now + Duration::from_secs(3600));
+    assert!(expires > now && expires <= now + Duration::from_hours(1));
 
     assert_eq!(parse_retry_after("18446744073709551615"), None);
 }
@@ -614,8 +611,8 @@ fn retries_only_transient_statuses_and_bounds_backoff() {
     limited_headers.insert(RETRY_AFTER, HeaderValue::from_static("30"));
     let limited = retry_directive(429, &limited_headers).expect("429 is retryable");
     assert_eq!(limited.reason, "rate_limit");
-    // The server-requested delay is honored (the retry loop clamps it to
-    // MAX_RETRY_DELAY instead of turning it into a final error).
+    // The response preserves Retry-After, but the render retry budget below
+    // rejects a delay longer than the complete sequence budget.
     assert!(
         limited
             .delay
@@ -627,6 +624,27 @@ fn retries_only_transient_statuses_and_bounds_backoff() {
         assert!(delay >= base);
         assert!(delay < base + Duration::from_millis(50));
     }
+}
+
+#[test]
+fn render_blocking_retries_are_short_and_bounded() {
+    assert!(REQUEST_TIMEOUT < RETRY_WINDOW);
+    assert_eq!(MAX_ATTEMPTS, 2);
+    assert_eq!(MAX_RETRY_DELAY, Duration::from_secs(3));
+
+    assert!(retry_fits_budget(1, Duration::ZERO, Duration::from_secs(3)));
+    assert!(
+        !retry_fits_budget(1, Duration::from_secs(2), Duration::from_secs(2)),
+        "an already-slow attempt cannot also consume a long Retry-After"
+    );
+    assert!(
+        !retry_fits_budget(2, Duration::ZERO, Duration::ZERO),
+        "a second failed attempt must be final"
+    );
+    assert!(
+        !retry_fits_budget(1, Duration::ZERO, Duration::from_secs(30)),
+        "a long Retry-After must not park a native render"
+    );
 }
 
 #[test]
@@ -832,11 +850,11 @@ fn maps_special_statuses() {
 fn parses_max_age_directive() {
     assert_eq!(
         parse_max_age("public, max-age=3600"),
-        Some(Duration::from_secs(3600))
+        Some(Duration::from_hours(1))
     );
     assert_eq!(
         parse_max_age("max-age=60, stale-while-revalidate=120"),
-        Some(Duration::from_secs(60))
+        Some(Duration::from_mins(1))
     );
     assert_eq!(parse_max_age("no-store"), None);
     assert_eq!(parse_max_age("max-age=abc"), Some(Duration::ZERO));
@@ -1024,7 +1042,7 @@ fn volatile_requests_bypass_negative_cache() {
 #[test]
 fn maps_http_dates_to_cache_metadata() {
     let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-    let expires = modified + Duration::from_secs(3600);
+    let expires = modified + Duration::from_hours(1);
     let mut headers = HeaderMap::new();
     headers.insert(
         LAST_MODIFIED,

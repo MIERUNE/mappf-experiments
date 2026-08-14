@@ -62,13 +62,13 @@ expect "$metrics" 'type: Resource' 'HPA must use a standard resource metric'
 expect "$metrics" 'averageUtilization: 50' 'HPA must retain 50% CPU headroom'
 reject "$metrics" 'type: (External|Object|Pods)' 'HPA must not require custom metrics'
 
-# Preserve fast burst expansion and the full provider retry window on scale-in.
+# Preserve fast burst expansion while retaining warm caches on scale-in.
 expect "$scale_up" 'stabilizationWindowSeconds: 0' 'scale-up must not be stabilized'
 expect "$scale_up" 'selectPolicy: Max' 'scale-up must choose the fastest allowed policy'
 expect_policy "$scale_up" scale-up Percent 100 15
 expect_policy "$scale_up" scale-up Pods 2 15
 expect "$scale_down" 'stabilizationWindowSeconds: 600' \
-  'scale-down must protect warm pods for the provider retry window'
+  'scale-down must protect warm pods through brief traffic gaps'
 expect_policy "$scale_down" scale-down Pods 1 60
 
 printf 'PASS: portable CPU HPA policies are explicit\n'

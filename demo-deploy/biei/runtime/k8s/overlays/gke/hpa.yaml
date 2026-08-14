@@ -8,8 +8,8 @@
 #
 # Degraded pods keep rendering on healthy slots, but a fully wedged pod can be
 # ready for cache hits while using almost no CPU. A CPU-only HPA cannot gate on
-# that state, so its scale-down stabilization covers the complete FileSource
-# retry window. This preserves warm pods through bounded provider incidents;
+# that state, so its scale-down stabilization deliberately retains warm pods
+# through brief traffic gaps and provider incidents;
 # production should additionally gate scale-down on `biei_renderer_health` via
 # a custom-metrics adapter.
 #
@@ -35,8 +35,8 @@ spec:
           averageUtilization: 50
   behavior:
     scaleDown:
-      # Match the 10-minute FileSource retry window: do not delete warm pods
-      # while a bounded provider incident can have driven render CPU to zero.
+      # Keep shader and resource caches through brief traffic gaps instead of
+      # coupling scale-in timing to the much shorter request retry budget.
       stabilizationWindowSeconds: 600
       policies:
         - type: Pods

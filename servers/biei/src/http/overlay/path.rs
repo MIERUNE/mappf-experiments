@@ -1,5 +1,7 @@
 use biei_core::types::{LngLat, PathOverlay};
 
+use mmpf_http::percent_decode as mmpf_percent_decode;
+
 use super::error::OverlayParseError;
 use super::{MAX_LAT, MAX_LON, MAX_PATH_POINTS, MIN_LAT, MIN_LON};
 
@@ -216,39 +218,7 @@ pub(super) fn validate_coordinate(point: LngLat) -> Result<(), OverlayParseError
 }
 
 pub(super) fn percent_decode(value: &str) -> Result<String, OverlayParseError> {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            let hi = *bytes
-                .get(index + 1)
-                .ok_or(OverlayParseError::InvalidPercentEncoding)?;
-            let lo = *bytes
-                .get(index + 2)
-                .ok_or(OverlayParseError::InvalidPercentEncoding)?;
-            let byte = from_hex(hi)
-                .and_then(|hi| from_hex(lo).map(|lo| (hi << 4) | lo))
-                .ok_or(OverlayParseError::InvalidPercentEncoding)?;
-            out.push(byte);
-            index += 3;
-        } else {
-            out.push(bytes[index]);
-            index += 1;
-        }
-    }
-
-    String::from_utf8(out).map_err(|_| OverlayParseError::InvalidPercentEncoding)
-}
-
-fn from_hex(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
+    mmpf_percent_decode(value).map_err(|_| OverlayParseError::InvalidPercentEncoding)
 }
 
 fn decode_delta(bytes: &[u8], index: &mut usize) -> Result<i64, OverlayParseError> {

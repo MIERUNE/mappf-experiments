@@ -6,7 +6,6 @@ pub(crate) mod ingress;
 pub(crate) mod internal;
 pub(crate) mod metrics;
 pub(crate) mod overlay;
-pub(crate) mod parse_util;
 pub(crate) mod path;
 pub(crate) mod preview;
 pub(crate) mod query;

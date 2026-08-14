@@ -167,30 +167,17 @@ fn validate_position(pos: &serde_json::Value) -> Result<(), OverlayParseError> {
 fn count_coordinates(g_type: &str, coords: &serde_json::Value) -> usize {
     match g_type {
         "Point" => 1,
-        "LineString" | "MultiPoint" => coords.as_array().map(Vec::len).unwrap_or(0),
-        "Polygon" | "MultiLineString" => coords
-            .as_array()
-            .map(|rings| {
-                rings
-                    .iter()
-                    .map(|r| r.as_array().map(Vec::len).unwrap_or(0))
-                    .sum()
-            })
-            .unwrap_or(0),
-        "MultiPolygon" => coords
-            .as_array()
-            .map(|polys| {
-                polys
-                    .iter()
-                    .filter_map(serde_json::Value::as_array)
-                    .flat_map(|rings| {
-                        rings
-                            .iter()
-                            .map(|r| r.as_array().map(Vec::len).unwrap_or(0))
-                    })
-                    .sum()
-            })
-            .unwrap_or(0),
+        "LineString" | "MultiPoint" => coords.as_array().map_or(0, Vec::len),
+        "Polygon" | "MultiLineString" => coords.as_array().map_or(0, |rings| {
+            rings.iter().map(|r| r.as_array().map_or(0, Vec::len)).sum()
+        }),
+        "MultiPolygon" => coords.as_array().map_or(0, |polys| {
+            polys
+                .iter()
+                .filter_map(serde_json::Value::as_array)
+                .flat_map(|rings| rings.iter().map(|r| r.as_array().map_or(0, Vec::len)))
+                .sum()
+        }),
         // `validate_feature` whitelists the geometry types reachable here, so
         // this arm is defense-in-depth only.
         _ => 0,

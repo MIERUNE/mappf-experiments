@@ -1,8 +1,8 @@
-use crate::http::parse_util::percent_decode_str;
 use crate::http::{
     error::{IngressError, invalid},
     is_safe_token_byte,
 };
+use mmpf_http::percent_decode_form;
 
 use biei_core::types::{AddLayer, AddLayerSource};
 
@@ -57,7 +57,7 @@ pub(crate) fn parse_addlayer_from_query(
     let Some(encoded) = found else {
         return Ok(None);
     };
-    let decoded = percent_decode_str(encoded)
+    let decoded = percent_decode_form(encoded)
         .map_err(|_| invalid("addlayer must be valid percent-encoded UTF-8"))?;
     if decoded.is_empty() {
         return Err(invalid("addlayer JSON must not be empty"));
@@ -167,8 +167,7 @@ fn validate_and_rewrite_addlayer_json(
         .ok_or_else(|| invalid("addlayer requires a string `type`"))?;
     if !ADDLAYER_ALLOWED_TYPES.contains(&layer_type) {
         return Err(invalid(format!(
-            "addlayer `type` must be one of {:?}; got `{layer_type}`",
-            ADDLAYER_ALLOWED_TYPES
+            "addlayer `type` must be one of {ADDLAYER_ALLOWED_TYPES:?}; got `{layer_type}`"
         )));
     }
 

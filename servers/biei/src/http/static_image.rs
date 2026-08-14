@@ -4,13 +4,13 @@ use tokio::time::Instant;
 
 use crate::http::error::{IngressError, invalid};
 use crate::http::format::parse_size_scale_format;
-use crate::http::parse_util::percent_decode_str;
 use crate::http::path::resolve_style;
 use biei_core::style_catalog::StyleCatalog;
 use biei_core::types::{
     AddLayer, InternalTask, Padding, PixelRatio, Positioning, RenderRequest, RequestId, Scale,
     StaticOverlay, StyleId, TaskId, TaskSpec,
 };
+use mmpf_http::percent_decode_form;
 
 pub(crate) const MAX_STATIC_WIDTH: u16 = 1920;
 pub(crate) const MAX_STATIC_HEIGHT: u16 = 1280;
@@ -112,7 +112,7 @@ const POSITION_MAX_PITCH: f32 = 85.0;
 fn parse_positioning(value: &str) -> Result<Positioning, IngressError> {
     let decoded;
     let value = if value.as_bytes().contains(&b'%') {
-        decoded = percent_decode_str(value)
+        decoded = percent_decode_form(value)
             .map_err(|_| invalid("position must be valid percent-encoded UTF-8"))?;
         decoded.as_str()
     } else {

@@ -102,36 +102,13 @@ fn decoded_namespace(path: &str, prefix: &str) -> Result<String, ()> {
         .and_then(|rest| rest.split('/').next())
         .filter(|segment| !segment.is_empty())
         .ok_or(())?;
-    let bytes = raw.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'%' {
-            decoded.push(bytes[index]);
-            index += 1;
-            continue;
-        }
-        let high = decode_hex(*bytes.get(index + 1).ok_or(())?).ok_or(())?;
-        let low = decode_hex(*bytes.get(index + 2).ok_or(())?).ok_or(())?;
-        decoded.push((high << 4) | low);
-        index += 3;
-    }
-    let decoded = String::from_utf8(decoded).map_err(|_| ())?;
+    let decoded = mmpf_http::percent_decode(raw).map_err(|_| ())?;
     decoded
         .split('/')
         .next()
         .filter(|namespace| !namespace.is_empty())
         .map(str::to_string)
         .ok_or(())
-}
-
-fn decode_hex(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn failure_response(failure: AuthFailure) -> Response {

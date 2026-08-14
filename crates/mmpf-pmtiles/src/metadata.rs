@@ -393,7 +393,9 @@ mod tests {
             Some("top")
         );
         assert_eq!(
-            other.get("nested_only").and_then(|value| value.as_bool()),
+            other
+                .get("nested_only")
+                .and_then(serde_json::Value::as_bool),
             Some(true)
         );
 

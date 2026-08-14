@@ -1253,7 +1253,7 @@ mod tests {
     #[tokio::test]
     async fn peer_snapshot_cache_coalesces_concurrent_loads() {
         const CALLERS: usize = 8;
-        let cache = PeerSnapshotCache::new(Duration::from_secs(60));
+        let cache = PeerSnapshotCache::new(Duration::from_mins(1));
         let expected: Arc<[Peer]> = vec![Peer {
             id: "node-a".to_string(),
             addr: "127.0.0.1:9090".parse().unwrap(),
@@ -1301,7 +1301,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_peer_snapshot_load_releases_waiters() {
-        let cache = PeerSnapshotCache::new(Duration::from_secs(60));
+        let cache = PeerSnapshotCache::new(Duration::from_mins(1));
         let started = Arc::new(Semaphore::new(0));
         let task = {
             let cache = cache.clone();

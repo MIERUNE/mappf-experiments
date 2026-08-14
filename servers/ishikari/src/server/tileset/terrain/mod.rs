@@ -303,6 +303,7 @@ async fn serve_derived_tile(
         } else {
             Some("gzip")
         },
+        "tile",
     )?;
     let routing_key = derived_resource_key(&request.tileset_id, request.product);
     let internal_path = format!(
@@ -791,7 +792,7 @@ mod tests {
 
     #[test]
     fn absent_response_is_short_lived_and_cacheable() {
-        let response = absent_derived_response(std::time::Duration::from_secs(60));
+        let response = absent_derived_response(std::time::Duration::from_mins(1));
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(
@@ -811,7 +812,7 @@ mod tests {
             &HeaderMap::new(),
         )
         .unwrap();
-        apply_degraded_cache_policy(&mut response, std::time::Duration::from_secs(60));
+        apply_degraded_cache_policy(&mut response, std::time::Duration::from_mins(1));
 
         assert_eq!(
             response.headers().get(header::CACHE_CONTROL).unwrap(),

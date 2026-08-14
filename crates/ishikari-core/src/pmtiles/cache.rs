@@ -13,7 +13,7 @@ use mmpf_pmtiles::{ArchiveBootstrap, Directory, Metadata};
 pub(crate) const DEFAULT_ARCHIVE_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const DEFAULT_LEAF_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 #[cfg(any(test, feature = "simulator-support"))]
-pub(crate) const DEFAULT_ARCHIVE_REVALIDATION_INTERVAL: Duration = Duration::from_secs(300);
+pub(crate) const DEFAULT_ARCHIVE_REVALIDATION_INTERVAL: Duration = Duration::from_mins(5);
 
 /// How long an authoritatively-absent archive is remembered. Deliberately tiny:
 /// long enough to collapse a burst of requests for the same missing archive into

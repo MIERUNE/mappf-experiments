@@ -267,10 +267,10 @@ mod tests {
         bytes.put_u8(tile_type);
         bytes.put_u8(0); // min zoom
         bytes.put_u8(14); // max zoom
-        bytes.put_i32_le(-1800000000); // min lon
-        bytes.put_i32_le(-850000000); // min lat
-        bytes.put_i32_le(1800000000); // max lon
-        bytes.put_i32_le(850000000); // max lat
+        bytes.put_i32_le(-1_800_000_000); // min lon
+        bytes.put_i32_le(-850_000_000); // min lat
+        bytes.put_i32_le(1_800_000_000); // max lon
+        bytes.put_i32_le(850_000_000); // max lat
         bytes.put_u8(0); // center zoom
         bytes.put_i32_le(0); // center lon
         bytes.put_i32_le(0); // center lat

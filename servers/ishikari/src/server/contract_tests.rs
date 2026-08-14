@@ -797,8 +797,8 @@ async fn harness_config(
             backend_fetch_max_inflight: 16,
             tile_cache_max_bytes: 1024 * 1024,
             chunk_cache_max_bytes: 1024 * 1024,
-            tile_negative_ttl: Duration::from_secs(60),
-            archive_revalidation_interval: Duration::from_secs(300),
+            tile_negative_ttl: Duration::from_mins(1),
+            archive_revalidation_interval: Duration::from_mins(5),
         }
         .resolve()
         .expect("valid resolver tuning"),
@@ -836,8 +836,9 @@ async fn harness_config(
             mapterhorn: None,
             cpu_work_concurrency: 1,
             cpu_work_max_inflight: 4,
-            derived_negative_ttl: Duration::from_secs(60),
+            derived_negative_ttl: Duration::from_mins(1),
             cache_capacities: crate::options::CacheCapacities::default(),
+            provider_fetch_concurrency: 8,
         },
     );
 

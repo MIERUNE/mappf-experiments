@@ -11,41 +11,13 @@ use std::{
 use axum::http::StatusCode;
 use ishikari_core::metrics::NodeMetrics;
 
-use super::HttpError;
-
-/// RAII reservation in the CPU-work admission counter. Reserving fails (a shed)
-/// when the counter is already at its ceiling; the reservation is released on
-/// drop — including when the awaiting future is cancelled before it acquires a
-/// permit — so the count can never leak.
-struct CpuWorkSlot {
-    inflight: Arc<AtomicUsize>,
-}
-
-impl CpuWorkSlot {
-    fn try_reserve(inflight: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
-        let previous = inflight.fetch_add(1, Ordering::Relaxed);
-        if previous >= max {
-            inflight.fetch_sub(1, Ordering::Relaxed);
-            None
-        } else {
-            Some(Self {
-                inflight: Arc::clone(inflight),
-            })
-        }
-    }
-}
-
-impl Drop for CpuWorkSlot {
-    fn drop(&mut self) {
-        self.inflight.fetch_sub(1, Ordering::Relaxed);
-    }
-}
+use super::{HttpError, inflight::InflightSlot};
 
 /// Admission ticket for one unit of CPU-bound request work. Holds both a
 /// concurrency permit and an in-flight slot; dropping it releases both.
 pub(super) struct CpuWorkPermit {
     _permit: tokio::sync::OwnedSemaphorePermit,
-    _slot: CpuWorkSlot,
+    _slot: InflightSlot,
 }
 
 #[derive(Clone)]
@@ -84,7 +56,7 @@ impl CpuWorkGate {
     ) -> Result<CpuWorkPermit, HttpError> {
         let queue_started = Instant::now();
         let slot =
-            CpuWorkSlot::try_reserve(&self.inflight, self.max_inflight).ok_or_else(|| {
+            InflightSlot::try_reserve(&self.inflight, self.max_inflight).ok_or_else(|| {
                 metrics.record_cpu_work_admission(work, "shed");
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -117,33 +89,5 @@ impl CpuWorkGate {
             concurrency: self.concurrency,
             max_inflight: self.max_inflight,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-
-    use super::CpuWorkSlot;
-
-    #[test]
-    fn cpu_work_admission_sheds_at_ceiling_and_releases_on_drop() {
-        let inflight = Arc::new(AtomicUsize::new(0));
-        // Fill the two slots.
-        let first = CpuWorkSlot::try_reserve(&inflight, 2).expect("first slot");
-        let second = CpuWorkSlot::try_reserve(&inflight, 2).expect("second slot");
-        // The third is shed while the counter is at its ceiling, and the failed
-        // reservation must not leave the counter inflated.
-        assert!(CpuWorkSlot::try_reserve(&inflight, 2).is_none());
-        assert_eq!(inflight.load(Ordering::Relaxed), 2);
-        // Freeing one slot re-opens admission.
-        drop(first);
-        let third = CpuWorkSlot::try_reserve(&inflight, 2).expect("slot after release");
-        drop(second);
-        drop(third);
-        assert_eq!(inflight.load(Ordering::Relaxed), 0);
     }
 }

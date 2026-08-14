@@ -194,12 +194,12 @@ mod tests {
     #[test]
     fn only_negative_entries_expire() {
         let expiry = TileExpiry {
-            negative_ttl: Duration::from_secs(60),
+            negative_ttl: Duration::from_mins(1),
         };
         // Absent tiles get the short TTL; present tiles never expire on their own.
         assert_eq!(
             expiry.ttl_for(&CachedTile::NotFound),
-            Some(Duration::from_secs(60))
+            Some(Duration::from_mins(1))
         );
         assert_eq!(expiry.ttl_for(&found()), None);
     }

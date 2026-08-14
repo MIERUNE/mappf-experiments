@@ -11,7 +11,8 @@ use bytes::Bytes;
 
 use super::FetchedProviderResource;
 use crate::server::{
-    HttpError, bytes_response, conditional::Validators, provider_body::decode_provider_body,
+    HttpError, apply_accept_encoding_vary, bytes_response, conditional::Validators,
+    provider_body::decode_provider_body,
 };
 use ishikari_core::storage::{
     InternalFetchResponse, PROVIDER_AGE_HEADER, PROVIDER_CACHE_CONTROL_HEADER,
@@ -81,6 +82,15 @@ impl ProviderResource {
 
     pub(crate) fn bytes(&self) -> &Bytes {
         &self.bytes
+    }
+
+    /// The transport encoding this representation is stored in, if any.
+    ///
+    /// Handlers need it to answer `406` when a client excludes the only coding
+    /// available: this service never cross-compresses a provider body, so an
+    /// unacceptable coding has no alternative representation to fall back to.
+    pub(crate) fn content_encoding(&self) -> Option<&str> {
+        self.content_encoding.as_deref()
     }
 
     pub(crate) fn cache_control(&self) -> &str {
@@ -165,7 +175,7 @@ impl ProviderResource {
 
     /// `304 Not Modified` for a matched conditional request: no body, and no
     /// representation metadata (`Content-Encoding`). It carries the cache
-    /// metadata and validators that a `200` would (RFC 9110 §15.4.5).
+    /// metadata, validators, and `Vary` that a `200` would (RFC 9110 §15.4.5).
     fn not_modified_response(&self) -> axum::response::Response {
         let mut response = axum::response::Response::new(axum::body::Body::empty());
         *response.status_mut() = StatusCode::NOT_MODIFIED;
@@ -178,8 +188,14 @@ impl ProviderResource {
         self.apply_content_encoding(headers);
     }
 
-    /// `Cache-Control`, `Age`, and validators — the metadata shared by a `200`
-    /// body response and its `304`. Excludes representation headers.
+    /// `Cache-Control`, `Age`, validators, and `Vary` — the metadata shared by a
+    /// `200` body response and its `304`. Excludes representation headers.
+    ///
+    /// `Vary` belongs here, not with `Content-Encoding`: a `304` carries no
+    /// representation, but it still answers a request that was negotiated on
+    /// `Accept-Encoding`, and a shared cache keys the stored `304`-refreshed entry
+    /// by whatever `Vary` names. Omitting it there would let one client's revalidation
+    /// re-validate an entry for a client that negotiated differently.
     fn apply_cache_metadata(&self, headers: &mut HeaderMap) {
         headers.insert(
             header::CACHE_CONTROL,
@@ -191,6 +207,9 @@ impl ProviderResource {
             HeaderValue::from_str(&self.age_seconds.to_string()).expect("age is numeric"),
         );
         self.validators.apply(headers);
+        if self.content_encoding.is_some() {
+            apply_accept_encoding_vary(headers);
+        }
     }
 
     fn apply_internal_headers(&self, headers: &mut HeaderMap) {
@@ -231,6 +250,8 @@ mod tests {
 
     use axum::http::{HeaderMap, StatusCode, header};
     use bytes::Bytes;
+
+    use std::sync::Arc;
 
     use super::ProviderResource;
     use crate::server::conditional::Validators;
@@ -322,6 +343,42 @@ mod tests {
         assert_eq!(headers[header::AGE], "7");
         assert_eq!(headers[header::ETAG], "\"v1\"");
         assert!(headers.get(header::CONTENT_ENCODING).is_none());
+
+        // Vary is cache metadata, not representation metadata, so it must survive on
+        // the 304. Without it a shared cache revalidating on behalf of one client
+        // would refresh an entry it cannot tell apart from a differently negotiated
+        // one.
+        assert!(
+            headers
+                .get_all(header::VARY)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|value| value.to_ascii_lowercase().contains("accept-encoding")),
+            "304 must repeat the 200's Vary"
+        );
+    }
+
+    /// An identity representation negotiates nothing, so neither its `200` nor its
+    /// `304` should claim to vary.
+    #[test]
+    fn an_identity_not_modified_response_declares_no_encoding_vary() {
+        let resource = ProviderResource {
+            bytes: Bytes::from_static(b"plain"),
+            cache_control: "public, max-age=30".into(),
+            age_seconds: 0,
+            validators: Validators::new(Some("\"v1\"".into()), None),
+            content_encoding: None,
+        };
+
+        let response = resource.not_modified_response();
+        assert!(
+            !response
+                .headers()
+                .get_all(header::VARY)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|value| value.to_ascii_lowercase().contains("accept-encoding"))
+        );
     }
 
     #[test]
@@ -340,5 +397,82 @@ mod tests {
             panic!("missing peer metadata must fail closed");
         };
         assert_eq!(error, "peer provider response is missing cache policy");
+    }
+
+    /// The deployment-sensitive contract: a provider body stored as a gzip stream
+    /// must reach the caller still compressed, labelled with the resource's own
+    /// content type, and declared as varying by `Accept-Encoding`.
+    ///
+    /// Getting any part of this wrong is silent. Dropping the encoding header hands
+    /// the caller gzip bytes labelled protobuf; dropping `Vary` lets a shared cache
+    /// serve them to a client that asked for identity.
+    #[test]
+    fn a_gzip_stored_body_is_forwarded_compressed_and_declared() {
+        let compressed = Bytes::from_static(&[0x1f, 0x8b, 0x08, 0x00]);
+        let resource = ProviderResource::from_cached(
+            compressed.clone(),
+            "public, max-age=86400".into(),
+            Validators::new(None, None),
+            Some(Arc::from("gzip")),
+            0,
+        );
+
+        assert_eq!(resource.content_encoding(), Some("gzip"));
+
+        let response = resource.public_response(
+            &HeaderMap::new(),
+            compressed.clone(),
+            "application/x-protobuf",
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/x-protobuf"
+        );
+        let vary: Vec<_> = response
+            .headers()
+            .get_all(header::VARY)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        assert!(
+            vary.iter()
+                .any(|value| value.to_ascii_lowercase().contains("accept-encoding")),
+            "Vary must list Accept-Encoding, got {vary:?}"
+        );
+    }
+
+    /// An identity body must not gain either header, so the common path stays
+    /// byte-for-byte what it was before compressed storage existed.
+    #[test]
+    fn an_identity_body_declares_no_encoding_and_no_encoding_vary() {
+        let resource = ProviderResource::from_cached(
+            Bytes::from_static(b"plain"),
+            "public, max-age=86400".into(),
+            Validators::new(None, None),
+            None,
+            0,
+        );
+
+        let response = resource.public_response(
+            &HeaderMap::new(),
+            Bytes::from_static(b"plain"),
+            "application/x-protobuf",
+        );
+
+        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+        assert!(
+            !response
+                .headers()
+                .get_all(header::VARY)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|value| value.to_ascii_lowercase().contains("accept-encoding"))
+        );
     }
 }

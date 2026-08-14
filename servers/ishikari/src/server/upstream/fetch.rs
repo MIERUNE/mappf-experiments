@@ -180,7 +180,13 @@ async fn fetch_http_provider(
     );
     let content_encoding = joined_header_values(&headers, header::CONTENT_ENCODING)
         .filter(|value| !value.trim().eq_ignore_ascii_case("identity"))
-        .map(|value| Arc::from(value.as_ref()));
+        .map(|value| Arc::from(value.as_ref()))
+        // Apply the same storage convention the object-store path uses, so a
+        // provider is described identically whichever transport reached it. An
+        // HTTP provider that serves gzip bytes under a compressed content type
+        // and no `Content-Encoding` would otherwise be forwarded as raw gzip
+        // labelled protobuf: the caller would try to parse a gzip stream.
+        .or_else(|| gzip_encoding_from_content_type(header_value(&headers, header::CONTENT_TYPE)));
     let mut body = BytesMut::with_capacity(
         response.content_length().unwrap_or(0).min(max_bytes as u64) as usize,
     );
@@ -278,7 +284,7 @@ async fn fetch_object_store_provider(
         result
             .attributes
             .get(&Attribute::ContentType)
-            .map(|value| value.as_ref()),
+            .map(std::convert::AsRef::as_ref),
         accepted_content_types,
         resource,
     )?;
@@ -287,19 +293,41 @@ async fn fetch_object_store_provider(
         result
             .attributes
             .get(&Attribute::CacheControl)
-            .map(|value| value.as_ref()),
+            .map(std::convert::AsRef::as_ref),
     );
     let last_modified = SystemTime::from(result.meta.last_modified);
     let validators = Validators::new(
         result.meta.e_tag.as_deref().map(Arc::from),
         (last_modified != UNIX_EPOCH).then_some(last_modified),
     );
+    let stored_content_type = result
+        .attributes
+        .get(&Attribute::ContentType)
+        .map(std::convert::AsRef::as_ref);
     let content_encoding = result
         .attributes
         .get(&Attribute::ContentEncoding)
-        .map(|value| value.as_ref())
+        .map(std::convert::AsRef::as_ref)
         .filter(|value| !value.trim().eq_ignore_ascii_case("identity"))
-        .map(Arc::from);
+        .map(Arc::from)
+        // An object stored *as* a compressed archive declares that through its
+        // content type, not through `Content-Encoding`.
+        //
+        // This matters because the two are not interchangeable on GCS. Setting
+        // `Content-Encoding: gzip` enables decompressive transcoding: a client
+        // that does not ask for gzip receives the object decompressed **and
+        // without `Content-Length`**, which `object_store` rejects outright
+        // (`header_meta` requires that header), so the fetch fails with a 502.
+        // `object_store` has no way to send `Accept-Encoding: gzip` — its reqwest
+        // build disables the feature — so the header form is unusable here.
+        //
+        // Storing the gzip bytes with a compressed content type instead keeps the
+        // transfer compressed end to end: GCS returns the bytes verbatim with a
+        // correct `Content-Length`, and declaring the encoding here lets
+        // `decode_provider_body` decompress when the server needs to read the
+        // body, while a byte-identical response forwards it to the caller with
+        // `Content-Encoding: gzip` for transparent client-side decoding.
+        .or_else(|| gzip_encoding_from_content_type(stored_content_type));
     let body = result
         .bytes()
         .await
@@ -314,6 +342,25 @@ async fn fetch_object_store_provider(
         content_encoding,
         initial_age: Duration::ZERO,
     }))
+}
+
+/// Recognises a content type that means "the stored bytes are a gzip stream".
+///
+/// Only an exact archive type counts. A `+gzip` structured suffix is deliberately
+/// accepted too, while anything else — including a plain protobuf or octet-stream
+/// type — is left alone, so an object that merely *contains* compressed data is
+/// never double-decoded.
+fn gzip_encoding_from_content_type(content_type: Option<&str>) -> Option<Arc<str>> {
+    let value = content_type?;
+    let essence = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let is_gzip = matches!(essence.as_str(), "application/gzip" | "application/x-gzip")
+        || essence.ends_with("+gzip");
+    is_gzip.then(|| Arc::from("gzip"))
 }
 
 /// The `BAD_GATEWAY` shed used when an upstream body exceeds the resource cap.
@@ -482,7 +529,41 @@ pub(super) fn provider_fetch_cache_weight(
 
 #[cfg(test)]
 mod tests {
-    use super::{fetch_http_provider, provider_failure_diagnostic};
+
+    #[test]
+    fn gzip_content_types_declare_the_stored_encoding() {
+        for value in [
+            "application/gzip",
+            "application/x-gzip",
+            "APPLICATION/GZIP",
+            "application/gzip; charset=binary",
+            "application/vnd.mapbox-vector-tile+gzip",
+        ] {
+            assert_eq!(
+                gzip_encoding_from_content_type(Some(value)).as_deref(),
+                Some("gzip"),
+                "{value} should declare gzip"
+            );
+        }
+
+        // A plain protobuf or octet-stream body is not compressed. Treating it as
+        // gzip would make the server try to inflate raw glyph bytes.
+        for value in [
+            "application/x-protobuf",
+            "application/octet-stream",
+            "application/json",
+            "",
+        ] {
+            assert!(
+                gzip_encoding_from_content_type(Some(value)).is_none(),
+                "{value} must not declare gzip"
+            );
+        }
+        assert!(gzip_encoding_from_content_type(None).is_none());
+    }
+    use super::{
+        fetch_http_provider, gzip_encoding_from_content_type, provider_failure_diagnostic,
+    };
     use reqwest::Client;
     use url::Url;
 

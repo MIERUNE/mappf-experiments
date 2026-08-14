@@ -216,7 +216,7 @@ async fn serve_tile(
     } = representation;
     let response = match format {
         RequestedTileFormat::AsStored => {
-            ensure_content_encoding_acceptable(headers, tile.content_encoding)?;
+            ensure_content_encoding_acceptable(headers, tile.content_encoding, "tile")?;
             state.metrics.add_egress_bytes(tile.bytes.len() as u64);
             debug!(
                 endpoint = "tile",
@@ -240,7 +240,7 @@ async fn serve_tile(
             } else {
                 Some("gzip")
             };
-            ensure_content_encoding_acceptable(headers, expected_encoding)?;
+            ensure_content_encoding_acceptable(headers, expected_encoding, "tile")?;
             let routing_key = ResourceRoutingKey::from(&tileset_id);
             let (bytes, content_encoding, served_format) = mlt_response_bytes(
                 &state,
@@ -345,7 +345,7 @@ pub(super) fn tile_data_response(
     tile: TileData,
     headers: &HeaderMap,
 ) -> Result<Response, HttpError> {
-    ensure_content_encoding_acceptable(headers, tile.content_encoding)?;
+    ensure_content_encoding_acceptable(headers, tile.content_encoding, "tile")?;
     Ok(TilesetResponse::from(tile)
         .with_cache_control(cache::TILE)
         .into_response())
@@ -481,16 +481,17 @@ impl IntoResponse for TilesetResponse {
 /// coding, and a matching coding is served as stored. Ishikari deliberately
 /// does not decompress or cross-compress tiles on this path; when the client
 /// excludes the only available representation, it returns `406`.
-pub(super) fn ensure_content_encoding_acceptable(
+pub(crate) fn ensure_content_encoding_acceptable(
     headers: &HeaderMap,
     content_encoding: Option<&str>,
+    resource: &str,
 ) -> Result<(), HttpError> {
     if content_encoding_is_acceptable(headers, content_encoding) {
         Ok(())
     } else {
         Err((
             StatusCode::NOT_ACCEPTABLE,
-            "no acceptable tile content encoding is available".to_string(),
+            format!("no acceptable {resource} content encoding is available"),
         ))
     }
 }
@@ -677,6 +678,7 @@ mod tests {
         let error = ensure_content_encoding_acceptable(
             &accept_encoding("br;q=1, gzip;q=0, identity;q=0"),
             Some("gzip"),
+            "tile",
         )
         .unwrap_err();
         assert_eq!(error.0, StatusCode::NOT_ACCEPTABLE);

@@ -29,6 +29,27 @@ pub(crate) fn bytes_response(
     out
 }
 
+/// Declares that the representation depends on the request's `Accept-Encoding`.
+///
+/// Required whenever a response may carry a transport coding: without it a shared
+/// cache can serve a gzip body to a client that asked for identity.
+pub(crate) fn apply_accept_encoding_vary(headers: &mut HeaderMap) {
+    const ACCEPT_ENCODING: &str = "Accept-Encoding";
+    let already_listed = headers.get_all(header::VARY).iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case(ACCEPT_ENCODING))
+        })
+    });
+    if already_listed {
+        return;
+    }
+    // Append: another layer may already vary on something else, and replacing
+    // that value would drop a dimension from every shared cache key.
+    headers.append(header::VARY, HeaderValue::from_static(ACCEPT_ENCODING));
+}
+
 /// Marks a generated document whose absolute URLs depend on request origin
 /// metadata supplied by the client or trusted reverse proxy.
 pub(crate) fn apply_origin_vary(headers: &mut HeaderMap) {

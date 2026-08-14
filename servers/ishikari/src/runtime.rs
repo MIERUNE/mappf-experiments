@@ -53,6 +53,9 @@ where
         backend_fetch_max_inflight = resolver_tuning.backend_fetch_max_inflight(),
         backend_max_active_body_bytes = options.backend_max_active_body_bytes,
         backend_active_body_budget_bytes = options.backend_active_body_budget_bytes,
+        provider_fetch_concurrency = options.provider_fetch_concurrency,
+        provider_max_active_body_bytes = options.provider_max_active_body_bytes,
+        provider_active_body_budget_bytes = options.provider_active_body_budget_bytes,
         artificial_backend_delay_ms = options.artificial_backend_delay_ms,
         tile_cache_max_bytes = resolver_tuning.tile_cache_max_bytes(),
         chunk_cache_max_bytes = resolver_tuning.chunk_cache_max_bytes(),
@@ -147,6 +150,7 @@ where
             cpu_work_max_inflight: options.cpu_work_max_inflight,
             derived_negative_ttl: resolver_tuning.tile_negative_ttl(),
             cache_capacities,
+            provider_fetch_concurrency: options.provider_fetch_concurrency,
         },
     );
     let refresh_state = app_state.clone();

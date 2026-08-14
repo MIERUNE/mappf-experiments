@@ -16,7 +16,7 @@ pub const HTTP_ADVERTISE_ADDR_KEY: &str = "http-advertise-addr";
 pub const DEAD_NODE_GRACE_PERIOD: Duration = Duration::from_secs(30);
 
 /// Ishikari's tombstone retention policy, shared by production and simulation.
-pub const MARKED_FOR_DELETION_GRACE_PERIOD: Duration = Duration::from_secs(60 * 60);
+pub const MARKED_FOR_DELETION_GRACE_PERIOD: Duration = Duration::from_hours(1);
 
 /// Decodes an explicitly published internal HTTP address.
 ///

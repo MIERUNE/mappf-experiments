@@ -14,7 +14,8 @@ use clap::Parser;
 use crate::config_file::ConfigFile;
 use crate::options::{
     DEFAULT_BACKEND_ACTIVE_BODY_BUDGET_BYTES, DEFAULT_CACHE_WEIGHT_BUDGET_BYTES,
-    DEFAULT_CHUNK_CACHE_MAX_BYTES, DEFAULT_TILE_CACHE_MAX_BYTES, Options, OptionsInput,
+    DEFAULT_CHUNK_CACHE_MAX_BYTES, DEFAULT_PROVIDER_ACTIVE_BODY_BUDGET_BYTES,
+    DEFAULT_TILE_CACHE_MAX_BYTES, Options, OptionsInput,
 };
 
 /// CLI flags and environment variables for configuring the server.
@@ -126,6 +127,17 @@ struct Cli {
         default_value_t = DEFAULT_BACKEND_ACTIVE_BODY_BUDGET_BYTES
     )]
     backend_active_body_budget_bytes: u64,
+
+    /// Reserve for concurrently active provider bodies (glyphs, styles, sprites),
+    /// in bytes. Startup fails when the fetch concurrency times the largest body
+    /// cap exceeds this, so the concurrency cannot be raised without declaring the
+    /// memory it needs.
+    #[arg(
+        long = "provider-active-body-budget-bytes",
+        env = "ISKR_PROVIDER_ACTIVE_BODY_BUDGET_BYTES",
+        default_value_t = DEFAULT_PROVIDER_ACTIVE_BODY_BUDGET_BYTES
+    )]
+    provider_active_body_budget_bytes: u64,
     #[arg(
         long = "artificial-backend-delay-ms",
         env = "ISKR_ARTIFICIAL_BACKEND_DELAY_MS",
@@ -207,6 +219,21 @@ struct Cli {
     /// concurrency.
     #[arg(long = "cpu-work-max-inflight", env = "ISKR_CPU_WORK_MAX_INFLIGHT")]
     cpu_work_max_inflight: Option<usize>,
+
+    /// Concurrent upstream provider body fetches (glyphs, styles, sprites).
+    ///
+    /// This bounds transient memory as much as throughput. One semaphore admits
+    /// every resource kind, so the worst case is this times the *largest* body cap
+    /// — 8 MiB for a sprite PNG, not the 1 MiB glyph the default is tuned for — and
+    /// startup rejects a value whose product exceeds
+    /// ISKR_PROVIDER_ACTIVE_BODY_BUDGET_BYTES. A cold CJK basemap render needs on
+    /// the order of 150 glyph ranges, so a low value turns one render into many
+    /// sequential waves.
+    #[arg(
+        long = "provider-fetch-concurrency",
+        env = "ISKR_PROVIDER_FETCH_CONCURRENCY"
+    )]
+    provider_fetch_concurrency: Option<usize>,
 }
 
 /// Parse CLI arguments and environment variables into runtime configuration,
@@ -282,6 +309,7 @@ fn resolve(cli: Cli) -> Result<Options, String> {
         backend_fetch_concurrency: cli.backend_fetch_concurrency,
         backend_fetch_max_inflight: cli.backend_fetch_max_inflight,
         backend_active_body_budget_bytes: cli.backend_active_body_budget_bytes,
+        provider_active_body_budget_bytes: cli.provider_active_body_budget_bytes,
         artificial_backend_delay_ms: cli.artificial_backend_delay_ms,
         cache_weight_budget_bytes: cli.cache_weight_budget_bytes,
         tile_cache_max_bytes: cli.tile_cache_max_bytes,
@@ -296,6 +324,7 @@ fn resolve(cli: Cli) -> Result<Options, String> {
         mapterhorn_negative_ttl_secs: cli.mapterhorn_negative_ttl_secs,
         cpu_work_concurrency,
         cpu_work_max_inflight: cli.cpu_work_max_inflight,
+        provider_fetch_concurrency: cli.provider_fetch_concurrency,
     })
 }
 
@@ -309,9 +338,7 @@ fn auto_node_id() -> String {
 }
 
 fn default_cpu_work_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(2)
+    std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get)
 }
 
 #[cfg(test)]
@@ -367,6 +394,7 @@ mod tests {
             backend_fetch_concurrency: 32,
             backend_fetch_max_inflight: None,
             backend_active_body_budget_bytes: DEFAULT_BACKEND_ACTIVE_BODY_BUDGET_BYTES,
+            provider_active_body_budget_bytes: DEFAULT_PROVIDER_ACTIVE_BODY_BUDGET_BYTES,
             artificial_backend_delay_ms: 0,
             cache_weight_budget_bytes: DEFAULT_CACHE_WEIGHT_BUDGET_BYTES,
             tile_cache_max_bytes: DEFAULT_TILE_CACHE_MAX_BYTES,
@@ -381,6 +409,7 @@ mod tests {
             mapterhorn_negative_ttl_secs: 3600,
             cpu_work_concurrency: Some(2),
             cpu_work_max_inflight: None,
+            provider_fetch_concurrency: None,
         }
     }
 

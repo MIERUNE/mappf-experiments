@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-const MAX_ARCHIVE_REVALIDATION_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const MAX_ARCHIVE_REVALIDATION_INTERVAL: Duration = Duration::from_hours(168);
 
 /// Raw resolver tuning supplied by a production or simulation composition root.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,8 +142,8 @@ mod tests {
             backend_fetch_max_inflight: 128,
             tile_cache_max_bytes: 512 * 1024 * 1024,
             chunk_cache_max_bytes: 256 * 1024 * 1024,
-            tile_negative_ttl: Duration::from_secs(60),
-            archive_revalidation_interval: Duration::from_secs(300),
+            tile_negative_ttl: Duration::from_mins(1),
+            archive_revalidation_interval: Duration::from_mins(5),
         }
     }
 
@@ -176,7 +176,7 @@ mod tests {
         assert_eq!(tuning.tile_negative_ttl(), Duration::ZERO);
         assert_eq!(
             tuning.archive_revalidation_interval(),
-            Duration::from_secs(300)
+            Duration::from_mins(5)
         );
     }
 

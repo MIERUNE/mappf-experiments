@@ -144,7 +144,7 @@ mod tests {
 
     fn resolver() -> MapterhornResolver {
         MapterhornResolver::new(
-            MapterhornConfig::new("mapterhorn/planet", 16, Duration::from_secs(3600))
+            MapterhornConfig::new("mapterhorn/planet", 16, Duration::from_hours(1))
                 .expect("valid config"),
         )
     }

@@ -72,3 +72,24 @@ The contract and evaluation dimensions live in [`../specs/isoline-and-hillshade-
 - Revisit framed internal APIs or end-to-end timeout budgets only if the current HTTP and fixed per-hop contracts prove insufficient.
 - Shorten dead-node retention only after measuring state growth under Spot churn.
 - Persist a monotonic membership incarnation only if wall-clock rollback becomes an operational concern.
+
+## Weighted provider fetch permits (or a sprite lane)
+
+One semaphore admits every provider resource, so the startup body reserve has to
+charge each permit the largest cap — an 8 MiB sprite PNG. That makes the default
+concurrency of 64 require a 512 MiB reserve
+(`ISKR_PROVIDER_ACTIVE_BODY_BUDGET_BYTES`), even though the workload the value was
+tuned for is glyph-dominated at 1 MiB per body. The reserve is therefore correct but
+pessimistic by roughly 8x against real traffic.
+
+Two ways out, both behaviour changes rather than accounting changes:
+
+- Weight the permits by each resource's cap, so a glyph costs 1 and a sprite PNG 8.
+  The reserve then tracks actual bytes, and 64 concurrent glyph fetches stop
+  reserving memory that only 64 concurrent sprite fetches could ever use.
+- Give sprites a separate, much lower-concurrency lane. Simpler, and sprite fetches
+  are rare and not on the cold-render critical path, but it adds a second knob.
+
+Until one of these lands, a deployment that lowers the reserve must lower the
+concurrency with it, which costs cold-render latency for memory it was never going
+to use.

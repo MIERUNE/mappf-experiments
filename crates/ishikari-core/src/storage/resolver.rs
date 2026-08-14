@@ -1069,8 +1069,8 @@ mod tests {
             backend_fetch_max_inflight: 128,
             tile_cache_max_bytes: 1024 * 1024,
             chunk_cache_max_bytes: 1024 * 1024,
-            tile_negative_ttl: Duration::from_secs(60),
-            archive_revalidation_interval: Duration::from_secs(300),
+            tile_negative_ttl: Duration::from_mins(1),
+            archive_revalidation_interval: Duration::from_mins(5),
         }
         .resolve()
         .expect("valid resolver tuning");

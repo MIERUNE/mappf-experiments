@@ -891,7 +891,7 @@ fn layer_hue(layer_id: &str) -> f64 {
         return hue;
     }
 
-    let mut hasher = XxHash64::with_seed(0x2c4a68f3);
+    let mut hasher = XxHash64::with_seed(0x2c4a_68f3);
     hasher.write(layer_id.as_bytes());
     (hasher.finish() % 360) as f64
 }
@@ -973,10 +973,10 @@ mod tests {
         bytes.put_u8(tile_type);
         bytes.put_u8(0); // min zoom
         bytes.put_u8(12); // max zoom
-        bytes.put_i32_le(-1800000000); // min lon
-        bytes.put_i32_le(-850000000); // min lat
-        bytes.put_i32_le(1800000000); // max lon
-        bytes.put_i32_le(850000000); // max lat
+        bytes.put_i32_le(-1_800_000_000); // min lon
+        bytes.put_i32_le(-850_000_000); // min lat
+        bytes.put_i32_le(1_800_000_000); // max lon
+        bytes.put_i32_le(850_000_000); // max lat
         bytes.put_u8(0); // center zoom
         bytes.put_i32_le(0); // center lon
         bytes.put_i32_le(0); // center lat

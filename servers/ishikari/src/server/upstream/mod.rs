@@ -1,12 +1,6 @@
 //! Shared bounded upstream fetch helpers for provider resources.
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use axum::http::StatusCode;
 use bytes::Bytes;
@@ -17,6 +11,7 @@ use crate::http_client::representation_preserving_builder;
 use crate::server::{
     HttpError,
     conditional::Validators,
+    inflight::InflightSlot,
     provider_cache_policy::{CachePolicy, NegativeCachePolicy},
 };
 
@@ -31,7 +26,39 @@ pub(crate) use resource::ProviderResource;
 /// Provider resources are much larger than PMTiles index reads. Bound active
 /// bodies process-wide so many distinct URLs cannot bypass per-key
 /// single-flight and consume unbounded memory.
-pub(super) const PROVIDER_FETCH_CONCURRENCY: usize = 16;
+///
+/// This is a memory bound, not a throughput knob. One semaphore covers every
+/// provider resource, so the worst case is `concurrency * MAX_PROVIDER_BODY_BYTES`
+/// — the *largest* cap, which is a sprite PNG, not the 1 MiB glyph the default was
+/// raised for. That product is validated against
+/// `ISKR_PROVIDER_ACTIVE_BODY_BUDGET_BYTES` at startup, so raising the concurrency
+/// requires raising the budget and therefore acknowledging the memory.
+///
+/// The value itself is chosen for the glyph workload: 1 MiB bodies, ~150 ranges per
+/// cold CJK render, so a low value turns one render into many sequential waves.
+/// Charging every resource the sprite cap makes the budget conservative rather than
+/// wrong; a sprite lane with its own lower concurrency would let the budget drop to
+/// roughly the glyph-dominated figure (see issues/ishikari-todo.md).
+///
+/// The default is sized for the demo's dominant cost. A CJK basemap needs on the
+/// order of 150 glyph ranges for one cold render, so 16 forced roughly ten
+/// sequential waves; at ~0.4 s per wave that is most of a four-second cold
+/// render. Override with `ISKR_PROVIDER_FETCH_CONCURRENCY` when a deployment's
+/// memory budget or upstream differs.
+pub(crate) const DEFAULT_PROVIDER_FETCH_CONCURRENCY: usize = 64;
+
+/// The largest single provider body any handler accepts, and therefore the
+/// multiplier for worst-case transient body memory across the shared fetch
+/// semaphore. Sprite PNGs are the largest; glyphs are 1 MiB and styles 2 MiB.
+///
+/// The assertions below fail the build if a handler ever raises its own cap past
+/// this, so the budget arithmetic in `options` cannot silently go stale.
+pub(crate) const MAX_PROVIDER_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+const _: () = assert!(crate::server::glyph::MAX_GLYPH_BYTES <= MAX_PROVIDER_BODY_BYTES);
+const _: () = assert!(crate::server::style::MAX_STYLE_BYTES <= MAX_PROVIDER_BODY_BYTES);
+const _: () = assert!(crate::server::sprite::MAX_SPRITE_JSON_BYTES <= MAX_PROVIDER_BODY_BYTES);
+const _: () = assert!(crate::server::sprite::MAX_SPRITE_PNG_BYTES <= MAX_PROVIDER_BODY_BYTES);
 pub(super) const PROVIDER_FETCH_MAX_INFLIGHT: usize = 128;
 /// Bounded so a slow or hung upstream cannot pin request tasks indefinitely
 /// (mirrors the tile backend fetch timeout).
@@ -54,7 +81,7 @@ pub(super) const PROVIDER_STALE_REVALIDATION_FAILURE_MAX_KEYS: u64 = 4_096;
 /// for the life of the process. Losing an entry early is safe but not free: a
 /// fetch in flight across the expiry sees a fence mismatch and is refetched
 /// rather than stored, so this must stay comfortably above the fetch timeout.
-pub(super) const PROVIDER_INVALIDATION_FENCE_RETENTION: Duration = Duration::from_secs(600);
+pub(super) const PROVIDER_INVALIDATION_FENCE_RETENTION: Duration = Duration::from_mins(10);
 
 /// The refresh fence a fetch captured immediately before its I/O.
 ///
@@ -153,33 +180,9 @@ pub(super) struct CachedProviderRepresentation {
     content_encoding: Option<Arc<str>>,
 }
 
-pub(super) struct ProviderFetchSlot {
-    inflight: Arc<AtomicUsize>,
-}
-
-impl ProviderFetchSlot {
-    fn try_reserve(inflight: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
-        let previous = inflight.fetch_add(1, Ordering::Relaxed);
-        if previous >= max {
-            inflight.fetch_sub(1, Ordering::Relaxed);
-            None
-        } else {
-            Some(Self {
-                inflight: Arc::clone(inflight),
-            })
-        }
-    }
-}
-
-impl Drop for ProviderFetchSlot {
-    fn drop(&mut self) {
-        self.inflight.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
 pub(super) struct ProviderFetchPermit {
     _permit: OwnedSemaphorePermit,
-    _slot: ProviderFetchSlot,
+    _slot: InflightSlot,
 }
 
 /// HTTP client for direct provider fetches. Redirects are disabled: provider

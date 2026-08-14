@@ -34,6 +34,9 @@ pub(crate) struct ServerRuntimeConfig {
     pub cpu_work_max_inflight: usize,
     pub derived_negative_ttl: Duration,
     pub cache_capacities: CacheCapacities,
+    /// Concurrent upstream provider body fetches; bounds transient memory as well
+    /// as how many sequential waves a cold render's glyph ranges take.
+    pub provider_fetch_concurrency: usize,
 }
 
 pub(super) struct CacheMaintenanceGuard {
@@ -172,11 +175,13 @@ impl AppState {
             cpu_work_max_inflight,
             derived_negative_ttl,
             cache_capacities,
+            provider_fetch_concurrency,
         } = runtime;
         let provider_fetcher = ProviderFetcher::new(
             metrics.clone(),
             object_store_registry,
             cache_capacities.provider_bytes(),
+            provider_fetch_concurrency,
         );
         Self(Arc::new(AppStateInner {
             membership,

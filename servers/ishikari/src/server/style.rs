@@ -25,7 +25,7 @@ use crate::server::{
 use ishikari_core::{interned::TilesetId, storage::ProviderRequest};
 use mmpf_http::style_key::StyleKey;
 
-const MAX_STYLE_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_STYLE_BYTES: usize = 2 * 1024 * 1024;
 const STYLE_CONTENT_TYPES: &[&str] = &["application/json", "text/json", "application/octet-stream"];
 
 pub(crate) async fn style_handler(

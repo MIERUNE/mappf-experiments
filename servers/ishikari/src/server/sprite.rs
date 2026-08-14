@@ -10,8 +10,8 @@ use ishikari_core::storage::{ProviderRequest, ProviderSpriteVariant};
 
 use crate::server::{AppState, HttpError, style::validate_style_key, upstream::ProviderResource};
 
-const MAX_SPRITE_JSON_BYTES: usize = 2 * 1024 * 1024;
-const MAX_SPRITE_PNG_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_SPRITE_JSON_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_SPRITE_PNG_BYTES: usize = 8 * 1024 * 1024;
 const SPRITE_JSON_CONTENT_TYPES: &[&str] =
     &["application/json", "text/json", "application/octet-stream"];
 const SPRITE_PNG_CONTENT_TYPES: &[&str] = &["image/png", "application/octet-stream"];

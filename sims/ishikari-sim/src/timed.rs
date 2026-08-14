@@ -319,7 +319,7 @@ fn summarize(mut latencies: Vec<Duration>) -> LatencySummary {
         p90_ms: percentile(&latencies, 0.90),
         p95_ms: percentile(&latencies, 0.95),
         p99_ms: percentile(&latencies, 0.99),
-        max_ms: latencies.last().copied().map(duration_ms).unwrap_or(0.0),
+        max_ms: latencies.last().copied().map_or(0.0, duration_ms),
     }
 }
 

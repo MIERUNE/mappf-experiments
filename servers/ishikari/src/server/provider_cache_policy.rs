@@ -6,15 +6,15 @@ use mmpf_http::cache_control::{ParsedCacheControl as CacheControl, parse_values}
 
 use super::cache;
 
-const STYLE_POSITIVE_TTL: Duration = Duration::from_secs(300);
-const GLYPH_POSITIVE_TTL: Duration = Duration::from_secs(86400);
+const STYLE_POSITIVE_TTL: Duration = Duration::from_mins(5);
+const GLYPH_POSITIVE_TTL: Duration = Duration::from_hours(24);
 /// Shorter than [`GLYPH_POSITIVE_TTL`] for the same reason `cache::SPRITE` is
 /// shorter than `cache::GLYPH`: a sprite path is mutable.
-const SPRITE_POSITIVE_TTL: Duration = Duration::from_secs(3600);
+const SPRITE_POSITIVE_TTL: Duration = Duration::from_hours(1);
 const PROVIDER_NEGATIVE_TTL: Duration = Duration::from_secs(30);
 /// Upper bound on any upstream-derived freshness or stale window. Ishikari is a
 /// shared cache, so a pathological `max-age` must not pin bytes for months.
-const MAX_PROVIDER_TTL: Duration = Duration::from_secs(7 * 86400);
+const MAX_PROVIDER_TTL: Duration = Duration::from_hours(168);
 
 /// Effective caching decision for one fetched provider resource, derived from
 /// the upstream `Cache-Control` (when present) or the per-resource defaults.
@@ -106,10 +106,7 @@ pub(super) fn cache_policy_with_freshness_values<'a>(
     let swr = if control.must_revalidate || control.proxy_revalidate {
         Duration::ZERO
     } else {
-        control
-            .stale_while_revalidate
-            .map(clamp)
-            .unwrap_or(Duration::ZERO)
+        control.stale_while_revalidate.map_or(Duration::ZERO, clamp)
     };
     (
         CachePolicy {
@@ -160,8 +157,7 @@ pub(super) fn negative_cache_policy_with_freshness_values<'a>(
     let fresh = control
         .s_maxage
         .or(control.max_age)
-        .map(Duration::from_secs)
-        .unwrap_or(PROVIDER_NEGATIVE_TTL)
+        .map_or(PROVIDER_NEGATIVE_TTL, Duration::from_secs)
         .min(PROVIDER_NEGATIVE_TTL);
     (
         NegativeCachePolicy { store: true, fresh },
@@ -179,18 +175,21 @@ fn normalized_cache_control(resource: &'static str, control: &CacheControl) -> S
 
     let clamp = |seconds: u64| seconds.min(MAX_PROVIDER_TTL.as_secs());
     if control.private {
-        let max_age = control.max_age.map(clamp).unwrap_or(0);
+        let max_age = control.max_age.map_or(0, clamp);
         return format!("private, max-age={max_age}");
     }
 
     let default_fresh = positive_ttl(resource).as_secs();
-    let max_age = control.max_age.map(clamp).unwrap_or_else(|| {
-        if control.s_maxage.is_some() {
-            0
-        } else {
-            default_fresh
-        }
-    });
+    let max_age = control.max_age.map_or_else(
+        || {
+            if control.s_maxage.is_some() {
+                0
+            } else {
+                default_fresh
+            }
+        },
+        clamp,
+    );
     let s_maxage = control
         .s_maxage
         .map(clamp)
@@ -250,12 +249,12 @@ mod tests {
 
     #[test]
     fn provider_cache_ttl_follows_how_mutable_the_resource_is() {
-        assert_eq!(positive_ttl("style"), Duration::from_secs(300));
+        assert_eq!(positive_ttl("style"), Duration::from_mins(5));
         // A glyph range is immutable by construction.
-        assert_eq!(positive_ttl("glyph"), Duration::from_secs(86400));
+        assert_eq!(positive_ttl("glyph"), Duration::from_hours(24));
         // A sprite path is mutable until sprites are content-addressed, so it
         // must not inherit the glyph lifetime.
-        assert_eq!(positive_ttl("sprite"), Duration::from_secs(3600));
+        assert_eq!(positive_ttl("sprite"), Duration::from_hours(1));
         assert!(positive_ttl("sprite") < positive_ttl("glyph"));
     }
 
@@ -263,12 +262,9 @@ mod tests {
     fn missing_upstream_cache_control_uses_resource_default() {
         let style = cache_policy("style", None);
         assert!(style.store);
-        assert_eq!(style.fresh, Duration::from_secs(300));
+        assert_eq!(style.fresh, Duration::from_mins(5));
         assert_eq!(style.swr, Duration::ZERO);
-        assert_eq!(
-            cache_policy("glyph", None).fresh,
-            Duration::from_secs(86400)
-        );
+        assert_eq!(cache_policy("glyph", None).fresh, Duration::from_hours(24));
     }
 
     #[test]
@@ -278,8 +274,8 @@ mod tests {
             Some("public, max-age=60, s-maxage=600, stale-while-revalidate=120"),
         );
         assert!(policy.store);
-        assert_eq!(policy.fresh, Duration::from_secs(600));
-        assert_eq!(policy.swr, Duration::from_secs(120));
+        assert_eq!(policy.fresh, Duration::from_mins(10));
+        assert_eq!(policy.swr, Duration::from_mins(2));
     }
 
     #[test]
@@ -342,7 +338,7 @@ mod tests {
                 )),
             );
             assert!(policy.store);
-            assert_eq!(policy.fresh, Duration::from_secs(60));
+            assert_eq!(policy.fresh, Duration::from_mins(1));
             assert_eq!(policy.swr, Duration::ZERO);
             assert!(
                 !policy
@@ -383,7 +379,7 @@ mod tests {
     fn quoted_extension_commas_do_not_create_policy_directives() {
         let policy = cache_policy("style", Some(r#"extension="private,no-store", max-age=60"#));
         assert!(policy.store);
-        assert_eq!(policy.fresh, Duration::from_secs(60));
+        assert_eq!(policy.fresh, Duration::from_mins(1));
     }
 
     #[test]

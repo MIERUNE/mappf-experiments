@@ -47,7 +47,7 @@ impl Validators {
         use std::hash::Hasher;
         // Seed "ISKR"; the value is opaque, so the choice only needs to be
         // stable across requests, which it is.
-        let mut hasher = twox_hash::XxHash64::with_seed(0x49534b52);
+        let mut hasher = twox_hash::XxHash64::with_seed(0x4953_4b52);
         hasher.write(body);
         Self::derived_etag(format!("\"{:016x}\"", hasher.finish()))
     }

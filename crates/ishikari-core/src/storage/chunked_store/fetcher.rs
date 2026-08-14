@@ -948,7 +948,11 @@ mod tests {
             .collect();
         samples.sort_unstable();
         let median_ms = samples[samples.len() / 2].as_secs_f64() * 1_000.0;
-        let mean_ms = samples.iter().map(|value| value.as_secs_f64()).sum::<f64>() * 1_000.0
+        let mean_ms = samples
+            .iter()
+            .map(std::time::Duration::as_secs_f64)
+            .sum::<f64>()
+            * 1_000.0
             / samples.len() as f64;
 
         assert!((52.0..58.0).contains(&median_ms), "median={median_ms}");

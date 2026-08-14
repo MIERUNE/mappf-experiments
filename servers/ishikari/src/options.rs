@@ -16,12 +16,23 @@ pub(crate) const DEFAULT_CACHE_WEIGHT_BUDGET_BYTES: u64 = 1024 * MIB;
 pub(crate) const DEFAULT_TILE_CACHE_MAX_BYTES: u64 = 256 * MIB;
 pub(crate) const DEFAULT_CHUNK_CACHE_MAX_BYTES: u64 = 256 * MIB;
 pub(crate) const DEFAULT_BACKEND_ACTIVE_BODY_BUDGET_BYTES: u64 = 128 * MIB;
+/// Reserve for concurrently active *provider* bodies (glyphs, styles, sprites).
+///
+/// This is exactly what the default fetch concurrency requires when every permit is
+/// charged the largest body cap (`64 * MAX_PROVIDER_BODY_BYTES`), so the default
+/// configuration validates with no slack: raising the concurrency fails at startup
+/// until an operator raises this reserve too, and has to justify the memory against
+/// the container limit. Combined with the cache weight budget and the backend body
+/// reserve, this is the third and last of the process's declared memory pools.
+pub(crate) const DEFAULT_PROVIDER_ACTIVE_BODY_BUDGET_BYTES: u64 = 512 * MIB;
 
 const RESOURCE_CACHE_MAX_BYTES: u64 = 64 * MIB;
 const ARCHIVE_CACHE_MAX_BYTES: u64 = 64 * MIB;
 const LEAF_CACHE_MAX_BYTES: u64 = 64 * MIB;
 // Keep origin provider objects and derived composite glyphs under the original
 // 64 MiB provider budget rather than quietly raising the process cache ceiling.
+use crate::server::upstream::{DEFAULT_PROVIDER_FETCH_CONCURRENCY, MAX_PROVIDER_BODY_BYTES};
+
 const PROVIDER_CACHE_MAX_BYTES: u64 = 48 * MIB;
 const GLYPH_COMPOSITE_CACHE_MAX_BYTES: u64 = 16 * MIB;
 const MLT_CACHE_MAX_BYTES: u64 = 64 * MIB;
@@ -63,9 +74,7 @@ impl CacheCapacities {
             DERIVED_TILE_CACHE_MAX_BYTES,
             DEM_TILE_CACHE_MAX_BYTES,
         ];
-        let configured_weight_bytes = capacities
-            .into_iter()
-            .try_fold(0_u64, |total, value| total.checked_add(value));
+        let configured_weight_bytes = capacities.into_iter().try_fold(0_u64, u64::checked_add);
         let Some(configured_weight_bytes) = configured_weight_bytes else {
             return Err("configured material-cache weights overflow u64".to_string());
         };
@@ -187,6 +196,18 @@ pub(crate) struct Options {
     pub(crate) cpu_work_concurrency: usize,
     /// Maximum admitted CPU-work units before new work is shed.
     pub(crate) cpu_work_max_inflight: usize,
+    /// Concurrent upstream provider body fetches. A memory bound first: one
+    /// semaphore covers every resource, so the worst case is this times the largest
+    /// cap — `MAX_PROVIDER_BODY_BYTES`, an 8 MiB sprite PNG, not the 1 MiB glyph or
+    /// 2 MiB style. `resolve` validates that product against
+    /// `provider_active_body_budget_bytes`. Raising it reduces the number of
+    /// sequential waves a cold CJK render needs for its ~150 glyph ranges.
+    pub(crate) provider_fetch_concurrency: usize,
+    /// Worst-case bytes across concurrently active provider bodies, as validated
+    /// against the reserve at startup.
+    pub(crate) provider_max_active_body_bytes: u64,
+    /// Startup ceiling for concurrently active provider response bodies.
+    pub(crate) provider_active_body_budget_bytes: u64,
 }
 
 /// Bounded, non-sensitive description of configured tileset backends for
@@ -281,6 +302,7 @@ pub(crate) struct OptionsInput {
     pub(crate) backend_fetch_concurrency: usize,
     pub(crate) backend_fetch_max_inflight: Option<usize>,
     pub(crate) backend_active_body_budget_bytes: u64,
+    pub(crate) provider_active_body_budget_bytes: u64,
     pub(crate) artificial_backend_delay_ms: u64,
     pub(crate) cache_weight_budget_bytes: u64,
     pub(crate) tile_cache_max_bytes: u64,
@@ -295,6 +317,7 @@ pub(crate) struct OptionsInput {
     pub(crate) mapterhorn_negative_ttl_secs: u64,
     pub(crate) cpu_work_concurrency: usize,
     pub(crate) cpu_work_max_inflight: Option<usize>,
+    pub(crate) provider_fetch_concurrency: Option<usize>,
 }
 
 impl Options {
@@ -403,6 +426,20 @@ impl Options {
             None => None,
         };
         let cpu_work_concurrency = input.cpu_work_concurrency.max(1);
+        // Reject zero rather than silently clamping: a deployment that sets this to
+        // zero has expressed something impossible, and clamping would hide it.
+        // Zero would mean "never fetch". The upper end is not an arbitrary count:
+        // the concurrency is only meaningful together with the bytes it admits, so
+        // it is validated against the declared body reserve below.
+        let provider_fetch_concurrency = match input.provider_fetch_concurrency {
+            Some(0) => return Err("provider fetch concurrency must be at least 1".to_string()),
+            Some(value) => value,
+            None => DEFAULT_PROVIDER_FETCH_CONCURRENCY,
+        };
+        let provider_max_active_body_bytes = resolve_provider_active_body_bytes(
+            provider_fetch_concurrency,
+            input.provider_active_body_budget_bytes,
+        )?;
         Ok(Self {
             auth_registries,
             anonymous_registry: input.anonymous_registry,
@@ -422,6 +459,8 @@ impl Options {
             resolver_tuning,
             backend_max_active_body_bytes,
             backend_active_body_budget_bytes: input.backend_active_body_budget_bytes,
+            provider_max_active_body_bytes,
+            provider_active_body_budget_bytes: input.provider_active_body_budget_bytes,
             artificial_backend_delay_ms: input.artificial_backend_delay_ms,
             provider,
             mapterhorn,
@@ -431,6 +470,7 @@ impl Options {
                 .cpu_work_max_inflight
                 .unwrap_or_else(|| cpu_work_concurrency.saturating_mul(64))
                 .max(cpu_work_concurrency),
+            provider_fetch_concurrency,
         })
     }
 }
@@ -468,6 +508,39 @@ fn resolve_backend_active_body_bytes(
     Ok(active_body_bytes)
 }
 
+/// Validates the provider fetch concurrency against the declared body reserve.
+///
+/// Charges every permit the largest per-resource cap. That is deliberately
+/// pessimistic — a real mix is glyph-dominated at 1 MiB — but the semaphore admits
+/// any resource kind, so the pessimistic figure is the only one that actually bounds
+/// the process.
+fn resolve_provider_active_body_bytes(
+    concurrency: usize,
+    budget_bytes: u64,
+) -> Result<u64, String> {
+    let max_body_bytes = u64::try_from(MAX_PROVIDER_BODY_BYTES)
+        .map_err(|_| "provider body cap does not fit u64".to_string())?;
+    let concurrency = u64::try_from(concurrency).map_err(|_| {
+        "configured provider fetch concurrency does not fit u64; reduce \
+         ISKR_PROVIDER_FETCH_CONCURRENCY"
+            .to_string()
+    })?;
+    let active_body_bytes = max_body_bytes.checked_mul(concurrency).ok_or_else(|| {
+        "configured aggregate active provider body size overflows u64; reduce \
+         ISKR_PROVIDER_FETCH_CONCURRENCY"
+            .to_string()
+    })?;
+    if active_body_bytes > budget_bytes {
+        return Err(format!(
+            "configured active provider bodies require up to {active_body_bytes} bytes, exceeding \
+             the {budget_bytes}-byte ISKR_PROVIDER_ACTIVE_BODY_BUDGET_BYTES reserve; reduce \
+             ISKR_PROVIDER_FETCH_CONCURRENCY, or raise the reserve only with matching \
+             container-memory headroom"
+        ));
+    }
+    Ok(active_body_bytes)
+}
+
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.trim().is_empty())
 }
@@ -499,6 +572,7 @@ mod tests {
             backend_fetch_concurrency: 32,
             backend_fetch_max_inflight: None,
             backend_active_body_budget_bytes: DEFAULT_BACKEND_ACTIVE_BODY_BUDGET_BYTES,
+            provider_active_body_budget_bytes: DEFAULT_PROVIDER_ACTIVE_BODY_BUDGET_BYTES,
             artificial_backend_delay_ms: 0,
             cache_weight_budget_bytes: DEFAULT_CACHE_WEIGHT_BUDGET_BYTES,
             tile_cache_max_bytes: DEFAULT_TILE_CACHE_MAX_BYTES,
@@ -513,6 +587,7 @@ mod tests {
             mapterhorn_negative_ttl_secs: 3600,
             cpu_work_concurrency: 2,
             cpu_work_max_inflight: None,
+            provider_fetch_concurrency: None,
         }
     }
 
@@ -527,6 +602,52 @@ mod tests {
         };
 
         assert_eq!(error, "chunk_size_bytes must be greater than zero");
+    }
+
+    #[test]
+    fn provider_fetch_concurrency_defaults_and_rejects_zero() {
+        // The default is a memory/latency trade-off, not an arbitrary number: a
+        // cold CJK render needs ~150 glyph ranges, so a small value turns one
+        // render into many sequential upstream waves.
+        let options = Options::resolve(input()).expect("defaults resolve");
+        assert_eq!(
+            options.provider_fetch_concurrency,
+            DEFAULT_PROVIDER_FETCH_CONCURRENCY
+        );
+
+        let mut explicit = input();
+        explicit.provider_fetch_concurrency = Some(32);
+        assert_eq!(
+            Options::resolve(explicit)
+                .expect("an explicit value is honored")
+                .provider_fetch_concurrency,
+            32
+        );
+
+        // Zero would mean "never fetch"; refuse it instead of clamping so the
+        // misconfiguration is visible at startup.
+        let mut zero = input();
+        zero.provider_fetch_concurrency = Some(0);
+        assert!(Options::resolve(zero).is_err());
+
+        // The upper end is the declared body reserve, not a bare count: the default
+        // concurrency fits it exactly, so one permit more must fail rather than
+        // quietly admitting another 8 MiB body.
+        let mut over = input();
+        over.provider_fetch_concurrency = Some(DEFAULT_PROVIDER_FETCH_CONCURRENCY + 1);
+        let Err(error) = Options::resolve(over) else {
+            panic!("one permit past the reserve must be rejected");
+        };
+        assert!(
+            error.contains("ISKR_PROVIDER_ACTIVE_BODY_BUDGET_BYTES"),
+            "expected the budget to be named so an operator knows what to raise: {error}"
+        );
+
+        // Raising the reserve alongside it is what makes the higher concurrency legal.
+        let mut funded = input();
+        funded.provider_fetch_concurrency = Some(DEFAULT_PROVIDER_FETCH_CONCURRENCY + 1);
+        funded.provider_active_body_budget_bytes = 1024 * MIB;
+        assert!(Options::resolve(funded).is_ok());
     }
 
     #[test]

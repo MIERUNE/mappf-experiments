@@ -375,10 +375,7 @@ async fn track_http_metrics(
     // Keep the cheap, owned `MatchedPath` (`Arc<str>`) across the await rather
     // than borrowing a label while the request is moved into `next.run`.
     let response = next.run(request).await;
-    let endpoint = matched
-        .as_ref()
-        .map(MatchedPath::as_str)
-        .unwrap_or("unknown");
+    let endpoint = matched.as_ref().map_or("unknown", MatchedPath::as_str);
     // Exclude the scrape itself: its handler performs cache-gauge maintenance,
     // and recording that work in the exported histogram makes scrape latency
     // self-referential on the following scrape.
@@ -472,13 +469,17 @@ pub(crate) mod conditional;
 mod contract_tests;
 mod cpu_work;
 pub(crate) mod glyph;
+mod inflight;
 pub(crate) mod internal;
 pub(crate) mod provider;
 mod provider_body;
 mod provider_cache_policy;
 mod refresh;
 mod response;
-pub(crate) use response::{apply_origin_vary, bytes_response, derived_json_response, get_origin};
+pub(crate) use response::{
+    apply_accept_encoding_vary, apply_origin_vary, bytes_response, derived_json_response,
+    get_origin,
+};
 mod state;
 pub(crate) use state::{AppState, ServerRuntimeConfig};
 pub(crate) mod sprite;

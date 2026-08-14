@@ -22,7 +22,7 @@ use crate::server::{AppState, HttpError, upstream::ProviderResource};
 
 const MAX_FONTSTACK_LEN: usize = 256;
 const MAX_FONTS_PER_STACK: usize = 8;
-const MAX_GLYPH_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_GLYPH_BYTES: usize = 1024 * 1024;
 // Glyph ids are Unicode code points stored as uint32 in the glyph PBF. Keep
 // the same full-Unicode ceiling as Martin; supplementary-plane fonts and
 // upstream composers can legitimately serve ranges above the BMP.
@@ -32,6 +32,13 @@ const GLYPH_CONTENT_TYPES: &[&str] = &[
     "application/vnd.google.protobuf",
     "application/protobuf",
     "application/octet-stream",
+    // A range stored as a gzip stream. Glyph PBFs compress to roughly 60-70% of
+    // their size, which matters because one cold CJK render pulls ~150 ranges of
+    // ~200 KiB. The encoding is declared by the content type rather than by
+    // `Content-Encoding` because the latter triggers GCS decompressive
+    // transcoding, which drops `Content-Length` and breaks `object_store`.
+    "application/gzip",
+    "application/x-gzip",
 ];
 
 #[derive(Clone, Debug)]
@@ -139,6 +146,16 @@ pub(crate) async fn glyph_handler(
     let range = validate_range(&range)?;
     let upstream = resolve_glyph_url(&state, &fontstack.canonical, range.as_str())?;
     let resource = route_glyph_bytes(&state, &fontstack, &range, upstream).await?;
+    // A range may be stored gzip-compressed, and this path never
+    // cross-compresses: if the client excludes the only coding available there is
+    // no alternative representation to offer, so refuse rather than send a body
+    // the client said it cannot read. `public_response` adds
+    // `Vary: Accept-Encoding` whenever a coding is present.
+    crate::server::tileset::tile::ensure_content_encoding_acceptable(
+        &headers,
+        resource.content_encoding(),
+        "glyph",
+    )?;
     Ok(resource.public_response(&headers, resource.bytes().clone(), "application/x-protobuf"))
 }
 
@@ -288,10 +305,13 @@ fn parse_fontstack(fontstack: &str) -> Result<ParsedFontstack, HttpError> {
     let mut seen = HashSet::new();
     for part in fontstack.split(',') {
         let name = part.trim();
+        // `.` and `..` survive percent-encoding and are normalized as relative
+        // URL path segments, so they must not reach the provider template.
         if name.is_empty()
             || name.chars().any(char::is_control)
             || name.contains('/')
             || name.contains('\\')
+            || matches!(name, "." | "..")
         {
             return Err((StatusCode::BAD_REQUEST, "fontstack invalid".to_string()));
         }
@@ -559,5 +579,32 @@ mod tests {
         let range = validate_range("0-255").unwrap();
         assert!(merge_glyph_pbf("A, B", &range, vec![Bytes::from_static(b"bad")]).is_err());
         assert!(merge_glyph_pbf("A, B", &range, vec![encoded("A", vec![glyph(256, 1)])]).is_err());
+    }
+    #[test]
+    fn a_dot_segment_fontstack_cannot_escape_the_glyph_prefix() {
+        for escape in ["..", ".", " .. "] {
+            assert!(
+                parse_fontstack(escape).is_err(),
+                "{escape:?} must be rejected as a fontstack"
+            );
+        }
+
+        // The same input, had it been accepted, resolves above the prefix.
+        let raw = "gs://bucket/fonts/{fontstack}/{range}.pbf"
+            .replace(
+                "{fontstack}",
+                &ishikari_core::storage::path_percent_encode(".."),
+            )
+            .replace("{range}", "0-255");
+        assert_eq!(
+            url::Url::parse(&raw).expect("template parses").path(),
+            "/0-255.pbf",
+            "this is the escape the validator now prevents"
+        );
+
+        // Dots inside a real font name stay legal.
+        assert!(parse_fontstack("...").is_ok());
+        assert!(parse_fontstack("Noto Sans v1.2").is_ok());
+        assert!(parse_fontstack("A.B,C.D").is_ok());
     }
 }

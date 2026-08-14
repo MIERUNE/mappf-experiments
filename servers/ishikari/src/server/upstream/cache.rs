@@ -21,11 +21,12 @@ use tokio::{sync::Semaphore, time::Instant as TokioInstant};
 use super::fetch::{fetch_limited_bytes_uncached, provider_fetch_cache_weight};
 use super::{
     CachedProviderRepresentation, FetchFence, FetchedProviderNegative, FetchedProviderResource,
-    PROVIDER_FETCH_CONCURRENCY, PROVIDER_FETCH_MAX_INFLIGHT, PROVIDER_INVALIDATION_FENCE_RETENTION,
+    PROVIDER_FETCH_MAX_INFLIGHT, PROVIDER_INVALIDATION_FENCE_RETENTION,
     PROVIDER_STALE_REVALIDATION_FAILURE_COOLDOWN, PROVIDER_STALE_REVALIDATION_FAILURE_MAX_KEYS,
-    ProviderFetchPermit, ProviderFetchSlot, ProviderFlightOutcome, ProviderFlightResult,
-    ProviderOriginOutcome, ProviderResource, provider_http_client, provider_negative_error,
+    ProviderFetchPermit, ProviderFlightOutcome, ProviderFlightResult, ProviderOriginOutcome,
+    ProviderResource, provider_http_client, provider_negative_error,
 };
+use crate::server::inflight::InflightSlot;
 use crate::server::provider_body::BodyValidation;
 use crate::server::{HttpError, conditional::Validators};
 use ishikari_core::metrics::NodeMetrics;
@@ -74,7 +75,7 @@ pub(super) struct ProviderFetchCache {
 }
 
 impl ProviderFetchCache {
-    fn new(max_capacity_bytes: u64) -> Self {
+    fn new(max_capacity_bytes: u64, fetch_concurrency: usize) -> Self {
         Self {
             entries: Cache::builder()
                 .max_capacity(max_capacity_bytes)
@@ -90,7 +91,7 @@ impl ProviderFetchCache {
             refreshes: Arc::new(AtomicU64::new(0)),
             inflight: SingleFlight::default(),
             http_client: provider_http_client(),
-            fetch_semaphore: Arc::new(Semaphore::new(PROVIDER_FETCH_CONCURRENCY)),
+            fetch_semaphore: Arc::new(Semaphore::new(fetch_concurrency)),
             fetch_inflight: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -298,14 +299,13 @@ impl ProviderFetchCache {
         &self,
         resource: &'static str,
     ) -> Result<ProviderFetchPermit, HttpError> {
-        let slot =
-            ProviderFetchSlot::try_reserve(&self.fetch_inflight, PROVIDER_FETCH_MAX_INFLIGHT)
-                .ok_or_else(|| {
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("{resource} upstream fetch queue full"),
-                    )
-                })?;
+        let slot = InflightSlot::try_reserve(&self.fetch_inflight, PROVIDER_FETCH_MAX_INFLIGHT)
+            .ok_or_else(|| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("{resource} upstream fetch queue full"),
+                )
+            })?;
         let permit = Arc::clone(&self.fetch_semaphore)
             .acquire_owned()
             .await
@@ -605,9 +605,10 @@ impl ProviderFetcher {
         metrics: NodeMetrics,
         object_store_registry: Arc<ObjectStoreRegistry>,
         cache_max_bytes: u64,
+        fetch_concurrency: usize,
     ) -> Self {
         Self {
-            cache: ProviderFetchCache::new(cache_max_bytes),
+            cache: ProviderFetchCache::new(cache_max_bytes, fetch_concurrency),
             metrics,
             object_store_registry,
         }
@@ -776,15 +777,15 @@ async fn fetch_limited_bytes_with_validation(
 
 #[cfg(test)]
 mod tests {
+    use super::super::DEFAULT_PROVIDER_FETCH_CONCURRENCY;
     use super::super::fetch::{
         corrected_initial_age, require_complete_provider_status, revalidated_provider_resource,
     };
     use super::{
         BodyValidation, CachedProviderFetch, FetchedProviderNegative, FetchedProviderResource,
         Freshness, PROVIDER_STALE_REVALIDATION_FAILURE_COOLDOWN, ProviderCacheStore,
-        ProviderFetchCache, ProviderFetchCacheKey, ProviderFetchSlot, ProviderFetcher,
-        ProviderFlightResult, ProviderOriginOutcome, Validators, record_cached_provider_fetch,
-        store_leader_result,
+        ProviderFetchCache, ProviderFetchCacheKey, ProviderFetcher, ProviderFlightResult,
+        ProviderOriginOutcome, Validators, record_cached_provider_fetch, store_leader_result,
     };
     use crate::server::provider_cache_policy::{NegativeCachePolicy, cache_policy};
     use axum::http::{HeaderMap, StatusCode, header};
@@ -793,10 +794,7 @@ mod tests {
     use ishikari_core::storage::ObjectStoreRegistry;
     use mmpf_common::singleflight::Flight;
     use std::{
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
+        sync::Arc,
         time::{Duration, SystemTime},
     };
 
@@ -837,16 +835,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_fetch_slots_are_bounded_and_released_on_drop() {
-        let inflight = Arc::new(AtomicUsize::new(0));
-        let slot = ProviderFetchSlot::try_reserve(&inflight, 1).expect("first slot");
-        assert!(ProviderFetchSlot::try_reserve(&inflight, 1).is_none());
-        assert_eq!(inflight.load(Ordering::Relaxed), 1);
-        drop(slot);
-        assert!(ProviderFetchSlot::try_reserve(&inflight, 1).is_some());
-    }
-
-    #[test]
     fn corrected_age_uses_the_largest_origin_or_apparent_age() {
         let now = SystemTime::now();
         let mut headers = HeaderMap::new();
@@ -872,7 +860,7 @@ mod tests {
             age_at_insert: Duration::from_secs(40),
             stored_at: std::time::Instant::now(),
             fresh_until: std::time::Instant::now(),
-            stale_until: std::time::Instant::now() + Duration::from_secs(60),
+            stale_until: std::time::Instant::now() + Duration::from_mins(1),
         }
         .representation()
         .expect("found representation");
@@ -893,7 +881,7 @@ mod tests {
         );
 
         assert_eq!(refreshed.bytes.as_ref(), b"validated-style");
-        assert_eq!(refreshed.policy.fresh, Duration::from_secs(120));
+        assert_eq!(refreshed.policy.fresh, Duration::from_mins(2));
         assert_eq!(refreshed.policy.swr, Duration::from_secs(30));
         assert_eq!(refreshed.validators.etag(), Some("\"v2\""));
         assert_eq!(refreshed.content_encoding.as_deref(), Some("gzip"));
@@ -927,7 +915,7 @@ mod tests {
     fn singleflight_joiner_does_not_record_a_cache_hit() {
         let metrics = NodeMetrics::new();
         let stored_at = std::time::Instant::now();
-        let fresh_until = stored_at + Duration::from_secs(60);
+        let fresh_until = stored_at + Duration::from_mins(1);
         let entry = CachedProviderFetch::Found {
             invalidation_epoch: 0,
             bytes: Bytes::from_static(b"style"),
@@ -953,7 +941,10 @@ mod tests {
 
     #[test]
     fn uncacheable_refresh_invalidates_an_existing_stale_body() {
-        let cache = ProviderFetchCache::new(TEST_PROVIDER_CACHE_MAX_BYTES);
+        let cache = ProviderFetchCache::new(
+            TEST_PROVIDER_CACHE_MAX_BYTES,
+            DEFAULT_PROVIDER_FETCH_CONCURRENCY,
+        );
         let key = ProviderFetchCacheKey::new(
             "style",
             "https://example/style.json",
@@ -983,7 +974,10 @@ mod tests {
 
     #[test]
     fn negative_cache_preserves_status_and_origin_bypass() {
-        let cache = ProviderFetchCache::new(TEST_PROVIDER_CACHE_MAX_BYTES);
+        let cache = ProviderFetchCache::new(
+            TEST_PROVIDER_CACHE_MAX_BYTES,
+            DEFAULT_PROVIDER_FETCH_CONCURRENCY,
+        );
         let key = ProviderFetchCacheKey::new(
             "style",
             "https://example/missing.json",
@@ -1028,7 +1022,10 @@ mod tests {
 
     #[test]
     fn upstream_age_reduces_local_freshness_and_is_emitted() {
-        let cache = ProviderFetchCache::new(TEST_PROVIDER_CACHE_MAX_BYTES);
+        let cache = ProviderFetchCache::new(
+            TEST_PROVIDER_CACHE_MAX_BYTES,
+            DEFAULT_PROVIDER_FETCH_CONCURRENCY,
+        );
         let key = ProviderFetchCacheKey::new(
             "style",
             "https://example/aged-style.json",
@@ -1053,7 +1050,7 @@ mod tests {
         assert!(resource.age_seconds() >= 45);
 
         let already_expired = FetchedProviderResource {
-            initial_age: Duration::from_secs(60),
+            initial_age: Duration::from_mins(1),
             ..fetched
         };
         assert!(
@@ -1066,7 +1063,10 @@ mod tests {
 
     #[test]
     fn upstream_age_also_reduces_default_freshness() {
-        let cache = ProviderFetchCache::new(TEST_PROVIDER_CACHE_MAX_BYTES);
+        let cache = ProviderFetchCache::new(
+            TEST_PROVIDER_CACHE_MAX_BYTES,
+            DEFAULT_PROVIDER_FETCH_CONCURRENCY,
+        );
         let key = ProviderFetchCacheKey::new(
             "style",
             "https://example/defaulted-style.json",
@@ -1078,7 +1078,7 @@ mod tests {
             policy: cache_policy("style", None),
             validators: Validators::default(),
             content_encoding: None,
-            initial_age: Duration::from_secs(300),
+            initial_age: Duration::from_mins(5),
         };
 
         assert!(
@@ -1095,6 +1095,7 @@ mod tests {
             NodeMetrics::new(),
             Arc::new(ObjectStoreRegistry::without_options()),
             TEST_PROVIDER_CACHE_MAX_BYTES,
+            DEFAULT_PROVIDER_FETCH_CONCURRENCY,
         );
         let key = provider_key("https://example/flight.json");
         let Flight::Leader(guard) = fetcher.cache.begin_fetch(key.clone()) else {
@@ -1144,6 +1145,7 @@ mod tests {
             NodeMetrics::new(),
             Arc::new(ObjectStoreRegistry::without_options()),
             TEST_PROVIDER_CACHE_MAX_BYTES,
+            DEFAULT_PROVIDER_FETCH_CONCURRENCY,
         );
         let key = provider_key("https://example/hinted-during-flight.json");
         let Flight::Leader(guard) = fetcher.cache.begin_fetch(key.clone()) else {
@@ -1192,6 +1194,7 @@ mod tests {
             NodeMetrics::new(),
             Arc::new(ObjectStoreRegistry::without_options()),
             TEST_PROVIDER_CACHE_MAX_BYTES,
+            DEFAULT_PROVIDER_FETCH_CONCURRENCY,
         );
         let url = "https://example/style.json";
         let json_key =
@@ -1234,7 +1237,10 @@ mod tests {
 
     #[test]
     fn refresh_fence_rejects_a_pre_hint_inflight_completion() {
-        let cache = ProviderFetchCache::new(TEST_PROVIDER_CACHE_MAX_BYTES);
+        let cache = ProviderFetchCache::new(
+            TEST_PROVIDER_CACHE_MAX_BYTES,
+            DEFAULT_PROVIDER_FETCH_CONCURRENCY,
+        );
         let key = provider_key("https://example/raced-style.json");
         let fetched = FetchedProviderResource {
             bytes: Bytes::from_static(br#"{"version":8}"#),
@@ -1270,7 +1276,10 @@ mod tests {
     /// extra fetch; it must never make pre-hint content visible again.
     #[test]
     fn a_fence_entry_evicted_mid_flight_still_refuses_the_stale_completion() {
-        let cache = ProviderFetchCache::new(TEST_PROVIDER_CACHE_MAX_BYTES);
+        let cache = ProviderFetchCache::new(
+            TEST_PROVIDER_CACHE_MAX_BYTES,
+            DEFAULT_PROVIDER_FETCH_CONCURRENCY,
+        );
         let key = provider_key("https://example/forgotten-fence.json");
         let fetched = FetchedProviderResource {
             bytes: Bytes::from_static(br#"{"version":8}"#),
@@ -1316,7 +1325,10 @@ mod tests {
     /// anywhere, a completion is stored regardless of per-key fence state.
     #[test]
     fn without_any_refresh_a_completion_is_stored_even_with_no_fence_entry() {
-        let cache = ProviderFetchCache::new(TEST_PROVIDER_CACHE_MAX_BYTES);
+        let cache = ProviderFetchCache::new(
+            TEST_PROVIDER_CACHE_MAX_BYTES,
+            DEFAULT_PROVIDER_FETCH_CONCURRENCY,
+        );
         let key = provider_key("https://example/never-refreshed.json");
         let fetched = FetchedProviderResource {
             bytes: Bytes::from_static(br#"{"version":8}"#),
@@ -1336,7 +1348,10 @@ mod tests {
     /// or every hint would discard concurrent work across the whole cache.
     #[test]
     fn a_refresh_of_another_key_does_not_supersede_a_matching_fence() {
-        let cache = ProviderFetchCache::new(TEST_PROVIDER_CACHE_MAX_BYTES);
+        let cache = ProviderFetchCache::new(
+            TEST_PROVIDER_CACHE_MAX_BYTES,
+            DEFAULT_PROVIDER_FETCH_CONCURRENCY,
+        );
         let key = provider_key("https://example/mine.json");
         let other = provider_key("https://example/theirs.json");
         let fetched = FetchedProviderResource {
@@ -1363,11 +1378,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn failed_stale_revalidation_is_suppressed_until_cooldown_elapses() {
-        let cache = ProviderFetchCache::new(TEST_PROVIDER_CACHE_MAX_BYTES);
+        let cache = ProviderFetchCache::new(
+            TEST_PROVIDER_CACHE_MAX_BYTES,
+            DEFAULT_PROVIDER_FETCH_CONCURRENCY,
+        );
         let key = provider_key("https://example/stale.json");
         cache
             .entries
-            .insert(key.clone(), stale_found(Duration::from_secs(60)));
+            .insert(key.clone(), stale_found(Duration::from_mins(1)));
 
         cache.mark_stale_revalidation_failure(&key);
         assert!(!cache.stale_revalidation_allowed(&key));
@@ -1385,15 +1403,18 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn failed_revalidation_cooldowns_are_per_key_and_success_clears_them() {
-        let cache = ProviderFetchCache::new(TEST_PROVIDER_CACHE_MAX_BYTES);
+        let cache = ProviderFetchCache::new(
+            TEST_PROVIDER_CACHE_MAX_BYTES,
+            DEFAULT_PROVIDER_FETCH_CONCURRENCY,
+        );
         let first = provider_key("https://example/first.json");
         let second = provider_key("https://example/second.json");
         cache
             .entries
-            .insert(first.clone(), stale_found(Duration::from_secs(60)));
+            .insert(first.clone(), stale_found(Duration::from_mins(1)));
         cache
             .entries
-            .insert(second.clone(), stale_found(Duration::from_secs(60)));
+            .insert(second.clone(), stale_found(Duration::from_mins(1)));
 
         cache.mark_stale_revalidation_failure(&first);
         assert!(!cache.stale_revalidation_allowed(&first));
@@ -1419,11 +1440,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn hard_expiry_does_not_suppress_blocking_fetch() {
-        let cache = ProviderFetchCache::new(TEST_PROVIDER_CACHE_MAX_BYTES);
+        let cache = ProviderFetchCache::new(
+            TEST_PROVIDER_CACHE_MAX_BYTES,
+            DEFAULT_PROVIDER_FETCH_CONCURRENCY,
+        );
         let key = provider_key("https://example/expired.json");
         cache
             .entries
-            .insert(key.clone(), stale_found(Duration::from_secs(60)));
+            .insert(key.clone(), stale_found(Duration::from_mins(1)));
         cache.mark_stale_revalidation_failure(&key);
         assert!(!cache.stale_revalidation_allowed(&key));
 
@@ -1458,11 +1482,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn delayed_stale_observation_cannot_revalidate_a_fresh_replacement() {
-        let cache = ProviderFetchCache::new(TEST_PROVIDER_CACHE_MAX_BYTES);
+        let cache = ProviderFetchCache::new(
+            TEST_PROVIDER_CACHE_MAX_BYTES,
+            DEFAULT_PROVIDER_FETCH_CONCURRENCY,
+        );
         let key = provider_key("https://example/replaced.json");
         cache
             .entries
-            .insert(key.clone(), stale_found(Duration::from_secs(60)));
+            .insert(key.clone(), stale_found(Duration::from_mins(1)));
         assert!(cache.stale_representation(&key).is_some());
 
         let refreshed = FetchedProviderResource {
@@ -1503,7 +1530,7 @@ mod tests {
             age_at_insert: Duration::ZERO,
             stored_at: two_seconds_ago,
             fresh_until: one_second_ago,
-            stale_until: now + Duration::from_secs(60),
+            stale_until: now + Duration::from_mins(1),
         };
         assert_eq!(entry.freshness(), Freshness::Stale);
         assert_eq!(entry.cache_outcome(Freshness::Stale), "stale_hit");

@@ -101,4 +101,12 @@ abashiri_policy="$(document NetworkPolicy abashiri-internal-only)"
 expect "$abashiri_policy" '^  ingress: \[\]$' \
   "abashiri must deny pod-originated ingress until a Console client is deployed"
 
+biei_route="$(document HTTPRoute biei)"
+expect "$biei_route" 'replacePrefixMatch: /styles/' \
+  "the Biei legacy route must redirect to the canonical style prefix"
+expect "$biei_route" 'statusCode: 301' \
+  "the Biei legacy route must be a permanent redirect"
+expect "$biei_route" 'value: /_internal' \
+  "Biei internal paths must retain their public refusal instead of redirecting"
+
 printf 'PASS: all deployment compositions render and preserve cluster contracts\n'

@@ -94,7 +94,9 @@ gcloud certificate-manager dns-authorizations describe mappf-biei-demo \
   --format='value(dnsResourceRecord.name,dnsResourceRecord.type,dnsResourceRecord.data)'
 ```
 
-The Gateway routes a catch-all `/` to biei's public listener (`:8080`), which serves the render namespaces plus top-level `/livez` `/readyz`. `/_internal/*`, `/metrics` and peer forwarding live on a separate cluster-internal port (`:9090`) that the Service does not expose and the Gateway does not route, so nothing internal is reachable publicly. The shared Gateway listens on HTTPS only.
+The Gateway routes canonical `/styles/*` requests and top-level `/livez` `/readyz` to Biei's public listener (`:8080`). `/_internal/*` and `/metrics` are forwarded only to the public listener so its explicit 404 boundary remains observable; peer forwarding and the actual metrics handlers live on a separate cluster-internal port (`:9090`) that the Service does not expose. The shared Gateway listens on HTTPS only.
+
+The GKE HTTPRoute also preserves links from the older `/{namespace}/{style_id}/...` grammar with a query-preserving `301 Moved Permanently` response pointing to `/styles/{namespace}/{style_id}/...`. Canonical `/styles/*`, health checks, and publicly refused internal paths continue directly to Biei.
 
 **Trust boundary:** the GKE overlay installs `biei-internal-boundary`: public `:8080` remains reachable, while peer forwarding on TCP `:9090` and gossip on UDP `:7946` are limited to biei pods in `map-demo`; the managed Prometheus collector may scrape `:9090`. If you deploy the base or another overlay, install an equivalent NetworkPolicy or service-mesh policy—the application protocol has no peer authentication of its own.
 

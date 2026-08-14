@@ -8,8 +8,28 @@ spec:
   hostnames:
     - biei-demo.mierune.dev
   rules:
+    # Canonical rendering paths and public operational endpoints still go
+    # directly to Biei. Reserved internal paths must retain their public 404.
     - matches:
-        - path: { type: PathPrefix, value: / }
+        - path: { type: PathPrefix, value: /styles }
+        - path: { type: Exact, value: /livez }
+        - path: { type: Exact, value: /readyz }
+        - path: { type: PathPrefix, value: /_internal }
+        - path: { type: PathPrefix, value: /metrics }
+        - path: { type: Exact, value: /favicon.ico }
       backendRefs:
         - name: biei
           port: 8080
+    # Preserve pre-canonical /{namespace}/{style_id}/... links without adding
+    # an application compatibility path. Query parameters are retained.
+    - matches:
+        - path: { type: PathPrefix, value: / }
+      filters:
+        - type: RequestRedirect
+          requestRedirect:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /styles/
+            # GKE Gateway supports 301/302 for RequestRedirect. Biei public
+            # delivery is GET/HEAD-only, so 301 is the permanent migration.
+            statusCode: 301

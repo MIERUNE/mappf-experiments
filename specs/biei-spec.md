@@ -166,7 +166,7 @@ Map mode and pixel ratio are fixed when an `ImageRenderer` is built. A worker th
 - The per-request deadline is distinct from the routing SLA. The SLA is the latency target that sizes the BL soft queue limit and the tier thresholds; the request deadline is how long one request may run before it is abandoned. The deadline is intentionally the larger of the two (a fixed multiple of the SLA), because the first render of a cold style pays one-time resource I/O — glyphs, sprites, source TileJSON — that can approach the SLA, and tying the deadline to the SLA made that cold render time out at exactly the routing target. Keeping them separate gives cold renders headroom without loosening the routing queue limit.
 - Reject before admission when too little budget remains to do useful work.
 - Check the deadline at each worker stage.
-- A native render cannot be preempted. If it returns after the deadline, report timeout and retire that actor.
+- A native render cannot be preempted. At the response deadline, report timeout and quarantine its slot, but continue awaiting the same actor. A late successful completion republishes the warm actor. Only a separate hard-wedge deadline, three total request budgets from arrival, permits actor retirement and bounded replacement.
 - Forward retries do not create a new end-to-end budget.
 
 ## 5. Trait Boundaries
@@ -339,7 +339,9 @@ The actor:
 6. Renders and encodes output.
 7. Cleans request-local state and reports typed errors.
 
-Native rendering cannot be cancelled. When a reply exceeds its deadline, biei queues `Retire` to the old actor, detaches it as a bounded orphan, and starts a replacement immediately. If the old render returns, it observes `Retire` and exits. Orphan count is bounded by renderer-slot count. If the orphan budget is exhausted for a worker, or spawning its replacement fails, that slot becomes unavailable. Every idle worker runs a one-second repair tick, so a finished retiring actor is joined and replaced without requiring another admitted task. Repeated repair attempts do not repeatedly increment replacement-exhaustion accounting.
+Native rendering cannot be cancelled. The client response deadline is therefore not an actor-health verdict. When it elapses, biei returns `504`, stops assigning new work to that slot, and retains the actor reply receiver. If the same call completes before the hard-wedge deadline, its warm actor is made available again without replacement; the late image is discarded because the caller has already left. Commands already queued behind a quarantined or retired slot are returned to the pool before starting and redispatched to a healthy slot.
+
+The hard-wedge deadline is three total request budgets from arrival. Only when that later deadline elapses does biei queue `Retire` to the old actor, detach it as a bounded orphan, and start a replacement. If the old render eventually returns, it observes `Retire` and exits. Orphan count is bounded by renderer-slot count. If the orphan budget is exhausted for a worker, or spawning its replacement fails, that slot remains unavailable. Every idle worker runs a one-second repair tick, so a finished retiring actor is joined and replaced without requiring another admitted task. Repeated repair attempts do not repeatedly increment replacement-exhaustion accounting.
 
 Orphans are bounded by count, not by memory: a detached render keeps its full per-renderer working set (parsed style, glyph/sprite atlases, tessellation) until the non-cancellable render returns, which under a slow provider can be long. Pod memory sizing must therefore budget for orphaned plus replacement renderers, not only the configured slots; a slow-render load can transiently approach twice the steady-state native footprint before the orphan budget closes admission.
 

@@ -105,7 +105,8 @@ pub trait Renderer: Send + Sync {
     /// folded into `render`.
     async fn ensure_source(&mut self, hash: SourceHash) -> Result<(), RendererError>;
     async fn render(&mut self, task: &InternalTask) -> Result<RendererOutput, RendererError>;
-    /// Stop using the current native actor after a caller-side timeout.
+    /// Stop using the current native actor after the separately bounded hard
+    /// wedge deadline, not merely because the caller response deadline elapsed.
     ///
     /// Implementations must not try to kill an in-flight native render. They
     /// may detach it under a bounded orphan budget and immediately install a
@@ -113,15 +114,15 @@ pub trait Renderer: Send + Sync {
     /// renderer slot.
     fn retire_after_current(&mut self) {}
 
-    /// Whether this renderer can accept another task right now. A timeout may
-    /// leave a non-cancellable native actor detached while replacement is
+    /// Whether this renderer can accept another task right now. A hard wedge
+    /// may leave a non-cancellable native actor detached while replacement is
     /// temporarily unavailable; the worker pool must not infer readiness from
     /// an empty queue in that state.
     fn is_available(&self) -> bool {
         true
     }
 
-    /// Attempt to restore an actor that could not be replaced at timeout time.
+    /// Attempt to restore an actor that could not be replaced at hard-wedge time.
     /// Called periodically even when no requests are admitted, so readiness
     /// recovery never depends on a new task reaching the worker.
     fn repair_if_needed(&mut self) -> Result<bool, RendererError> {

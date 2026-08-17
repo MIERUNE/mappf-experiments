@@ -16,7 +16,7 @@ use crate::types::{
     InternalTask, NodeId, NodeKvs, ProcessError, RouteTier, TaskOutcome, TaskResult, WorkerId,
     WorkerProfile, WorkerView, encode_worker_kvs,
 };
-use crate::worker::{WorkerCmd, WorkerReply, WorkerRuntime, worker_loop};
+use crate::worker::{WorkerCmd, WorkerReply, WorkerRuntime, response_timeout_outcome, worker_loop};
 use mmpf_common::sync::lock_unpoisoned;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -55,9 +55,9 @@ struct PickContext<'a> {
 pub(crate) struct WorkerHandle {
     pub tx: mpsc::Sender<WorkerCmd>,
     pub queue_depth: Arc<AtomicUsize>,
-    /// False while the renderer behind this slot is retired and has not yet
-    /// been repaired. Queue depth alone cannot represent that state: a timed
-    /// out command drops its reservation before the periodic repair tick.
+    /// False while the renderer behind this slot is quarantined by a late call,
+    /// or retired and not yet repaired. Queue depth alone cannot represent
+    /// either state.
     available: Arc<AtomicBool>,
     /// Retained so a graceful shutdown can await the worker task. `None` after it
     /// has been joined (or its join timed out and the handle was detached).
@@ -531,13 +531,18 @@ impl WorkerPool {
                 idx,
                 dispatch_generation,
             );
+            let response_deadline = task.deadline;
+            let timeout_outcome = response_timeout_outcome(&task);
+            let (started_tx, mut started_rx) = oneshot::channel();
             let (tx, rx) = oneshot::channel();
+            let mut rx = Box::pin(rx);
             if let Err(err) =
                 w.tx.send(WorkerCmd::Process {
                     task,
                     prepared_profile,
                     route_tier,
                     admitted_at_overflow,
+                    started: started_tx,
                     respond_to: tx,
                     completion,
                 })
@@ -549,7 +554,17 @@ impl WorkerPool {
                 }
                 unreachable!("worker send failure returns the Process command we sent");
             }
-            match rx.await.map_err(|_| ProcessError::QueueDisconnected)? {
+            let reply = tokio::select! {
+                reply = &mut rx => reply.map_err(|_| ProcessError::QueueDisconnected)?,
+                started = &mut started_rx => {
+                    started.map_err(|_| ProcessError::QueueDisconnected)?;
+                    rx.await.map_err(|_| ProcessError::QueueDisconnected)?
+                }
+                _ = tokio::time::sleep_until(response_deadline) => {
+                    return Ok(timeout_outcome);
+                }
+            };
+            match reply {
                 WorkerReply::Outcome(outcome) => return Ok(outcome),
                 WorkerReply::Redispatch {
                     task: returned,
@@ -1655,6 +1670,11 @@ mod tests {
                 reason: crate::types::RejectionReason::DeadlineExceeded
             }
         ));
+        assert_eq!(
+            outcome.deadline_stage,
+            Some(crate::types::DeadlineStage::AcquireRenderPermit),
+            "the pool deadline must not mask the worker's stage attribution"
+        );
         {
             let state = lock_unpoisoned(&pool.state);
             assert_eq!(state.loaded[0], None);
@@ -1663,12 +1683,14 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn render_finishing_after_deadline_is_failed_as_timeout() {
+    async fn render_finishing_after_response_deadline_preserves_the_renderer() {
         let retire_count = Arc::new(AtomicUsize::new(0));
         let pool = WorkerPool::spawn(WorkerPoolSpawn {
             node_id: NodeId::from_index(0),
             renderers: vec![Box::new(SlowRenderer {
-                delay: Duration::from_millis(5),
+                // Finish after the 1ms response deadline but before the 3ms
+                // hard-wedge deadline.
+                delay: Duration::from_millis(2),
                 retire_count: retire_count.clone(),
             })],
             bl_capacity: 1,
@@ -1690,22 +1712,31 @@ mod tests {
             panic!("expected failed timeout");
         };
         assert_eq!(error, RendererError::Timeout.to_string());
-        assert_eq!(retire_count.load(Ordering::Acquire), 1);
+        assert_eq!(retire_count.load(Ordering::Acquire), 0);
+        tokio::task::yield_now().await;
+        assert!(
+            !pool.has_available_worker(),
+            "the still-running renderer must be quarantined"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(retire_count.load(Ordering::Acquire), 0);
         assert!(
             pool.has_available_worker(),
-            "an immediately usable renderer must be republished after retirement"
+            "a late successful renderer must be republished without replacement"
         );
         pool.shutdown(Instant::now() + Duration::from_secs(5)).await;
     }
 
-    /// After one slot's render overruns its deadline, later requests must not keep
-    /// selecting that slot and answering `renderer_dead`.
+    /// After one slot's render overruns its response deadline, later requests
+    /// must not select it while it is quarantined. Replacement happens only at
+    /// the later hard-wedge deadline.
     ///
-    /// A native render cannot be cancelled, so detaching and replacing the actor is
-    /// correct; what must not happen is the pool continuing to route new work to the
-    /// detached slot while a healthy slot sits idle. Observed in the live demo: one
-    /// heavy cold request returned `504 render_timeout`, and the requests behind it
-    /// received `500 renderer_dead`.
+    /// A native render cannot be cancelled. A client timeout alone does not prove
+    /// the actor is wedged, so the pool first hides the same actor and continues
+    /// waiting. Observed in the live demo: one heavy cold request returned `504
+    /// render_timeout`, and requests behind it previously received
+    /// `500 renderer_dead`.
     #[tokio::test(start_paused = true)]
     async fn a_timed_out_slot_stops_attracting_new_work() {
         let renders = Arc::new(AtomicUsize::new(0));
@@ -1747,19 +1778,16 @@ mod tests {
             "first request should fail on the deadline"
         );
         assert!(
-            retired.load(Ordering::Acquire),
-            "the slot should be retired"
+            !retired.load(Ordering::Acquire),
+            "the response deadline must not retire a potentially healthy actor"
         );
-        // Hidden *immediately*, on the same code path that observed the timeout —
-        // not eventually by the periodic repair tick. The tick runs once a second,
-        // and in production every request admitted inside that window is answered
-        // by the detached actor with `renderer_dead`. Asserting before any time
-        // advances is what distinguishes the two mechanisms: virtual time in this
-        // runtime jumps freely, so a test that only checks later outcomes passes
-        // even with the immediate hide deleted.
+        // The pool-side response timer and the worker-side quarantine timer
+        // become ready together. Let the worker observe its timer, without
+        // advancing to the periodic repair tick.
+        tokio::task::yield_now().await;
         assert!(
             !pool.workers[0].available.load(Ordering::Acquire),
-            "the timed-out slot must be hidden before the repair tick can run"
+            "the timed-out slot must be quarantined before the repair tick"
         );
 
         // Subsequent requests choose a slot on their own. None may be answered by
@@ -1780,7 +1808,16 @@ mod tests {
         }
         assert_eq!(
             dead_answers, 0,
-            "requests were routed to the detached slot instead of the healthy one"
+            "requests were routed to the quarantined slot instead of the healthy one"
+        );
+
+        // The injected render never returns within its three-budget hard bound.
+        // Only now may the worker classify it as wedged and retire it.
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            retired.load(Ordering::Acquire),
+            "the hard-wedge deadline must still retire a truly stuck actor"
         );
 
         pool.shutdown(Instant::now() + Duration::from_secs(5)).await;

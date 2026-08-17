@@ -9,13 +9,18 @@ use tokio::time::Instant;
 
 use crate::renderer::{BoxRenderer, PreparedProfile};
 use crate::types::{
-    CachePolicy, CompletedInfo, CredentialCachePartition, DeadlineStage, InternalTask, NodeId,
-    RejectionReason, RenderObservation, RenderRequest, RendererError, RouteTier, SourceHash,
-    TaskOutcome, TaskResult, WorkerId, WorkerProfile,
+    CachePolicy, CompletedInfo, CredentialCachePartition, DeadlineStage, FailureKind, InternalTask,
+    NodeId, RejectionReason, RenderObservation, RenderRequest, RendererError, RouteTier,
+    SourceHash, TaskOutcome, TaskResult, WorkerId, WorkerProfile,
 };
 use crate::worker_pool::WorkerCompletion;
 
 pub(crate) const RENDERER_REPAIR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A caller deadline is an HTTP/SLA boundary, not proof that the native actor
+/// is wedged. Keep the same actor quarantined for up to three request budgets
+/// in total; only the later hard deadline permits bounded orphan replacement.
+const RENDERER_HARD_WEDGE_BUDGET_MULTIPLIER: u32 = 3;
 
 #[derive(Debug)]
 // `Process` is the hot path sent on every render; boxing it to shrink the rare
@@ -27,6 +32,7 @@ pub(crate) enum WorkerCmd {
         prepared_profile: Option<PreparedProfile>,
         route_tier: RouteTier,
         admitted_at_overflow: bool,
+        started: oneshot::Sender<()>,
         respond_to: oneshot::Sender<WorkerReply>,
         completion: WorkerCompletion,
     },
@@ -165,9 +171,15 @@ pub(crate) async fn worker_loop(
                 prepared_profile,
                 route_tier,
                 admitted_at_overflow,
+                started,
                 respond_to,
                 completion,
             } => {
+                // Once dequeued, this worker owns the response deadline and
+                // guarantees either a stage outcome or a bounded hard-wedge
+                // outcome. Before this acknowledgement the pool keeps the
+                // deadline for commands still waiting in the channel.
+                let _ = started.send(());
                 // A preceding command may have retired this renderer after the
                 // current command was already queued. Repair if possible; if
                 // not, return the untouched command to the pool instead of
@@ -184,7 +196,11 @@ pub(crate) async fn worker_loop(
                     continue;
                 }
                 let had_source = task.has_source();
-                let outcome = match run_stages(
+                let response_deadline = task.deadline;
+                let hard_wedge_deadline = hard_wedge_deadline(&task);
+                let response_timeout = response_timeout_outcome(&task);
+                let mut respond_to = Some(respond_to);
+                let mut stages = Box::pin(run_stages(
                     &mut renderer,
                     &mut current_profile,
                     &mut cache,
@@ -192,9 +208,35 @@ pub(crate) async fn worker_loop(
                     native_render_permits.clone(),
                     &mut task,
                     prepared_profile,
-                )
-                .await
-                {
+                ));
+                let mut response_deadline_elapsed = false;
+                let stage_result = tokio::select! {
+                    biased;
+                    result = &mut stages => result,
+                    _ = tokio::time::sleep_until(response_deadline) => {
+                        // Stop attracting new work, but keep awaiting this exact
+                        // renderer. A slow successful render preserves its native
+                        // caches; only the later hard deadline retires the actor.
+                        response_deadline_elapsed = true;
+                        available.store(false, Ordering::Release);
+                        if let Some(respond_to) = respond_to.take() {
+                            let _ = respond_to.send(WorkerReply::Outcome(
+                                response_timeout.clone(),
+                            ));
+                        }
+                        match tokio::time::timeout_at(hard_wedge_deadline, &mut stages).await {
+                            Ok(result) => result,
+                            Err(_) => Err(StageFailure::RendererError {
+                                at: DeadlineStage::Render,
+                                err: RendererError::Timeout,
+                            }),
+                        }
+                    }
+                };
+                // Release the mutable renderer/task borrows before timeout
+                // recovery inspects or replaces the actor.
+                drop(stages);
+                let outcome = match stage_result {
                     Ok(success) => completed_outcome(
                         &task,
                         had_source,
@@ -231,11 +273,29 @@ pub(crate) async fn worker_loop(
                         failed_outcome(&task, had_source, RendererError::ActorDead)
                     }
                 };
+                if response_deadline_elapsed {
+                    // Late success makes the same warm actor usable again;
+                    // hard-wedge replacement publishes the replacement here.
+                    sync_availability(&mut renderer, id, &available);
+                }
+                if !response_deadline_elapsed
+                    && Instant::now() >= response_deadline
+                    && matches!(&outcome.result, TaskResult::Completed { .. })
+                {
+                    // `run_stages` is polled first when completion and the
+                    // timer become ready together. Preserve the healthy actor,
+                    // but never turn an after-deadline completion into a 200.
+                    if let Some(respond_to) = respond_to.take() {
+                        let _ = respond_to.send(WorkerReply::Outcome(response_timeout));
+                    }
+                }
                 // Finalize shared warm-state and queue accounting even when
                 // the request future (and therefore the response receiver)
                 // was dropped after dispatch.
                 completion.finish(&outcome);
-                let _ = respond_to.send(WorkerReply::Outcome(outcome));
+                if let Some(respond_to) = respond_to {
+                    let _ = respond_to.send(WorkerReply::Outcome(outcome));
+                }
             }
             WorkerCmd::Retire => break,
         }
@@ -377,13 +437,6 @@ async fn run_stages(
     drop(native_render_permit);
     drop(permit);
 
-    if native_render_completed_at > task.deadline {
-        return Err(StageFailure::RendererError {
-            at: DeadlineStage::Render,
-            err: RendererError::Timeout,
-        });
-    }
-
     Ok(StageSuccess {
         output: rendered.output,
         started_at,
@@ -395,6 +448,25 @@ async fn run_stages(
         style_setup_duration,
         source_setup_duration,
     })
+}
+
+fn hard_wedge_deadline(task: &InternalTask) -> Instant {
+    let request_budget = task.deadline.saturating_duration_since(task.arrived_at);
+    task.deadline + request_budget.saturating_mul(RENDERER_HARD_WEDGE_BUDGET_MULTIPLIER - 1)
+}
+
+pub(crate) fn response_timeout_outcome(task: &InternalTask) -> TaskOutcome {
+    TaskOutcome {
+        task_id: task.id,
+        request_id: task.request_id.clone(),
+        arrived_at: task.arrived_at,
+        had_source: task.has_source(),
+        deadline_stage: None,
+        result: TaskResult::Failed {
+            error: RendererError::Timeout.to_string(),
+            kind: FailureKind::RenderTimeout,
+        },
+    }
 }
 
 async fn acquire_permit(

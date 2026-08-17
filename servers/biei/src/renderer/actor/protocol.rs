@@ -12,7 +12,6 @@ use biei_core::types::{
 };
 use mmpf_common::sync::lock_unpoisoned;
 use tokio::sync::oneshot;
-use tokio::time::Instant;
 
 use super::super::RendererOutput;
 use super::backend::MapLibreNativeBackend;
@@ -62,7 +61,6 @@ pub(crate) struct RenderTaskView {
     pub request: RenderRequest,
     pub pixel_ratio: PixelRatio,
     pub output_format: ImageFormat,
-    pub deadline: Instant,
 }
 
 impl From<&InternalTask> for RenderTaskView {
@@ -77,7 +75,6 @@ impl From<&InternalTask> for RenderTaskView {
             request: task.request.clone(),
             pixel_ratio: task.pixel_ratio,
             output_format: task.output_format,
-            deadline: task.deadline,
         }
     }
 }
@@ -212,11 +209,10 @@ impl RendererActor {
         task: RenderTaskView,
     ) -> Result<(), RendererError> {
         let (reply, rx) = oneshot::channel();
-        let deadline = task.deadline;
         self.tx
             .send(RenderCmd::LoadProfile { style, task, reply })
             .map_err(|_| RendererError::ActorDead)?;
-        await_actor_reply(deadline, rx).await
+        await_actor_reply(rx).await
     }
 
     pub(crate) async fn render(
@@ -224,11 +220,10 @@ impl RendererActor {
         task: RenderTaskView,
     ) -> Result<RendererOutput, RendererError> {
         let (reply, rx) = oneshot::channel();
-        let deadline = task.deadline;
         self.tx
             .send(RenderCmd::Render { task, reply })
             .map_err(|_| RendererError::ActorDead)?;
-        await_actor_reply(deadline, rx).await
+        await_actor_reply(rx).await
     }
 
     pub(crate) fn retire_after_current(&self) {
@@ -327,13 +322,11 @@ impl Drop for ActorThreadExit {
 }
 
 async fn await_actor_reply<T>(
-    deadline: Instant,
     rx: oneshot::Receiver<Result<T, RendererError>>,
 ) -> Result<T, RendererError> {
-    match tokio::time::timeout_at(deadline, rx).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err(RendererError::ActorDead),
-        Err(_) => Err(RendererError::Timeout),
+    match rx.await {
+        Ok(result) => result,
+        Err(_) => Err(RendererError::ActorDead),
     }
 }
 
@@ -597,7 +590,6 @@ mod tests {
             },
             pixel_ratio: PixelRatio::X1,
             output_format: ImageFormat::Png,
-            deadline: Instant::now() + std::time::Duration::from_secs(1),
         }
     }
 
@@ -715,7 +707,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_reply_wait_respects_task_deadline() {
+    async fn actor_reply_waits_for_native_completion() {
         let actor = RendererActor::spawn_with_backend(
             RendererActorConfig {
                 worker_id: 5,
@@ -726,19 +718,16 @@ mod tests {
         .expect("actor spawns");
         let style = resolved_style();
         let rev = style.revision.clone();
-        let mut task = task_view(rev);
+        let task = task_view(rev);
         actor
             .load_profile(style, task.clone())
             .await
             .expect("profile loads");
-        task.deadline = Instant::now() + std::time::Duration::from_millis(5);
 
-        let err = actor
+        actor
             .render(task)
             .await
-            .expect_err("actor reply wait times out at task deadline");
-
-        assert!(matches!(err, RendererError::Timeout));
+            .expect("actor remains reusable when native work finishes late");
     }
 
     #[tokio::test]

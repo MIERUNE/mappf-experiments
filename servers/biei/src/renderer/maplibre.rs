@@ -171,9 +171,10 @@ impl Renderer for MapLibreRenderer {
     fn retire_after_current(&mut self) {
         self.retiring = true;
         self.actor.retire_after_current();
-        // Native renders cannot be preempted safely. Replace the actor now and
-        // let the bounded orphan tracker account for the old thread until its
-        // native call returns.
+        // The worker invokes this only after the hard-wedge deadline. Native
+        // renders cannot be preempted safely, so replace the actor now and let
+        // the bounded orphan tracker account for the old thread until its call
+        // returns.
         let _ = self.replace_retiring_actor();
     }
 

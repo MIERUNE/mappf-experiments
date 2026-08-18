@@ -14,7 +14,7 @@ resources:
 images:
   - name: ishikari
     newName: asia-northeast1-docker.pkg.dev/mappf-experiment/ishikari/ishikari
-    digest: sha256:97a1eaad2721e970337e804fd448777496e2ec442886f4e80ddb23caf425ead1
+    digest: sha256:fab4c92b3f949b606de3a94034a8c751bfc261032ff507ac9c827f0f1684d766
 
 patches:
   - path: patch-serviceaccount.yaml

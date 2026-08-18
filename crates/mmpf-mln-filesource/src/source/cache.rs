@@ -40,13 +40,13 @@ impl ResourceCache {
         self.cache.get(key)
     }
 
-    /// Return the explicit freshness deadline for a response already served
-    /// by the Database source. The Network source uses this to defer its
-    /// refresh instead of returning the same body through a second callback.
-    pub(super) fn fresh_until(&self, key: &SharedResourceRequestKey) -> Option<SystemTime> {
+    /// Return a response whose explicit freshness lifetime has not elapsed.
+    /// The Network source uses this to close a race where another renderer
+    /// populates Database after this renderer's cache lookup missed.
+    pub(super) fn fresh_response(&self, key: &SharedResourceRequestKey) -> Option<Arc<Response>> {
         let response = self.lookup_shared(key)?;
         let expires = response.expires?;
-        (expires > SystemTime::now()).then_some(expires)
+        (expires > SystemTime::now()).then_some(response)
     }
 
     fn lookup(&self, key: &SharedResourceRequestKey) -> CacheLookup {
@@ -343,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_deadline_only_returns_usable_unexpired_responses() {
+    fn fresh_response_only_returns_usable_unexpired_responses() {
         let cache = ResourceCache::new(4096);
         let fresh = Arc::new(ResourceRequestKey::test_key(
             "https://resource.test/fresh",
@@ -364,8 +364,14 @@ mod tests {
                 .with_expires(SystemTime::now() - std::time::Duration::from_secs(1)),
         );
 
-        assert!(cache.fresh_until(&fresh).is_some());
-        assert!(cache.fresh_until(&expired).is_none());
+        assert_eq!(
+            cache
+                .fresh_response(&fresh)
+                .and_then(|response| response.data.clone())
+                .as_deref(),
+            Some(b"fresh".as_slice())
+        );
+        assert!(cache.fresh_response(&expired).is_none());
     }
 
     #[test]
@@ -379,7 +385,7 @@ mod tests {
 
         assert!(matches!(cache.lookup(&key), CacheLookup::Hit(_)));
         assert!(
-            cache.fresh_until(&key).is_none(),
+            cache.fresh_response(&key).is_none(),
             "without an explicit freshness lifetime, Network must revalidate"
         );
     }

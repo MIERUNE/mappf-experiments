@@ -487,15 +487,10 @@ impl Node {
         task: &InternalTask,
         miss_admission: CacheMissAdmission,
     ) -> Result<Option<RenderFlightLeader>, TaskOutcome> {
-        let style_revalidation_blocks_cache = !self
+        let style_revalidation_blocks_cache = self
             .inner
             .style_catalog
-            .is_current_cluster_revision(&task.style)
-            && (self
-                .inner
-                .style_catalog
-                .has_pending_revalidation(&task.style.id)
-                || self.inner.style_catalog.needs_revalidation(&task.style.id));
+            .revalidation_blocks_output_cache(&task.style);
         if style_revalidation_blocks_cache {
             // A publisher hint may arrive before its 10-second fetch floor. Do
             // not let a stale output hit — or a render during that floor — hide

@@ -407,9 +407,9 @@ Database behavior:
 - Capacity controlled by `BIEI_MLN_RESOURCE_CACHE_BYTES`.
 - No persistent disk cache yet.
 - Network responses are stored directly before crossing the bridge. This avoids an extra FFI round trip and lets a bodyless native 304 refresh the materialized shared-cache entry without recopying the image/resource body.
-- A fresh Database response is delivered once. The paired low-priority Network request waits until the explicit expiry (and minimum update interval), capped at five minutes. If the shared entry is still fresh at that cap, the request completes with a bodyless 304; otherwise it performs conditional refresh. It must not return the same cached body through a second MLN callback or retain a Tokio task for an arbitrarily long freshness lifetime.
+- A usable Database response is delivered once while its paired Network request waits for explicit expiry (and minimum update interval), capped at five minutes. This is background work only when the native request carries metadata but no `priorData`, proving Database already delivered its body. A Database miss, or a stale body withheld as `priorData` for revalidation, receives a concurrently inserted fresh body immediately instead of parking a render-blocking callback or returning a 304 without a representation. At expiry the ordinary path performs conditional revalidation.
 
-Resource metrics distinguish FileSource lifecycle time, admission wait, actual upstream HTTP attempt count/latency, deferred refreshes, bytes, in-flight work, the current deferred-refresh sleeper count, single-flight roles, and Database hit/miss/revalidate/bypass operations. Kind, priority, usage, and outcome labels are bounded enums.
+Resource metrics distinguish FileSource lifecycle time, admission wait, actual upstream HTTP attempt count/latency, fresh-cache insertion races, deferred background refreshes, bytes, in-flight work, the current deferred-refresh sleeper count, single-flight roles, and Database hit/miss/revalidate/bypass operations. Kind, priority, usage, and outcome labels are bounded enums.
 
 `maplibre_native` 0.8.7 preserves all FileSource response fields across the C++ bridge. The direct Rust cache remains part of the design because it provides process-wide memory bounds and revalidation control, not because of a bridge limitation.
 
@@ -420,10 +420,10 @@ Replacing both native leaves is a deliberate optimization boundary and must be t
 - cold completion time and warm rendered-output-cache-miss latency;
 - `mmpf_mln_resource_cache_total` hit/miss/revalidate mix;
 - `mmpf_mln_resource_upstream_attempts_total` and upstream-attempt latency;
-- admission wait, single-flight leader/waiter ratio, and deferred refreshes;
+- admission wait, single-flight leader/waiter ratio, cache-insertion races, and deferred refreshes;
 - actor timeout, replacement, orphan, and renderer-availability metrics.
 
-An unexpired Database hit must not cause an immediate upstream HTTP attempt or a duplicate resource callback. A cold burst must coalesce identical requests, must not consume network timeout while waiting for admission, and must not degrade all renderer slots. Resource kind, URL range, and tile identity must be part of the cache key; volatile resources and `no-store`/`private` responses must not enter the shared positive cache.
+An unexpired Database hit must not cause an immediate upstream HTTP attempt or return a second copy of the body when the renderer already owns one. A cache-insertion race must still supply a body immediately to a renderer whose own Database lookup missed. A cold burst must coalesce identical requests, must not consume network timeout while waiting for admission, and must not degrade all renderer slots. Resource kind, URL range, and tile identity must be part of the cache key; volatile resources and `no-store`/`private` responses must not enter the shared positive cache.
 
 ### 8.5 Remaining efficiency limits
 

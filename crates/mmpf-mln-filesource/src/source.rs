@@ -93,9 +93,9 @@ const MIB: u64 = 1024 * 1024;
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(15);
 /// Bounds attacker-controlled or broken-style URL cardinality.
 const NEGATIVE_CACHE_CAPACITY: u64 = 4_096;
-/// A fresh Database hit has already satisfied the render, so its paired
-/// background refresh must not keep one Tokio task parked for an arbitrarily
-/// long upstream freshness lifetime.
+/// A usable Database hit has already satisfied its requester, so the paired
+/// background Network callback may wait for expiry. Cap that wait so an
+/// upstream's long freshness lifetime cannot retain a Tokio task for hours.
 const MAX_REFRESH_DEFERRAL: Duration = Duration::from_mins(5);
 /// A normal cache miss is not provider-failure evidence. Promote only an
 /// attempt that has spent this long in actual network I/O (after admission),
@@ -372,6 +372,67 @@ impl NetworkFileSource {
                 .collect(),
             provider_health,
         })
+    }
+
+    /// Inputs the shared-cache race decision needs, separated from
+    /// `ResourceRequest` so this branch can be exercised directly.
+    ///
+    /// `ResourceRequest` is `#[non_exhaustive]` with only a crate-private
+    /// constructor upstream, so no test can build one. Without this split the only
+    /// testable surface was the classification helpers — and a test over those
+    /// stays green even if the early return below is deleted, which is exactly the
+    /// production failure it is supposed to guard.
+    async fn resolve_shared_cache_race(
+        &self,
+        negative_key: &Arc<ResourceRequestKey>,
+        inputs: SharedCacheRaceInputs,
+        observation: &mut RequestObservation,
+    ) -> Option<Response> {
+        if inputs.consults_shared_cache
+            && let Some(cached) = self.resource_cache.fresh_response(negative_key)
+        {
+            let native_database_state =
+                native_database_state(inputs.prior_data_present, inputs.prior_metadata_present);
+            let expires = match resolve_fresh_cache_race(
+                &cached,
+                native_database_state,
+                inputs.priority == "low",
+            ) {
+                FreshCacheResolution::Serve(response) => {
+                    fs_metrics()
+                        .fresh_cache_race_total
+                        .with_label_values(&[inputs.kind, native_database_state.label()])
+                        .inc();
+                    observation.complete(&response);
+                    return Some(response);
+                }
+                FreshCacheResolution::Defer(expires) => expires,
+            };
+
+            fs_metrics()
+                .refresh_deferred_total
+                .with_label_values(&[inputs.kind, inputs.priority])
+                .inc();
+            let _deferred = DeferredRefreshGuard::new(inputs.kind, inputs.priority);
+            let deferral = refresh_deferral(expires, inputs.minimum_update_interval);
+            // Measure the actual park rather than trusting `deferral.wait`: the
+            // sleep can be cancelled or run long, and the reported duration must
+            // exclude what really happened, not what was planned.
+            let parked_since = Instant::now();
+            tokio::time::sleep(deferral.wait).await;
+            observation.add_parked(parked_since.elapsed());
+
+            if let Some(response) = complete_deferred_refresh(
+                &deferral,
+                self.resource_cache
+                    .fresh_response(negative_key)
+                    .and_then(|response| response.expires),
+            ) {
+                observation.complete(&response);
+                return Some(response);
+            }
+        }
+        None
     }
 
     fn flight_shard(&self, key: &FlightKey) -> &FlightMap {
@@ -889,35 +950,24 @@ impl TokioFileSource for NetworkFileSource {
     async fn request(&self, request: ResourceRequest) -> Response {
         let mut observation = RequestObservation::new(&request);
         let negative_key = Arc::new(ResourceRequestKey::from_request(&request));
-        // MainResourceLoader serves a usable Database response immediately,
-        // then keeps a low-priority Network request alive for refresh. Match
-        // the native OnlineFileSource behavior by waiting until expiry. An
-        // immediate cached response here would deliver the same body through
-        // the MLN callback twice and copy/parse it twice. NetworkOnly remains
-        // an explicit refresh and bypasses this path.
-        if uses_shared_cache(request.storage_policy)
-            && request.loading_methods.has_cache()
-            && let Some(expires) = self.resource_cache.fresh_until(&negative_key)
+        // MainResourceLoader normally serves a usable Database response and
+        // keeps the paired Network request alive as a background refresh. A
+        // concurrent renderer can, however, populate the shared cache after
+        // this request's Database lookup missed. That request has no prior
+        // representation and must receive the cached body immediately. A stale
+        // Database hit also needs that body: `priorData` means native withheld the
+        // stale representation for revalidation. Only a metadata-only prior state
+        // proves that Database already delivered a usable body and is safe to park.
+        // NetworkOnly remains an explicit refresh and bypasses this path.
+        if let Some(response) = self
+            .resolve_shared_cache_race(
+                &negative_key,
+                SharedCacheRaceInputs::from_request(&request),
+                &mut observation,
+            )
+            .await
         {
-            fs_metrics()
-                .refresh_deferred_total
-                .with_label_values(&[kind_label(request.kind)])
-                .inc();
-            let _deferred = DeferredRefreshGuard::new(kind_label(request.kind));
-            let deferral = refresh_deferral(expires, request.minimum_update_interval);
-            tokio::time::sleep(deferral.wait).await;
-
-            if let Some(response) =
-                complete_deferred_refresh(&deferral, self.resource_cache.fresh_until(&negative_key))
-            {
-                // The render already received this fresh body from Database.
-                // Complete the background callback without copying it again;
-                // a future request will revalidate once the shared entry is
-                // actually stale. This also prevents a long Cache-Control
-                // lifetime from retaining one Tokio task for hours.
-                observation.outcome = outcome_label(&response);
-                return response;
-            }
+            return response;
         }
         if uses_shared_cache(request.storage_policy)
             && request.loading_methods.has_cache()
@@ -928,8 +978,10 @@ impl TokioFileSource for NetworkFileSource {
                     .negative_cache_total
                     .with_label_values(&[kind_label(request.kind), "hit"])
                     .inc();
+                observation.complete(&entry.response);
+                // A negative hit is a distinct operational fact, so it keeps its own
+                // outcome rather than the response's generic label.
                 observation.outcome = "negative_cache_hit";
-                observation.response_bytes = entry.response.data.as_ref().map_or(0, Vec::len);
                 return entry.response;
             }
             self.negative_cache.invalidate(&negative_key);
@@ -942,10 +994,108 @@ impl TokioFileSource for NetworkFileSource {
         let response = self
             .fetch_coalesced(&request, Arc::clone(&negative_key))
             .await;
-        observation.outcome = outcome_label(&response);
-        observation.response_bytes = response.data.as_ref().map_or(0, Vec::len);
+        observation.complete(&response);
         response
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SharedCacheRaceInputs {
+    consults_shared_cache: bool,
+    prior_data_present: bool,
+    prior_metadata_present: bool,
+    kind: &'static str,
+    /// mbgl demotes the paired background refresh to `Low` when Database delivered
+    /// a usable body. A request classified `Delivered` that is still `regular` was
+    /// therefore not demoted by that path — something is waiting on it — so this is
+    /// the label that shows whether a park is genuinely a background refresh.
+    priority: &'static str,
+    minimum_update_interval: Duration,
+}
+
+impl SharedCacheRaceInputs {
+    fn from_request(request: &ResourceRequest) -> Self {
+        Self {
+            consults_shared_cache: uses_shared_cache(request.storage_policy)
+                && request.loading_methods.has_cache(),
+            prior_data_present: request.prior_data.is_some(),
+            prior_metadata_present: request.prior_etag.is_some()
+                || request.prior_modified.is_some()
+                || request.prior_expires.is_some(),
+            kind: kind_label(request.kind),
+            priority: priority_label(request.priority),
+            minimum_update_interval: request.minimum_update_interval,
+        }
+    }
+}
+
+enum FreshCacheResolution {
+    Serve(Response),
+    Defer(SystemTime),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeDatabaseState {
+    /// This request's Database lookup missed, so no representation was delivered.
+    Miss,
+    /// Database delivered a usable representation before starting Network.
+    Delivered,
+    /// Database found an unusable representation and withheld it for revalidation.
+    WithheldForRevalidation,
+}
+
+impl NativeDatabaseState {
+    /// Bounded label so a reproduction can tell a legitimate background refresh
+    /// from a callback that was still blocking a render.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Miss => "miss",
+            Self::Delivered => "delivered",
+            Self::WithheldForRevalidation => "withheld",
+        }
+    }
+}
+
+fn native_database_state(
+    prior_data_present: bool,
+    prior_metadata_present: bool,
+) -> NativeDatabaseState {
+    // MainResourceLoader sets `priorData` only when the Database response was not
+    // usable and therefore was not delivered to the requester. A usable response
+    // is delivered immediately and only its validators/freshness metadata are
+    // copied into the paired low-priority Network request.
+    if prior_data_present {
+        NativeDatabaseState::WithheldForRevalidation
+    } else if prior_metadata_present {
+        NativeDatabaseState::Delivered
+    } else {
+        NativeDatabaseState::Miss
+    }
+}
+
+fn resolve_fresh_cache_race(
+    cached: &Response,
+    native_database_state: NativeDatabaseState,
+    demoted_to_background: bool,
+) -> FreshCacheResolution {
+    // Parking requires *both* signals to agree. `Delivered` is inferred from field
+    // presence, and mbgl demotes the paired request to `Low` on exactly the same
+    // branch that delivers the body, so a request that still carries `regular`
+    // priority was not produced by that branch — something is waiting on it.
+    //
+    // Fully cold processes never expose the difference: they hold nothing to
+    // revalidate, so every `Delivered` classification there really is the
+    // background refresh. A long-lived process revalidating aged entries is where
+    // the two signals can disagree, and parking such a request stalls the render
+    // behind it for up to `MAX_REFRESH_DEFERRAL`.
+    if native_database_state == NativeDatabaseState::Delivered && demoted_to_background {
+        return FreshCacheResolution::Defer(
+            cached
+                .expires
+                .expect("fresh cache responses have an explicit expiry"),
+        );
+    }
+    FreshCacheResolution::Serve(cached.clone())
 }
 
 #[derive(Debug, PartialEq, Eq)]

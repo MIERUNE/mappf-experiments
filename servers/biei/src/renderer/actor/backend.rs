@@ -208,6 +208,13 @@ impl BlockingRenderBackend for MapLibreNativeBackend {
     }
 
     fn render(&mut self, task: &RenderTaskView) -> Result<RendererOutput, RendererError> {
+        let render_started = std::time::Instant::now();
+        tracing::debug!(
+            task_id = task.id,
+            style_id = ?task.style.id,
+            style_version = task.style.version,
+            "native render started"
+        );
         let (image, source_setup_duration) = match task.request {
             RenderRequest::Tile { z, x, y, tile_size } => {
                 let key = RendererKey::new(biei_core::types::RenderMode::Tile, task.pixel_ratio);
@@ -347,8 +354,26 @@ impl BlockingRenderBackend for MapLibreNativeBackend {
             StaticRenderError::Setup(source) => RendererError::RenderFailed(source),
         })?;
 
+        let native_completed = std::time::Instant::now();
+        let output = encode_image(&image, task.output_format)?;
+        let encode_completed = std::time::Instant::now();
+        tracing::debug!(
+            task_id = task.id,
+            style_id = ?task.style.id,
+            // Renderer selection, camera setup, overlay construction and add-layer
+            // source setup all sit inside this span, so it is not purely the native
+            // render call. Named for what it measures: a slow request must not be
+            // misattributed to rasterisation when the cost was setup.
+            render_before_encode_ms =
+                native_completed.duration_since(render_started).as_millis() as u64,
+            encode_ms = encode_completed.duration_since(native_completed).as_millis() as u64,
+            total_ms = encode_completed.duration_since(render_started).as_millis() as u64,
+            output_bytes = output.bytes.len(),
+            "native render completed"
+        );
+
         Ok(RendererOutput {
-            output: encode_image(&image, task.output_format)?,
+            output,
             source_setup_duration,
         })
     }

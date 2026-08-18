@@ -269,6 +269,10 @@ fn apply_config_file(cli: &mut Cli, file: ConfigFile) {
     cli.mapterhorn_maxzoom = ConfigFile::fill(cli.mapterhorn_maxzoom, file.mapterhorn_maxzoom);
     cli.cpu_work_concurrency =
         ConfigFile::fill(cli.cpu_work_concurrency, file.cpu_work_concurrency);
+    cli.provider_fetch_concurrency = ConfigFile::fill(
+        cli.provider_fetch_concurrency,
+        file.provider_fetch_concurrency,
+    );
     cli.cpu_work_max_inflight =
         ConfigFile::fill(cli.cpu_work_max_inflight, file.cpu_work_max_inflight);
 }

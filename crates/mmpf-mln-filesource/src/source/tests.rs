@@ -377,6 +377,57 @@ fn not_modified_without_body_or_validator_is_rejected() {
 }
 
 #[test]
+fn fresh_cache_race_serves_body_unless_database_already_delivered_one() {
+    let expires = SystemTime::now() + Duration::from_hours(24);
+    let cached = Response::data(b"cached".to_vec()).with_expires(expires);
+
+    assert_eq!(
+        native_database_state(false, false),
+        NativeDatabaseState::Miss
+    );
+    assert_eq!(
+        native_database_state(true, true),
+        NativeDatabaseState::WithheldForRevalidation,
+        "priorData means the stale body was withheld, not delivered"
+    );
+    assert_eq!(
+        native_database_state(false, true),
+        NativeDatabaseState::Delivered
+    );
+
+    // Labels must stay bounded and distinct so a reproduction can separate a
+    // legitimate background refresh from a callback still blocking a render.
+    assert_eq!(NativeDatabaseState::Miss.label(), "miss");
+    assert_eq!(NativeDatabaseState::Delivered.label(), "delivered");
+    assert_eq!(
+        NativeDatabaseState::WithheldForRevalidation.label(),
+        "withheld"
+    );
+
+    for state in [
+        NativeDatabaseState::Miss,
+        NativeDatabaseState::WithheldForRevalidation,
+    ] {
+        match resolve_fresh_cache_race(&cached, state, true) {
+            FreshCacheResolution::Serve(response) => {
+                assert_eq!(response.data.as_deref(), Some(b"cached".as_slice()));
+                assert_eq!(response.expires, Some(expires));
+            }
+            FreshCacheResolution::Defer(_) => {
+                panic!("a requester without a delivered body needs the fresh cache body now")
+            }
+        }
+    }
+
+    match resolve_fresh_cache_race(&cached, NativeDatabaseState::Delivered, true) {
+        FreshCacheResolution::Defer(observed) => assert_eq!(observed, expires),
+        FreshCacheResolution::Serve(_) => {
+            panic!("a usable Database hit must not receive the body twice")
+        }
+    }
+}
+
+#[test]
 fn refresh_wait_honors_expiry_and_minimum_update_interval() {
     let expiry_wait = refresh_deferral(SystemTime::now() + Duration::from_mins(1), Duration::ZERO);
     assert!(!expiry_wait.capped);
@@ -1086,4 +1137,132 @@ fn credentialed_redirect_chain_cannot_change_origin() {
         &[credentialed, same_origin],
         &other_origin
     ));
+}
+
+/// Drives the shared-cache race branch on a real source and a real cache, so the
+/// early return that serves the body is itself covered.
+///
+/// The classification helpers are tested separately, but a test over those alone
+/// stays green if the early return is deleted — which is the production failure:
+/// a requester still awaiting bytes parks for up to five minutes and then gets a
+/// bodyless 304.
+#[tokio::test(start_paused = true)]
+async fn a_peer_cache_fill_is_served_to_every_requester_still_awaiting_bytes() {
+    fn inputs(prior_data_present: bool, prior_metadata_present: bool) -> SharedCacheRaceInputs {
+        SharedCacheRaceInputs {
+            consults_shared_cache: true,
+            prior_data_present,
+            prior_metadata_present,
+            kind: "glyphs",
+            priority: "low",
+            minimum_update_interval: Duration::from_secs(0),
+        }
+    }
+
+    // (label, prior_data, prior_metadata) as MainResourceLoader would set them.
+    for (label, prior_data, prior_metadata) in [
+        ("database miss", false, false),
+        ("stale body withheld for revalidation", true, true),
+    ] {
+        let cache = cache::ResourceCache::new(1024 * 1024);
+        let source = NetworkFileSource::new(
+            cache.clone(),
+            vec!["resource.test".to_string()],
+            FileSourceIoPermits::default(),
+            ProviderHealthTracker::default(),
+            "test-agent",
+        )
+        .expect("file source builds");
+
+        let key = Arc::new(ResourceRequestKey::test_key(
+            "https://resource.test/glyphs",
+            ResourceKind::Glyphs,
+        ));
+        // A concurrent renderer lands the body after this request's Database
+        // lookup was already decided.
+        assert!(
+            cache.store(
+                key.clone(),
+                Response::data(b"filled-by-peer".to_vec())
+                    .with_expires(SystemTime::now() + Duration::from_hours(24)),
+            ),
+            "{label}: the peer fill is cacheable"
+        );
+
+        let mut observation = RequestObservation::for_test("glyphs");
+        let response = source
+            .resolve_shared_cache_race(&key, inputs(prior_data, prior_metadata), &mut observation)
+            .await
+            .unwrap_or_else(|| panic!("{label}: the race branch must resolve, not fall through"));
+
+        assert_eq!(
+            response.data.as_deref(),
+            Some(b"filled-by-peer".as_slice()),
+            "{label}: a requester still awaiting bytes must receive the body"
+        );
+        assert!(
+            !response.not_modified,
+            "{label}: a bodyless 304 leaves the render without this resource"
+        );
+    }
+
+    // The one case that may park: Database already delivered a usable body.
+    let cache = cache::ResourceCache::new(1024 * 1024);
+    let source = NetworkFileSource::new(
+        cache.clone(),
+        vec!["resource.test".to_string()],
+        FileSourceIoPermits::default(),
+        ProviderHealthTracker::default(),
+        "test-agent",
+    )
+    .expect("file source builds");
+    let key = Arc::new(ResourceRequestKey::test_key(
+        "https://resource.test/glyphs",
+        ResourceKind::Glyphs,
+    ));
+    assert!(
+        cache.store(
+            key.clone(),
+            Response::data(b"filled-by-peer".to_vec())
+                .with_expires(SystemTime::now() + Duration::from_secs(30)),
+        )
+    );
+    let mut observation = RequestObservation::for_test("glyphs");
+    let response = source
+        .resolve_shared_cache_race(&key, inputs(false, true), &mut observation)
+        .await
+        .expect("a delivered requester still resolves, after parking");
+    assert!(
+        response.not_modified,
+        "a requester that already holds the body gets a 304, not a second copy"
+    );
+}
+
+/// A `Delivered` classification is not enough on its own: mbgl demotes the paired
+/// background refresh to `Low` on the very branch that delivers the body, so a
+/// request still carrying `regular` priority was not produced by that branch and
+/// something is waiting on it.
+///
+/// Parking such a request stalls the render behind it for up to five minutes. A
+/// fully cold process cannot expose this — it holds nothing to revalidate — which
+/// is why the cold reproduction passed while long-lived pods kept timing out.
+#[test]
+fn a_regular_priority_request_is_never_parked_even_when_classified_delivered() {
+    let expires = SystemTime::now() + Duration::from_hours(24);
+    let cached = Response::data(b"cached".to_vec()).with_expires(expires);
+
+    match resolve_fresh_cache_race(&cached, NativeDatabaseState::Delivered, false) {
+        FreshCacheResolution::Serve(response) => {
+            assert_eq!(response.data.as_deref(), Some(b"cached".as_slice()));
+        }
+        FreshCacheResolution::Defer(_) => {
+            panic!("a request that was not demoted to background must not be parked")
+        }
+    }
+
+    // The genuine background refresh still parks.
+    match resolve_fresh_cache_race(&cached, NativeDatabaseState::Delivered, true) {
+        FreshCacheResolution::Defer(observed) => assert_eq!(observed, expires),
+        FreshCacheResolution::Serve(_) => panic!("the demoted refresh may still park"),
+    }
 }

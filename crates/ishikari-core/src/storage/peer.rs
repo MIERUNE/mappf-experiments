@@ -301,10 +301,6 @@ impl<'a> ProviderRequest<'a> {
         }
     }
 
-    pub fn upstream_url(&self) -> &str {
-        self.upstream_url
-    }
-
     fn placement_key(&self) -> String {
         match self.resource {
             ProviderResource::Style { .. } => format!("style:{}", self.upstream_url),

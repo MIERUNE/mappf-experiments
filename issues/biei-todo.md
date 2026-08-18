@@ -16,8 +16,15 @@ The implemented contract — content-derived revisions, activation, the refresh 
 
 - **Observed in the live demo (2026-08-08):** the first static render of `carto/positron-gl-style` after its caches aged out returned `504` at 5.06 s, against the 5-second default SLA; five immediate repeats returned `200` in 0.14–0.25 s, and the other five configured styles were 0.23–0.50 s throughout. The pod recorded one `render`/`504`, so the deadline was reached inside Biei rather than at the Gateway. A cold style therefore spends most of a request budget on profile and glyph I/O, and the first caller after any cache expiry can absorb a user-visible timeout while every later caller is served from warm state.
 - **Controlled cold-stack measurement (2026-08-12):** fresh Biei and Ishikari processes rendered `mierune/jp_mierune_gray` plus the weather overlay at `600x500@2x` in 4.06 s on the deployed images. Native render residency was 3.16 s and profile preparation was 0.52 s. The render requested 152 glyph ranges (29.0 MiB decoded) and 12 tiles (2.7 MiB); glyph requests accumulated 67.5 s of overlapped request time, including 24.6 s waiting for Biei's resource permits, while Ishikari accumulated 41.9 s across the same cold glyph requests. On separate fresh Biei processes backed by already-warm public delivery, removing all 64 symbol layers reduced native render residency from 2.44 s to 1.39 s. Glyph and symbol work is therefore a material cold-path cost, but the current images did not reproduce the earlier 10-second outlier; do not attribute that tail to tile geometry or change the SLA from this one sample.
-- **Do not equate a request timeout with a dead renderer.** The current native call is not cancellable, but an overrun is not evidence that its actor is corrupt. Replace timeout-driven retirement with a quarantined-late-completion path: stop routing new work to the busy slot, return the client timeout, and make the same actor eligible again if the native call eventually returns successfully. Reserve actor replacement and orphan accounting for an actual actor exit, panic, failed recovery, or a separately bounded hard-wedge policy. This preserves the warm native cache and prevents one slow cold render from creating a `renderer_dead` tail for later requests.
-- **Decide between three responses, with measurement first:** raise the default budget for a cold render only (a warm render needs nothing near 5 s); pre-warm configured styles at startup and after a refresh hint, which converts the timeout into background work but adds a startup cost proportional to catalog size; or accept it and document that the first request after expiry may fail. Attribute the 5 s first: `biei_render_duration_seconds` with the style-setup and profile-preparation calibration histograms already separate profile I/O from render+encode, so the split between glyph fetches and native setup is measurable without new instrumentation.
+- **Concurrent cold-cache fault isolated (2026-08-17):** one isolated cold render completed consistently in about 3.4 s and all FileSource I/O finished within about 0.8 s. Two identical cold renders could instead leave one or both native renders waiting past 10 s even though normal I/O, body, and retry gauges were zero. The blocked run had glyph Network requests sleeping in `refresh_deferred_inflight`: another renderer populated the shared Database cache between their Database miss and Network request, and the Network leaf parked a render-blocking callback under the false assumption that this requester had received the Database body. The fault disappeared with the Rust resource cache disabled and with MapLibre Native's default loader. Deferred refresh is valid only when Database already delivered a usable body. A miss, or a stale body carried as `priorData` because native withheld it for revalidation, receives the newly cached fresh body immediately. Regression coverage as it actually stands: the race branch is exercised directly
+against a real source and cache (`a_peer_cache_fill_is_served_to_every_requester_still_awaiting_bytes`),
+and deleting the early return that serves the body makes it fail. There is **no**
+concurrent cold-render probe in the suite, and none can be written today —
+`ResourceRequest` is `#[non_exhaustive]` with a crate-private constructor upstream,
+so `NetworkFileSource::request` cannot be driven from a test at all (tracked in
+`issues/mln-rs-wishlist.md`). The two-identical-cold-renders reproduction remains a
+manual procedure. Do not use this incident to justify a larger SLA or pre-warming.
+- **Treat ordinary cold latency separately:** the remaining roughly 3–4 s cold cost is mostly native glyph decode, symbol layout, shader/raster work, and encoding after network completion. Consider predictive warming only if that latency is a product problem; it is no longer a mitigation for the resolved 10-second cache-callback fault.
 - **Predictive warm handoff is planner-only.** `crates/biei-core/src/warm_plan.rs` accepts bounded recommendations pulled from other live nodes, reduces them to revision-independent `(style, mode, scale)` hints, resolves the current revision locally, and admits only the top two HRW owners. This intentionally treats peer advice as a replicated working-set hint: a primary teaches its likely successor early, while the receiver independently decides whether to spend work. No separate demand-history protocol is planned. The planner is not yet wired into runtime behaviour.
   - **Pull advice only while idle.** Add a versioned internal endpoint that returns the serving node's bounded, deduplicated loaded profiles. An idle node samples one live peer at a time in round-robin order with a short timeout; do not fan out to the whole cluster on every tick. The receiver unions only a small bounded window of replies, then recomputes HRW ownership and catalog revision locally. Advice is advisory, never a remote command.
   - **Warm only anonymous-access profiles in version one.** `WorkerView.loaded_profile` intentionally carries no credential or cache-partition identity. The executor must reconstruct current anonymous authorization locally and check local partition-aware renderer state before warming; credentials and partition identifiers never enter gossip.
@@ -56,39 +63,58 @@ The implemented contract — content-derived revisions, activation, the refresh 
 - **Orphan render memory accounting:** add byte-level orphan admission only if a slow-render or distinct-key measurement shows the count-bounded orphan pool can approach the pod memory limit. Orphans are bounded by count, not bytes (see biei-spec §8.2).
 - **Production packaging:** add Helm or broader policy only if Biei moves beyond the current deployment-demo scope.
 
-## Reproducible 504: a style's first render on a pod, while Ishikari is cold
+## The 504s are render-permit waiting, not preparation
 
-Rolling Ishikari (Biei untouched) makes the next render for a style fail on the
-response deadline before recovering:
+Third and final correction of this symptom. The claim I carried for most of a
+session — "profile preparation runs inside the response deadline, so it turns into
+504s" — is not supported by the counters. Measured on the pod that produced the
+failures:
 
-    attempt 1  504  10.11s
-    attempt 2  504  10.37s
-    attempt 3  200   2.88s
-    attempt 4  200   0.19s
+    tasks_rejected_total{reason="deadline_exceeded"}                    5
+      of which deadline_exceeded_total{stage="acquire_render_permit"}   3
+    tasks_failed_by_kind_total{kind="render_timeout"}                   1   (9.95s)
+    profile_prepare_duration_seconds{outcome="failure"}                 1   at 0.012s
+    profile_prepare_duration_seconds{outcome="success"}   mean 1.3ms over 170
 
-The failing requests log the same pair, ~9.99s apart, with nothing in between:
+Preparation is fast in both the success and failure cases; the code already
+separates `PreparationTimeout` from `RenderTimeout` for exactly this reason, and
+production logged `RenderTimeout`. What actually consumes the deadline is queueing
+for a render permit under capacity pressure, plus one genuinely slow native render.
 
-    INFO  biei::renderer::maplibre::profile: style content changed;
-          later requests use the new revision
-          requested_version=1 observed_version=13085273775788304881
-    WARN  biei::http::response: render request failed failure_kind=RenderTimeout
+This matters for the queue-multiplier question: raising `queue_capacity_multiplier`
+3 -> 4 makes requests wait *longer* for the same permits, so it would increase
+`deadline_exceeded_total{stage="acquire_render_permit"}` — a counter that is already
+non-zero. Fewer `503`s would be bought with more `504`s, which are worse: no
+`Retry-After`, and the queued work is discarded rather than never admitted.
 
-`requested_version=1` is *not* evidence of a revision reset. `style_content_version`
-is a SHA-256 of the normalized style JSON with the high bit set, so it is stable
-across an Ishikari restart, and `1` is the documented reserved sentinel for "no
-content observed yet". Counting occurrences over ~8h of uptime: 2 on one pod, 0 on
-the other, each a distinct style — consistent with the sentinel appearing on a
-pod's first request for a style, which is expected, not a fault.
+Given the demo cluster accepts capacity shedding (see below), there is nothing to
+fix here. If this workload were ever run for real, the lever is more renderer slots
+or replicas, not a deeper queue, and the metric to watch is the permit-wait stage
+rather than the 503 count.
 
-The fault is what it costs. That first preparation runs inside the render deadline,
-so when Ishikari is also cold — exactly the case right after a rollout — it crosses
-10s and the caller gets `504` instead of a slow `200`. Warm-Ishikari cold-Biei
-renders measured 0.5-6.4s and all succeeded, so neither cold path alone is fatal;
-the combination is.
+## Accepted for the demo cluster: capacity shedding and Spot churn
 
-The fix is deadline separation, not revision handling: preparation should degrade to
-a slow render, not a response failure. Until then, every Ishikari rollout costs the
-first request per (pod, style) a `504`.
+Decided rather than deferred, so it is not re-investigated:
 
-Reproduce: `kubectl rollout restart deploy/ishikari -n map-demo`, wait for Ready,
-then request a style that pod has not served yet.
+- `503 no_capacity` under a burst of distinct style profiles is the admission
+  control working. Six renderer slots (3 per pod x 2 pods) cannot hold twelve warm
+  profiles; shedding the excess with `Retry-After` is preferable to queueing it.
+- Spot node reclaims periodically halve Biei capacity until a replacement is
+  scheduled. Measured effect: one burst returned 12/12 `504` during a reclaim, and
+  the identical burst on a stable cluster returned 12/12 `200` in 1.1-1.8s.
+- The HPA scales on CPU at a 50% target and sits at ~1%, so it will not react to
+  either. `maxReplicas: 6` is therefore unreachable under this workload.
+
+None of these are fixed, on purpose: this is an experiment cluster, and the fixes
+(more replicas, a shed-rate or queue-depth scaling signal, a deeper queue) all cost
+money or latency for burst absorption the demo does not need.
+
+The response deadline still bounds preparation, permit waiting, and rendering; a
+capacity event may therefore produce `504` rather than an arbitrarily slow `200`.
+That is the intended client contract. It no longer classifies the renderer as dead:
+the slot is quarantined while the same native call continues, returns to service on
+late success, and is replaced only after the separate hard-wedge deadline.
+
+Measurement discipline, since ignoring the cause does not remove the noise: record
+Biei pod readiness with every latency measurement. Three separate conclusions in one
+session were confounded by not doing so, each of them plausible and wrong.

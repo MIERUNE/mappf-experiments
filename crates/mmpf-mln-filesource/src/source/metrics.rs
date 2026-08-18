@@ -23,6 +23,7 @@ pub(super) struct FsMetrics {
     pub(super) slow_attempts_inflight: IntGauge,
     pub(super) negative_cache_total: IntCounterVec,
     pub(super) singleflight_total: IntCounterVec,
+    pub(super) fresh_cache_race_total: IntCounterVec,
     pub(super) refresh_deferred_total: IntCounterVec,
     pub(super) refresh_deferred_inflight: IntGaugeVec,
     pub(super) duration_seconds: HistogramVec,
@@ -72,15 +73,20 @@ impl FsMetrics {
             "Cross-renderer resource single-flight participation by role.",
             &["kind", "role"],
         );
+        let fresh_cache_race_total = counter_vec(
+            "mmpf_mln_resource_fresh_cache_race_total",
+            "Network requests completed from a fresh shared-cache body because Database did not deliver a usable one (missed, or withheld a stale body for revalidation).",
+            &["kind", "classification"],
+        );
         let refresh_deferred_total = counter_vec(
             "mmpf_mln_resource_refresh_deferred_total",
-            "Fresh cache hits whose network refresh was deferred until expiry.",
-            &["kind"],
+            "Fresh Database hits whose paired network refresh was deferred until expiry.",
+            &["kind", "priority"],
         );
         let refresh_deferred_inflight = gauge_vec(
             "mmpf_mln_resource_refresh_deferred_inflight",
-            "Network FileSource requests currently sleeping until cache expiry.",
-            &["kind"],
+            "Background Network FileSource requests currently sleeping until cache expiry.",
+            &["kind", "priority"],
         );
         let duration_seconds = histogram_vec(
             "mmpf_mln_resource_request_duration_seconds",
@@ -125,6 +131,7 @@ impl FsMetrics {
             Box::new(slow_attempts_inflight.clone()),
             Box::new(negative_cache_total.clone()),
             Box::new(singleflight_total.clone()),
+            Box::new(fresh_cache_race_total.clone()),
             Box::new(refresh_deferred_total.clone()),
             Box::new(refresh_deferred_inflight.clone()),
             Box::new(duration_seconds.clone()),
@@ -146,6 +153,7 @@ impl FsMetrics {
             slow_attempts_inflight,
             negative_cache_total,
             singleflight_total,
+            fresh_cache_race_total,
             refresh_deferred_total,
             refresh_deferred_inflight,
             duration_seconds,
@@ -226,17 +234,62 @@ pub(super) struct RequestObservation {
     priority: &'static str,
     usage: &'static str,
     started: std::time::Instant,
+    /// Time this request spent deliberately parked rather than doing work.
+    ///
+    /// Subtracted from the reported duration. The deferred-refresh path sleeps
+    /// until a cached entry expires — up to five minutes — and counting that as
+    /// request duration made the histogram unusable for the question it is
+    /// actually asked: how long does fetching a resource take. A single 300s
+    /// sample sits in the same `kind` series as a 17ms glyph fetch, and
+    /// `duration_seconds` carries no label to separate them.
+    ///
+    /// The park itself stays observable through `refresh_deferred_total` and the
+    /// deferred-refresh inflight gauge, so nothing is hidden by excluding it here.
+    parked: std::time::Duration,
     pub(super) outcome: &'static str,
     pub(super) response_bytes: usize,
 }
 
 impl RequestObservation {
+    /// Record the outcome and size from the response being returned.
+    ///
+    /// One call rather than two field assignments, so a new early return cannot
+    /// set the outcome and forget the byte count (or the reverse).
+    pub(super) fn complete(&mut self, response: &Response) {
+        self.outcome = outcome_label(response);
+        self.response_bytes = response.data.as_ref().map_or(0, Vec::len);
+    }
+
+    /// Add time spent parked rather than working.
+    pub(super) fn add_parked(&mut self, parked: std::time::Duration) {
+        self.parked = self.parked.saturating_add(parked);
+    }
+
+    /// Test-only constructor. `ResourceRequest` cannot be built downstream, so a
+    /// test that needs an observation has no other way to obtain one.
+    #[cfg(test)]
+    pub(super) fn for_test(kind: &'static str) -> Self {
+        Self {
+            kind,
+            priority: "regular",
+            usage: "online",
+            started: std::time::Instant::now(),
+            parked: std::time::Duration::ZERO,
+            outcome: "cancelled",
+            response_bytes: 0,
+        }
+    }
+
     pub(super) fn new(request: &ResourceRequest) -> Self {
         Self {
             kind: kind_label(request.kind),
             priority: priority_label(request.priority),
             usage: usage_label(request.usage),
             started: std::time::Instant::now(),
+            parked: std::time::Duration::ZERO,
+            // Fail safe: a future dropped before it records an outcome must not be
+            // counted as a success. Every early return in `request` sets this
+            // through `complete`.
             outcome: "cancelled",
             response_bytes: 0,
         }
@@ -245,11 +298,26 @@ impl RequestObservation {
 
 impl Drop for RequestObservation {
     fn drop(&mut self) {
+        let duration = self.started.elapsed().saturating_sub(self.parked);
+        // `trace`, not `debug`: a cold render fetches on the order of a hundred
+        // resources, and emitting a record per resource at debug perturbs the very
+        // latency being investigated. Aggregate counters and histograms below carry
+        // the routine signal; this is for when someone deliberately wants the
+        // per-resource trail.
+        tracing::trace!(
+            kind = self.kind,
+            priority = self.priority,
+            usage = self.usage,
+            outcome = self.outcome,
+            response_bytes = self.response_bytes,
+            duration_ms = duration.as_millis() as u64,
+            "FileSource resource request completed"
+        );
         let metrics = fs_metrics();
         metrics
             .duration_seconds
             .with_label_values(&[self.kind])
-            .observe(self.started.elapsed().as_secs_f64());
+            .observe(duration.as_secs_f64());
         metrics
             .requests_total
             .with_label_values(&[self.kind, self.priority, self.usage, self.outcome])
@@ -285,6 +353,15 @@ impl UpstreamAttemptObservation {
 
 impl Drop for UpstreamAttemptObservation {
     fn drop(&mut self) {
+        // Same reasoning as the request-level record: one per upstream attempt is
+        // per-resource volume, so it belongs at `trace`.
+        tracing::trace!(
+            kind = self.kind,
+            priority = self.priority,
+            outcome = self.outcome,
+            network_duration_ms = self.network_duration.as_millis() as u64,
+            "FileSource upstream attempt completed"
+        );
         let metrics = fs_metrics();
         metrics
             .upstream_attempts_total
@@ -304,10 +381,10 @@ pub(super) struct BodyInflightGuard(IntGauge);
 pub(super) struct DeferredRefreshGuard(IntGauge);
 
 impl DeferredRefreshGuard {
-    pub(super) fn new(kind: &'static str) -> Self {
+    pub(super) fn new(kind: &'static str, priority: &'static str) -> Self {
         let gauge = fs_metrics()
             .refresh_deferred_inflight
-            .with_label_values(&[kind]);
+            .with_label_values(&[kind, priority]);
         gauge.inc();
         Self(gauge)
     }

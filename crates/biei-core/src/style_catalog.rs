@@ -323,6 +323,28 @@ impl StyleCatalogInner {
             && self.latest_version(style_id) == Some(version))
     }
 
+    fn needs_revalidation(&self, style_id: &StyleId, now: Instant) -> bool {
+        let local = self.observed.get(style_id);
+        self.cluster_observed
+            .get(style_id)
+            .is_some_and(|cluster| local.is_none_or(|local| local.version != cluster.version))
+            || local.is_none_or(|observed| now >= observed.revalidate_after)
+    }
+
+    fn has_pending_revalidation(&self, style_id: &StyleId) -> bool {
+        self.pending_hints.contains_key(style_id)
+            || self
+                .observed
+                .get(style_id)
+                .is_some_and(|observed| observed.pending_revalidation)
+    }
+
+    fn is_current_cluster_revision(&self, revision: &StyleRevision) -> bool {
+        self.cluster_observed
+            .get(&revision.id)
+            .is_some_and(|observed| observed.version == revision.version)
+    }
+
     /// Whether no refresh hint at all can have landed since `fence` was captured.
     ///
     /// When true the per-style map cannot have lost anything relevant, so a
@@ -542,24 +564,13 @@ impl StyleCatalog {
     /// Whether the style should be re-checked against its provider. A style with
     /// no observed content has never been fetched and always needs one.
     pub fn needs_revalidation(&self, style_id: &StyleId) -> bool {
-        let inner = read_unpoisoned(&self.inner);
-        let local = inner.observed.get(style_id);
-        inner
-            .cluster_observed
-            .get(style_id)
-            .is_some_and(|cluster| local.is_none_or(|local| local.version != cluster.version))
-            || local.is_none_or(|observed| Instant::now() >= observed.revalidate_after)
+        read_unpoisoned(&self.inner).needs_revalidation(style_id, Instant::now())
     }
 
     /// Whether an accepted publisher hint still awaits a provider fetch that
     /// began after the hint. Output caches must not short-circuit that fetch.
     pub fn has_pending_revalidation(&self, style_id: &StyleId) -> bool {
-        let inner = read_unpoisoned(&self.inner);
-        inner.pending_hints.contains_key(style_id)
-            || inner
-                .observed
-                .get(style_id)
-                .is_some_and(|observed| observed.pending_revalidation)
+        read_unpoisoned(&self.inner).has_pending_revalidation(style_id)
     }
 
     /// Captures the refresh fence immediately before provider I/O begins.
@@ -701,10 +712,19 @@ impl StyleCatalog {
     /// An exact output-cache entry under this content-derived key is safe even
     /// before this process has fetched the style bytes itself.
     pub fn is_current_cluster_revision(&self, revision: &StyleRevision) -> bool {
-        read_unpoisoned(&self.inner)
-            .cluster_observed
-            .get(&revision.id)
-            .is_some_and(|observed| observed.version == revision.version)
+        read_unpoisoned(&self.inner).is_current_cluster_revision(revision)
+    }
+
+    /// Whether output-cache reuse would hide a required provider revalidation.
+    ///
+    /// Keep the three related observations under one read lock: taking separate
+    /// snapshots can both add per-request synchronization and combine states that
+    /// never existed together while a refresh hint is being applied.
+    pub(crate) fn revalidation_blocks_output_cache(&self, revision: &StyleRevision) -> bool {
+        let inner = read_unpoisoned(&self.inner);
+        !inner.is_current_cluster_revision(revision)
+            && (inner.has_pending_revalidation(&revision.id)
+                || inner.needs_revalidation(&revision.id, Instant::now()))
     }
 
     /// Whether `revision` is the configured placeholder retained across the

@@ -87,3 +87,26 @@ Priorities follow current biei blockers and measured maintenance cost, not a his
 Things that work through an awkward workaround on biei's side — baking pin labels into bitmaps, accepting the silent `before_layer` append, range-checking coordinates at ingress — go in the improvement tier. Things with no workaround at all (`setfilter`, FFI exception safety) are required. Things already covered by `AnyLayer::from_json_str` — expressions, filters on newly constructed layers, `source-layer`, visibility, detailed paint/layout properties, and untyped layer types through `OpaqueLayer` — are deliberately absent. The same applies to SymbolLayer text/icon rendering: the JSON construction path exists, so adopting it for pin labels and adding end-to-end tests is biei work rather than a missing binding. Render cancellation is an engine constraint tracked in [`biei-spec.md` §8.6](../specs/biei-spec.md#86-permanent-engine-constraints), not a Rust-binding wishlist item. And things biei should own outright — the URL parser, polyline decoder, simplestyle property reading, and tileset catalog — belong in biei's own roadmap, not here.
 
 The process-global FileSource registration API landed in `maplibre_native` 0.8.4 and is sufficient for biei's one-process/one-provider model. Version 0.8.6 also exposes `ResourceRequest.priority` and `usage`, and 0.8.7 preserves all FileSource response fields across the C++ bridge. The reusable `mmpf-mln-filesource` crate consumes that API, and biei uses the crates.io release. A renderer-scoped variant is not a current wishlist item; revisit it only if a real multi-tenant or per-renderer cache-isolation requirement appears — or if per-render in-render I/O attribution ever needs to be exact in production: `ResourceRequest` carries no requester identity (mbgl's engine-global `FileSource` interface has none to forward), so the process-global source cannot know which render a fetch blocks. biei currently estimates this statistically over verified resource-warm windows and obtains exact attribution only in single-renderer-slot benches where every regular-lane fetch belongs to the only in-flight render.
+
+## Constructing a `ResourceRequest` in tests
+
+`ResourceRequest` is `#[non_exhaustive]` and its only constructor is
+`pub(super) fn from_ffi`, so no downstream crate can build one. Every FileSource
+test therefore stops at helper functions and cannot drive `NetworkFileSource::request`
+end to end.
+
+That gap has already cost us. The Database -> Network race handling was reviewed
+twice on the strength of unit tests over `native_database_state` and
+`resolve_fresh_cache_race`; the semantics of native's `priorData` were read
+backwards at one point, and no test could have caught it, because the only tests
+possible were over the same abstraction that encoded the misreading. Verifying a
+boundary requires exercising it from outside, and here the outside cannot be
+reached.
+
+What would fix it, in preference order:
+
+- A `#[cfg(feature = "test-util")]` builder or `ResourceRequest::for_test(..)`.
+- Making the fields exhaustively constructible, so `..Default::default()` works.
+
+Until then, any claim about the Database -> Network sequence rests on reading
+`main_resource_loader.cpp` and on production observation, not on a regression test.

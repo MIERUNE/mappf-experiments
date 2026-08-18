@@ -72,6 +72,13 @@ pub(crate) struct ConfigFile {
     pub(crate) cpu_work_concurrency: Option<usize>,
     /// Queued CPU-work ceiling before shedding.
     pub(crate) cpu_work_max_inflight: Option<usize>,
+    /// Concurrent upstream provider body fetches (glyphs, styles, sprites).
+    ///
+    /// Admissible here because the flag carries no built-in default: it is `None`
+    /// exactly when the operator did not set it. Its companion reserve,
+    /// `ISKR_PROVIDER_ACTIVE_BODY_BUDGET_BYTES`, is deliberately absent for the
+    /// opposite reason — it has a default, so the document could only shadow it.
+    pub(crate) provider_fetch_concurrency: Option<usize>,
 }
 
 /// The only format this build understands.
@@ -95,6 +102,7 @@ impl Default for ConfigFile {
             mapterhorn_maxzoom: None,
             cpu_work_concurrency: None,
             cpu_work_max_inflight: None,
+            provider_fetch_concurrency: None,
         }
     }
 }
@@ -188,6 +196,36 @@ mod tests {
         );
         assert_eq!(parsed.mapterhorn_maxzoom, Some(16));
         assert_eq!(parsed.cpu_work_concurrency, None);
+    }
+
+    /// The document must admit exactly the flags that carry no built-in default,
+    /// which is the invariant that keeps "flag wins, file fills the gap"
+    /// unambiguous. `provider_fetch_concurrency` qualifies and was missing;
+    /// `provider_active_body_budget_bytes` does not, because it has a default the
+    /// document could only shadow.
+    ///
+    /// The value below is one a document can carry *on its own*. Anything above the
+    /// default concurrency also needs `ISKR_PROVIDER_ACTIVE_BODY_BUDGET_BYTES`
+    /// raised, because option resolution multiplies concurrency by the largest body
+    /// cap and refuses to exceed the reserve — so a larger literal here would
+    /// document a file that cannot start a process by itself.
+    #[test]
+    fn admits_the_provider_fetch_concurrency_but_not_its_defaulted_reserve() {
+        let parsed = ConfigFile::parse(
+            r#"
+            schema_version = 1
+            provider_fetch_concurrency = 32
+            "#,
+        )
+        .expect("document with the provider concurrency parses");
+        assert_eq!(parsed.provider_fetch_concurrency, Some(32));
+
+        let rejected =
+            ConfigFile::parse("schema_version = 1\nprovider_active_body_budget_bytes = 1073741824");
+        assert!(
+            rejected.is_err(),
+            "a defaulted setting must not be silently shadowed by the document"
+        );
     }
 
     #[test]

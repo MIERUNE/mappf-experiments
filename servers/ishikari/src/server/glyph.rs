@@ -18,7 +18,9 @@ use ishikari_core::storage::ProviderRequest;
 use moka::{Expiry, future::Cache};
 use pbf_font_tools::{Fontstack, Glyphs, prost::Message};
 
-use crate::server::{AppState, HttpError, upstream::ProviderResource};
+use crate::server::{
+    AppState, HttpError, provider_body::UNTYPED_OBJECT_CONTENT_TYPE, upstream::ProviderResource,
+};
 
 const MAX_FONTSTACK_LEN: usize = 256;
 const MAX_FONTS_PER_STACK: usize = 8;
@@ -32,6 +34,7 @@ const GLYPH_CONTENT_TYPES: &[&str] = &[
     "application/vnd.google.protobuf",
     "application/protobuf",
     "application/octet-stream",
+    UNTYPED_OBJECT_CONTENT_TYPE,
 ];
 
 #[derive(Clone, Debug)]

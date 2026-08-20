@@ -9,6 +9,18 @@ use serde::de::IgnoredAny;
 
 use super::HttpError;
 
+/// Media type that S3-compatible object stores report when an object was
+/// uploaded without an explicit `Content-Type`. Ceph RGW returns this for any
+/// such object.
+///
+/// It is not IANA-registered, but it carries the same meaning as
+/// `application/octet-stream`, which every provider allowlist below already
+/// accepts. `validate_content_type` also accepts a *missing* `Content-Type`
+/// outright, so rejecting this value while accepting its absence would be
+/// inconsistent: it would fail exactly the objects whose type is least
+/// specific, not the ones whose type is wrong.
+pub(super) const UNTYPED_OBJECT_CONTENT_TYPE: &str = "binary/octet-stream";
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum BodyValidation {
     Bytes,
@@ -110,7 +122,23 @@ fn content_type_matches(value: &str, accepted: &[&str]) -> bool {
 mod tests {
     use bytes::Bytes;
 
-    use super::{BodyValidation, content_type_matches, decode_provider_body, validate_body};
+    use super::{
+        BodyValidation, UNTYPED_OBJECT_CONTENT_TYPE, content_type_matches, decode_provider_body,
+        validate_body, validate_content_type,
+    };
+
+    #[test]
+    fn untyped_object_content_type_is_accepted_like_a_missing_one() {
+        // Ceph RGW reports `binary/octet-stream` for objects stored without an
+        // explicit type. A missing `Content-Type` is already accepted, so this
+        // must be too.
+        let accepted = &["application/x-protobuf", UNTYPED_OBJECT_CONTENT_TYPE];
+        assert!(validate_content_type(None, accepted, "glyph").is_ok());
+        assert!(
+            validate_content_type(Some(UNTYPED_OBJECT_CONTENT_TYPE), accepted, "glyph").is_ok()
+        );
+        assert!(validate_content_type(Some("text/html"), accepted, "glyph").is_err());
+    }
 
     #[test]
     fn content_type_match_ignores_parameters_and_case() {

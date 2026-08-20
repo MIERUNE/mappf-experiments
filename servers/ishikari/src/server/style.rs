@@ -19,14 +19,19 @@ pub(crate) struct StyleQuery {
 use crate::provider::{ProviderConfig, path_percent_encode_segments};
 use crate::server::{
     AppState, HttpError, apply_origin_vary, auth::PropagatedAccessToken, cache,
-    conditional::Validators, get_origin, sprite, tileset::render_preview_html,
-    upstream::ProviderResource,
+    conditional::Validators, get_origin, provider_body::UNTYPED_OBJECT_CONTENT_TYPE, sprite,
+    tileset::render_preview_html, upstream::ProviderResource,
 };
 use ishikari_core::{interned::TilesetId, storage::ProviderRequest};
 use mmpf_http::style_key::StyleKey;
 
 const MAX_STYLE_BYTES: usize = 2 * 1024 * 1024;
-const STYLE_CONTENT_TYPES: &[&str] = &["application/json", "text/json", "application/octet-stream"];
+const STYLE_CONTENT_TYPES: &[&str] = &[
+    "application/json",
+    "text/json",
+    "application/octet-stream",
+    UNTYPED_OBJECT_CONTENT_TYPE,
+];
 
 pub(crate) async fn style_handler(
     State(state): State<AppState>,

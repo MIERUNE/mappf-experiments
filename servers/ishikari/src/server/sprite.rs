@@ -8,13 +8,24 @@ use axum::{
 
 use ishikari_core::storage::{ProviderRequest, ProviderSpriteVariant};
 
-use crate::server::{AppState, HttpError, style::validate_style_key, upstream::ProviderResource};
+use crate::server::{
+    AppState, HttpError, provider_body::UNTYPED_OBJECT_CONTENT_TYPE, style::validate_style_key,
+    upstream::ProviderResource,
+};
 
 pub(crate) const MAX_SPRITE_JSON_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const MAX_SPRITE_PNG_BYTES: usize = 8 * 1024 * 1024;
-const SPRITE_JSON_CONTENT_TYPES: &[&str] =
-    &["application/json", "text/json", "application/octet-stream"];
-const SPRITE_PNG_CONTENT_TYPES: &[&str] = &["image/png", "application/octet-stream"];
+const SPRITE_JSON_CONTENT_TYPES: &[&str] = &[
+    "application/json",
+    "text/json",
+    "application/octet-stream",
+    UNTYPED_OBJECT_CONTENT_TYPE,
+];
+const SPRITE_PNG_CONTENT_TYPES: &[&str] = &[
+    "image/png",
+    "application/octet-stream",
+    UNTYPED_OBJECT_CONTENT_TYPE,
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SpriteFormat {

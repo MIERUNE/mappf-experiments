@@ -20,6 +20,40 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --default-toolchain stable --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
 
+# Keep the MapLibre Native core and headers on the same pinned source revision.
+# The release publishes both Linux architectures; BuildKit supplies TARGETARCH.
+ARG MLN_CORE_REVISION=f442c704b806d6f1e64242aa462a31c6f128cf47
+ARG MLN_CORE_HEADERS_SHA256=5700c4c90206d6ca8e7c266b3bc9d8172e7b0a3dfaa2062a553c9b2e67754666
+ARG MLN_CORE_LINUX_X64_OPENGL_SHA256=2635decd8e2803f96b448531ebb9c57ef3ca6202ad2460a9d95e632e5053e7a9
+ARG MLN_CORE_LINUX_ARM64_OPENGL_SHA256=45b78e19f3ac9fe2ded8f3b477e4c987305f72caebaab924906b4e0d897815dd
+ARG TARGETARCH
+RUN set -eux; \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "${arch}" in \
+        amd64) \
+            asset=libmaplibre-native-core-amalgam-linux-x64-opengl.a; \
+            asset_sha256="${MLN_CORE_LINUX_X64_OPENGL_SHA256}"; \
+            ;; \
+        arm64) \
+            asset=libmaplibre-native-core-amalgam-linux-arm64-opengl.a; \
+            asset_sha256="${MLN_CORE_LINUX_ARM64_OPENGL_SHA256}"; \
+            ;; \
+        *) \
+            echo "unsupported MapLibre Native core architecture: ${arch}" >&2; \
+            exit 1; \
+            ;; \
+    esac; \
+    release="https://github.com/ciscorn/maplibre-native/releases/download/core-${MLN_CORE_REVISION}"; \
+    mkdir -p /opt/maplibre-native; \
+    curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+        --output /opt/maplibre-native/libmbgl-core-amalgam.a \
+        "${release}/${asset}"; \
+    curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+        --output /opt/maplibre-native/maplibre-native-headers.tar.gz \
+        "${release}/maplibre-native-headers.tar.gz"; \
+    echo "${asset_sha256}  /opt/maplibre-native/libmbgl-core-amalgam.a" | sha256sum --check --strict; \
+    echo "${MLN_CORE_HEADERS_SHA256}  /opt/maplibre-native/maplibre-native-headers.tar.gz" | sha256sum --check --strict
+
 WORKDIR /src
 
 # Keep dependency compilation in a source-independent layer. Cloud Build
@@ -36,11 +70,13 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS build
 COPY --from=planner /src/recipe.json recipe.json
 
-# MLN_PRECOMPILE=1 downloads the prebuilt mbgl-core amalgam instead of compiling
-# it from source. `cargo chef cook` primes target/ using only dependency inputs;
+# Use the checksum-pinned fork release rather than maplibre-native-rs's older
+# default amalgam. `cargo chef cook` primes target/ using only dependency inputs;
 # the final build then recompiles the workspace crates but not their dependency
 # graph when Cargo.toml/Cargo.lock are unchanged.
-ENV MLN_PRECOMPILE=1
+ENV MLN_PRECOMPILE=1 \
+    MLN_CORE_LIBRARY_PATH=/opt/maplibre-native/libmbgl-core-amalgam.a \
+    MLN_CORE_LIBRARY_HEADERS_PATH=/opt/maplibre-native/maplibre-native-headers.tar.gz
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     cargo chef cook --release --locked -p biei --features gl-opengl \

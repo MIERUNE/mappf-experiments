@@ -307,62 +307,62 @@ async fn authorize_style(
     headers: &HeaderMap,
     action: ManagementAction,
     request_id: &RequestId,
-) -> Result<AuthorizedStyle, Response> {
+) -> Result<AuthorizedStyle, Box<Response>> {
     let auth = state.auth.as_ref().ok_or_else(|| {
-        mutation_error(
+        Box::new(mutation_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "authentication_unavailable",
             "Management authentication is unavailable",
             request_id,
-        )
+        ))
     })?;
     let publishing = state.publishing.clone().ok_or_else(|| {
-        mutation_error(
+        Box::new(mutation_error(
             StatusCode::NOT_FOUND,
             "not_found",
             "Resource not found",
             request_id,
-        )
+        ))
     })?;
     let principal = auth
         .authenticate(headers)
         .await
-        .map_err(|failure| auth_failure_response(failure, request_id))?;
+        .map_err(|failure| Box::new(auth_failure_response(failure, request_id)))?;
     let account = AccountId::try_new(account).map_err(|_| {
-        mutation_error(
+        Box::new(mutation_error(
             StatusCode::BAD_REQUEST,
             "invalid_account_id",
             "Invalid account ID",
             request_id,
-        )
+        ))
     })?;
     let style = LocalResourceId::try_new(style).map_err(|_| {
-        mutation_error(
+        Box::new(mutation_error(
             StatusCode::BAD_REQUEST,
             "invalid_style_id",
             "Invalid style ID",
             request_id,
-        )
+        ))
     })?;
     principal.authorize(&account, action).map_err(|_| {
-        mutation_error(
+        Box::new(mutation_error(
             StatusCode::FORBIDDEN,
             "forbidden",
             "Management credential is not authorized",
             request_id,
-        )
+        ))
     })?;
     let location = publishing
         .catalog
         .resolve(&account, &style)
         .cloned()
         .ok_or_else(|| {
-            mutation_error(
+            Box::new(mutation_error(
                 StatusCode::NOT_FOUND,
                 "style_not_found",
                 "Style is not present in the management catalog",
                 request_id,
-            )
+            ))
         })?;
     Ok(AuthorizedStyle {
         publishing,
@@ -390,7 +390,7 @@ async fn get_style(
     .await
     {
         Ok(authorized) => authorized,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let document = match authorized
         .publishing
@@ -442,7 +442,7 @@ async fn publish_style(
     .await
     {
         Ok(authorized) => authorized,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if request
         .headers()

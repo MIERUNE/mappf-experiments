@@ -86,8 +86,6 @@ pub(crate) fn load() -> Command {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser as _;
-
     use super::*;
 
     #[test]

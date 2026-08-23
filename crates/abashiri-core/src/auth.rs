@@ -490,7 +490,7 @@ fn decode_sha256(value: &str) -> anyhow::Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use object_store::{ObjectStoreExt as _, memory::InMemory};
+    use object_store::memory::InMemory;
     use serde_json::json;
 
     use super::*;

@@ -482,6 +482,9 @@ impl Node {
         self.record_forwarded_outcome(outcome)
     }
 
+    // `Err` also carries the successful cache-hit fast path. Boxing it would
+    // add a heap allocation to the path this cache exists to make cheap.
+    #[allow(clippy::result_large_err)]
     async fn acquire_render_output_cache(
         &self,
         task: &InternalTask,

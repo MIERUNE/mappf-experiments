@@ -25,7 +25,7 @@ pub struct BurstPattern {
     pub style_focus: Option<u32>,
 }
 
-/// Source generation for tasks. The static image API allows at most one
+/// Source generation for tasks. A static render accepts at most one
 /// `addlayer` per request, so each task carries at most one source. The
 /// `probability` decides whether this request has an addlayer at all; the
 /// `provider` decides which addlayer pool it's drawn from (use `Mixed` for

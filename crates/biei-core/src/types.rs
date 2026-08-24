@@ -416,8 +416,8 @@ pub enum CachePolicy {
     OneShot,
 }
 
-/// A reference to a source datum a task needs. The static image API
-/// allows at most one `addlayer` per request, so each task carries at most
+/// A reference to a source datum a task needs. A static render accepts at
+/// most one `addlayer` per request, so each task carries at most
 /// one additional source beyond the base style's intrinsic sources.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SourceRef {
@@ -594,10 +594,10 @@ pub enum RenderRequest {
         height: u16,
         overlays: Vec<StaticOverlay>,
         /// `before_layer={X}` URL query parameter: render all overlays just
-        /// below the base-style layer named X (static-image-API-compatible). When
-        /// `addlayer` is also present, the addlayer is placed in the same
-        /// band, immediately below the overlays. `None` = the biei-added
-        /// band sits on top of the entire base style.
+        /// below the base-style layer named X. When `addlayer` is also
+        /// present, the addlayer is placed in the same band, immediately
+        /// below the overlays. `None` = the biei-added band sits on top of
+        /// the entire base style.
         #[serde(deserialize_with = "deserialize_required_option")]
         before_layer: Option<String>,
         /// `padding={...}` URL query parameter: viewport insets applied to

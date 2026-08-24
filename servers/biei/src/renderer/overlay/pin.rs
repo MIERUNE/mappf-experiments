@@ -540,7 +540,9 @@ mod tests {
     }
 
     #[test]
-    fn label_color_matches_reference_luminance_threshold() {
+    fn a_light_pin_fill_takes_a_black_label_and_a_dark_fill_takes_white() {
+        // Pairs straddle the crossover so a change to either the luma weights or
+        // the threshold moves at least one case across it.
         assert_eq!(label_color_for_pin((158, 158, 158)), [255, 255, 255]);
         assert_eq!(label_color_for_pin((161, 161, 161)), [0, 0, 0]);
         assert_eq!(label_color_for_pin((255, 117, 117)), [255, 255, 255]);

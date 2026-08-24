@@ -2,6 +2,10 @@
 .github/
 target/
 **/target/
+**/node_modules/
+**/.svelte-kit/
+apps/*/build/
+apps/*/dist/
 **/*.pmtiles
 **/*.png
 **/*.jpg

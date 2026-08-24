@@ -30,8 +30,8 @@ const ADDLAYER_BIEI_ID_PREFIX: &str = "__biei_";
 const ADDLAYER_ALLOWED_TYPES: &[&str] = &["fill", "line", "circle"];
 
 /// Extract `addlayer={percent-encoded JSON}` from a query string. At most
-/// one `addlayer` parameter is allowed per request (static image API
-/// rule). Returns `Ok(None)` if not set.
+/// one `addlayer` parameter is allowed per request. Returns `Ok(None)` if
+/// not set.
 pub(crate) fn parse_addlayer_from_query(
     query: Option<&str>,
     tileset_url_template: &str,

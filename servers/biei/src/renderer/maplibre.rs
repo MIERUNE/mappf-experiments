@@ -3,7 +3,8 @@
 use async_trait::async_trait;
 
 use crate::renderer::actor::{
-    RenderTaskView, RendererActor, RendererActorConfig, RendererActorSupervisor, ResolvedStyle,
+    RenderTaskView, RendererActor, RendererActorConfig, RendererActorSupervisor, ReplacementReason,
+    ResolvedStyle,
 };
 use crate::renderer::{PreparedProfile, Renderer, RendererOutput};
 #[cfg(test)]
@@ -92,7 +93,7 @@ impl MapLibreRenderer {
         // Reserve bounded orphan capacity before creating another native
         // renderer thread. Otherwise an exhausted slot briefly creates and
         // immediately tears down a replacement on every retry.
-        self.spawn_and_install_replacement()?;
+        self.spawn_and_install_replacement(ReplacementReason::HardWedge)?;
         self.retiring = false;
         tracing::warn!(
             worker_id = self.config.worker_id,
@@ -102,18 +103,29 @@ impl MapLibreRenderer {
     }
 
     fn replace_finished_actor(&mut self) -> Result<(), RendererError> {
-        self.spawn_and_install_replacement()
+        // Deliberately distinct from the hard-wedge message. Both paths land in
+        // `renderer_replacements_total`, and during this investigation the absence
+        // of a specific line here meant the two could only be told apart by
+        // grepping for the *other* one's sentence.
+        tracing::warn!(
+            worker_id = self.config.worker_id,
+            "renderer thread had already exited; spawning replacement"
+        );
+        self.spawn_and_install_replacement(ReplacementReason::ThreadFinished)
     }
 
     /// Spawns and installs a replacement actor while keeping slot health and
     /// replacement metrics synchronized for every replacement path.
-    fn spawn_and_install_replacement(&mut self) -> Result<(), RendererError> {
+    fn spawn_and_install_replacement(
+        &mut self,
+        reason: ReplacementReason,
+    ) -> Result<(), RendererError> {
         match RendererActor::spawn_supervised(self.config.clone(), self.supervisor.clone()) {
             Ok(actor) => {
                 self.actor = actor;
                 self.supervisor
                     .set_slot_available(&mut self.slot_available, true);
-                self.supervisor.record_replacement_succeeded();
+                self.supervisor.record_replacement_succeeded(reason);
                 Ok(())
             }
             Err(err) => {

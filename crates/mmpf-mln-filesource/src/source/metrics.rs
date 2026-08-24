@@ -33,6 +33,7 @@ pub(super) struct FsMetrics {
     pub(super) upstream_attempt_duration_seconds: HistogramVec,
     pub(super) inflight: IntGaugeVec,
     pub(super) bodies_inflight: IntGaugeVec,
+    pub(super) caller_threads: IntGauge,
 }
 
 impl FsMetrics {
@@ -63,6 +64,11 @@ impl FsMetrics {
             "Render-blocking upstream attempts still in flight after the provider-health threshold.",
         )
         .expect("valid slow-attempt gauge");
+        let caller_threads = IntGauge::new(
+            "mmpf_mln_resource_caller_threads",
+            "Distinct threads MapLibre Native has used to invoke this file source.",
+        )
+        .expect("valid caller-thread gauge");
         let negative_cache_total = counter_vec(
             "mmpf_mln_resource_negative_cache_total",
             "Negative resource cache operations by resource kind.",
@@ -81,12 +87,12 @@ impl FsMetrics {
         let refresh_deferred_total = counter_vec(
             "mmpf_mln_resource_refresh_deferred_total",
             "Fresh Database hits whose paired network refresh was deferred until expiry.",
-            &["kind", "priority"],
+            &["kind"],
         );
         let refresh_deferred_inflight = gauge_vec(
             "mmpf_mln_resource_refresh_deferred_inflight",
             "Background Network FileSource requests currently sleeping until cache expiry.",
-            &["kind", "priority"],
+            &["kind"],
         );
         let duration_seconds = histogram_vec(
             "mmpf_mln_resource_request_duration_seconds",
@@ -141,6 +147,7 @@ impl FsMetrics {
             Box::new(upstream_attempt_duration_seconds.clone()),
             Box::new(inflight.clone()),
             Box::new(bodies_inflight.clone()),
+            Box::new(caller_threads.clone()),
         ] {
             registry.register(collector).expect("register fs metric");
         }
@@ -163,6 +170,7 @@ impl FsMetrics {
             upstream_attempt_duration_seconds,
             inflight,
             bodies_inflight,
+            caller_threads,
         }
     }
 }
@@ -189,6 +197,29 @@ pub fn gather_metrics() -> Vec<prometheus::proto::MetricFamily> {
 
 pub(super) fn mark_metrics_started() {
     let _ = METRICS_STARTED.set(());
+}
+
+thread_local! {
+    /// Registered once per thread so the shared gauge is touched once per thread
+    /// rather than once per resource request.
+    static CALLER_THREAD_COUNTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Records that MapLibre Native invoked this file source from the current thread.
+///
+/// Every resource request is dispatched through the `MainResourceLoader` that
+/// `FileSourceManager` resolved for the renderer's `ResourceOptions`, and each
+/// loader owns exactly one thread. Renderers sharing `ResourceOptions` therefore
+/// share one dispatch thread, so this gauge reads 1 however many renderers run;
+/// giving each renderer a distinct `platformContext` would split both the loader
+/// and the thread. Measured rather than inferred: the deployed core is a
+/// prebuilt amalgam, not the checkout this reasoning was read from.
+pub(super) fn note_caller_thread() {
+    CALLER_THREAD_COUNTED.with(|counted| {
+        if !counted.replace(true) {
+            fs_metrics().caller_threads.inc();
+        }
+    });
 }
 
 /// Bounded label for a resource kind. `ResourceKind` is a cxx shared enum
@@ -233,6 +264,10 @@ pub(super) struct RequestObservation {
     kind: &'static str,
     priority: &'static str,
     usage: &'static str,
+    /// Native attached a withheld prior body (revalidation of an undelivered
+    /// representation) — the axis the 304-materialization contract lives on.
+    prior_body: bool,
+    prior_validator: bool,
     started: std::time::Instant,
     /// Time this request spent deliberately parked rather than doing work.
     ///
@@ -273,6 +308,8 @@ impl RequestObservation {
             kind,
             priority: "regular",
             usage: "online",
+            prior_body: false,
+            prior_validator: false,
             started: std::time::Instant::now(),
             parked: std::time::Duration::ZERO,
             outcome: "cancelled",
@@ -285,6 +322,8 @@ impl RequestObservation {
             kind: kind_label(request.kind),
             priority: priority_label(request.priority),
             usage: usage_label(request.usage),
+            prior_body: request.prior_data.is_some(),
+            prior_validator: request.prior_etag.is_some() || request.prior_modified.is_some(),
             started: std::time::Instant::now(),
             parked: std::time::Duration::ZERO,
             // Fail safe: a future dropped before it records an outcome must not be
@@ -309,6 +348,8 @@ impl Drop for RequestObservation {
             priority = self.priority,
             usage = self.usage,
             outcome = self.outcome,
+            prior_body = self.prior_body,
+            prior_validator = self.prior_validator,
             response_bytes = self.response_bytes,
             duration_ms = duration.as_millis() as u64,
             "FileSource resource request completed"
@@ -381,10 +422,10 @@ pub(super) struct BodyInflightGuard(IntGauge);
 pub(super) struct DeferredRefreshGuard(IntGauge);
 
 impl DeferredRefreshGuard {
-    pub(super) fn new(kind: &'static str, priority: &'static str) -> Self {
+    pub(super) fn new(kind: &'static str) -> Self {
         let gauge = fs_metrics()
             .refresh_deferred_inflight
-            .with_label_values(&[kind, priority]);
+            .with_label_values(&[kind]);
         gauge.inc();
         Self(gauge)
     }
@@ -431,7 +472,11 @@ pub(super) fn outcome_label(response: &Response) -> &'static str {
         return "no_content";
     }
     let Some(error) = &response.error else {
-        return "ok";
+        return if response.not_modified {
+            "not_modified"
+        } else {
+            "ok"
+        };
     };
     let reason = error.reason;
     if reason == ErrorReason::NotFound {

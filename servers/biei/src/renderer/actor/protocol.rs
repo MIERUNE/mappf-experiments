@@ -2,7 +2,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -24,6 +24,40 @@ const ACTOR_JOIN_GRACE: std::time::Duration = std::time::Duration::from_millis(1
 const THREAD_RUNNING: u8 = 0;
 const THREAD_ORPHANED: u8 = 1;
 const THREAD_FINISHED: u8 = 2;
+
+// What the actor thread is doing right now. Written only by the actor thread;
+// read by `try_abandon` so the detach log can say what the orphan was stuck in.
+// `/proc/<tid>/wchan` proves *that* a thread waits, never *where* — this cell
+// and the generation/tid logs exist so a live specimen can be matched to a
+// backtrace without guessing which thread belongs to which actor generation.
+const OP_IDLE: u8 = 0;
+const OP_LOAD_PROFILE: u8 = 1;
+const OP_RENDER: u8 = 2;
+const OP_RETIRING: u8 = 3;
+
+fn op_label(op: u8) -> &'static str {
+    match op {
+        OP_LOAD_PROFILE => "load_profile",
+        OP_RENDER => "render",
+        OP_RETIRING => "retiring",
+        _ => "idle",
+    }
+}
+
+/// Monotonic across all workers, so a replacement is distinguishable from the
+/// actor it replaced in logs and backtraces.
+static NEXT_ACTOR_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Linux thread id of the calling thread, from `/proc/thread-self`. `None` off
+/// Linux (tests on macOS); the deployment target is Linux.
+fn current_tid() -> Option<u64> {
+    std::fs::read_to_string("/proc/thread-self/stat")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct RendererActorConfig {
@@ -105,9 +139,14 @@ pub(crate) trait BlockingRenderBackend: 'static {
 
 pub(crate) struct RendererActor {
     worker_id: WorkerId,
+    generation: u64,
     tx: mpsc::Sender<RenderCmd>,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
     thread_status: Arc<AtomicU8>,
+    /// Linux TID of the actor thread; 0 until the thread reports it.
+    thread_tid: Arc<AtomicU64>,
+    /// Current actor operation (`OP_*`), written only by the actor thread.
+    thread_op: Arc<AtomicU8>,
     supervisor: RendererActorSupervisor,
 }
 
@@ -170,18 +209,28 @@ impl RendererActor {
     {
         let (tx, rx) = mpsc::channel();
         let thread_status = Arc::new(AtomicU8::new(THREAD_RUNNING));
+        let thread_tid = Arc::new(AtomicU64::new(0));
+        let thread_op = Arc::new(AtomicU8::new(OP_IDLE));
+        let generation = NEXT_ACTOR_GENERATION.fetch_add(1, Ordering::Relaxed);
         let exit_status = Arc::clone(&thread_status);
         let exit_supervisor = supervisor.clone();
+        let started_tid = Arc::clone(&thread_tid);
+        let actor_op = Arc::clone(&thread_op);
         let worker_id = config.worker_id;
         let thread = thread::Builder::new()
             .name(format!("biei-renderer-{}", config.worker_id))
             .spawn(move || {
+                let tid = current_tid().unwrap_or(0);
+                started_tid.store(tid, Ordering::Release);
+                tracing::info!(worker_id, generation, tid, "renderer actor thread started");
                 let _exit = ActorThreadExit {
                     worker_id,
+                    generation,
+                    tid,
                     status: exit_status,
                     supervisor: exit_supervisor,
                 };
-                run_actor(rx, backend_factory());
+                run_actor(rx, backend_factory(), worker_id, generation, &actor_op);
             })
             .map_err(|err| {
                 RendererError::RenderFailed(format!("failed to spawn renderer actor: {err}"))
@@ -189,9 +238,12 @@ impl RendererActor {
 
         Ok(Self {
             worker_id,
+            generation,
             tx,
             thread: Mutex::new(Some(thread)),
             thread_status,
+            thread_tid,
+            thread_op,
             supervisor,
         })
     }
@@ -254,6 +306,13 @@ impl RendererActor {
             Ordering::Acquire,
         ) {
             Ok(_) => {
+                tracing::warn!(
+                    worker_id = self.worker_id,
+                    generation = self.generation,
+                    tid = self.thread_tid.load(Ordering::Acquire),
+                    op = op_label(self.thread_op.load(Ordering::Acquire)),
+                    "detaching wedged renderer actor thread"
+                );
                 // Dropping a JoinHandle detaches the still-running thread.
                 thread.take();
                 true
@@ -309,13 +368,23 @@ impl Drop for RendererActor {
 
 struct ActorThreadExit {
     worker_id: WorkerId,
+    generation: u64,
+    tid: u64,
     status: Arc<AtomicU8>,
     supervisor: RendererActorSupervisor,
 }
 
 impl Drop for ActorThreadExit {
     fn drop(&mut self) {
-        if self.status.swap(THREAD_FINISHED, Ordering::AcqRel) == THREAD_ORPHANED {
+        let was_orphaned = self.status.swap(THREAD_FINISHED, Ordering::AcqRel) == THREAD_ORPHANED;
+        tracing::info!(
+            worker_id = self.worker_id,
+            generation = self.generation,
+            tid = self.tid,
+            was_orphaned,
+            "renderer actor thread exited"
+        );
+        if was_orphaned {
             self.supervisor.release_orphan(self.worker_id);
         }
     }
@@ -330,8 +399,13 @@ async fn await_actor_reply<T>(
     }
 }
 
-fn run_actor<B>(rx: mpsc::Receiver<RenderCmd>, mut backend: B)
-where
+fn run_actor<B>(
+    rx: mpsc::Receiver<RenderCmd>,
+    mut backend: B,
+    worker_id: WorkerId,
+    generation: u64,
+    op: &AtomicU8,
+) where
     B: BlockingRenderBackend,
 {
     let mut loaded: Option<RendererProfileIdentity> = None;
@@ -340,8 +414,17 @@ where
         match cmd {
             RenderCmd::LoadProfile { style, task, reply } => {
                 let identity = style.identity();
+                tracing::debug!(worker_id, generation, "native load_profile started");
+                op.store(OP_LOAD_PROFILE, Ordering::Release);
                 let result =
                     catch_backend_unwind("load_profile", || backend.load_profile(&style, &task));
+                op.store(OP_IDLE, Ordering::Release);
+                tracing::debug!(
+                    worker_id,
+                    generation,
+                    ok = result.is_ok(),
+                    "native load_profile finished"
+                );
                 if result.is_ok() {
                     loaded = Some(identity);
                 } else {
@@ -355,7 +438,17 @@ where
                     .as_ref()
                     .is_some_and(|profile| task.matches_profile(profile))
                 {
-                    catch_backend_unwind("render", || backend.render(&task))
+                    tracing::debug!(worker_id, generation, "native render started");
+                    op.store(OP_RENDER, Ordering::Release);
+                    let result = catch_backend_unwind("render", || backend.render(&task));
+                    op.store(OP_IDLE, Ordering::Release);
+                    tracing::debug!(
+                        worker_id,
+                        generation,
+                        ok = result.is_ok(),
+                        "native render finished"
+                    );
+                    result
                 } else {
                     Err(RendererError::StyleNotReady {
                         style_id: task.style.id.clone(),

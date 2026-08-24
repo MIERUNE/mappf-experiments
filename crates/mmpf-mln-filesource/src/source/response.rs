@@ -128,11 +128,26 @@ pub(super) fn negative_cache_ttl(
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct PriorResponse<'a> {
-    pub(super) data: Option<&'a [u8]>,
+    /// Body the native side withheld for revalidation. Its presence means the
+    /// consumer behind this request has NOT received the representation, so a
+    /// 304 must be materialized before native sees it.
+    pub(super) native_data: Option<&'a [u8]>,
+    /// Body known only to the process-wide Rust cache. Native consumers of a
+    /// background refresh already hold their copy, so a 304 backed only by
+    /// this stays bodyless for native — re-sending the body would make
+    /// sprite/tile consumers re-parse an unchanged representation.
+    pub(super) cache_data: Option<&'a [u8]>,
     pub(super) etag: Option<&'a str>,
     pub(super) modified: Option<SystemTime>,
     pub(super) expires: Option<SystemTime>,
     pub(super) must_revalidate: bool,
+}
+
+impl<'a> PriorResponse<'a> {
+    /// The representation this process holds, regardless of who else has it.
+    pub(super) fn body(&self) -> Option<&'a [u8]> {
+        self.native_data.or(self.cache_data)
+    }
 }
 
 pub(super) fn prior_response_with_cache<'a>(
@@ -140,10 +155,8 @@ pub(super) fn prior_response_with_cache<'a>(
     cached: Option<&'a Response>,
 ) -> PriorResponse<'a> {
     PriorResponse {
-        data: request
-            .prior_data
-            .as_deref()
-            .or_else(|| cached.and_then(|response| response.data.as_deref())),
+        native_data: request.prior_data.as_deref(),
+        cache_data: cached.and_then(|response| response.data.as_deref()),
         etag: request
             .prior_etag
             .as_deref()
@@ -201,13 +214,16 @@ pub(super) fn response_from_http(
     }
 }
 
-/// Materialize a 304 response for the process-wide Rust cache. MLN receives
-/// the original bodyless response and merges it with its prior representation.
+/// Merge the representation this process holds into a 304. The result always
+/// feeds the process-wide Rust cache; it also becomes the native response when
+/// the prior body came from native itself (withheld for revalidation), which is
+/// the same merge the stock `OnlineFileSource` performs before consumers see a
+/// 304.
 pub(super) fn materialize_not_modified(
     response: &Response,
     prior: PriorResponse<'_>,
 ) -> Option<Response> {
-    let data = prior.data?;
+    let data = prior.body()?;
     let mut materialized = response.clone();
     materialized.not_modified = false;
     materialized.data = Some(data.to_vec());
@@ -252,7 +268,7 @@ fn with_cache_metadata(
             .and_then(|max_age| now.checked_add(max_age))
             .or_else(|| header_date(headers, EXPIRES))
             .or_else(|| match prior.expires {
-                Some(expires) if prior.data.is_some() && expires <= now => {
+                Some(expires) if prior.body().is_some() && expires <= now => {
                     now.checked_add(REVALIDATED_FALLBACK_TTL)
                 }
                 expires => expires,

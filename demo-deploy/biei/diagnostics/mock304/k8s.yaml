@@ -1,0 +1,41 @@
+# Deterministic 304 upstream for the renderer-wedge regression
+# (issues/wedge-root-cause-bodyless-304.md). Sprites carry s-maxage=10 + ETag,
+# so pointing an isolated Biei at this service turns the 1h natural
+# revalidation cycle into ~20s:
+#
+#   kubectl -n map-demo create configmap mock304-src \
+#     --from-file=server.py=demo-deploy/biei/diagnostics/mock304/server.py
+#   kubectl apply -f demo-deploy/biei/diagnostics/mock304/k8s.yaml
+#   # on the canary: BIEI_STYLE_TEMPLATES=http://mock304:8080/styles/{style_id}/style.json
+#   #                BIEI_MLN_RESOURCE_PRIVATE_HOSTS=mock304
+#
+# The mock's request log (If-None-Match + status per line) is the witness that
+# the revalidation path was exercised. Never route production traffic here.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: mock304, namespace: map-demo, labels: { app: mock304 } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: mock304 } }
+  template:
+    metadata: { labels: { app: mock304 } }
+    spec:
+      containers:
+        - name: mock
+          image: python:3.12-alpine
+          command: ["python", "/src/server.py"]
+          ports: [{ containerPort: 8080 }]
+          volumeMounts: [{ name: src, mountPath: /src }]
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 250m, memory: 128Mi }
+      volumes:
+        - name: src
+          configMap: { name: mock304-src }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: mock304, namespace: map-demo }
+spec:
+  selector: { app: mock304 }
+  ports: [{ port: 8080, targetPort: 8080 }]

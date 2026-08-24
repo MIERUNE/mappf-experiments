@@ -43,8 +43,8 @@ pub use metrics::gather_metrics;
 use metrics::usage_label;
 use metrics::{
     BodyInflightGuard, DeferredRefreshGuard, InflightGuard, RequestObservation,
-    UpstreamAttemptObservation, fs_metrics, kind_label, mark_metrics_started, outcome_label,
-    priority_label,
+    UpstreamAttemptObservation, fs_metrics, kind_label, mark_metrics_started, note_caller_thread,
+    outcome_label, priority_label,
 };
 use response::{
     CachePolicy, PriorResponse, RetryDirective, cache_policy_for_response,
@@ -63,7 +63,6 @@ use singleflight::{
     FLIGHT_SHARDS, Flight, FlightKey, FlightLeader, FlightMap, FlightRequestSemantics,
 };
 
-#[cfg(test)]
 use maplibre_native::file_source::Usage;
 
 use crate::http::{redacted_query_keys, redacted_url_str, reqwest_error_label};
@@ -396,7 +395,7 @@ impl NetworkFileSource {
             let expires = match resolve_fresh_cache_race(
                 &cached,
                 native_database_state,
-                inputs.priority == "low",
+                inputs.is_low_priority && inputs.is_online,
             ) {
                 FreshCacheResolution::Serve(response) => {
                     fs_metrics()
@@ -411,9 +410,9 @@ impl NetworkFileSource {
 
             fs_metrics()
                 .refresh_deferred_total
-                .with_label_values(&[inputs.kind, inputs.priority])
+                .with_label_values(&[inputs.kind])
                 .inc();
-            let _deferred = DeferredRefreshGuard::new(inputs.kind, inputs.priority);
+            let _deferred = DeferredRefreshGuard::new(inputs.kind);
             let deferral = refresh_deferral(expires, inputs.minimum_update_interval);
             // Measure the actual park rather than trusting `deferral.wait`: the
             // sleep can be cancelled or run long, and the reported duration must
@@ -918,9 +917,10 @@ fn not_modified_attempt(
     let not_modified = response_from_http(304, headers, Vec::new(), kind, prior);
     let Some(materialized) = materialize_not_modified(&not_modified, prior) else {
         return if prior.etag.is_some() || prior.modified.is_some() {
-            // NetworkOnly may carry only a validator. MLN already owns the
-            // representation associated with it, so preserve the bodyless 304
-            // instead of requiring Rust to materialize a cache entry.
+            // A validator without a prior body means native delivered the
+            // representation to its consumer and holds this request only for
+            // revalidation. A bodyless 304 is the correct answer there: the
+            // consumer treats `notModified` as "keep what you have".
             FetchAttempt::done(not_modified)
         } else {
             FetchAttempt::done(Response::error(
@@ -929,19 +929,34 @@ fn not_modified_attempt(
             ))
         };
     };
-    // maplibre_native 0.8.7 preserves notModified and all cache metadata
-    // across the bridge. MLN can therefore merge this bodyless response with
-    // priorData itself; only the process-wide Rust cache needs a materialized
-    // response.
-    FetchAttempt::done_with_cache_response(
-        not_modified,
-        cache_policy_for_response(storage_policy, headers),
-        materialized,
-    )
+    let cache_policy = cache_policy_for_response(storage_policy, headers);
+    if prior.native_data.is_some() {
+        // A prior body on the request means native withheld the representation
+        // for revalidation — the consumer does NOT have it. The stock
+        // OnlineFileSource merges `priorData` into the 304 before anyone
+        // downstream sees it (`online_file_source.cpp`:
+        // `if (response.notModified && resource.priorData)`), and
+        // glyph/sprite/tile consumers rely on that: they treat `notModified`
+        // as a no-op without completing their load. This source replaced that
+        // layer, so it must perform the same merge; returning the bodyless 304
+        // here parks the consumer's load forever.
+        return FetchAttempt::done_with_cache_response(
+            materialized.clone(),
+            cache_policy,
+            materialized,
+        );
+    }
+    // The body exists only in the process-wide Rust cache: native delivered
+    // its copy to the consumer already (a background refresh). A bodyless 304
+    // is the correct native answer — re-sending the body would make consumers
+    // re-parse an unchanged representation — while the Rust cache still takes
+    // the materialized entry to refresh its own metadata.
+    FetchAttempt::done_with_cache_response(not_modified, cache_policy, materialized)
 }
 
 impl TokioFileSource for NetworkFileSource {
     fn can_request(&self, request: &ResourceRequest) -> bool {
+        note_caller_thread();
         request.loading_methods.has_network()
             && url::Url::parse(&request.url)
                 .is_ok_and(|url| self.url_policy.permits_url_without_dns(&url))
@@ -1005,11 +1020,15 @@ struct SharedCacheRaceInputs {
     prior_data_present: bool,
     prior_metadata_present: bool,
     kind: &'static str,
-    /// mbgl demotes the paired background refresh to `Low` when Database delivered
-    /// a usable body. A request classified `Delivered` that is still `regular` was
-    /// therefore not demoted by that path — something is waiting on it — so this is
-    /// the label that shows whether a park is genuinely a background refresh.
-    priority: &'static str,
+    /// Typed rather than derived from the metrics label: policy must not depend on
+    /// the spelling of a monitoring string. An unexpected spelling would fail safe
+    /// (serve immediately), but the coupling is still wrong.
+    is_low_priority: bool,
+    /// `Low` alone does not mean "body already delivered". `offline_download.cpp`
+    /// also creates low-priority requests, and those are awaiting bytes. Biei only
+    /// renders online today, so that path is unreachable here — but this type is a
+    /// reusable library, and the condition costs nothing.
+    is_online: bool,
     minimum_update_interval: Duration,
 }
 
@@ -1023,7 +1042,8 @@ impl SharedCacheRaceInputs {
                 || request.prior_modified.is_some()
                 || request.prior_expires.is_some(),
             kind: kind_label(request.kind),
-            priority: priority_label(request.priority),
+            is_low_priority: request.priority == Priority::Low,
+            is_online: request.usage == Usage::Online,
             minimum_update_interval: request.minimum_update_interval,
         }
     }
@@ -1076,19 +1096,21 @@ fn native_database_state(
 fn resolve_fresh_cache_race(
     cached: &Response,
     native_database_state: NativeDatabaseState,
-    demoted_to_background: bool,
+    is_background_refresh: bool,
 ) -> FreshCacheResolution {
-    // Parking requires *both* signals to agree. `Delivered` is inferred from field
-    // presence, and mbgl demotes the paired request to `Low` on exactly the same
-    // branch that delivers the body, so a request that still carries `regular`
-    // priority was not produced by that branch — something is waiting on it.
+    // Parking requires every signal to agree. `Delivered` is inferred from field
+    // presence; mbgl demotes the paired request to `Low` on exactly the same branch
+    // that delivers the body, so a request still carrying `regular` priority was not
+    // produced by that branch and something is waiting on it. `Low` on its own is
+    // not sufficient either — `offline_download.cpp` sets it on requests that are
+    // awaiting bytes — so the caller also requires online usage.
     //
     // Fully cold processes never expose the difference: they hold nothing to
     // revalidate, so every `Delivered` classification there really is the
     // background refresh. A long-lived process revalidating aged entries is where
     // the two signals can disagree, and parking such a request stalls the render
     // behind it for up to `MAX_REFRESH_DEFERRAL`.
-    if native_database_state == NativeDatabaseState::Delivered && demoted_to_background {
+    if native_database_state == NativeDatabaseState::Delivered && is_background_refresh {
         return FreshCacheResolution::Defer(
             cached
                 .expires

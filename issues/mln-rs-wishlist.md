@@ -1,6 +1,6 @@
 # maplibre-native-rs wishlist
 
-This is biei's own wishlist of binding additions that would help us build static-image-API-compatible features on top of maplibre-native-rs. It's just notes from a downstream user, not a roadmap.
+This is biei's own wishlist of binding additions that would help us build biei's static render features on top of maplibre-native-rs. It's just notes from a downstream user, not a roadmap.
 
 We've tried to keep the requests general-purpose rather than biei-specific. biei handles its own application policy — URL grammar, body size and nesting depth, allowed layer types, resolving `source.url` as a tileset id, rejecting direct network URLs — so what's left here is mostly plain style / layer / source operations that happen to be hard to reach from Rust today.
 
@@ -110,3 +110,14 @@ What would fix it, in preference order:
 
 Until then, any claim about the Database -> Network sequence rests on reading
 `main_resource_loader.cpp` and on production observation, not on a regression test.
+
+## Test constructor for `ResourceRequest`
+
+`ResourceRequest` is `#[non_exhaustive]` and only constructible via
+`pub(super) fn from_ffi`, so a downstream `TokioFileSource` implementation
+cannot be driven end-to-end from its own tests. This hid a contract bug for us:
+our source failed to materialize 304s for natively withheld prior bodies
+(the `OnlineFileSource` merge), which permanently wedges still renders — and no
+test could cover the real request path. A `#[doc(hidden)]` builder or a
+`test-util`-feature constructor would let downstream sources test against real
+`ResourceRequest` values, including `prior_data`/`prior_etag` combinations.

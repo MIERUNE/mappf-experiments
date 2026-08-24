@@ -18,6 +18,7 @@ pub(crate) use protocol::{
 pub(crate) use supervisor::RendererActorSupervisor;
 #[cfg(test)]
 pub(crate) use supervisor::RendererHealth;
+pub(crate) use supervisor::ReplacementReason;
 
 #[cfg(test)]
 mod tests {

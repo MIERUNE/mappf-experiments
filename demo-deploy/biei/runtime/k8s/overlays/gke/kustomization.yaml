@@ -14,7 +14,7 @@ resources:
 images:
   - name: biei
     newName: asia-northeast1-docker.pkg.dev/mappf-experiment/biei/biei
-    digest: sha256:54f5d128b120fde9f4e58d005cac707627657c0c15391c814ee573d7212bd523
+    digest: sha256:b2bbcc3860fbd71936f3a7f15b0ebc1def474d65fd830800a592247c9985f716
 
 patches:
   - path: patch-deployment.yaml

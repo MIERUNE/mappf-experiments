@@ -24,6 +24,13 @@ struct RendererActorSupervisorInner {
     orphaned_threads: AtomicUsize,
     orphaned_by_worker: Mutex<HashMap<WorkerId, usize>>,
     replacements_succeeded: AtomicU64,
+    /// Split by cause. `renderer_replacements_total` alone cannot distinguish an
+    /// abandoned hard wedge from a thread that exited on its own, and those imply
+    /// different faults. Telling them apart currently requires grepping the log for
+    /// one specific sentence, which sent this investigation down the wrong
+    /// mechanism twice.
+    replacements_hard_wedge: AtomicU64,
+    replacements_thread_finished: AtomicU64,
     replacements_exhausted: AtomicU64,
     replacements_failed: AtomicU64,
     provider_health: mmpf_mln_filesource::ProviderHealthTracker,
@@ -52,6 +59,8 @@ pub(crate) struct RendererActorHealthSnapshot {
     pub available_slots: usize,
     pub orphaned_threads: usize,
     pub replacements_succeeded: u64,
+    pub replacements_hard_wedge: u64,
+    pub replacements_thread_finished: u64,
     pub replacements_exhausted: u64,
     pub replacements_failed: u64,
     pub health: RendererHealth,
@@ -82,6 +91,8 @@ impl RendererActorSupervisor {
                 orphaned_threads: AtomicUsize::new(0),
                 orphaned_by_worker: Mutex::new(HashMap::new()),
                 replacements_succeeded: AtomicU64::new(0),
+                replacements_hard_wedge: AtomicU64::new(0),
+                replacements_thread_finished: AtomicU64::new(0),
                 replacements_exhausted: AtomicU64::new(0),
                 replacements_failed: AtomicU64::new(0),
                 provider_health,
@@ -137,6 +148,11 @@ impl RendererActorSupervisor {
             available_slots: self.inner.available_slots.load(Ordering::Acquire),
             orphaned_threads: self.inner.orphaned_threads.load(Ordering::Acquire),
             replacements_succeeded: self.inner.replacements_succeeded.load(Ordering::Relaxed),
+            replacements_hard_wedge: self.inner.replacements_hard_wedge.load(Ordering::Relaxed),
+            replacements_thread_finished: self
+                .inner
+                .replacements_thread_finished
+                .load(Ordering::Relaxed),
             replacements_exhausted: self.inner.replacements_exhausted.load(Ordering::Relaxed),
             replacements_failed: self.inner.replacements_failed.load(Ordering::Relaxed),
             health: self.health(),
@@ -175,7 +191,12 @@ impl RendererActorSupervisor {
         self.inner.orphaned_threads.fetch_sub(1, Ordering::AcqRel);
     }
 
-    pub(crate) fn record_replacement_succeeded(&self) {
+    pub(crate) fn record_replacement_succeeded(&self, reason: ReplacementReason) {
+        match reason {
+            ReplacementReason::HardWedge => &self.inner.replacements_hard_wedge,
+            ReplacementReason::ThreadFinished => &self.inner.replacements_thread_finished,
+        }
+        .fetch_add(1, Ordering::Relaxed);
         self.inner
             .replacements_succeeded
             .fetch_add(1, Ordering::Relaxed);
@@ -203,6 +224,32 @@ impl RendererActorSupervisor {
             self.inner.available_slots.fetch_sub(1, Ordering::AcqRel);
         }
         *available = next;
+    }
+}
+
+/// Why a renderer actor was replaced.
+///
+/// Recorded because the two paths have completely different meanings and today
+/// they are indistinguishable in metrics: telling them apart required grepping the
+/// log for one specific sentence. During this investigation that ambiguity sent me
+/// down the wrong mechanism twice — a hard-wedge retirement and a thread that
+/// simply exited look identical in `renderer_replacements_total`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplacementReason {
+    /// The native render passed the hard-wedge deadline, so the actor was
+    /// abandoned while its call kept running. Produces an orphan thread.
+    HardWedge,
+    /// The actor's thread had already exited, so a live slot needed a new one. No
+    /// orphan: there is nothing left running.
+    ThreadFinished,
+}
+
+impl ReplacementReason {
+    pub(crate) fn as_label(self) -> &'static str {
+        match self {
+            Self::HardWedge => "hard_wedge",
+            Self::ThreadFinished => "thread_finished",
+        }
     }
 }
 

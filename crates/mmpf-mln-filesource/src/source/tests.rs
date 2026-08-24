@@ -209,6 +209,42 @@ fn singleflight_does_not_mix_network_only_and_cache_revalidation() {
 }
 
 #[test]
+fn a_withheld_body_request_never_shares_a_flight_with_a_bodyless_refresh() {
+    // Waiters receive the leader's response verbatim. A request whose native
+    // side withheld the body needs a materialized 304 (its consumer holds
+    // nothing), while a background refresh must stay bodyless. Sharing one
+    // flight across that difference would hand one of them the wrong shape —
+    // the wedge only ever reproduced under concurrency because of exactly this
+    // coincidence — so `has_prior_data` must partition the flight key.
+    let resource = Arc::new(ResourceRequestKey::test_key(
+        "https://resource.test/tile",
+        ResourceKind::Tile,
+    ));
+    let withheld_body = FlightKey {
+        resource: resource.clone(),
+        persistent: true,
+        priority: "regular",
+        semantics: FlightRequestSemantics {
+            has_prior_data: true,
+            prior_etag: Some("\"v1\"".to_string()),
+            ..FlightRequestSemantics::default()
+        },
+    };
+    let bodyless_refresh = FlightKey {
+        resource,
+        persistent: true,
+        priority: "regular",
+        semantics: FlightRequestSemantics {
+            has_prior_data: false,
+            prior_etag: Some("\"v1\"".to_string()),
+            ..FlightRequestSemantics::default()
+        },
+    };
+
+    assert_ne!(withheld_body, bodyless_refresh);
+}
+
+#[test]
 fn singleflight_does_not_mix_different_validators() {
     let resource = Arc::new(ResourceRequestKey::test_key(
         "https://resource.test/tile",
@@ -336,13 +372,46 @@ fn validator_only_not_modified_stays_bodyless() {
 }
 
 #[test]
-fn not_modified_with_prior_body_stays_bodyless_for_native() {
+fn a_304_for_a_withheld_prior_body_reaches_native_with_that_body() {
+    // A prior body on the request means native withheld the representation for
+    // revalidation, so its consumer (glyph/sprite/tile loader) has nothing and
+    // treats `notModified` as a no-op without completing the load. The stock
+    // OnlineFileSource merges `priorData` into the 304 before consumers see
+    // it; this source replaced that layer and must do the same, or the load —
+    // and any still render behind it — waits forever.
     let attempt = not_modified_attempt(
         ResourceKind::Tile,
         maplibre_native::file_source::StoragePolicy::Permanent,
         &HeaderMap::new(),
         PriorResponse {
-            data: Some(b"cached"),
+            native_data: Some(b"cached"),
+            etag: Some("\"v1\""),
+            ..PriorResponse::default()
+        },
+    );
+
+    assert!(!attempt.response.not_modified);
+    assert_eq!(attempt.response.data.as_deref(), Some(b"cached".as_slice()));
+    let cached = attempt
+        .cache_response
+        .expect("Rust cache receives materialized response");
+    assert!(!cached.not_modified);
+    assert_eq!(cached.data.as_deref(), Some(b"cached".as_slice()));
+}
+
+#[test]
+fn a_304_backed_only_by_the_shared_cache_stays_bodyless_for_native() {
+    // No native prior body means native delivered the representation to its
+    // consumer and holds this request only as a background refresh. Re-sending
+    // the body would make sprite/tile consumers re-parse an unchanged
+    // representation; only the process-wide Rust cache takes the materialized
+    // entry.
+    let attempt = not_modified_attempt(
+        ResourceKind::Tile,
+        maplibre_native::file_source::StoragePolicy::Permanent,
+        &HeaderMap::new(),
+        PriorResponse {
+            cache_data: Some(b"cached"),
             etag: Some("\"v1\""),
             ..PriorResponse::default()
         },
@@ -576,7 +645,7 @@ fn not_modified_response_retains_required_revalidation() {
         Vec::new(),
         ResourceKind::Tile,
         PriorResponse {
-            data: Some(b"cached"),
+            cache_data: Some(b"cached"),
             expires: Some(SystemTime::UNIX_EPOCH),
             must_revalidate: true,
             ..PriorResponse::default()
@@ -597,7 +666,7 @@ fn not_modified_response_gets_a_bounded_freshness_window() {
         Vec::new(),
         ResourceKind::Tile,
         PriorResponse {
-            data: Some(b"cached"),
+            cache_data: Some(b"cached"),
             expires: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
             ..PriorResponse::default()
         },
@@ -861,7 +930,7 @@ fn maps_special_statuses() {
         Vec::new(),
         ResourceKind::Tile,
         PriorResponse {
-            data: Some(b"cached"),
+            cache_data: Some(b"cached"),
             etag: Some("\"old\""),
             ..PriorResponse::default()
         },
@@ -873,7 +942,7 @@ fn maps_special_statuses() {
     let materialized = materialize_not_modified(
         &not_modified,
         PriorResponse {
-            data: Some(b"cached"),
+            cache_data: Some(b"cached"),
             ..PriorResponse::default()
         },
     )
@@ -1149,14 +1218,7 @@ fn credentialed_redirect_chain_cannot_change_origin() {
 #[tokio::test(start_paused = true)]
 async fn a_peer_cache_fill_is_served_to_every_requester_still_awaiting_bytes() {
     fn inputs(prior_data_present: bool, prior_metadata_present: bool) -> SharedCacheRaceInputs {
-        SharedCacheRaceInputs {
-            consults_shared_cache: true,
-            prior_data_present,
-            prior_metadata_present,
-            kind: "glyphs",
-            priority: "low",
-            minimum_update_interval: Duration::from_secs(0),
-        }
+        background_inputs(prior_data_present, prior_metadata_present, true)
     }
 
     // (label, prior_data, prior_metadata) as MainResourceLoader would set them.
@@ -1265,4 +1327,123 @@ fn a_regular_priority_request_is_never_parked_even_when_classified_delivered() {
         FreshCacheResolution::Defer(observed) => assert_eq!(observed, expires),
         FreshCacheResolution::Serve(_) => panic!("the demoted refresh may still park"),
     }
+}
+
+/// Inputs as the production call site builds them, with the background-refresh
+/// signal under test control.
+fn background_inputs(
+    prior_data_present: bool,
+    prior_metadata_present: bool,
+    is_background_refresh: bool,
+) -> SharedCacheRaceInputs {
+    SharedCacheRaceInputs {
+        consults_shared_cache: true,
+        prior_data_present,
+        prior_metadata_present,
+        kind: "glyphs",
+        is_low_priority: is_background_refresh,
+        is_online: true,
+        minimum_update_interval: Duration::from_secs(0),
+    }
+}
+
+/// Pins the *production wiring*, not just the decision function.
+///
+/// The pure-function test would stay green if the call site were changed to pass
+/// `true` unconditionally, which is exactly the regression that reintroduces the
+/// stall. Driving `resolve_shared_cache_race` with regular priority proves the
+/// real path forwards the background-refresh signal.
+///
+/// Paused time makes the assertion sharp: a park would sleep until expiry, so
+/// returning at all means no park happened.
+#[tokio::test(start_paused = true)]
+async fn the_call_site_forwards_the_background_refresh_signal() {
+    let cache = cache::ResourceCache::new(1024 * 1024);
+    let source = NetworkFileSource::new(
+        cache.clone(),
+        vec!["resource.test".to_string()],
+        FileSourceIoPermits::default(),
+        ProviderHealthTracker::default(),
+        "test-agent",
+    )
+    .expect("file source builds");
+    let key = Arc::new(ResourceRequestKey::test_key(
+        "https://resource.test/glyphs",
+        ResourceKind::Glyphs,
+    ));
+    assert!(
+        cache.store(
+            key.clone(),
+            Response::data(b"cached".to_vec())
+                .with_expires(SystemTime::now() + Duration::from_hours(24)),
+        )
+    );
+
+    // Classified `Delivered` (metadata, no prior body) but *not* demoted to
+    // background: something is waiting on it.
+    let mut observation = RequestObservation::for_test("glyphs");
+    let response = source
+        .resolve_shared_cache_race(
+            &key,
+            background_inputs(false, true, false),
+            &mut observation,
+        )
+        .await
+        .expect("a request awaiting bytes must resolve immediately");
+    assert_eq!(
+        response.data.as_deref(),
+        Some(b"cached".as_slice()),
+        "a regular-priority request must receive the body, not a park"
+    );
+
+    // The genuine background refresh still parks, so the gate is not simply off.
+    let mut observation = RequestObservation::for_test("glyphs");
+    let parked = source
+        .resolve_shared_cache_race(&key, background_inputs(false, true, true), &mut observation)
+        .await
+        .expect("the demoted refresh resolves after parking");
+    assert!(
+        parked.not_modified,
+        "the background refresh still revalidates rather than re-delivering"
+    );
+}
+
+/// `Low` alone does not mean "body already delivered": `offline_download.cpp` sets
+/// low priority on requests that are still awaiting bytes. Biei renders online
+/// today so that path is unreachable here, but this type is a reusable library.
+#[tokio::test(start_paused = true)]
+async fn offline_usage_is_never_parked_even_at_low_priority() {
+    let cache = cache::ResourceCache::new(1024 * 1024);
+    let source = NetworkFileSource::new(
+        cache.clone(),
+        vec!["resource.test".to_string()],
+        FileSourceIoPermits::default(),
+        ProviderHealthTracker::default(),
+        "test-agent",
+    )
+    .expect("file source builds");
+    let key = Arc::new(ResourceRequestKey::test_key(
+        "https://resource.test/glyphs",
+        ResourceKind::Glyphs,
+    ));
+    assert!(
+        cache.store(
+            key.clone(),
+            Response::data(b"cached".to_vec())
+                .with_expires(SystemTime::now() + Duration::from_hours(24)),
+        )
+    );
+
+    let mut offline = background_inputs(false, true, true);
+    offline.is_online = false;
+    let mut observation = RequestObservation::for_test("glyphs");
+    let response = source
+        .resolve_shared_cache_race(&key, offline, &mut observation)
+        .await
+        .expect("offline low-priority work must resolve immediately");
+    assert_eq!(
+        response.data.as_deref(),
+        Some(b"cached".as_slice()),
+        "an offline download awaiting bytes must not be parked"
+    );
 }

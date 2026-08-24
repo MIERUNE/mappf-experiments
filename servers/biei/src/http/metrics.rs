@@ -4,6 +4,7 @@
 //! server-only runtime state, constructs its gauge families, and composes both
 //! sets into the Prometheus response.
 
+use crate::renderer::actor::ReplacementReason;
 use biei_core::gossip::GossipBus;
 use biei_core::metrics::NodeMetrics;
 use mmpf_common::metrics::{counter_vec, encode_metric_families, gauge_vec, register_collectors};
@@ -34,6 +35,11 @@ struct RuntimeGauges {
     renderer_replacements_succeeded: u64,
     renderer_replacements_exhausted: u64,
     renderer_replacements_failed: u64,
+    /// Successful replacements split by cause. `outcome` says whether a
+    /// replacement worked; these say *why one was needed*, which is the part that
+    /// distinguishes an abandoned hard wedge from a thread that exited by itself.
+    renderer_replacements_hard_wedge: u64,
+    renderer_replacements_thread_finished: u64,
 }
 
 #[derive(Serialize)]
@@ -290,6 +296,8 @@ impl HttpMetrics {
             renderer_replacements_succeeded: renderer.replacements_succeeded,
             renderer_replacements_exhausted: renderer.replacements_exhausted,
             renderer_replacements_failed: renderer.replacements_failed,
+            renderer_replacements_hard_wedge: renderer.replacements_hard_wedge,
+            renderer_replacements_thread_finished: renderer.replacements_thread_finished,
         };
         // The scrape reads the tally before this request's own increment (the
         // middleware records after the response), so a `/metrics` scrape never
@@ -422,6 +430,11 @@ fn runtime_metric_families(runtime: &RuntimeGauges) -> Vec<MetricFamily> {
         "Renderer actor replacement attempts by outcome.",
         &["node", "outcome"],
     );
+    let renderer_replacement_reasons = counter_vec(
+        "biei_renderer_replacement_reasons_total",
+        "Why a renderer actor replacement was needed. `outcome` reports whether the replacement worked; this reports the fault that required one, which the outcome cannot distinguish.",
+        &["node", "reason"],
+    );
 
     register_collectors(
         &registry,
@@ -435,6 +448,7 @@ fn runtime_metric_families(runtime: &RuntimeGauges) -> Vec<MetricFamily> {
             Box::new(renderer_orphaned.clone()),
             Box::new(renderer_health.clone()),
             Box::new(renderer_replacements.clone()),
+            Box::new(renderer_replacement_reasons.clone()),
         ],
         "register biei metric",
     );
@@ -477,6 +491,22 @@ fn runtime_metric_families(runtime: &RuntimeGauges) -> Vec<MetricFamily> {
     ] {
         renderer_replacements
             .with_label_values(&[node, outcome])
+            .inc_by(value);
+    }
+    // Labels come from `ReplacementReason` rather than literals, so a new variant
+    // cannot be added without a label to publish it under.
+    for (reason, value) in [
+        (
+            ReplacementReason::HardWedge,
+            runtime.renderer_replacements_hard_wedge,
+        ),
+        (
+            ReplacementReason::ThreadFinished,
+            runtime.renderer_replacements_thread_finished,
+        ),
+    ] {
+        renderer_replacement_reasons
+            .with_label_values(&[node, reason.as_label()])
             .inc_by(value);
     }
 
@@ -522,6 +552,8 @@ mod tests {
             renderer_replacements_succeeded: 11,
             renderer_replacements_exhausted: 12,
             renderer_replacements_failed: 13,
+            renderer_replacements_hard_wedge: 7,
+            renderer_replacements_thread_finished: 5,
         };
 
         let rendered =
@@ -544,6 +576,8 @@ mod tests {
             "biei_renderer_replacements_total{node=\"node-a\",outcome=\"success\"} 11",
             "biei_renderer_replacements_total{node=\"node-a\",outcome=\"exhausted\"} 12",
             "biei_renderer_replacements_total{node=\"node-a\",outcome=\"spawn_failed\"} 13",
+            "biei_renderer_replacement_reasons_total{node=\"node-a\",reason=\"hard_wedge\"} 7",
+            "biei_renderer_replacement_reasons_total{node=\"node-a\",reason=\"thread_finished\"} 5",
             "# TYPE biei_tasks_completed_total counter",
         ] {
             assert!(

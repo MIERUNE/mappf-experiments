@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::time::Instant;
@@ -67,6 +67,32 @@ enum StageFailure {
     PermitClosed {
         at: DeadlineStage,
     },
+}
+
+// The hard-wedge timeout cancels `run_stages` from outside, so the failure it
+// synthesizes cannot know where the future was parked. `run_stages` publishes
+// the last stage it entered through an `AtomicU8`; the timeout arm reads it
+// back. Stores happen before each await (Release) and the reader uses Acquire,
+// which is exact enough for a snapshot that is only consumed after the future
+// stopped being polled.
+const fn stage_code(stage: DeadlineStage) -> u8 {
+    match stage {
+        DeadlineStage::AcquireRenderPermit => 0,
+        DeadlineStage::StyleSwap => 1,
+        DeadlineStage::EnsureSource => 2,
+        DeadlineStage::AcquireNativeRenderPermit => 3,
+        DeadlineStage::Render => 4,
+    }
+}
+
+fn stage_from_code(code: u8) -> DeadlineStage {
+    match code {
+        0 => DeadlineStage::AcquireRenderPermit,
+        1 => DeadlineStage::StyleSwap,
+        2 => DeadlineStage::EnsureSource,
+        3 => DeadlineStage::AcquireNativeRenderPermit,
+        _ => DeadlineStage::Render,
+    }
 }
 
 struct StageSuccess {
@@ -200,6 +226,7 @@ pub(crate) async fn worker_loop(
                 let hard_wedge_deadline = hard_wedge_deadline(&task);
                 let response_timeout = response_timeout_outcome(&task);
                 let mut respond_to = Some(respond_to);
+                let stage_progress = AtomicU8::new(stage_code(DeadlineStage::AcquireRenderPermit));
                 let mut stages = Box::pin(run_stages(
                     &mut renderer,
                     &mut current_profile,
@@ -208,6 +235,7 @@ pub(crate) async fn worker_loop(
                     native_render_permits.clone(),
                     &mut task,
                     prepared_profile,
+                    &stage_progress,
                 ));
                 let mut response_deadline_elapsed = false;
                 let stage_result = tokio::select! {
@@ -227,7 +255,7 @@ pub(crate) async fn worker_loop(
                         match tokio::time::timeout_at(hard_wedge_deadline, &mut stages).await {
                             Ok(result) => result,
                             Err(_) => Err(StageFailure::RendererError {
-                                at: DeadlineStage::Render,
+                                at: stage_from_code(stage_progress.load(Ordering::Acquire)),
                                 err: RendererError::Timeout,
                             }),
                         }
@@ -250,8 +278,15 @@ pub(crate) async fn worker_loop(
                         deadline_rejected_outcome(&task, had_source, at)
                     }
                     Err(StageFailure::RendererError { at, err }) => {
-                        let _ = at;
                         if matches!(err, RendererError::Timeout) {
+                            tracing::error!(
+                                worker_id = id,
+                                stage = crate::metrics::deadline_stage_label(at),
+                                task_id = task.id,
+                                request_id = %task.request_id,
+                                style_id = task.style.id.as_str(),
+                                "hard-wedge deadline elapsed; stage is the last stage entered"
+                            );
                             // Queue accounting is finalized immediately after
                             // this branch. Hide the slot first so it cannot look
                             // like an idle fresh worker before repair completes.
@@ -340,6 +375,7 @@ fn renderer_error_invalidates_warm_state(err: &RendererError) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_stages(
     renderer: &mut BoxRenderer,
     current_profile: &mut Option<(WorkerProfile, Option<CredentialCachePartition>)>,
@@ -348,6 +384,7 @@ async fn run_stages(
     native_render_permits: Arc<Semaphore>,
     task: &mut InternalTask,
     prepared_profile: Option<PreparedProfile>,
+    stage_progress: &AtomicU8,
 ) -> Result<StageSuccess, StageFailure> {
     let task_profile = task.worker_profile();
     let task_authorization_partition = task
@@ -362,11 +399,16 @@ async fn run_stages(
         .as_ref()
         .and_then(|prepared| prepared.addlayer_source.clone());
 
+    stage_progress.store(
+        stage_code(DeadlineStage::AcquireRenderPermit),
+        Ordering::Release,
+    );
     let permit = acquire_permit(render_permits, task, DeadlineStage::AcquireRenderPermit).await?;
     let started_at = Instant::now();
     let mut style_setup_duration = None;
 
     if style_swap {
+        stage_progress.store(stage_code(DeadlineStage::StyleSwap), Ordering::Release);
         check_deadline_at(task, DeadlineStage::StyleSwap)?;
         let setup_started_at = Instant::now();
         renderer
@@ -381,6 +423,7 @@ async fn run_stages(
         cache.clear();
     }
 
+    stage_progress.store(stage_code(DeadlineStage::EnsureSource), Ordering::Release);
     check_deadline_at(task, DeadlineStage::EnsureSource)?;
     let mut source_loaded = false;
     let mut source_setup_duration = None;
@@ -403,6 +446,10 @@ async fn run_stages(
         }
     }
 
+    stage_progress.store(
+        stage_code(DeadlineStage::AcquireNativeRenderPermit),
+        Ordering::Release,
+    );
     let native_render_permit = acquire_permit(
         native_render_permits,
         task,
@@ -411,6 +458,7 @@ async fn run_stages(
     .await?;
     let native_render_started_at = Instant::now();
 
+    stage_progress.store(stage_code(DeadlineStage::Render), Ordering::Release);
     check_deadline_at(task, DeadlineStage::Render)?;
     if let Some(source) = prepared_addlayer_source
         && let RenderRequest::StaticImage {

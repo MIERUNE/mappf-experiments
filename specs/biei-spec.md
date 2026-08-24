@@ -411,6 +411,8 @@ Database behavior:
 
 Resource metrics distinguish FileSource lifecycle time, admission wait, actual upstream HTTP attempt count/latency, fresh-cache insertion races, deferred background refreshes, bytes, in-flight work, the current deferred-refresh sleeper count, single-flight roles, and Database hit/miss/revalidate/bypass operations. Kind, priority, usage, and outcome labels are bounded enums.
 
+MapLibre Native dispatches every resource request through the `MainResourceLoader` that `FileSourceManager` resolves for a renderer's `ResourceOptions`, and each loader owns one thread. Renderers sharing `ResourceOptions` therefore share a single dispatch thread. `mmpf_mln_resource_caller_threads` reports how many distinct threads have reached the source, so that topology stays measured rather than inferred from an engine checkout that the deployed prebuilt core need not match.
+
 `maplibre_native` 0.8.7 preserves all FileSource response fields across the C++ bridge. The direct Rust cache remains part of the design because it provides process-wide memory bounds and revalidation control, not because of a bridge limitation.
 
 #### FileSource performance regression protocol
@@ -422,6 +424,8 @@ Replacing both native leaves is a deliberate optimization boundary and must be t
 - `mmpf_mln_resource_upstream_attempts_total` and upstream-attempt latency;
 - admission wait, single-flight leader/waiter ratio, cache-insertion races, and deferred refreshes;
 - actor timeout, replacement, orphan, and renderer-availability metrics.
+
+Every comparison must also include an aged-cache pass: let entries carrying `s-maxage`/`must-revalidate` expire (or stage a short-`s-maxage` fixture), then drive style-swap load so revalidation runs with natively withheld bodies. A 304 for a withheld prior body must reach the renderer materialized; a bodyless 304 there parks the consumer's load and wedges the still render permanently (see `issues/wedge-root-cause-bodyless-304.md`). Cold and warm passes alone cannot exercise this path.
 
 An unexpired Database hit must not cause an immediate upstream HTTP attempt or return a second copy of the body when the renderer already owns one. A cache-insertion race must still supply a body immediately to a renderer whose own Database lookup missed. A cold burst must coalesce identical requests, must not consume network timeout while waiting for admission, and must not degrade all renderer slots. Resource kind, URL range, and tile identity must be part of the cache key; volatile resources and `no-store`/`private` responses must not enter the shared positive cache.
 

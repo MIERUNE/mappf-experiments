@@ -590,7 +590,7 @@ const DEADLINE_STAGES: [DeadlineStage; 5] = [
     DeadlineStage::Render,
 ];
 
-fn deadline_stage_label(stage: DeadlineStage) -> &'static str {
+pub(crate) fn deadline_stage_label(stage: DeadlineStage) -> &'static str {
     match stage {
         DeadlineStage::AcquireRenderPermit => "acquire_render_permit",
         DeadlineStage::StyleSwap => "style_swap",

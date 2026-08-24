@@ -26,7 +26,7 @@ async fn run() -> anyhow::Result<()> {
                 auth_root,
                 state_root,
                 journal_root,
-                style_catalog,
+                style_object_layout,
                 style_refresh_endpoints,
                 operational_status_endpoints,
             } = *args;
@@ -45,14 +45,9 @@ async fn run() -> anyhow::Result<()> {
                 );
                 None
             };
-            let publishing = match (state_root, journal_root, style_catalog) {
-                (Some(state_root), Some(journal_root), Some(catalog_url)) => {
+            let publishing = match (state_root, journal_root) {
+                (Some(state_root), Some(journal_root)) => {
                     ensure!(auth.is_some(), "style publication requires --auth-root");
-                    let catalog = abashiri_core::catalog::StyleCatalog::from_url(
-                        &catalog_url,
-                        options.clone(),
-                    )
-                    .await?;
                     let publisher = abashiri_core::style::StylePublisher::from_urls(
                         &state_root,
                         &journal_root,
@@ -64,13 +59,16 @@ async fn run() -> anyhow::Result<()> {
                     tracing::info!(
                         %state_root,
                         %journal_root,
-                        %catalog_url,
-                        styles = catalog.len(),
-                        "Abashiri style publication enabled"
+                        layout = ?style_object_layout,
+                        "Abashiri resource publication enabled"
                     );
-                    Some(server::StylePublishing::new(catalog, publisher, notifier)?)
+                    Some(server::StylePublishing::new(
+                        publisher,
+                        notifier,
+                        style_object_layout.into(),
+                    )?)
                 }
-                (None, None, None) => {
+                (None, None) => {
                     ensure!(
                         style_refresh_endpoints.is_empty(),
                         "style refresh endpoints require style publication"
@@ -78,9 +76,7 @@ async fn run() -> anyhow::Result<()> {
                     None
                 }
                 _ => {
-                    anyhow::bail!(
-                        "--state-root, --journal-root, and --style-catalog must be configured together"
-                    )
+                    anyhow::bail!("--state-root and --journal-root must be configured together")
                 }
             };
             let operations = if operational_status_endpoints.is_empty() {

@@ -1,7 +1,7 @@
 //! Object-storage-backed authentication for the Abashiri management plane.
 //!
 //! This registry is intentionally distinct from `mmpf-auth`: a management
-//! credential authorizes account-scoped publishing actions and is never a
+//! credential authorizes namespace-scoped publishing actions and is never a
 //! Biei or Ishikari delivery credential. Requests authenticate from one
 //! validated in-memory snapshot; object storage is consulted only on cold load
 //! or after the bounded refresh interval.
@@ -26,7 +26,7 @@ const CURRENT_OBJECT: &str = "current.json";
 const SCHEMA_VERSION: u32 = 1;
 const MAX_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_CREDENTIALS: usize = 10_000;
-const MAX_ACCOUNTS_PER_CREDENTIAL: usize = 256;
+const MAX_NAMESPACES_PER_CREDENTIAL: usize = 256;
 const MIN_CREDENTIAL_BYTES: usize = 32;
 const MAX_CREDENTIAL_BYTES: usize = 4_096;
 const REFRESH_INTERVAL: Duration = Duration::from_mins(1);
@@ -42,6 +42,10 @@ pub enum ManagementAction {
     StyleRead,
     #[serde(rename = "style.publish")]
     StylePublish,
+    #[serde(rename = "tileset.read")]
+    TilesetRead,
+    #[serde(rename = "tileset.publish")]
+    TilesetPublish,
 }
 
 impl ManagementAction {
@@ -50,6 +54,8 @@ impl ManagementAction {
             Self::OperationsRead => "operations.read",
             Self::StyleRead => "style.read",
             Self::StylePublish => "style.publish",
+            Self::TilesetRead => "tileset.read",
+            Self::TilesetPublish => "tileset.publish",
         }
     }
 }
@@ -58,7 +64,7 @@ impl ManagementAction {
 #[derive(Clone, Debug)]
 pub struct AuthenticatedManagement {
     actor: Actor,
-    accounts: Arc<[AccountId]>,
+    namespaces: Arc<[AccountId]>,
     actions: Arc<[ManagementAction]>,
     registry_revision: u64,
 }
@@ -68,8 +74,8 @@ impl AuthenticatedManagement {
         &self.actor
     }
 
-    pub fn accounts(&self) -> &[AccountId] {
-        &self.accounts
+    pub fn namespaces(&self) -> &[AccountId] {
+        &self.namespaces
     }
 
     pub fn actions(&self) -> &[ManagementAction] {
@@ -82,21 +88,21 @@ impl AuthenticatedManagement {
 
     pub fn authorize(
         &self,
-        account: &AccountId,
+        namespace: &AccountId,
         action: ManagementAction,
     ) -> Result<(), ManagementAuthFailure> {
-        let account_allowed = self
-            .accounts
-            .binary_search_by(|candidate| candidate.as_str().cmp(account.as_str()))
+        let namespace_allowed = self
+            .namespaces
+            .binary_search_by(|candidate| candidate.as_str().cmp(namespace.as_str()))
             .is_ok();
-        if account_allowed && self.authorize_action(action).is_ok() {
+        if namespace_allowed && self.authorize_action(action).is_ok() {
             Ok(())
         } else {
             Err(ManagementAuthFailure::Forbidden)
         }
     }
 
-    /// Authorizes an action whose resource is not account-scoped.
+    /// Authorizes an action whose resource is not namespace-scoped.
     pub fn authorize_action(&self, action: ManagementAction) -> Result<(), ManagementAuthFailure> {
         if self.actions.binary_search(&action).is_ok() {
             Ok(())
@@ -189,7 +195,7 @@ impl ObjectStoreManagementAuth {
             .ok_or(ManagementAuthFailure::InvalidCredential)?;
         Ok(AuthenticatedManagement {
             actor: grant.actor.clone(),
-            accounts: Arc::clone(&grant.accounts),
+            namespaces: Arc::clone(&grant.namespaces),
             actions: Arc::clone(&grant.actions),
             registry_revision: snapshot.revision,
         })
@@ -313,7 +319,8 @@ struct CredentialGrantWire {
     credential_sha256: String,
     enabled: bool,
     actor: ActorWire,
-    accounts: Vec<String>,
+    #[serde(alias = "accounts")]
+    namespaces: Vec<String>,
     actions: Vec<ManagementAction>,
 }
 
@@ -333,7 +340,7 @@ struct RegistrySnapshot {
 struct CredentialGrant {
     enabled: bool,
     actor: Actor,
-    accounts: Arc<[AccountId]>,
+    namespaces: Arc<[AccountId]>,
     actions: Arc<[ManagementAction]>,
 }
 
@@ -366,16 +373,16 @@ impl RegistrySnapshot {
                 "management credential actions must not be empty"
             );
             ensure!(
-                grant.accounts.len() <= MAX_ACCOUNTS_PER_CREDENTIAL,
-                "management credential accounts must be bounded"
+                grant.namespaces.len() <= MAX_NAMESPACES_PER_CREDENTIAL,
+                "management credential namespaces must be bounded"
             );
-            let requires_account = grant
+            let requires_namespace = grant
                 .actions
                 .iter()
                 .any(|action| !matches!(action, ManagementAction::OperationsRead));
             ensure!(
-                !requires_account || !grant.accounts.is_empty(),
-                "account-scoped management actions require at least one account"
+                !requires_namespace || !grant.namespaces.is_empty(),
+                "namespace-scoped management actions require at least one namespace"
             );
             ensure!(
                 grant.actor.kind == ActorKind::Workload,
@@ -384,14 +391,14 @@ impl RegistrySnapshot {
 
             let actor = Actor::try_new(grant.actor.kind, grant.actor.issuer, grant.actor.subject)
                 .context("validate management actor")?;
-            let mut accounts = grant
-                .accounts
+            let mut namespaces = grant
+                .namespaces
                 .into_iter()
                 .map(AccountId::try_new)
                 .collect::<Result<Vec<_>, _>>()
-                .context("validate management account grant")?;
-            accounts.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
-            accounts.dedup();
+                .context("validate management namespace grant")?;
+            namespaces.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+            namespaces.dedup();
             let mut actions = grant.actions;
             actions.sort_unstable();
             actions.dedup();
@@ -400,7 +407,7 @@ impl RegistrySnapshot {
                 CredentialGrant {
                     enabled: grant.enabled,
                     actor,
-                    accounts: accounts.into(),
+                    namespaces: namespaces.into(),
                     actions: actions.into(),
                 },
             );
@@ -545,7 +552,7 @@ mod tests {
         assert_eq!(principal.actor().subject(), "publisher");
         assert_eq!(
             principal
-                .accounts()
+                .namespaces()
                 .iter()
                 .map(AccountId::as_str)
                 .collect::<Vec<_>>(),
@@ -661,7 +668,7 @@ mod tests {
                     "issuer": "test",
                     "subject": "person"
                 },
-                "accounts": ["example"],
+                "namespaces": ["example"],
                 "actions": ["style.publish"]
             }]
         });
@@ -672,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn global_operations_action_does_not_require_a_fake_account() {
+    fn global_operations_action_does_not_require_a_fake_namespace() {
         let body = json!({
             "schema_version": 1,
             "revision": 1,
@@ -684,20 +691,20 @@ mod tests {
                     "issuer": "test",
                     "subject": "observer"
                 },
-                "accounts": [],
+                "namespaces": [],
                 "actions": ["operations.read"]
             }]
         });
         assert!(RegistrySnapshot::parse(&serde_json::to_vec(&body).unwrap()).is_ok());
 
-        let mut account_scoped = body;
-        account_scoped["credentials"][0]["actions"] = json!(["style.read"]);
+        let mut namespace_scoped = body;
+        namespace_scoped["credentials"][0]["actions"] = json!(["style.read"]);
         assert!(
-            RegistrySnapshot::parse(&serde_json::to_vec(&account_scoped).unwrap())
+            RegistrySnapshot::parse(&serde_json::to_vec(&namespace_scoped).unwrap())
                 .err()
                 .unwrap()
                 .to_string()
-                .contains("require at least one account")
+                .contains("require at least one namespace")
         );
     }
 

@@ -1,0 +1,55 @@
+name: MMPF Console CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/mmpf-console/**"
+      - ".github/workflows/console-ci.yml"
+  pull_request:
+    paths:
+      - "apps/mmpf-console/**"
+      - ".github/workflows/console-ci.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/mmpf-console
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/mmpf-console/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Validate runtime configuration entrypoint
+        env:
+          MMPF_CONSOLE_API_BASE_URL: https://abashiri.example.test/api
+          MMPF_CONSOLE_POLL_INTERVAL_MS: "7000"
+          MMPF_CONSOLE_STYLE_PREVIEW_BASE_URL: https://biei.example.test
+          MMPF_CONSOLE_TILESET_PREVIEW_BASE_URL: https://ishikari.example.test
+        run: |
+          MMPF_CONSOLE_CONFIG_PATH="$RUNNER_TEMP/console-config.json" sh docker-entrypoint.d/40-console-config.sh
+          node -e 'const c=require(process.env.RUNNER_TEMP + "/console-config.json"); if(c.apiBaseUrl!==process.env.MMPF_CONSOLE_API_BASE_URL || c.pollIntervalMs!==7000 || c.stylePreviewBaseUrl!==process.env.MMPF_CONSOLE_STYLE_PREVIEW_BASE_URL || c.tilesetPreviewBaseUrl!==process.env.MMPF_CONSOLE_TILESET_PREVIEW_BASE_URL) process.exit(1)'
+      - name: Check types and Svelte components
+        run: npm run check
+      - name: Test
+        run: npm test
+      - name: Build
+        run: npm run build
+      - name: Audit dependencies
+        run: npm audit --audit-level=high

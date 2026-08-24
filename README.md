@@ -1,6 +1,6 @@
 # Map Platform Experiments
 
-[![Ishikari CI](https://github.com/MIERUNE/mappf-experiments/actions/workflows/ishikari-ci.yml/badge.svg)](https://github.com/MIERUNE/mappf-experiments/actions/workflows/ishikari-ci.yml) [![Biei CI](https://github.com/MIERUNE/mappf-experiments/actions/workflows/biei-ci.yml/badge.svg)](https://github.com/MIERUNE/mappf-experiments/actions/workflows/biei-ci.yml) [![Abashiri CI](https://github.com/MIERUNE/mappf-experiments/actions/workflows/abashiri-ci.yml/badge.svg)](https://github.com/MIERUNE/mappf-experiments/actions/workflows/abashiri-ci.yml) [![Runtime E2E](https://github.com/MIERUNE/mappf-experiments/actions/workflows/runtime-e2e.yml/badge.svg)](https://github.com/MIERUNE/mappf-experiments/actions/workflows/runtime-e2e.yml)
+[![Ishikari CI](https://github.com/MIERUNE/mappf-experiments/actions/workflows/ishikari-ci.yml/badge.svg)](https://github.com/MIERUNE/mappf-experiments/actions/workflows/ishikari-ci.yml) [![Biei CI](https://github.com/MIERUNE/mappf-experiments/actions/workflows/biei-ci.yml/badge.svg)](https://github.com/MIERUNE/mappf-experiments/actions/workflows/biei-ci.yml) [![Abashiri CI](https://github.com/MIERUNE/mappf-experiments/actions/workflows/abashiri-ci.yml/badge.svg)](https://github.com/MIERUNE/mappf-experiments/actions/workflows/abashiri-ci.yml) [![MMPF Console CI](https://github.com/MIERUNE/mappf-experiments/actions/workflows/console-ci.yml/badge.svg)](https://github.com/MIERUNE/mappf-experiments/actions/workflows/console-ci.yml) [![Runtime E2E](https://github.com/MIERUNE/mappf-experiments/actions/workflows/runtime-e2e.yml/badge.svg)](https://github.com/MIERUNE/mappf-experiments/actions/workflows/runtime-e2e.yml)
 
 This repository explores how to build a scalable map platform for serving, caching and rendering web maps.
 
@@ -10,6 +10,7 @@ This repository explores how to build a scalable map platform for serving, cachi
 - [Biei](servers/biei/README.md) is a scalable static map and raster tile renderer powered by MapLibre Native.
 - [Ishikari](servers/ishikari/README.md) is a distributed cache proxy for PMTiles archives and MapLibre style resources.
 - [Abashiri](servers/abashiri/README.md) is the experimental management and publishing API.
+- [MMPF Console](apps/mmpf-console/README.md) is the standalone SvelteKit client for Abashiri identity and operational status.
 
 Biei and Ishikari can run independently or together, with Ishikari supplying resources either directly to web browsers or to Biei for server-side rendering.
 

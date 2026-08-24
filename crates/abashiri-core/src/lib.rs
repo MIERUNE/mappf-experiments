@@ -4,7 +4,6 @@
 #![deny(unreachable_pub)]
 
 pub mod auth;
-pub mod catalog;
 pub mod mutation;
 pub mod storage;
 mod store_policy;

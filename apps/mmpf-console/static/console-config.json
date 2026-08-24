@@ -1,0 +1,6 @@
+{
+  "apiBaseUrl": "/api",
+  "pollIntervalMs": 5000,
+  "stylePreviewBaseUrl": "https://biei-demo.mierune.dev",
+  "tilesetPreviewBaseUrl": "https://ishikari-demo.mierune.dev"
+}

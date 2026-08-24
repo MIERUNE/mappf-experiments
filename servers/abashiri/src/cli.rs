@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use url::Url;
 
 use crate::operations::OperationalStatusEndpoint;
@@ -58,10 +58,14 @@ pub(crate) struct ServeArgs {
     /// Its bucket must not be readable by delivery workloads.
     #[arg(long, env = "ABASHIRI_JOURNAL_ROOT")]
     pub(crate) journal_root: Option<Url>,
-    /// URL of the trusted style-catalog JSON object. Required together with
-    /// both publication roots; management credentials remain separately configured.
-    #[arg(long, env = "ABASHIRI_STYLE_CATALOG")]
-    pub(crate) style_catalog: Option<Url>,
+    /// Physical layout used for deterministic style object paths.
+    #[arg(
+        long,
+        env = "ABASHIRI_STYLE_OBJECT_LAYOUT",
+        value_enum,
+        default_value_t
+    )]
+    pub(crate) style_object_layout: StyleObjectLayoutArg,
     /// Biei or Ishikari internal style-refresh receiver. Repeat the option, or
     /// provide a comma-separated environment value, to notify both services.
     #[arg(
@@ -78,6 +82,22 @@ pub(crate) struct ServeArgs {
         value_delimiter = ','
     )]
     pub(crate) operational_status_endpoints: Vec<OperationalStatusEndpoint>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub(crate) enum StyleObjectLayoutArg {
+    #[default]
+    Nested,
+    Flat,
+}
+
+impl From<StyleObjectLayoutArg> for abashiri_core::style::StyleObjectLayout {
+    fn from(value: StyleObjectLayoutArg) -> Self {
+        match value {
+            StyleObjectLayoutArg::Nested => Self::Nested,
+            StyleObjectLayoutArg::Flat => Self::Flat,
+        }
+    }
 }
 
 pub(crate) fn load() -> Command {
@@ -98,7 +118,7 @@ mod tests {
         assert!(args.auth_root.is_none());
         assert!(args.state_root.is_none());
         assert!(args.journal_root.is_none());
-        assert!(args.style_catalog.is_none());
+        assert_eq!(args.style_object_layout, StyleObjectLayoutArg::Nested);
         assert!(args.style_refresh_endpoints.is_empty());
         assert!(args.operational_status_endpoints.is_empty());
     }
@@ -122,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_style_publication_roots_and_catalog() {
+    fn parses_style_publication_roots_and_layout() {
         let cli = Cli::try_parse_from([
             "abashiri",
             "serve",
@@ -130,8 +150,8 @@ mod tests {
             "gs://example-delivery/state/",
             "--journal-root",
             "gs://example-control/journal/",
-            "--style-catalog",
-            "gs://example-control/catalog/current.json",
+            "--style-object-layout",
+            "flat",
             "--style-refresh-endpoint",
             "http://biei:9090/_internal/refresh/style",
             "--style-refresh-endpoint",
@@ -151,10 +171,7 @@ mod tests {
             args.journal_root.unwrap().as_str(),
             "gs://example-control/journal/"
         );
-        assert_eq!(
-            args.style_catalog.unwrap().as_str(),
-            "gs://example-control/catalog/current.json"
-        );
+        assert_eq!(args.style_object_layout, StyleObjectLayoutArg::Flat);
         assert_eq!(args.style_refresh_endpoints.len(), 2);
         assert_eq!(args.operational_status_endpoints.len(), 1);
     }

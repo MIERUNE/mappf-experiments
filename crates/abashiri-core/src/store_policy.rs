@@ -1,7 +1,7 @@
 //! Rules every object-store-backed component in Abashiri obeys.
 //!
 //! The management plane configures several independent stores — the auth
-//! registry, the style catalog, and the state and journal roots. Each parses an
+//! registry and the state and journal roots. Each parses an
 //! operator-supplied URL through `parse_url_opts` and each bounds its reads. Both
 //! rules belong in one place so a new store cannot be added with a subtly weaker
 //! version of either.

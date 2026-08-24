@@ -30,7 +30,9 @@ printf '%s' "$ABASHIRI_PUBLISH_TOKEN" |
   cargo run -q -p abashiri -- hash-credential
 ```
 
-With auth configured, `GET /whoami` accepts one `Authorization: Bearer` header and returns the bounded workload identity, account grants, actions, and registry revision. The registry is cached in memory; it is not fetched for every request. Without auth configuration, `/whoami` remains unavailable and the server is health-only. Give the serving workload read-only registry access; publish `current.json` with a separate bootstrap identity.
+With auth configured, `GET /whoami` accepts one `Authorization: Bearer` header and returns the bounded workload identity, namespace grants, actions, and registry revision. The registry is cached in memory; it is not fetched for every request. Without auth configuration, `/whoami` remains unavailable and the server is health-only. Give the serving workload read-only registry access; publish `current.json` with a separate bootstrap identity.
+
+`GET /auth/capabilities` is an unauthenticated, non-cacheable bootstrap contract for MMPF Console. It currently advertises `bearer` only when object-store management authentication is configured; future OIDC or trusted-proxy adapters add methods without changing the Console's management APIs.
 
 Before enabling a writer API, verify the real published-state backend with the serving identity:
 
@@ -60,37 +62,23 @@ cargo run -p abashiri -- serve \
   --auth-root gs://example-management-auth/abashiri/ \
   --state-root gs://example-delivery-state/abashiri/ \
   --journal-root gs://example-management-journal/abashiri/ \
-  --style-catalog gs://example-management-catalog/abashiri/current.json \
   --style-refresh-endpoint http://biei:9090/_internal/refresh/style \
   --style-refresh-endpoint http://ishikari:9090/_internal/refresh/style \
   --operational-status-endpoint biei=http://biei:9090/_internal/operations/v1/status \
   --operational-status-endpoint ishikari=http://ishikari:9090/_internal/operations/v1/status
 ```
 
-The catalog maps management IDs to trusted delivery paths; request paths are never concatenated into object-store keys:
+Abashiri derives style paths from the validated `{namespace}/{style_id}` identity. The default nested layout stores `styles/demo/basic/style.json`; `--style-object-layout flat` stores `styles/demo/basic.json`. Both publish and notify the same logical `demo/basic` style. Inventory is discovered by bounded listing under `styles/` and `tilesets/`; object paths are parsed as canonical resource identities before authorization. A storage prefix is therefore an identity encoding, not an IAM boundary.
 
-```json
-{
-  "schema_version": 1,
-  "styles": [
-    {
-      "account_id": "example",
-      "style_id": "basic",
-      "object_path": "styles/demo/basic/style.json"
-    }
-  ]
-}
-```
-
-The flat `styles/demo/basic.json` object path is also accepted. Both layouts publish and notify the same `demo/basic` delivery style.
-
-`GET /accounts/{account_id}/styles/{style_id}` requires the `style.read` action and returns the exact style plus an opaque `ETag`. `PUT` requires `style.publish`, one `Idempotency-Key`, and an explicit precondition:
+`GET /namespaces/{namespace}/styles/{style_id}` requires the `style.read` action and returns the exact style plus an opaque `ETag`. `PUT` requires `style.publish`, one `Idempotency-Key`, and an explicit precondition. The earlier `/accounts/{namespace}/styles/{style_id}` spelling remains a compatibility alias.
 
 When named operational endpoints are configured, `GET /operations/status` requires the global `operations.read` action. Abashiri polls at most eight endpoints in parallel with a one-second request deadline, coalesces requests for two seconds, and returns partial results. A failed source may retain a last-known-good snapshot for at most five minutes, always marked `stale`; internal endpoint URLs and transport details are never returned.
 
+`GET /namespaces` returns namespace choices for the Console. An operator with `operations.read` discovers first-level namespace prefixes below styles and tilesets; an ordinary resource reader receives its granted namespace names without an object-store listing. `GET /inventory?namespace={namespace}` lists canonical styles and PMTiles archives only below that selected namespace and only for resource kinds the principal may read. The response reports `visibility` as `all` or `granted`, and never returns storage locations, non-canonical nested objects, legacy namespace-less tilesets, or mutation-journal data.
+
 ```sh
 # Create only
-curl -i -X PUT http://127.0.0.1:8080/accounts/example/styles/basic \
+curl -i -X PUT http://127.0.0.1:8080/namespaces/example/styles/basic \
   -H "Authorization: Bearer $ABASHIRI_PUBLISH_TOKEN" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: create-basic-1' \
@@ -98,7 +86,7 @@ curl -i -X PUT http://127.0.0.1:8080/accounts/example/styles/basic \
   --data-binary @style.json
 
 # Replace only the version returned by GET or PUT
-curl -i -X PUT http://127.0.0.1:8080/accounts/example/styles/basic \
+curl -i -X PUT http://127.0.0.1:8080/namespaces/example/styles/basic \
   -H "Authorization: Bearer $ABASHIRI_PUBLISH_TOKEN" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: replace-basic-1' \
@@ -108,8 +96,8 @@ curl -i -X PUT http://127.0.0.1:8080/accounts/example/styles/basic \
 
 Publication validates MapLibre style version 8, writes an immutable audit intent before state, conditionally commits exact style bytes, and records a durable completion before reporting success. The ETag encodes both backend ETag and object version so GCS generation-based replacement remains safe.
 
-When publication is enabled, a background reconciliation scan runs immediately and every five minutes. It completes a missing journal record only when the validated current style still names that intent; it never replays a state mutation, and absent or superseded state remains unchanged. New intents retain the trusted catalog-resolved object path so recovery does not depend on a later catalog mapping.
+When publication is enabled, a background reconciliation scan runs immediately and every five minutes. It completes a missing journal record only when the validated current style still names that intent; it never replays a state mutation, and absent or superseded state remains unchanged. New intents retain the resolved object path. Legacy intents without one use the configured deterministic style layout.
 
-Configured refresh endpoints receive the same advisory hint in parallel after the durable completion. The JSON response reports `refresh` as `delivered`, `partial_failure`, or `not_configured`. Notification failure never changes a committed mutation into an HTTP failure. Repeating the identical request with the same idempotency key retries notification without republishing the style; delivery polling remains the correctness fallback. When refresh endpoints are configured, every catalog delivery path is checked against the shared hint envelope before the server starts. Without a notifier, that transport-specific validation is not applied.
+Configured refresh endpoints receive the same advisory hint in parallel after the durable completion. The JSON response reports `refresh` as `delivered`, `partial_failure`, or `not_configured`. Notification failure never changes a committed mutation into an HTTP failure. Repeating the identical request with the same idempotency key retries notification without republishing the style; delivery polling remains the correctness fallback. The shared canonical style-key validator guarantees that every derived publication path can form a refresh hint.
 
 See [`../../specs/abashiri-spec.md`](../../specs/abashiri-spec.md) for the native management contract and [`../../issues/abashiri-todo.md`](../../issues/abashiri-todo.md) for unresolved work.

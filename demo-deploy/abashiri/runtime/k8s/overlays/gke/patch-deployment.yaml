@@ -18,13 +18,11 @@ spec:
           imagePullPolicy: Always
           env:
             - name: ABASHIRI_AUTH_ROOT
-              value: "gs://mappf-experiment-abashiri-control/auth/"
+              value: "gs://mappf-experiment-abashiri-control/auth-role-aware/"
             - name: ABASHIRI_STATE_ROOT
               value: "gs://mappf-experiment-demo/"
             - name: ABASHIRI_JOURNAL_ROOT
               value: "gs://mappf-experiment-abashiri-journal/"
-            - name: ABASHIRI_STYLE_CATALOG
-              value: "gs://mappf-experiment-abashiri-control/catalog/current.json"
             - name: ABASHIRI_STYLE_REFRESH_ENDPOINTS
               value: "http://biei-internal:9090/_internal/refresh/style,http://ishikari-internal:9090/_internal/refresh/style"
             - name: ABASHIRI_OPERATIONAL_STATUS_ENDPOINTS

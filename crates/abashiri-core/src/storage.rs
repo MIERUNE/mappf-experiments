@@ -11,8 +11,8 @@ use anyhow::{Context as _, bail, ensure};
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use object_store::{
-    Attribute, AttributeValue, Attributes, Error as ObjectStoreError, GetResult, ObjectMeta,
-    ObjectStore, ObjectStoreExt as _, PutMode, PutOptions, PutResult, UpdateVersion,
+    Attribute, AttributeValue, Attributes, Error as ObjectStoreError, GetResult, ListResult,
+    ObjectMeta, ObjectStore, ObjectStoreExt as _, PutMode, PutOptions, PutResult, UpdateVersion,
     parse_url_opts, path::Path as ObjectPath,
 };
 use url::Url;
@@ -147,6 +147,13 @@ impl ConditionalStore {
         prefix: &ObjectPath,
     ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         self.store.list(Some(prefix))
+    }
+
+    pub(crate) async fn list_with_delimiter(
+        &self,
+        prefix: &ObjectPath,
+    ) -> object_store::Result<ListResult> {
+        self.store.list_with_delimiter(Some(prefix)).await
     }
 }
 

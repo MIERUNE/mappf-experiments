@@ -110,14 +110,41 @@ What would fix it, in preference order:
 
 Until then, any claim about the Database -> Network sequence rests on reading
 `main_resource_loader.cpp` and on production observation, not on a regression test.
+That includes the complete SWR sequence: stale Database delivery, the paired
+low-priority Network request, a `304`, and the refreshed Database entry.
 
-## Test constructor for `ResourceRequest`
+## Bridge-level 304 materialization (or document the contract)
 
-`ResourceRequest` is `#[non_exhaustive]` and only constructible via
-`pub(super) fn from_ffi`, so a downstream `TokioFileSource` implementation
-cannot be driven end-to-end from its own tests. This hid a contract bug for us:
-our source failed to materialize 304s for natively withheld prior bodies
-(the `OnlineFileSource` merge), which permanently wedges still renders — and no
-test could cover the real request path. A `#[doc(hidden)]` builder or a
-`test-util`-feature constructor would let downstream sources test against real
-`ResourceRequest` values, including `prior_data`/`prior_etag` combinations.
+Replacing `FileSourceType::Network` silently transfers an undocumented
+obligation from `OnlineFileSource`: when `resource.priorData` is present
+(native withheld the representation for revalidation), a `notModified`
+response must be merged with that body before consumers see it —
+glyph/sprite/tile consumers treat `notModified` as a no-op without completing
+their load. Our source missed this and still renders wedged permanently in
+`currentThreadRunLoopWait`; we even had a comment asserting "MLN can merge
+this bodyless response with priorData itself", which is true only of the layer
+we had replaced.
+
+The adapter can make this class of bug impossible: at the response completion
+site the original `mbgl::Resource` is in scope, so the stock five-line merge
+(`if (response.notModified && resource.priorData) { data = move(priorData);
+notModified = false; }`) could run for every downstream source. This restores
+stock semantics rather than adding a constraint: in unmodified mbgl no consumer
+ever sees an unmerged `notModified + priorData` response, so no legitimate
+implementation can depend on passing one through, and the merge is idempotent
+for sources that already materialize.
+
+Scoping that keeps it faithful and non-obstructive:
+
+- apply it only to `FileSourceType::Network` registrations — the stock merge
+  lives in `OnlineFileSource`, not in Database/Mbtiles semantics;
+- it is a safety net, not a substitute: an implementation that maintains its
+  own shared cache still has to materialize for that cache itself (the bridge
+  only touches the response handed to native);
+- no opt-out: a `notModified` for a withheld `priorData` has exactly one
+  valid interpretation (every consumer of these responses is mbgl code), so an
+  opt-out's only practical effect would be re-enabling the permanent wait. A
+  release note suffices for the behavioural change.
+
+Failing all that, documenting the contract on `ResourceRequest::prior_data` /
+`Response::not_modified()` would at least have prevented our misreading.

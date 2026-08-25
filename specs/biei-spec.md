@@ -240,7 +240,7 @@ The overlay count, feature count, coordinate count, JSON depth, and payload size
 
 Pins are generated as 2x bitmaps and registered with a pixel ratio of 2. Their shape, shadow, label placement, and black/white label contrast are handled in the renderer. Generated-pin labels accept one ASCII letter or a canonical decimal number from `0` through `99`; letters are rendered uppercase. Maki icon names are not generated-pin labels. Provider-specific built-in icon names and URL marker images are not supported.
 
-`addlayer` accepts a policy-validated style layer JSON object. The JSON path via `AnyLayer::from_json_str` lets MapLibre Native parse paint/layout expressions, filters, visibility, `source-layer`, and supported layer types.
+`addlayer` accepts a policy-validated style layer JSON object. When delivery auth is active, a namespaced addlayer tileset (`{namespace}/{tileset_id}`) must fall inside the caller's readable namespaces and is refused with `403` otherwise; a flat tileset id is a globally shared resource, like glyph ranges.  The JSON path via `AnyLayer::from_json_str` lets MapLibre Native parse paint/layout expressions, filters, visibility, `source-layer`, and supported layer types.
 
 The source may be:
 
@@ -248,6 +248,8 @@ The source may be:
 - A vector source object whose `url` value is a biei `tileset_id`.
 
 Direct HTTP(S) URLs are rejected. The tileset catalog resolves the id to a TileJSON URL, fetches it before worker admission, validates it, and rewrites the source to a concrete `tiles` source. Stable source ids support worker-local LRU reuse and soft source affinity. Source affinity is a hint, never correctness state.
+
+Style revalidation is conditional: the coordinator stores the provider's `ETag` beside the cached representation and revalidates with `If-None-Match`; a `304` advances freshness and reuses the held bytes without re-transfer or re-hashing a changed revision into existence.
 
 `before_layer` repositions the request overlay band. Missing-layer validation is limited by the current binding's introspection API. `setfilter` for an existing base-style layer remains blocked on the binding operation tracked in [`../issues/mln-rs-wishlist.md`](../issues/mln-rs-wishlist.md).
 
@@ -408,6 +410,8 @@ Database behavior:
 - No persistent disk cache yet.
 - Network responses are stored directly before crossing the bridge. This avoids an extra FFI round trip and lets a bodyless native 304 refresh the materialized shared-cache entry without recopying the image/resource body.
 - A usable Database response is delivered once while its paired Network request waits for explicit expiry (and minimum update interval), capped at five minutes. This is background work only when the native request carries metadata but no `priorData`, proving Database already delivered its body. A Database miss, or a stale body withheld as `priorData` for revalidation, receives a concurrently inserted fresh body immediately instead of parking a render-blocking callback or returning a 304 without a representation. At expiry the ordinary path performs conditional revalidation.
+
+The shared cache honors RFC 5861 `stale-while-revalidate` for Network resources: inside the origin's grant an expired entry is served usable-stale, so MapLibre Native delivers the body and pairs a background revalidation instead of withholding it and blocking the render on the round trip. An explicit `must-revalidate`, `proxy-revalidate`, or `no-cache` cancels the grant; `s-maxage` alone does not (origins pair it with the grant deliberately). Outside a grant, an expired resource is never served while refreshing. A failed background refresh starts a five-second per-resource cooldown so render rate cannot amplify a provider outage; foreground and post-window revalidation are never suppressed. A `304` that omits `Cache-Control` conservatively keeps the stored absolute SWR boundary, while a present field replaces it.
 
 Resource metrics distinguish FileSource lifecycle time, admission wait, actual upstream HTTP attempt count/latency, fresh-cache insertion races, deferred background refreshes, bytes, in-flight work, the current deferred-refresh sleeper count, single-flight roles, and Database hit/miss/revalidate/bypass operations. Kind, priority, usage, and outcome labels are bounded enums.
 

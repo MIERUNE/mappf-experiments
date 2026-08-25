@@ -6,8 +6,8 @@ No Biei-specific implementation item is currently active. This queue records bou
 
 The implemented contract — content-derived revisions, activation, the refresh receiver, fence semantics, hint idempotency, and convergence — is in [`../specs/biei-spec.md`](../specs/biei-spec.md) §8.3 and §9.1. What remains open:
 
-- Add conditional revalidation. Ishikari emits a derived `ETag` over the exact rewritten bytes, so unchanged content should cost one `304` rather than a complete body transfer.
-- Measure request-path revalidation latency. Move refresh into a bounded background stale-while-revalidate path only if production profiles justify the additional task and failure-state machinery.
+- Extend conditional revalidation to tileset JSON. Styles now revalidate with `If-None-Match` and reuse held bytes on `304`; the tileset fetch (`fetch_tileset_json_with_auth`, used by addlayer sources and base-source rewriting) still transfers the full body on every refresh even though Ishikari emits a derived `ETag` there too. Same shape as the style implementation.
+- Style-layer stale-while-revalidate stays deliberately unimplemented: the background refresh has no requester to borrow `provider_bearer_token` from, so implementing it would breach the credential-partition contract; conditional `If-None-Match` revalidation already reduces the request-path cost to one bodyless round trip. Sub-resources honor SWR in the FileSource. The remaining availability gap is served-last-known-good on failed refresh (below), not SWR.
 - Decide whether a failed refresh may serve the last-known-good revision, for how long, and how deletion differs from a transient provider failure.
 - Decide whether a future revision also covers resolved dependency identity. It currently covers the normalized style representation only.
 - Measure the number and memory cost of successfully observed dynamic style ids before imposing a catalog limit. `observed` is deliberately process-lifetime revision authority: LRU eviction could resurrect the bootstrap identity or reject current/previous peer work. If cardinality becomes material, add an explicit configurable admission/catalog limit before provider fetch rather than silently evicting revision state.
@@ -36,6 +36,14 @@ manual procedure. Do not use this incident to justify a larger SLA or pre-warmin
 - **Do not tune the readiness probe in response.** `failureThreshold: 1` with a 1-second timeout looked fragile against a CPU-saturating renderer, but `BIEI_CORES=2` under a 4-CPU limit leaves roughly two cores for the async runtime, so `/readyz` is not competing with render slots.
 
 ## Compatibility and product triggers
+
+- **Flat tileset ids are globally shared by convention, not declaration.** Biei's
+  addlayer authorization treats a namespace-less tileset id as a shared
+  resource (like glyph ranges) because Abashiri's ownership model only covers
+  namespaced tilesets. Reopen when Abashiri starts managing flat tilesets as
+  owned resources; per-tileset grants stay out of scope — finer sharing is
+  modeled by creating a namespace, never by adding resource ACLs to the
+  registry snapshot.
 
 - **Object-storage custom marker images (planned):** support managed marker images without accepting arbitrary request-supplied URLs. The request carries a bounded logical marker ID; deployment configuration resolves that ID through an object-storage root/template. Prefer a content-addressed immutable ID and object so decoded images and rendered outputs can be cached without an invalidation protocol. Before implementation:
   - choose the public overlay syntax and object layout; reproducing a third-party `url-*` overlay parameter is not a goal if it would expose an arbitrary fetch target;

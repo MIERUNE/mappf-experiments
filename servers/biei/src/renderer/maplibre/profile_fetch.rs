@@ -2,7 +2,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use reqwest::header::{AGE, CACHE_CONTROL, DATE, EXPIRES, HeaderMap};
+use reqwest::header::{AGE, CACHE_CONTROL, DATE, EXPIRES, HeaderMap, IF_NONE_MATCH};
 use tokio::time::Instant;
 
 use biei_core::types::{
@@ -24,6 +24,18 @@ const MAX_TILESET_JSON_BYTES: usize = 1024 * 1024;
 pub(super) struct FetchedStyleJson {
     pub(super) json: String,
     pub(super) served_freshness: Duration,
+    /// Provider validator for later conditional revalidation.
+    pub(super) etag: Option<String>,
+}
+
+/// Outcome of a style fetch that may carry a stored validator.
+pub(super) enum StyleFetchOutcome {
+    Fetched(FetchedStyleJson),
+    /// HTTP 304: the held bytes are current; only freshness advances.
+    /// Possible only when a validator was sent.
+    NotModified {
+        served_freshness: Duration,
+    },
 }
 
 pub(super) fn addlayer_source_from_task(task: &InternalTask) -> Option<&AddLayerSource> {
@@ -337,13 +349,22 @@ pub(super) async fn fetch_style_json(
     style_url: &str,
     deadline: Instant,
 ) -> Result<String, ProfileFetchError> {
-    fetch_style_json_with_auth(
-        client, url_policy, style_id, style_url, None, None, deadline,
+    match fetch_style_json_with_auth(
+        client, url_policy, style_id, style_url, None, None, None, deadline,
     )
-    .await
-    .map(|fetched| fetched.json)
+    .await?
+    {
+        StyleFetchOutcome::Fetched(fetched) => Ok(fetched.json),
+        // Unreachable: no validator was sent, and the fetch layer rejects
+        // unsolicited 304s before returning.
+        StyleFetchOutcome::NotModified { .. } => Err(ProfileFetchError::transient_load(
+            style_id,
+            "provider answered 304 to an unconditional fetch",
+        )),
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn fetch_style_json_with_auth(
     client: &reqwest::Client,
     url_policy: &mmpf_mln_filesource::policy::ResourceUrlPolicy,
@@ -351,8 +372,9 @@ pub(super) async fn fetch_style_json_with_auth(
     style_url: &str,
     provider_token: Option<&ProviderBearerToken>,
     auth_provider_origin: Option<&url::Url>,
+    if_none_match: Option<&str>,
     deadline: Instant,
-) -> Result<FetchedStyleJson, ProfileFetchError> {
+) -> Result<StyleFetchOutcome, ProfileFetchError> {
     let fetched = match url::Url::parse(style_url) {
         Ok(mut url) if url.scheme() == "http" || url.scheme() == "https" => {
             attach_provider_token(
@@ -362,7 +384,13 @@ pub(super) async fn fetch_style_json_with_auth(
                 auth_provider_origin,
                 "style",
             )?;
-            fetch_http_style_json(client, url_policy, style_id, url, deadline).await?
+            let outcome =
+                fetch_http_style_json(client, url_policy, style_id, url, if_none_match, deadline)
+                    .await?;
+            let StyleFetchOutcome::Fetched(fetched) = outcome else {
+                return Ok(outcome);
+            };
+            fetched
         }
         Ok(url) if url.scheme() == "file" => {
             let path = url.to_file_path().map_err(|_| {
@@ -374,6 +402,7 @@ pub(super) async fn fetch_style_json_with_auth(
             FetchedStyleJson {
                 json: read_style_json_file(style_id, &path, deadline).await?,
                 served_freshness: Duration::ZERO,
+                etag: None,
             }
         }
         Ok(url) => {
@@ -385,6 +414,7 @@ pub(super) async fn fetch_style_json_with_auth(
         Err(_) => FetchedStyleJson {
             json: read_style_json_file(style_id, std::path::Path::new(style_url), deadline).await?,
             served_freshness: Duration::ZERO,
+            etag: None,
         },
     };
 
@@ -394,7 +424,7 @@ pub(super) async fn fetch_style_json_with_auth(
     serde_json::from_str::<serde_json::Value>(&fetched.json).map_err(|err| {
         ProfileFetchError::permanent_invalid(style_id, format!("style JSON parse failed: {err}"))
     })?;
-    Ok(fetched)
+    Ok(StyleFetchOutcome::Fetched(fetched))
 }
 
 fn attach_provider_token(
@@ -429,8 +459,9 @@ async fn fetch_http_style_json(
     url_policy: &mmpf_mln_filesource::policy::ResourceUrlPolicy,
     style_id: &biei_core::types::StyleId,
     style_url: url::Url,
+    if_none_match: Option<&str>,
     deadline: Instant,
-) -> Result<FetchedStyleJson, ProfileFetchError> {
+) -> Result<StyleFetchOutcome, ProfileFetchError> {
     let safe_url = redacted_url(&style_url);
     if !url_policy.permits_url_without_dns(&style_url) {
         return Err(ProfileFetchError::permanent_invalid(
@@ -439,7 +470,11 @@ async fn fetch_http_style_json(
         ));
     }
     let request_started = Instant::now();
-    let response = tokio::time::timeout_at(deadline, client.get(style_url.clone()).send())
+    let mut request = client.get(style_url.clone());
+    if let Some(validator) = if_none_match {
+        request = request.header(IF_NONE_MATCH, validator);
+    }
+    let response = tokio::time::timeout_at(deadline, request.send())
         .await
         .map_err(|_| ProfileFetchError::caller_deadline())?
         .map_err(|err| {
@@ -458,6 +493,17 @@ async fn fetch_http_style_json(
         })?;
 
     let status = response.status();
+    if status == reqwest::StatusCode::NOT_MODIFIED {
+        if if_none_match.is_none() {
+            return Err(ProfileFetchError::transient_load(
+                style_id,
+                format!("unsolicited 304 for {safe_url}"),
+            ));
+        }
+        let served_freshness =
+            style_response_freshness(response.headers(), request_started.elapsed());
+        return Ok(StyleFetchOutcome::NotModified { served_freshness });
+    }
     if !status.is_success() {
         tracing::debug!(
             style_id = style_id.as_str(),
@@ -501,10 +547,12 @@ async fn fetch_http_style_json(
     let json = String::from_utf8(bytes).map_err(|err| {
         ProfileFetchError::permanent_invalid(style_id, format!("style JSON is not UTF-8: {err}"))
     })?;
-    Ok(FetchedStyleJson {
+    let etag = header_str(&response_headers, reqwest::header::ETAG).map(str::to_owned);
+    Ok(StyleFetchOutcome::Fetched(FetchedStyleJson {
         json,
         served_freshness,
-    })
+        etag,
+    }))
 }
 
 /// Remaining freshness of an HTTP style response before Biei applies its
@@ -747,17 +795,21 @@ mod tests {
         let style_id = StyleId("test/style".to_string());
         let token = ProviderBearerToken::try_new("public.a+b&c".to_string()).unwrap();
 
-        let fetched = fetch_style_json_with_auth(
+        let outcome = fetch_style_json_with_auth(
             &client,
             &policy,
             &style_id,
             style_url.as_str(),
             Some(&token),
             Some(&origin),
+            None,
             Instant::now() + Duration::from_secs(5),
         )
         .await
         .unwrap_or_else(|error| panic!("authenticated style fetch failed: {}", error.error()));
+        let StyleFetchOutcome::Fetched(fetched) = outcome else {
+            panic!("unconditional fetch must return a body");
+        };
         assert!(fetched.json.contains("\"version\":8"));
         assert_eq!(
             server.await.expect("profile fixture task"),

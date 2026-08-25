@@ -608,6 +608,106 @@ mod tests {
         assert!(Arc::ptr_eq(&first.style_json, &second.style_json));
     }
 
+    async fn spawn_etag_style_server(
+        body: &'static str,
+    ) -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        const ETAG: &str = "\"style-v1\"";
+        let full = Arc::new(AtomicUsize::new(0));
+        let not_modified = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server binds");
+        let addr = listener.local_addr().expect("test server has local addr");
+        let server_full = Arc::clone(&full);
+        let server_not_modified = Arc::clone(&not_modified);
+        let server = tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+                let server_full = Arc::clone(&server_full);
+                let server_not_modified = Arc::clone(&server_not_modified);
+                async move {
+                    use axum::response::IntoResponse;
+                    let matches = headers
+                        .get(axum::http::header::IF_NONE_MATCH)
+                        .and_then(|value| value.to_str().ok())
+                        == Some(ETAG);
+                    let headers = [
+                        (axum::http::header::CACHE_CONTROL, "max-age=0"),
+                        (axum::http::header::ETAG, ETAG),
+                    ];
+                    if matches {
+                        server_not_modified.fetch_add(1, Ordering::SeqCst);
+                        (axum::http::StatusCode::NOT_MODIFIED, headers, "").into_response()
+                    } else {
+                        server_full.fetch_add(1, Ordering::SeqCst);
+                        (axum::http::StatusCode::OK, headers, body).into_response()
+                    }
+                }
+            });
+            axum::serve(listener, app).await.expect("test server runs");
+        });
+        (
+            format!("http://{addr}/style.json"),
+            full,
+            not_modified,
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_matching_validator_turns_style_revalidation_into_a_304() {
+        let body = r#"{"version":8,"name":"etag","sources":{},"layers":[]}"#;
+        let (style_url, full, not_modified, server) = spawn_etag_style_server(body).await;
+        let bootstrap = revision();
+        let catalog = Arc::new(StyleCatalog::with_minimum_revalidation_interval_for_tests(
+            Duration::from_millis(10),
+        ));
+        catalog.upsert_definition(
+            bootstrap.id.clone(),
+            StyleDefinition::new(style_url, bootstrap.version),
+        );
+        let preparer = MapLibreProfilePreparer::for_tests(Arc::clone(&catalog));
+
+        let first = preparer
+            .prepare_profile(&internal_task(bootstrap.clone()))
+            .await
+            .expect("initial fetch prepares")
+            .expect("prepared profile");
+        assert_eq!(full.load(Ordering::SeqCst), 1);
+        assert_eq!(not_modified.load(Ordering::SeqCst), 0);
+
+        let content_revision = StyleRevision {
+            id: bootstrap.id.clone(),
+            version: style_content_version(body),
+        };
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let second = preparer
+            .prepare_profile(&internal_task(content_revision))
+            .await
+            .expect("revalidation prepares")
+            .expect("prepared profile");
+
+        assert_eq!(
+            not_modified.load(Ordering::SeqCst),
+            1,
+            "the revalidation must send the stored validator"
+        );
+        assert_eq!(
+            full.load(Ordering::SeqCst),
+            1,
+            "an unchanged style must not transfer its body again"
+        );
+        assert!(
+            Arc::ptr_eq(&first.style_json, &second.style_json),
+            "a 304 reuses the held representation"
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn profile_preparer_activates_content_revision_without_a_duplicate_fetch() {
         let first_body = r#"{"version":8,"name":"first","sources":{},"layers":[]}"#;

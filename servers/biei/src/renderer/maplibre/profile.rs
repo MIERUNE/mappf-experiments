@@ -17,7 +17,7 @@ use tokio::time::Instant;
 use crate::renderer::{PreparedProfile, ProfilePreparer, StyleAvailabilityError};
 
 use super::profile_fetch::{
-    FetchedStyleJson, addlayer_source_from_task, addlayer_source_hash_from_task,
+    StyleFetchOutcome, addlayer_source_from_task, addlayer_source_hash_from_task,
     fetch_style_json_with_auth, fetch_tileset_json_with_auth, rewrite_tileset_source_json,
     source_url_from_addlayer_source,
 };
@@ -47,6 +47,9 @@ pub(crate) struct MapLibreProfilePreparer {
     auth_provider_origin: Option<url::Url>,
     fetch_permits: Arc<tokio::sync::Semaphore>,
     style_json_cache: Cache<StyleCacheKey, Arc<str>>,
+    /// Provider validators for conditional style revalidation, keyed like the
+    /// JSON cache so a stale entry and its validator travel together.
+    style_etag_cache: Cache<StyleCacheKey, Arc<str>>,
     style_error_cache: Cache<StyleCacheKey, ProfilePreparationError>,
     tileset_json_cache: Cache<TilesetCacheKey, Arc<str>>,
     tileset_error_cache: Cache<TilesetCacheKey, ProfilePreparationError>,
@@ -113,6 +116,7 @@ impl MapLibreProfilePreparer {
             auth_provider_origin,
             fetch_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_fetches.max(1))),
             style_json_cache: style_json_cache(),
+            style_etag_cache: style_etag_cache(),
             style_error_cache: error_cache(),
             tileset_json_cache: tileset_json_cache(),
             tileset_error_cache: error_cache(),
@@ -258,11 +262,15 @@ impl MapLibreProfilePreparer {
                     let first_observation =
                         self.style_catalog.observed_version(&style.id).is_none();
                     let revalidation_fence = self.style_catalog.revalidation_fence(&style.id);
+                    // A held representation plus its validator turns this
+                    // revalidation into a conditional GET; a 304 then reuses
+                    // the held bytes instead of transferring the body again.
+                    let validator = stale.as_ref().and_then(|_| self.style_etag_cache.get(&key));
                     let result = self
-                        .fetch_uncached_style(style, authorization, deadline)
+                        .fetch_uncached_style(style, authorization, deadline, validator.as_deref())
                         .await;
-                    let fetched = match result {
-                        Ok(fetched) => fetched,
+                    let outcome = match result {
+                        Ok(outcome) => outcome,
                         Err(failure) => {
                             if failure.negative_cacheable {
                                 self.style_error_cache
@@ -277,7 +285,27 @@ impl MapLibreProfilePreparer {
                         }
                     };
 
-                    let json: Arc<str> = Arc::from(fetched.json);
+                    let (json, served_freshness, etag): (Arc<str>, _, Option<Arc<str>>) =
+                        match outcome {
+                            StyleFetchOutcome::Fetched(fetched) => {
+                                let etag = fetched.etag.map(Arc::<str>::from);
+                                (Arc::from(fetched.json), fetched.served_freshness, etag)
+                            }
+                            StyleFetchOutcome::NotModified { served_freshness } => {
+                                let Some(json) = stale.clone() else {
+                                    // The fetch layer rejects unsolicited 304s;
+                                    // defensive because losing this invariant
+                                    // would republish an empty representation.
+                                    let failure = ProfileFetchError::transient_load(
+                                        &style.id,
+                                        "provider answered 304 without a held representation",
+                                    );
+                                    guard.complete_with_error(failure.clone());
+                                    return Err(failure);
+                                };
+                                (json, served_freshness, validator.clone())
+                            }
+                        };
                     let observed_version = style_content_version(&json);
                     let observed_revision = StyleRevision {
                         id: style.id.clone(),
@@ -292,13 +320,17 @@ impl MapLibreProfilePreparer {
                     // revision through the catalog.
                     self.style_json_cache
                         .insert(observed_key.clone(), Arc::clone(&json));
+                    if let Some(etag) = etag.as_ref() {
+                        self.style_etag_cache
+                            .insert(observed_key.clone(), Arc::clone(etag));
+                    }
                     self.style_error_cache.invalidate(&observed_key);
                     self.style_error_cache.invalidate(&key);
 
                     let changed = self.style_catalog.record_observed_for_generation(
                         &style.id,
                         observed_version,
-                        fetched.served_freshness,
+                        served_freshness,
                         revalidation_fence,
                     );
 
@@ -313,6 +345,9 @@ impl MapLibreProfilePreparer {
                         // Retain the bytes under it for this admitted request and
                         // under the content revision for every later request.
                         self.style_json_cache.insert(key.clone(), Arc::clone(&json));
+                        if let Some(etag) = etag.as_ref() {
+                            self.style_etag_cache.insert(key.clone(), Arc::clone(etag));
+                        }
                         Arc::clone(&json)
                     } else if self.style_catalog.is_bootstrap_revision(style) {
                         // Another credential partition may have been admitted
@@ -322,6 +357,9 @@ impl MapLibreProfilePreparer {
                         // independently fetched and validated bytes are safe
                         // to retain for that already-admitted bootstrap task.
                         self.style_json_cache.insert(key.clone(), Arc::clone(&json));
+                        if let Some(etag) = etag.as_ref() {
+                            self.style_etag_cache.insert(key.clone(), Arc::clone(etag));
+                        }
                         Arc::clone(&json)
                     } else {
                         let failure = ProfileFetchError::transient_load(
@@ -436,7 +474,8 @@ impl MapLibreProfilePreparer {
         style: &StyleRevision,
         authorization: Option<&RenderAuthorization>,
         deadline: Instant,
-    ) -> Result<FetchedStyleJson, ProfileFetchError> {
+        if_none_match: Option<&str>,
+    ) -> Result<StyleFetchOutcome, ProfileFetchError> {
         let _permit = tokio::time::timeout_at(deadline, self.fetch_permits.acquire())
             .await
             .map_err(|_| ProfileFetchError::caller_deadline())?
@@ -462,6 +501,7 @@ impl MapLibreProfilePreparer {
             &definition.style_url,
             authorization.and_then(|authorization| authorization.provider_bearer_token.as_ref()),
             self.auth_provider_origin.as_ref(),
+            if_none_match,
             deadline,
         )
         .await
@@ -504,6 +544,14 @@ struct JsonCaches<'a, K: Eq + Hash> {
     json: &'a Cache<K, Arc<str>>,
     error: &'a Cache<K, ProfilePreparationError>,
     inflight: &'a SingleFlight<K, ProfileFetchError>,
+}
+
+fn style_etag_cache() -> Cache<StyleCacheKey, Arc<str>> {
+    Cache::builder()
+        .max_capacity(4096)
+        .time_to_idle(STYLE_JSON_CACHE_IDLE_TTL)
+        .time_to_live(STYLE_JSON_CACHE_MAX_AGE)
+        .build()
 }
 
 fn style_json_cache() -> Cache<StyleCacheKey, Arc<str>> {
@@ -696,6 +744,7 @@ impl MapLibreProfilePreparer {
             auth_provider_origin: None,
             fetch_permits: Arc::new(tokio::sync::Semaphore::new(16)),
             style_json_cache: style_json_cache(),
+            style_etag_cache: style_etag_cache(),
             style_error_cache: error_cache(),
             tileset_json_cache: tileset_json_cache(),
             tileset_error_cache: error_cache(),

@@ -33,7 +33,7 @@ use biei_core::node::Node;
 use biei_core::style_catalog::StyleCatalog;
 use biei_core::types::{
     CredentialCachePartition, InternalTask, NamespaceSet, ProviderBearerToken, RenderAuthorization,
-    RequestId, StyleId, TaskId,
+    RenderRequest, RequestId, StyleId, TaskId,
 };
 
 #[derive(Debug)]
@@ -320,6 +320,14 @@ impl HttpIngress {
             Err(err) => return response_from_ingress_error(err).with_request_id(&request_id),
         };
         task.authorization = authorization;
+        if let Some(denied) = addlayer_namespace_denied(&task) {
+            tracing::debug!(
+                namespace = denied,
+                "addlayer tileset namespace outside the caller's readable namespaces"
+            );
+            return crate::auth::failure_response(mmpf_auth::AuthFailure::Forbidden)
+                .with_request_id(&request_id);
+        }
         let node = self.node.clone();
         match tokio::spawn(async move {
             // Keep ingress/drain admission attached to the non-cancellable
@@ -340,6 +348,32 @@ impl HttpIngress {
 
 #[cfg(test)]
 const TEST_TILESET_URL_TEMPLATE: &str = "https://tiles.example.test/{tileset_id}/tileset.json";
+
+/// A namespaced addlayer tileset is a caller-named resource and must fall
+/// inside the caller's readable namespaces. A flat (namespace-less) id is a
+/// globally shared resource, like glyph ranges — `mmpf-auth` reserves
+/// namespace-less resources for exactly that. Returns the denied namespace.
+fn addlayer_namespace_denied(task: &InternalTask) -> Option<&str> {
+    let authorization = task.authorization.as_ref()?;
+    let RenderRequest::StaticImage {
+        addlayer: Some(addlayer),
+        ..
+    } = &task.request
+    else {
+        return None;
+    };
+    let source = addlayer.source.as_ref()?;
+    let (namespace, _) = source.tileset_id.split_once('/')?;
+    // `allows` owns the wildcard-grant semantics; anything that cannot form a
+    // valid required set is denied rather than waved through.
+    let Ok(required) = NamespaceSet::try_new(vec![namespace.to_string()]) else {
+        return Some(namespace);
+    };
+    if authorization.readable_namespaces.allows(&required) {
+        return None;
+    }
+    Some(namespace)
+}
 
 #[allow(clippy::too_many_arguments)]
 fn parse_path_with_request_id(
@@ -395,6 +429,78 @@ mod tests {
             StyleDefinition::new("https://styles.test/static/style.json", 1),
         );
         catalog
+    }
+
+    fn addlayer_task(tileset_id: &str, grants: &[&str]) -> InternalTask {
+        let layer = serde_json::json!({
+            "id": "probe",
+            "type": "line",
+            "source": { "type": "vector", "url": tileset_id },
+        });
+        // Encode only what would break the outer query string, mirroring the
+        // addlayer test helper.
+        let mut encoded = String::new();
+        for byte in layer.to_string().bytes() {
+            match byte {
+                b'%' => encoded.push_str("%25"),
+                b'&' => encoded.push_str("%26"),
+                b'=' => encoded.push_str("%3D"),
+                b'+' => encoded.push_str("%2B"),
+                b'#' => encoded.push_str("%23"),
+                other => encoded.push(char::from(other)),
+            }
+        }
+        let query = format!("addlayer={encoded}");
+        let mut task = parse_path_with_request_id(
+            "/styles/carto/static/static/none/0,0,1,0,0/64x64.png",
+            Some(&query),
+            &catalog(),
+            1,
+            RequestId::default(),
+            Duration::from_secs(2),
+            Instant::now(),
+        )
+        .expect("task parses");
+        task.authorization = Some(RenderAuthorization {
+            readable_namespaces: NamespaceSet::try_new(
+                grants.iter().map(|value| value.to_string()).collect(),
+            )
+            .expect("grants"),
+            cache_partition: CredentialCachePartition::from_digest([0; 32]),
+            provider_bearer_token: None,
+        });
+        task
+    }
+
+    #[test]
+    fn a_namespaced_addlayer_tileset_outside_the_grant_is_denied() {
+        let task = addlayer_task("mierune/private", &["carto"]);
+        assert_eq!(addlayer_namespace_denied(&task), Some("mierune"));
+    }
+
+    #[test]
+    fn a_namespaced_addlayer_tileset_inside_the_grant_is_allowed() {
+        let task = addlayer_task("carto/roads", &["carto"]);
+        assert_eq!(addlayer_namespace_denied(&task), None);
+    }
+
+    #[test]
+    fn a_flat_addlayer_tileset_is_globally_shared() {
+        let task = addlayer_task("planet", &["carto"]);
+        assert_eq!(addlayer_namespace_denied(&task), None);
+    }
+
+    #[test]
+    fn a_wildcard_grant_allows_any_addlayer_namespace() {
+        let task = addlayer_task("mierune/private", &["*"]);
+        assert_eq!(addlayer_namespace_denied(&task), None);
+    }
+
+    #[test]
+    fn an_anonymous_task_is_not_gated_on_addlayer_namespaces() {
+        let mut task = addlayer_task("mierune/private", &["carto"]);
+        task.authorization = None;
+        assert_eq!(addlayer_namespace_denied(&task), None);
     }
 
     #[allow(clippy::too_many_arguments)]

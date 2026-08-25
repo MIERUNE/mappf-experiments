@@ -31,7 +31,10 @@ const DEFAULT_HEURISTIC_FRESHNESS: Duration = Duration::from_mins(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CachePolicy {
-    Store,
+    Store {
+        /// Absolute end of the origin's stale-while-revalidate window.
+        stale_until: Option<SystemTime>,
+    },
     Remove,
     Unchanged,
 }
@@ -49,8 +52,65 @@ pub(super) fn cache_policy_for_response(
     {
         CachePolicy::Remove
     } else {
-        CachePolicy::Store
+        CachePolicy::Store {
+            stale_until: stale_until_for_response(headers, control.as_ref()),
+        }
     }
+}
+
+/// A 304 may omit `Cache-Control`. In that case RFC 9111 retains the stored
+/// field, so keep the existing absolute SWR boundary instead of silently
+/// discarding the grant. A present field replaces the stored field and is
+/// evaluated normally.
+pub(super) fn cache_policy_for_not_modified(
+    storage_policy: StoragePolicy,
+    headers: &reqwest::header::HeaderMap,
+    prior_stale_until: Option<SystemTime>,
+) -> CachePolicy {
+    let policy = cache_policy_for_response(storage_policy, headers);
+    if headers.contains_key(CACHE_CONTROL) {
+        policy
+    } else {
+        match policy {
+            CachePolicy::Store { .. } => CachePolicy::Store {
+                stale_until: prior_stale_until,
+            },
+            other => other,
+        }
+    }
+}
+
+/// End of the origin's RFC 5861 stale-while-revalidate window, anchored on the
+/// origin's own clock: `now + (lifetime + grant) - current_age`. Deriving it
+/// from an expiry already saturated to `now` would hand a response that arrived
+/// mid-window a fresh full grant, letting chained caches extend the origin's
+/// permitted stale lifetime. Without an explicit lifetime there is nothing to
+/// anchor the window on, so no grant is recorded.
+fn stale_until_for_response(
+    headers: &reqwest::header::HeaderMap,
+    control: Option<&ParsedCacheControl>,
+) -> Option<SystemTime> {
+    let grant = control.and_then(stale_while_revalidate_grant)?;
+    if let Some(lifetime) = shared_max_age(control) {
+        let remaining = lifetime
+            .saturating_add(grant)
+            .saturating_sub(response_current_age(headers));
+        return SystemTime::now().checked_add(remaining);
+    }
+    header_date(headers, EXPIRES)?.checked_add(grant)
+}
+
+/// RFC 5861 grant: the window after expiry in which a shared cache may serve
+/// the stale representation while revalidating in the background. An explicit
+/// `must-revalidate`/`proxy-revalidate`/`no-cache` prohibits serving stale and
+/// overrides it. `s-maxage` alone does not: origins pair `s-maxage` with
+/// `stale-while-revalidate` precisely to allow this (RFC 9111's implied
+/// proxy-revalidate yields to the explicit grant).
+fn stale_while_revalidate_grant(control: &ParsedCacheControl) -> Option<Duration> {
+    if control.must_revalidate || control.proxy_revalidate || control.no_cache {
+        return None;
+    }
+    control.stale_while_revalidate.map(Duration::from_secs)
 }
 
 #[derive(Clone, Copy)]
@@ -141,6 +201,9 @@ pub(super) struct PriorResponse<'a> {
     pub(super) modified: Option<SystemTime>,
     pub(super) expires: Option<SystemTime>,
     pub(super) must_revalidate: bool,
+    /// Absolute end of the stored response's SWR grant. A sparse 304 retains
+    /// it because the corresponding `Cache-Control` field was not replaced.
+    pub(super) stale_until: Option<SystemTime>,
 }
 
 impl<'a> PriorResponse<'a> {
@@ -153,6 +216,7 @@ impl<'a> PriorResponse<'a> {
 pub(super) fn prior_response_with_cache<'a>(
     request: &'a ResourceRequest,
     cached: Option<&'a Response>,
+    cached_stale_until: Option<SystemTime>,
 ) -> PriorResponse<'a> {
     PriorResponse {
         native_data: request.prior_data.as_deref(),
@@ -168,6 +232,7 @@ pub(super) fn prior_response_with_cache<'a>(
             .prior_expires
             .or_else(|| cached.and_then(|response| response.expires)),
         must_revalidate: cached.is_some_and(|response| response.must_revalidate),
+        stale_until: cached_stale_until,
     }
 }
 
@@ -328,6 +393,12 @@ pub(super) fn parse_max_age(cache_control: &str) -> Option<Duration> {
 }
 
 fn parsed_cache_control(headers: &reqwest::header::HeaderMap) -> Option<ParsedCacheControl> {
+    if unreadable_cache_control(headers) {
+        return Some(ParsedCacheControl {
+            no_store: true,
+            ..ParsedCacheControl::default()
+        });
+    }
     parse_values(cache_control_values(headers))
 }
 
@@ -370,10 +441,23 @@ pub(super) fn has_cache_directive(headers: &reqwest::header::HeaderMap, expected
 }
 
 fn cache_control_values(headers: &reqwest::header::HeaderMap) -> impl Iterator<Item = &str> {
+    // `HeaderValue::to_str` rejects HTAB, which HTTP optional whitespace
+    // permits inside a valid field. Falling from "present" to "absent" would
+    // silently upgrade a `no-store` to heuristic caching, so accept any UTF-8
+    // and let `unreadable_cache_control` fail the rest closed.
     headers
         .get_all(CACHE_CONTROL)
         .iter()
-        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| std::str::from_utf8(value.as_bytes()).ok())
+}
+
+/// A physically present `Cache-Control` field that cannot be decoded must be
+/// treated as the most conservative directive, never as absent.
+fn unreadable_cache_control(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get_all(CACHE_CONTROL)
+        .iter()
+        .any(|value| std::str::from_utf8(value.as_bytes()).is_err())
 }
 
 pub(super) fn parse_retry_after(value: &str) -> Option<SystemTime> {

@@ -47,9 +47,9 @@ use metrics::{
     outcome_label, priority_label,
 };
 use response::{
-    CachePolicy, PriorResponse, RetryDirective, cache_policy_for_response,
-    materialize_not_modified, negative_cache_ttl, prior_response_with_cache, response_from_http,
-    response_from_reqwest_error, retry_directive,
+    CachePolicy, PriorResponse, RetryDirective, cache_policy_for_not_modified,
+    cache_policy_for_response, materialize_not_modified, negative_cache_ttl,
+    prior_response_with_cache, response_from_http, response_from_reqwest_error, retry_directive,
 };
 #[cfg(test)]
 use response::{has_cache_directive, parse_max_age, parse_retry_after};
@@ -92,6 +92,9 @@ const MIB: u64 = 1024 * 1024;
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(15);
 /// Bounds attacker-controlled or broken-style URL cardinality.
 const NEGATIVE_CACHE_CAPACITY: u64 = 4_096;
+/// A failed speculative refresh must not turn render rate into provider retry
+/// rate. Foreground revalidation remains unaffected.
+const REFRESH_FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
 /// A usable Database hit has already satisfied its requester, so the paired
 /// background Network callback may wait for expiry. Cap that wait so an
 /// upstream's long freshness lifetime cannot retain a Tokio task for hours.
@@ -278,6 +281,7 @@ struct NetworkFileSource {
     low_priority: Semaphore,
     bodies: Semaphore,
     negative_cache: Cache<SharedResourceRequestKey, NegativeCacheEntry>,
+    refresh_failure_cooldown: Cache<SharedResourceRequestKey, ()>,
     resource_cache: cache::ResourceCache,
     inflight: Box<[FlightMap]>,
     provider_health: ProviderHealthTracker,
@@ -365,6 +369,10 @@ impl NetworkFileSource {
                 .max_capacity(NEGATIVE_CACHE_CAPACITY)
                 .time_to_live(NEGATIVE_CACHE_TTL)
                 .build(),
+            refresh_failure_cooldown: Cache::builder()
+                .max_capacity(NEGATIVE_CACHE_CAPACITY)
+                .time_to_live(REFRESH_FAILURE_COOLDOWN)
+                .build(),
             resource_cache,
             inflight: (0..FLIGHT_SHARDS)
                 .map(|_| Mutex::new(HashMap::new()))
@@ -393,7 +401,7 @@ impl NetworkFileSource {
             let native_database_state =
                 native_database_state(inputs.prior_data_present, inputs.prior_metadata_present);
             let expires = match resolve_fresh_cache_race(
-                &cached,
+                &cached.response,
                 native_database_state,
                 inputs.is_low_priority && inputs.is_online,
             ) {
@@ -425,7 +433,7 @@ impl NetworkFileSource {
                 &deferral,
                 self.resource_cache
                     .fresh_response(negative_key)
-                    .and_then(|response| response.expires),
+                    .and_then(|entry| entry.response.expires),
             ) {
                 observation.complete(&response);
                 return Some(response);
@@ -508,6 +516,62 @@ impl NetworkFileSource {
         }
     }
 
+    fn resolve_refresh_failure_cooldown(
+        &self,
+        resource_key: &SharedResourceRequestKey,
+        inputs: SharedCacheRaceInputs,
+        observation: &mut RequestObservation,
+    ) -> Option<Response> {
+        if !inputs.is_background_refresh()
+            || !self
+                .resource_cache
+                .is_stale_while_revalidating(resource_key)
+            || self.refresh_failure_cooldown.get(resource_key).is_none()
+        {
+            return None;
+        }
+
+        // Database already delivered the stale representation. Completing the
+        // paired Network callback as unchanged avoids another provider attempt
+        // without withholding bytes from the current render.
+        let response = Response::not_modified();
+        observation.complete(&response);
+        observation.outcome = "refresh_cooldown";
+        Some(response)
+    }
+
+    fn finish_fetch_sequence(
+        &self,
+        request: &ResourceRequest,
+        resource_key: &SharedResourceRequestKey,
+        attempt: FetchAttempt,
+    ) -> Response {
+        let inputs = SharedCacheRaceInputs::from_request(request);
+        let response = self.finish_fetch(resource_key, attempt);
+        self.update_refresh_failure_cooldown(resource_key, inputs, &response);
+        response
+    }
+
+    fn update_refresh_failure_cooldown(
+        &self,
+        resource_key: &SharedResourceRequestKey,
+        inputs: SharedCacheRaceInputs,
+        response: &Response,
+    ) {
+        if inputs.is_background_refresh() {
+            if response.error.is_some()
+                && self
+                    .resource_cache
+                    .is_stale_while_revalidating(resource_key)
+            {
+                self.refresh_failure_cooldown
+                    .insert(Arc::clone(resource_key), ());
+            } else if response.error.is_none() {
+                self.refresh_failure_cooldown.invalidate(resource_key);
+            }
+        }
+    }
+
     /// Performs at most one short retry for transient failures (transport,
     /// 5xx, 408/429), then returns the final error to MapLibre. Still renders
     /// complete on required-resource errors; keeping the callback pending past
@@ -559,7 +623,7 @@ impl NetworkFileSource {
             }
 
             let Some(retry) = attempt.retry else {
-                return self.finish_fetch(resource_key, attempt);
+                return self.finish_fetch_sequence(request, resource_key, attempt);
             };
 
             if tracks_provider_health(request.priority) {
@@ -570,7 +634,7 @@ impl NetworkFileSource {
                 .delay
                 .unwrap_or_else(|| retry_delay(&request.url, attempt_index));
             if !retry_fits_budget(attempt_index + 1, retry_started.elapsed(), delay) {
-                return self.finish_fetch(resource_key, attempt);
+                return self.finish_fetch_sequence(request, resource_key, attempt);
             }
             fs_metrics()
                 .retries_total
@@ -593,11 +657,12 @@ impl NetworkFileSource {
             ..
         } = attempt;
         match cache_policy {
-            CachePolicy::Store => {
+            CachePolicy::Store { stale_until } => {
                 // A 304 path already owns a separate materialized cache value;
                 // move it instead of cloning its potentially large body again.
                 let cached = cache_response.unwrap_or_else(|| response.clone());
-                self.resource_cache.store(Arc::clone(resource_key), cached);
+                self.resource_cache
+                    .store(Arc::clone(resource_key), cached, stale_until);
             }
             CachePolicy::Remove => self.resource_cache.invalidate(resource_key),
             CachePolicy::Unchanged => {}
@@ -646,7 +711,11 @@ impl NetworkFileSource {
             may_consult_shared_cache(request.storage_policy, request.loading_methods.has_cache())
                 .then(|| self.resource_cache.lookup_shared(resource_key))
                 .flatten();
-        let prior = prior_response_with_cache(request, cached.as_deref());
+        let prior = prior_response_with_cache(
+            request,
+            cached.as_ref().map(|entry| &entry.response),
+            cached.as_ref().and_then(|entry| entry.stale_until()),
+        );
         let mut builder = self.client.get(&request.url);
         if let Some(range) = &request.data_range {
             builder = builder.header(RANGE, format!("bytes={}-{}", range.start(), range.end()));
@@ -929,7 +998,7 @@ fn not_modified_attempt(
             ))
         };
     };
-    let cache_policy = cache_policy_for_response(storage_policy, headers);
+    let cache_policy = cache_policy_for_not_modified(storage_policy, headers, prior.stale_until);
     if prior.native_data.is_some() {
         // A prior body on the request means native withheld the representation
         // for revalidation — the consumer does NOT have it. The stock
@@ -1002,6 +1071,14 @@ impl TokioFileSource for NetworkFileSource {
             self.negative_cache.invalidate(&negative_key);
         }
 
+        if let Some(response) = self.resolve_refresh_failure_cooldown(
+            &negative_key,
+            SharedCacheRaceInputs::from_request(&request),
+            &mut observation,
+        ) {
+            return response;
+        }
+
         // NetworkAttemptBudget applies REQUEST_TIMEOUT to each actual HTTP
         // attempt. Do not include semaphore/single-flight admission time: a
         // cold burst must not turn queued requests into synthetic network
@@ -1046,6 +1123,14 @@ impl SharedCacheRaceInputs {
             is_online: request.usage == Usage::Online,
             minimum_update_interval: request.minimum_update_interval,
         }
+    }
+
+    fn is_background_refresh(self) -> bool {
+        self.consults_shared_cache
+            && !self.prior_data_present
+            && self.prior_metadata_present
+            && self.is_low_priority
+            && self.is_online
     }
 }
 

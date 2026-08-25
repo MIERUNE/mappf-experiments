@@ -1,6 +1,8 @@
 //! Process-wide MapLibre resource cache used as the `Database` FileSource.
 
 use std::sync::{Arc, OnceLock};
+#[cfg(test)]
+use std::time::Duration;
 use std::time::SystemTime;
 
 use maplibre_native::file_source::{
@@ -14,18 +16,34 @@ use super::{ResourceRequestKey, SharedResourceRequestKey, kind_label};
 
 const ENTRY_OVERHEAD_BYTES: usize = 128;
 
+/// A cached response plus the origin's RFC 5861 grant, which lives beside the
+/// response because MapLibre Native's `Response` cannot express it.
+pub(super) struct CachedResource {
+    pub(super) response: Response,
+    /// End of the `stale-while-revalidate` window; absent = no grant.
+    stale_until: Option<SystemTime>,
+}
+
+impl CachedResource {
+    pub(super) fn stale_until(&self) -> Option<SystemTime> {
+        self.stale_until
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct ResourceCache {
-    cache: Cache<SharedResourceRequestKey, Arc<Response>>,
+    cache: Cache<SharedResourceRequestKey, Arc<CachedResource>>,
 }
 
 impl ResourceCache {
     pub(super) fn new(max_capacity_bytes: u64) -> Self {
         let cache = Cache::builder()
             .max_capacity(max_capacity_bytes)
-            .weigher(|key: &SharedResourceRequestKey, response: &Arc<Response>| {
-                resource_weight(key, response).clamp(1, u32::MAX as usize) as u32
-            })
+            .weigher(
+                |key: &SharedResourceRequestKey, entry: &Arc<CachedResource>| {
+                    resource_weight(key, &entry.response).clamp(1, u32::MAX as usize) as u32
+                },
+            )
             .eviction_listener(|key, _response, cause| {
                 cache_metrics()
                     .operations_total
@@ -36,34 +54,64 @@ impl ResourceCache {
         Self { cache }
     }
 
-    pub(super) fn lookup_shared(&self, key: &SharedResourceRequestKey) -> Option<Arc<Response>> {
+    pub(super) fn lookup_shared(
+        &self,
+        key: &SharedResourceRequestKey,
+    ) -> Option<Arc<CachedResource>> {
         self.cache.get(key)
     }
 
     /// Return a response whose explicit freshness lifetime has not elapsed.
     /// The Network source uses this to close a race where another renderer
     /// populates Database after this renderer's cache lookup missed.
-    pub(super) fn fresh_response(&self, key: &SharedResourceRequestKey) -> Option<Arc<Response>> {
-        let response = self.lookup_shared(key)?;
-        let expires = response.expires?;
-        (expires > SystemTime::now()).then_some(response)
+    pub(super) fn fresh_response(
+        &self,
+        key: &SharedResourceRequestKey,
+    ) -> Option<Arc<CachedResource>> {
+        let entry = self.lookup_shared(key)?;
+        let expires = entry.response.expires?;
+        (expires > SystemTime::now()).then_some(entry)
+    }
+
+    pub(super) fn is_stale_while_revalidating(&self, key: &SharedResourceRequestKey) -> bool {
+        let Some(entry) = self.lookup_shared(key) else {
+            return false;
+        };
+        let now = SystemTime::now();
+        entry.response.expires.is_some_and(|expires| expires <= now)
+            && entry
+                .stale_until
+                .is_some_and(|stale_until| now < stale_until)
     }
 
     fn lookup(&self, key: &SharedResourceRequestKey) -> CacheLookup {
-        let Some(response) = self.lookup_shared(key) else {
+        let Some(entry) = self.lookup_shared(key) else {
             return CacheLookup::Miss;
         };
-        let response = (*response).clone();
-        let expired = response
-            .expires
-            .is_some_and(|expires| expires <= SystemTime::now());
-        if expired || (response.must_revalidate && response.expires.is_none()) {
+        let response = entry.response.clone();
+        let now = SystemTime::now();
+        let expired = response.expires.is_some_and(|expires| expires <= now);
+        if expired {
+            if entry
+                .stale_until
+                .is_some_and(|stale_until| now < stale_until)
+            {
+                return CacheLookup::ServeStaleWhileRevalidating(response);
+            }
+            return CacheLookup::Revalidate(response);
+        }
+        if response.must_revalidate && response.expires.is_none() {
             return CacheLookup::Revalidate(response);
         }
         CacheLookup::Hit(response)
     }
 
-    pub(super) fn store(&self, key: SharedResourceRequestKey, response: Response) -> bool {
+    pub(super) fn store(
+        &self,
+        key: SharedResourceRequestKey,
+        response: Response,
+        stale_until: Option<SystemTime>,
+    ) -> bool {
         if !is_cacheable_response(&response) {
             cache_metrics()
                 .operations_total
@@ -72,7 +120,13 @@ impl ResourceCache {
             return false;
         }
         let kind = key.kind;
-        self.cache.insert(key, Arc::new(response));
+        self.cache.insert(
+            key,
+            Arc::new(CachedResource {
+                response,
+                stale_until,
+            }),
+        );
         cache_metrics()
             .operations_total
             .with_label_values(&[kind, "insert"])
@@ -103,6 +157,8 @@ impl ResourceCache {
 
 enum CacheLookup {
     Hit(Response),
+    /// Expired, but inside the origin's stale-while-revalidate window.
+    ServeStaleWhileRevalidating(Response),
     Revalidate(Response),
     Miss,
 }
@@ -138,11 +194,20 @@ impl TokioFileSource for DatabaseFileSource {
         let response = self.cache.lookup(&key);
         let (operation, response) = match response {
             CacheLookup::Hit(response) => ("hit", response),
+            CacheLookup::ServeStaleWhileRevalidating(mut response) => {
+                // The origin granted RFC 5861 stale-while-revalidate. Serve as
+                // usable-stale so MainResourceLoader delivers the body to its
+                // consumer and pairs a background revalidation, instead of
+                // withholding it and blocking the render on the round trip.
+                response.must_revalidate = false;
+                ("serve_stale", response)
+            }
             CacheLookup::Revalidate(mut response) => {
                 // MainResourceLoader copies this stale body and its validators
-                // into the following Network request. Force strict
-                // revalidation even when the provider only supplied an expiry:
-                // biei never serves an expired resource while refreshing it.
+                // into the following Network request. Force strict revalidation
+                // even when the provider only supplied an expiry: outside an
+                // explicit stale-while-revalidate grant, biei never serves an
+                // expired resource while refreshing it.
                 response.must_revalidate = true;
                 ("revalidate", response)
             }
@@ -262,7 +327,7 @@ mod tests {
         ));
         let response = Response::data(b"tile".to_vec()).with_etag("v1");
 
-        assert!(cache.store(key.clone(), response));
+        assert!(cache.store(key.clone(), response, None));
         let CacheLookup::Hit(cached) = shared.lookup(&key) else {
             panic!("shared cached response");
         };
@@ -304,6 +369,61 @@ mod tests {
     }
 
     #[test]
+    fn an_expired_entry_inside_the_grant_serves_stale_while_revalidating() {
+        let cache = ResourceCache::new(1024);
+        let key = Arc::new(ResourceRequestKey::test_key(
+            "https://resource.test/swr",
+            ResourceKind::Tile,
+        ));
+        cache.store(
+            key.clone(),
+            Response::data(b"stale".to_vec())
+                .with_expires(SystemTime::now() - Duration::from_secs(1))
+                .with_must_revalidate(true),
+            Some(SystemTime::now() + Duration::from_secs(59)),
+        );
+
+        assert!(matches!(
+            cache.lookup(&key),
+            CacheLookup::ServeStaleWhileRevalidating(_)
+        ));
+    }
+
+    #[test]
+    fn an_expired_entry_past_the_grant_requires_revalidation() {
+        let cache = ResourceCache::new(1024);
+        let key = Arc::new(ResourceRequestKey::test_key(
+            "https://resource.test/swr-expired",
+            ResourceKind::Tile,
+        ));
+        cache.store(
+            key.clone(),
+            Response::data(b"stale".to_vec())
+                .with_expires(SystemTime::now() - Duration::from_secs(120)),
+            Some(SystemTime::now() - Duration::from_secs(60)),
+        );
+
+        assert!(matches!(cache.lookup(&key), CacheLookup::Revalidate(_)));
+    }
+
+    #[test]
+    fn a_fresh_entry_ignores_the_grant() {
+        let cache = ResourceCache::new(1024);
+        let key = Arc::new(ResourceRequestKey::test_key(
+            "https://resource.test/swr-fresh",
+            ResourceKind::Tile,
+        ));
+        cache.store(
+            key.clone(),
+            Response::data(b"fresh".to_vec())
+                .with_expires(SystemTime::now() + Duration::from_secs(60)),
+            Some(SystemTime::now() + Duration::from_secs(120)),
+        );
+
+        assert!(matches!(cache.lookup(&key), CacheLookup::Hit(_)));
+    }
+
+    #[test]
     fn expired_must_revalidate_entry_is_not_served_stale() {
         let cache = ResourceCache::new(1024);
         let key = Arc::new(ResourceRequestKey::test_key(
@@ -315,13 +435,14 @@ mod tests {
             Response::data(b"stale".to_vec())
                 .with_expires(SystemTime::UNIX_EPOCH)
                 .with_must_revalidate(true),
+            None,
         );
 
         assert!(matches!(cache.lookup(&key), CacheLookup::Revalidate(_)));
         assert_eq!(
             cache
                 .lookup_shared(&key)
-                .and_then(|response| response.data.clone()),
+                .and_then(|entry| entry.response.data.clone()),
             Some(b"stale".to_vec()),
             "validators and prior bytes remain available to the network source"
         );
@@ -337,6 +458,7 @@ mod tests {
         cache.store(
             key.clone(),
             Response::data(b"stale".to_vec()).with_expires(SystemTime::UNIX_EPOCH),
+            None,
         );
 
         assert!(matches!(cache.lookup(&key), CacheLookup::Revalidate(_)));
@@ -357,17 +479,19 @@ mod tests {
             fresh.clone(),
             Response::data(b"fresh".to_vec())
                 .with_expires(SystemTime::now() + std::time::Duration::from_mins(1)),
+            None,
         );
         cache.store(
             expired.clone(),
             Response::data(b"expired".to_vec())
                 .with_expires(SystemTime::now() - std::time::Duration::from_secs(1)),
+            None,
         );
 
         assert_eq!(
             cache
                 .fresh_response(&fresh)
-                .and_then(|response| response.data.clone())
+                .and_then(|entry| entry.response.data.clone())
                 .as_deref(),
             Some(b"fresh".as_slice())
         );
@@ -381,7 +505,7 @@ mod tests {
             "https://resource.test/no-expiration",
             ResourceKind::Glyphs,
         ));
-        cache.store(key.clone(), Response::data(b"cached".to_vec()));
+        cache.store(key.clone(), Response::data(b"cached".to_vec()), None);
 
         assert!(matches!(cache.lookup(&key), CacheLookup::Hit(_)));
         assert!(

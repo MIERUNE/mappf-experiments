@@ -290,7 +290,8 @@ fn credential_bearing_urls_partition_shared_cache_and_singleflight_identity() {
     let cache = cache::ResourceCache::new(4096);
     assert!(cache.store(
         broad.clone(),
-        Response::data(b"authorized-for-broad-token".to_vec())
+        Response::data(b"authorized-for-broad-token".to_vec()),
+        None
     ));
     assert!(cache.lookup_shared(&broad).is_some());
     assert!(
@@ -424,6 +425,53 @@ fn a_304_backed_only_by_the_shared_cache_stays_bodyless_for_native() {
         .expect("Rust cache receives materialized response");
     assert!(!cached.not_modified);
     assert_eq!(cached.data.as_deref(), Some(b"cached".as_slice()));
+}
+
+#[test]
+fn a_sparse_304_retains_the_stored_swr_boundary() {
+    let stale_until = SystemTime::now() + Duration::from_hours(12);
+    let attempt = not_modified_attempt(
+        ResourceKind::Tile,
+        maplibre_native::file_source::StoragePolicy::Permanent,
+        &HeaderMap::new(),
+        PriorResponse {
+            cache_data: Some(b"cached"),
+            etag: Some("\"v1\""),
+            stale_until: Some(stale_until),
+            ..PriorResponse::default()
+        },
+    );
+
+    assert_eq!(
+        attempt.cache_policy,
+        CachePolicy::Store {
+            stale_until: Some(stale_until)
+        },
+        "an omitted Cache-Control field retains the stored field"
+    );
+}
+
+#[test]
+fn cache_control_on_a_304_replaces_the_stored_swr_grant() {
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("max-age=60"));
+    let attempt = not_modified_attempt(
+        ResourceKind::Tile,
+        maplibre_native::file_source::StoragePolicy::Permanent,
+        &headers,
+        PriorResponse {
+            cache_data: Some(b"cached"),
+            etag: Some("\"v1\""),
+            stale_until: Some(SystemTime::now() + Duration::from_hours(12)),
+            ..PriorResponse::default()
+        },
+    );
+
+    assert_eq!(
+        attempt.cache_policy,
+        CachePolicy::Store { stale_until: None },
+        "a present Cache-Control field replaces the stored field"
+    );
 }
 
 #[test]
@@ -638,6 +686,115 @@ fn shared_cache_rejects_private_responses() {
 }
 
 #[test]
+fn the_swr_grant_survives_s_maxage_but_not_must_revalidate() {
+    // Ishikari's actual style/TileJSON header: RFC 9111's s-maxage-implied
+    // proxy-revalidate yields to the origin's explicit RFC 5861 grant.
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static(
+            "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400",
+        ),
+    );
+    let floor = SystemTime::now() + Duration::from_secs(3600 + 86400 - 2);
+    let policy = cache_policy_for_response(
+        maplibre_native::file_source::StoragePolicy::Permanent,
+        &headers,
+    );
+    let CachePolicy::Store {
+        stale_until: Some(stale_until),
+    } = policy
+    else {
+        panic!("an swr grant with an explicit lifetime records a window");
+    };
+    assert!(stale_until > floor, "window anchors on lifetime + grant");
+
+    // An explicit must-revalidate prohibits serving stale and wins.
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("must-revalidate, stale-while-revalidate=86400"),
+    );
+    assert_eq!(
+        cache_policy_for_response(
+            maplibre_native::file_source::StoragePolicy::Permanent,
+            &headers,
+        ),
+        CachePolicy::Store { stale_until: None }
+    );
+}
+
+#[test]
+fn a_transported_age_shrinks_the_swr_window_instead_of_restarting_it() {
+    // s-maxage=3600, swr=86400, Age=43200: the response is already twelve
+    // hours into its retention. The correct remainder is 3600 + 86400 - 43200
+    // = 46800s; deriving the window from an expiry saturated to `now` would
+    // hand back the full 86400s and extend the origin's permitted stale
+    // lifetime by eleven hours.
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("s-maxage=3600, stale-while-revalidate=86400"),
+    );
+    headers.insert(reqwest::header::AGE, HeaderValue::from_static("43200"));
+    let now = SystemTime::now();
+    let CachePolicy::Store {
+        stale_until: Some(stale_until),
+    } = cache_policy_for_response(
+        maplibre_native::file_source::StoragePolicy::Permanent,
+        &headers,
+    )
+    else {
+        panic!("a mid-window response still records its remaining window");
+    };
+    let remaining = stale_until
+        .duration_since(now)
+        .expect("remaining window is in the future");
+    assert!(
+        remaining <= Duration::from_secs(46_800 + 2),
+        "the transported age must be charged against the whole retention"
+    );
+    assert!(
+        remaining > Duration::from_secs(46_800 - 60),
+        "the remainder is lifetime + grant - age, not the full grant"
+    );
+}
+
+#[test]
+fn an_unreadable_cache_control_field_fails_closed() {
+    // HTAB is valid HTTP optional whitespace but `HeaderValue::to_str`
+    // rejects it; the field must not silently degrade to "absent".
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_bytes(b"no-store,\tmax-age=0").expect("HTAB is a valid header byte"),
+    );
+    assert_eq!(
+        cache_policy_for_response(
+            maplibre_native::file_source::StoragePolicy::Permanent,
+            &headers,
+        ),
+        CachePolicy::Remove,
+        "a tab-separated no-store must still be honored"
+    );
+
+    // A present-but-undecodable field is conservative, never heuristic.
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_bytes(&[0x6d, 0x61, 0x78, 0xff]).expect("arbitrary header bytes"),
+    );
+    assert_eq!(
+        cache_policy_for_response(
+            maplibre_native::file_source::StoragePolicy::Permanent,
+            &headers,
+        ),
+        CachePolicy::Remove,
+        "an unreadable Cache-Control must fail closed"
+    );
+}
+
+#[test]
 fn not_modified_response_retains_required_revalidation() {
     let response = response_from_http(
         304,
@@ -695,6 +852,20 @@ fn extreme_cache_durations_do_not_panic_or_overflow() {
         .expires
         .expect("bounded heuristic expiry, no overflow");
     assert!(expires > now && expires <= now + Duration::from_hours(1));
+
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static(
+            "max-age=18446744073709551615, stale-while-revalidate=18446744073709551615",
+        ),
+    );
+    assert!(matches!(
+        cache_policy_for_response(
+            maplibre_native::file_source::StoragePolicy::Permanent,
+            &headers,
+        ),
+        CachePolicy::Store { .. }
+    ));
 
     assert_eq!(parse_retry_after("18446744073709551615"), None);
 }
@@ -1247,6 +1418,7 @@ async fn a_peer_cache_fill_is_served_to_every_requester_still_awaiting_bytes() {
                 key.clone(),
                 Response::data(b"filled-by-peer".to_vec())
                     .with_expires(SystemTime::now() + Duration::from_hours(24)),
+                None,
             ),
             "{label}: the peer fill is cacheable"
         );
@@ -1287,6 +1459,7 @@ async fn a_peer_cache_fill_is_served_to_every_requester_still_awaiting_bytes() {
             key.clone(),
             Response::data(b"filled-by-peer".to_vec())
                 .with_expires(SystemTime::now() + Duration::from_secs(30)),
+            None,
         )
     );
     let mut observation = RequestObservation::for_test("glyphs");
@@ -1347,6 +1520,93 @@ fn background_inputs(
     }
 }
 
+#[test]
+fn failed_background_refreshes_are_cooled_down_per_resource() {
+    let cache = cache::ResourceCache::new(1024 * 1024);
+    let source = NetworkFileSource::new(
+        cache.clone(),
+        vec!["resource.test".to_string()],
+        FileSourceIoPermits::default(),
+        ProviderHealthTracker::default(),
+        "test-agent",
+    )
+    .expect("file source builds");
+    let key = Arc::new(ResourceRequestKey::test_key(
+        "https://resource.test/glyphs",
+        ResourceKind::Glyphs,
+    ));
+    assert!(cache.store(
+        key.clone(),
+        Response::data(b"stale".to_vec()).with_expires(SystemTime::now() - Duration::from_secs(1)),
+        Some(SystemTime::now() + Duration::from_secs(60)),
+    ));
+    let background = background_inputs(false, true, true);
+
+    source.update_refresh_failure_cooldown(
+        &key,
+        background,
+        &Response::error(ErrorReason::Server, "provider unavailable"),
+    );
+    let mut observation = RequestObservation::for_test("glyphs");
+    let suppressed = source
+        .resolve_refresh_failure_cooldown(&key, background, &mut observation)
+        .expect("the next speculative refresh is suppressed");
+    assert!(suppressed.not_modified);
+    assert_eq!(observation.outcome, "refresh_cooldown");
+
+    source.update_refresh_failure_cooldown(&key, background, &Response::data(b"fresh".to_vec()));
+    assert!(
+        source
+            .resolve_refresh_failure_cooldown(&key, background, &mut observation)
+            .is_none(),
+        "a successful refresh clears the cooldown"
+    );
+}
+
+#[test]
+fn refresh_cooldown_never_suppresses_foreground_or_out_of_window_revalidation() {
+    let cache = cache::ResourceCache::new(1024 * 1024);
+    let source = NetworkFileSource::new(
+        cache.clone(),
+        vec!["resource.test".to_string()],
+        FileSourceIoPermits::default(),
+        ProviderHealthTracker::default(),
+        "test-agent",
+    )
+    .expect("file source builds");
+    let key = Arc::new(ResourceRequestKey::test_key(
+        "https://resource.test/glyphs",
+        ResourceKind::Glyphs,
+    ));
+    assert!(
+        cache.store(
+            key.clone(),
+            Response::data(b"stale".to_vec())
+                .with_expires(SystemTime::now() - Duration::from_secs(120)),
+            Some(SystemTime::now() - Duration::from_secs(60)),
+        )
+    );
+    let background = background_inputs(false, true, true);
+    source.refresh_failure_cooldown.insert(key.clone(), ());
+
+    let mut observation = RequestObservation::for_test("glyphs");
+    assert!(
+        source
+            .resolve_refresh_failure_cooldown(&key, background, &mut observation)
+            .is_none(),
+        "strict revalidation after the SWR window must still reach the provider"
+    );
+
+    let mut foreground = background;
+    foreground.is_low_priority = false;
+    assert!(
+        source
+            .resolve_refresh_failure_cooldown(&key, foreground, &mut observation)
+            .is_none(),
+        "foreground revalidation is never suppressed"
+    );
+}
+
 /// Pins the *production wiring*, not just the decision function.
 ///
 /// The pure-function test would stay green if the call site were changed to pass
@@ -1376,6 +1636,7 @@ async fn the_call_site_forwards_the_background_refresh_signal() {
             key.clone(),
             Response::data(b"cached".to_vec())
                 .with_expires(SystemTime::now() + Duration::from_hours(24)),
+            None,
         )
     );
 
@@ -1431,6 +1692,7 @@ async fn offline_usage_is_never_parked_even_at_low_priority() {
             key.clone(),
             Response::data(b"cached".to_vec())
                 .with_expires(SystemTime::now() + Duration::from_hours(24)),
+            None,
         )
     );
 

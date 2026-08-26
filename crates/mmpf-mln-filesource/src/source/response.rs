@@ -31,12 +31,41 @@ const DEFAULT_HEURISTIC_FRESHNESS: Duration = Duration::from_mins(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CachePolicy {
-    Store {
-        /// Absolute end of the origin's stale-while-revalidate window.
-        stale_until: Option<SystemTime>,
-    },
+    Store { freshness: CachedFreshness },
     Remove,
     Unchanged,
+}
+
+/// Effective freshness policy at store time, retained beside the cached
+/// representation. A sparse 304 inherits absent caching fields from the stored
+/// response (RFC 9111 §4.3.4), which is only possible if the effective
+/// directives — not just their derived timestamps — survive the store.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct CachedFreshness {
+    /// Effective shared freshness lifetime (`s-maxage` falling back to
+    /// `max-age`), when declared.
+    pub(super) lifetime: Option<Duration>,
+    /// RFC 5861 stale-while-revalidate grant, when declared and not cancelled.
+    pub(super) stale_while_revalidate: Option<Duration>,
+    /// Absolute end of the stale-while-revalidate window, anchored on the
+    /// origin's clock (transported `Age` charged against the whole retention).
+    pub(super) stale_until: Option<SystemTime>,
+}
+
+impl CachedFreshness {
+    /// Re-derive the window after a validation that restated nothing: the
+    /// inherited directives re-anchor at validation time, minus the 304's own
+    /// transported age.
+    pub(super) fn reanchored(self, current_age: Duration) -> Self {
+        let stale_until = self.stale_while_revalidate.and_then(|grant| {
+            let lifetime = self.lifetime.unwrap_or_default();
+            SystemTime::now().checked_add((lifetime + grant).saturating_sub(current_age))
+        });
+        Self {
+            stale_until,
+            ..self
+        }
+    }
 }
 
 pub(super) fn cache_policy_for_response(
@@ -53,51 +82,64 @@ pub(super) fn cache_policy_for_response(
         CachePolicy::Remove
     } else {
         CachePolicy::Store {
-            stale_until: stale_until_for_response(headers, control.as_ref()),
+            freshness: freshness_for_response(headers, control.as_ref()),
         }
     }
 }
 
-/// A 304 may omit `Cache-Control`. In that case RFC 9111 retains the stored
-/// field, so keep the existing absolute SWR boundary instead of silently
-/// discarding the grant. A present field replaces the stored field and is
-/// evaluated normally.
+/// A 304 may omit caching headers entirely. RFC 9111 §4.3.4 then retains the
+/// stored fields, so the stored effective policy is inherited and re-anchored
+/// at validation time (a successful validation resets the response's age). A
+/// present `Cache-Control` — or `Expires`, for origins that restate freshness
+/// without one — replaces the stored policy and is evaluated normally,
+/// including removing the grant when the restatement omits it. Inheriting
+/// past an `Expires`-only restatement would keep the entry's expiry and its
+/// stale-while-revalidate window on two different policies.
 pub(super) fn cache_policy_for_not_modified(
     storage_policy: StoragePolicy,
     headers: &reqwest::header::HeaderMap,
-    prior_stale_until: Option<SystemTime>,
+    prior_freshness: CachedFreshness,
 ) -> CachePolicy {
     let policy = cache_policy_for_response(storage_policy, headers);
-    if headers.contains_key(CACHE_CONTROL) {
+    if headers.contains_key(CACHE_CONTROL) || headers.contains_key(EXPIRES) {
         policy
     } else {
         match policy {
             CachePolicy::Store { .. } => CachePolicy::Store {
-                stale_until: prior_stale_until,
+                freshness: prior_freshness.reanchored(response_current_age(headers)),
             },
             other => other,
         }
     }
 }
 
-/// End of the origin's RFC 5861 stale-while-revalidate window, anchored on the
-/// origin's own clock: `now + (lifetime + grant) - current_age`. Deriving it
-/// from an expiry already saturated to `now` would hand a response that arrived
-/// mid-window a fresh full grant, letting chained caches extend the origin's
-/// permitted stale lifetime. Without an explicit lifetime there is nothing to
-/// anchor the window on, so no grant is recorded.
-fn stale_until_for_response(
+/// Derives the effective freshness policy — lifetime, grant, and the absolute
+/// end of the stale-while-revalidate window — in one place. The window anchors
+/// on the origin's own clock: `now + (lifetime + grant) - current_age`.
+/// Deriving it from an expiry already saturated to `now` would hand a response
+/// that arrived mid-window a fresh full grant, letting chained caches extend
+/// the origin's permitted stale lifetime. Without an explicit lifetime there is
+/// nothing to anchor the window on except an absolute `Expires`.
+fn freshness_for_response(
     headers: &reqwest::header::HeaderMap,
     control: Option<&ParsedCacheControl>,
-) -> Option<SystemTime> {
-    let grant = control.and_then(stale_while_revalidate_grant)?;
-    if let Some(lifetime) = shared_max_age(control) {
-        let remaining = lifetime
-            .saturating_add(grant)
-            .saturating_sub(response_current_age(headers));
-        return SystemTime::now().checked_add(remaining);
+) -> CachedFreshness {
+    let lifetime = shared_max_age(control);
+    let grant = control.and_then(stale_while_revalidate_grant);
+    let stale_until = grant.and_then(|grant| {
+        if let Some(lifetime) = lifetime {
+            let remaining = lifetime
+                .saturating_add(grant)
+                .saturating_sub(response_current_age(headers));
+            return SystemTime::now().checked_add(remaining);
+        }
+        header_date(headers, EXPIRES)?.checked_add(grant)
+    });
+    CachedFreshness {
+        lifetime,
+        stale_while_revalidate: grant,
+        stale_until,
     }
-    header_date(headers, EXPIRES)?.checked_add(grant)
 }
 
 /// RFC 5861 grant: the window after expiry in which a shared cache may serve
@@ -201,9 +243,10 @@ pub(super) struct PriorResponse<'a> {
     pub(super) modified: Option<SystemTime>,
     pub(super) expires: Option<SystemTime>,
     pub(super) must_revalidate: bool,
-    /// Absolute end of the stored response's SWR grant. A sparse 304 retains
-    /// it because the corresponding `Cache-Control` field was not replaced.
-    pub(super) stale_until: Option<SystemTime>,
+    /// Effective freshness policy stored beside the cached representation. A
+    /// sparse 304 inherits it because the corresponding fields were not
+    /// replaced (RFC 9111 §4.3.4).
+    pub(super) freshness: CachedFreshness,
 }
 
 impl<'a> PriorResponse<'a> {
@@ -216,7 +259,7 @@ impl<'a> PriorResponse<'a> {
 pub(super) fn prior_response_with_cache<'a>(
     request: &'a ResourceRequest,
     cached: Option<&'a Response>,
-    cached_stale_until: Option<SystemTime>,
+    cached_freshness: CachedFreshness,
 ) -> PriorResponse<'a> {
     PriorResponse {
         native_data: request.prior_data.as_deref(),
@@ -232,7 +275,7 @@ pub(super) fn prior_response_with_cache<'a>(
             .prior_expires
             .or_else(|| cached.and_then(|response| response.expires)),
         must_revalidate: cached.is_some_and(|response| response.must_revalidate),
-        stale_until: cached_stale_until,
+        freshness: cached_freshness,
     }
 }
 
@@ -334,7 +377,12 @@ fn with_cache_metadata(
             .or_else(|| header_date(headers, EXPIRES))
             .or_else(|| match prior.expires {
                 Some(expires) if prior.body().is_some() && expires <= now => {
-                    now.checked_add(REVALIDATED_FALLBACK_TTL)
+                    // A sparse revalidation inherits the stored lifetime
+                    // (RFC 9111 §4.3.4) re-anchored at validation time; the
+                    // bounded fallback only covers a prior that never declared
+                    // one.
+                    let lifetime = prior.freshness.lifetime.unwrap_or(REVALIDATED_FALLBACK_TTL);
+                    now.checked_add(lifetime.saturating_sub(response_current_age(headers)))
                 }
                 expires => expires,
             })
@@ -441,10 +489,11 @@ pub(super) fn has_cache_directive(headers: &reqwest::header::HeaderMap, expected
 }
 
 fn cache_control_values(headers: &reqwest::header::HeaderMap) -> impl Iterator<Item = &str> {
-    // `HeaderValue::to_str` rejects HTAB, which HTTP optional whitespace
-    // permits inside a valid field. Falling from "present" to "absent" would
-    // silently upgrade a `no-store` to heuristic caching, so accept any UTF-8
-    // and let `unreadable_cache_control` fail the rest closed.
+    // `HeaderValue::to_str` rejects obs-text (0x80–0xFF), which reaches here
+    // because `HeaderValue` accepts it on construction. Falling from
+    // "present" to "absent" would silently upgrade a `no-store` to heuristic
+    // caching, so accept any UTF-8 and let `unreadable_cache_control` fail
+    // the rest closed.
     headers
         .get_all(CACHE_CONTROL)
         .iter()

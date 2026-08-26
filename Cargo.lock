@@ -2656,6 +2656,7 @@ dependencies = [
  "reqwest 0.13.4",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "url",
 ]
 

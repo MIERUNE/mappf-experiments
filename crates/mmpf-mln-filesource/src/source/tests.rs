@@ -291,7 +291,7 @@ fn credential_bearing_urls_partition_shared_cache_and_singleflight_identity() {
     assert!(cache.store(
         broad.clone(),
         Response::data(b"authorized-for-broad-token".to_vec()),
-        None
+        CachedFreshness::default(),
     ));
     assert!(cache.lookup_shared(&broad).is_some());
     assert!(
@@ -428,8 +428,16 @@ fn a_304_backed_only_by_the_shared_cache_stays_bodyless_for_native() {
 }
 
 #[test]
-fn a_sparse_304_retains_the_stored_swr_boundary() {
-    let stale_until = SystemTime::now() + Duration::from_hours(12);
+fn a_sparse_304_inherits_and_reanchors_the_stored_policy() {
+    // RFC 9111 §4.3.4: a 304 that restates nothing inherits the stored
+    // directives, and the successful validation resets the response's age —
+    // the window re-anchors at validation time instead of freezing at the
+    // original boundary.
+    let stored = CachedFreshness {
+        lifetime: Some(Duration::from_secs(3600)),
+        stale_while_revalidate: Some(Duration::from_secs(86400)),
+        stale_until: Some(SystemTime::now() + Duration::from_secs(30)),
+    };
     let attempt = not_modified_attempt(
         ResourceKind::Tile,
         maplibre_native::file_source::StoragePolicy::Permanent,
@@ -437,17 +445,34 @@ fn a_sparse_304_retains_the_stored_swr_boundary() {
         PriorResponse {
             cache_data: Some(b"cached"),
             etag: Some("\"v1\""),
-            stale_until: Some(stale_until),
+            expires: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            freshness: stored,
             ..PriorResponse::default()
         },
     );
 
+    let CachePolicy::Store { freshness } = attempt.cache_policy else {
+        panic!("a sparse 304 keeps storing");
+    };
+    assert_eq!(freshness.lifetime, stored.lifetime);
     assert_eq!(
-        attempt.cache_policy,
-        CachePolicy::Store {
-            stale_until: Some(stale_until)
-        },
-        "an omitted Cache-Control field retains the stored field"
+        freshness.stale_while_revalidate,
+        stored.stale_while_revalidate
+    );
+    let floor = SystemTime::now() + Duration::from_secs(3600 + 86400 - 2);
+    assert!(
+        freshness.stale_until.is_some_and(|until| until > floor),
+        "the inherited window re-anchors at validation time"
+    );
+    // The materialized entry's freshness also inherits the stored lifetime
+    // instead of the invented fallback TTL.
+    let cached = attempt.cache_response.expect("materialized entry");
+    let expires_floor = SystemTime::now() + Duration::from_secs(3600 - 2);
+    assert!(
+        cached
+            .expires
+            .is_some_and(|expires| expires > expires_floor),
+        "a sparse revalidation restores the stored lifetime, not one minute"
     );
 }
 
@@ -462,15 +487,69 @@ fn cache_control_on_a_304_replaces_the_stored_swr_grant() {
         PriorResponse {
             cache_data: Some(b"cached"),
             etag: Some("\"v1\""),
-            stale_until: Some(SystemTime::now() + Duration::from_hours(12)),
+            freshness: CachedFreshness {
+                lifetime: Some(Duration::from_secs(3600)),
+                stale_while_revalidate: Some(Duration::from_secs(86400)),
+                stale_until: Some(SystemTime::now() + Duration::from_hours(12)),
+            },
             ..PriorResponse::default()
         },
     );
 
+    let CachePolicy::Store { freshness } = attempt.cache_policy else {
+        panic!("a restated policy keeps storing");
+    };
     assert_eq!(
-        attempt.cache_policy,
-        CachePolicy::Store { stale_until: None },
-        "a present Cache-Control field replaces the stored field"
+        freshness.stale_until, None,
+        "a present Cache-Control field replaces the stored field, dropping the grant"
+    );
+    assert_eq!(freshness.lifetime, Some(Duration::from_secs(60)));
+}
+
+#[test]
+fn an_expires_only_304_replaces_the_stored_policy_and_drops_the_grant() {
+    // An origin that restates freshness with a bare short `Expires` has
+    // withdrawn the earlier long grant; inheriting it would let the entry's
+    // stale-while-revalidate window outlive the restated expiry.
+    let expires = SystemTime::now() + Duration::from_secs(60);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        EXPIRES,
+        HeaderValue::from_str(&httpdate::fmt_http_date(expires)).expect("valid date"),
+    );
+    let attempt = not_modified_attempt(
+        ResourceKind::Tile,
+        maplibre_native::file_source::StoragePolicy::Permanent,
+        &headers,
+        PriorResponse {
+            cache_data: Some(b"cached"),
+            etag: Some("\"v1\""),
+            freshness: CachedFreshness {
+                lifetime: Some(Duration::from_secs(3600)),
+                stale_while_revalidate: Some(Duration::from_secs(86400)),
+                stale_until: Some(SystemTime::now() + Duration::from_hours(12)),
+            },
+            ..PriorResponse::default()
+        },
+    );
+
+    let CachePolicy::Store { freshness } = attempt.cache_policy else {
+        panic!("a restated policy keeps storing");
+    };
+    assert_eq!(
+        freshness.stale_until, None,
+        "an Expires-only restatement drops the stored stale-while-revalidate grant"
+    );
+    assert_eq!(freshness.stale_while_revalidate, None);
+    assert_eq!(
+        freshness.lifetime, None,
+        "the restatement declared no relative lifetime"
+    );
+    let cached = attempt.cache_response.expect("materialized entry");
+    let ceiling = SystemTime::now() + Duration::from_secs(62);
+    assert!(
+        cached.expires.is_some_and(|entry| entry <= ceiling),
+        "the materialized entry expires at the restated Expires, not the stored lifetime"
     );
 }
 
@@ -701,13 +780,13 @@ fn the_swr_grant_survives_s_maxage_but_not_must_revalidate() {
         maplibre_native::file_source::StoragePolicy::Permanent,
         &headers,
     );
-    let CachePolicy::Store {
-        stale_until: Some(stale_until),
-    } = policy
-    else {
+    let CachePolicy::Store { freshness } = policy else {
         panic!("an swr grant with an explicit lifetime records a window");
     };
-    assert!(stale_until > floor, "window anchors on lifetime + grant");
+    assert!(
+        freshness.stale_until.is_some_and(|until| until > floor),
+        "window anchors on lifetime + grant"
+    );
 
     // An explicit must-revalidate prohibits serving stale and wins.
     let mut headers = HeaderMap::new();
@@ -715,13 +794,14 @@ fn the_swr_grant_survives_s_maxage_but_not_must_revalidate() {
         CACHE_CONTROL,
         HeaderValue::from_static("must-revalidate, stale-while-revalidate=86400"),
     );
-    assert_eq!(
-        cache_policy_for_response(
-            maplibre_native::file_source::StoragePolicy::Permanent,
-            &headers,
-        ),
-        CachePolicy::Store { stale_until: None }
-    );
+    let CachePolicy::Store { freshness } = cache_policy_for_response(
+        maplibre_native::file_source::StoragePolicy::Permanent,
+        &headers,
+    ) else {
+        panic!("must-revalidate still stores");
+    };
+    assert_eq!(freshness.stale_until, None);
+    assert_eq!(freshness.stale_while_revalidate, None);
 }
 
 #[test]
@@ -738,15 +818,15 @@ fn a_transported_age_shrinks_the_swr_window_instead_of_restarting_it() {
     );
     headers.insert(reqwest::header::AGE, HeaderValue::from_static("43200"));
     let now = SystemTime::now();
-    let CachePolicy::Store {
-        stale_until: Some(stale_until),
-    } = cache_policy_for_response(
+    let CachePolicy::Store { freshness } = cache_policy_for_response(
         maplibre_native::file_source::StoragePolicy::Permanent,
         &headers,
-    )
-    else {
+    ) else {
         panic!("a mid-window response still records its remaining window");
     };
+    let stale_until = freshness
+        .stale_until
+        .expect("a mid-window response still records its remaining window");
     let remaining = stale_until
         .duration_since(now)
         .expect("remaining window is in the future");
@@ -1418,7 +1498,7 @@ async fn a_peer_cache_fill_is_served_to_every_requester_still_awaiting_bytes() {
                 key.clone(),
                 Response::data(b"filled-by-peer".to_vec())
                     .with_expires(SystemTime::now() + Duration::from_hours(24)),
-                None,
+                CachedFreshness::default(),
             ),
             "{label}: the peer fill is cacheable"
         );
@@ -1459,7 +1539,7 @@ async fn a_peer_cache_fill_is_served_to_every_requester_still_awaiting_bytes() {
             key.clone(),
             Response::data(b"filled-by-peer".to_vec())
                 .with_expires(SystemTime::now() + Duration::from_secs(30)),
-            None,
+            CachedFreshness::default(),
         )
     );
     let mut observation = RequestObservation::for_test("glyphs");
@@ -1538,7 +1618,10 @@ fn failed_background_refreshes_are_cooled_down_per_resource() {
     assert!(cache.store(
         key.clone(),
         Response::data(b"stale".to_vec()).with_expires(SystemTime::now() - Duration::from_secs(1)),
-        Some(SystemTime::now() + Duration::from_secs(60)),
+        CachedFreshness {
+            stale_until: Some(SystemTime::now() + Duration::from_secs(60)),
+            ..CachedFreshness::default()
+        },
     ));
     let background = background_inputs(false, true, true);
 
@@ -1583,7 +1666,10 @@ fn refresh_cooldown_never_suppresses_foreground_or_out_of_window_revalidation() 
             key.clone(),
             Response::data(b"stale".to_vec())
                 .with_expires(SystemTime::now() - Duration::from_secs(120)),
-            Some(SystemTime::now() - Duration::from_secs(60)),
+            CachedFreshness {
+                stale_until: Some(SystemTime::now() - Duration::from_secs(60)),
+                ..CachedFreshness::default()
+            },
         )
     );
     let background = background_inputs(false, true, true);
@@ -1636,7 +1722,7 @@ async fn the_call_site_forwards_the_background_refresh_signal() {
             key.clone(),
             Response::data(b"cached".to_vec())
                 .with_expires(SystemTime::now() + Duration::from_hours(24)),
-            None,
+            CachedFreshness::default(),
         )
     );
 
@@ -1692,7 +1778,7 @@ async fn offline_usage_is_never_parked_even_at_low_priority() {
             key.clone(),
             Response::data(b"cached".to_vec())
                 .with_expires(SystemTime::now() + Duration::from_hours(24)),
-            None,
+            CachedFreshness::default(),
         )
     );
 

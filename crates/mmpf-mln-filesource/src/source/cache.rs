@@ -12,6 +12,7 @@ use moka::notification::RemovalCause;
 use moka::sync::Cache;
 use prometheus::{IntCounterVec, IntGauge, Opts, Registry};
 
+use super::response::CachedFreshness;
 use super::{ResourceRequestKey, SharedResourceRequestKey, kind_label};
 
 const ENTRY_OVERHEAD_BYTES: usize = 128;
@@ -20,13 +21,13 @@ const ENTRY_OVERHEAD_BYTES: usize = 128;
 /// response because MapLibre Native's `Response` cannot express it.
 pub(super) struct CachedResource {
     pub(super) response: Response,
-    /// End of the `stale-while-revalidate` window; absent = no grant.
-    stale_until: Option<SystemTime>,
+    /// Effective freshness policy at store time; a sparse 304 inherits it.
+    freshness: CachedFreshness,
 }
 
 impl CachedResource {
-    pub(super) fn stale_until(&self) -> Option<SystemTime> {
-        self.stale_until
+    pub(super) fn freshness(&self) -> CachedFreshness {
+        self.freshness
     }
 }
 
@@ -80,6 +81,7 @@ impl ResourceCache {
         let now = SystemTime::now();
         entry.response.expires.is_some_and(|expires| expires <= now)
             && entry
+                .freshness
                 .stale_until
                 .is_some_and(|stale_until| now < stale_until)
     }
@@ -93,6 +95,7 @@ impl ResourceCache {
         let expired = response.expires.is_some_and(|expires| expires <= now);
         if expired {
             if entry
+                .freshness
                 .stale_until
                 .is_some_and(|stale_until| now < stale_until)
             {
@@ -110,7 +113,7 @@ impl ResourceCache {
         &self,
         key: SharedResourceRequestKey,
         response: Response,
-        stale_until: Option<SystemTime>,
+        freshness: CachedFreshness,
     ) -> bool {
         if !is_cacheable_response(&response) {
             cache_metrics()
@@ -124,7 +127,7 @@ impl ResourceCache {
             key,
             Arc::new(CachedResource {
                 response,
-                stale_until,
+                freshness,
             }),
         );
         cache_metrics()
@@ -327,7 +330,7 @@ mod tests {
         ));
         let response = Response::data(b"tile".to_vec()).with_etag("v1");
 
-        assert!(cache.store(key.clone(), response, None));
+        assert!(cache.store(key.clone(), response, CachedFreshness::default()));
         let CacheLookup::Hit(cached) = shared.lookup(&key) else {
             panic!("shared cached response");
         };
@@ -380,7 +383,10 @@ mod tests {
             Response::data(b"stale".to_vec())
                 .with_expires(SystemTime::now() - Duration::from_secs(1))
                 .with_must_revalidate(true),
-            Some(SystemTime::now() + Duration::from_secs(59)),
+            CachedFreshness {
+                stale_until: Some(SystemTime::now() + Duration::from_secs(59)),
+                ..CachedFreshness::default()
+            },
         );
 
         assert!(matches!(
@@ -400,7 +406,10 @@ mod tests {
             key.clone(),
             Response::data(b"stale".to_vec())
                 .with_expires(SystemTime::now() - Duration::from_secs(120)),
-            Some(SystemTime::now() - Duration::from_secs(60)),
+            CachedFreshness {
+                stale_until: Some(SystemTime::now() - Duration::from_secs(60)),
+                ..CachedFreshness::default()
+            },
         );
 
         assert!(matches!(cache.lookup(&key), CacheLookup::Revalidate(_)));
@@ -417,7 +426,10 @@ mod tests {
             key.clone(),
             Response::data(b"fresh".to_vec())
                 .with_expires(SystemTime::now() + Duration::from_secs(60)),
-            Some(SystemTime::now() + Duration::from_secs(120)),
+            CachedFreshness {
+                stale_until: Some(SystemTime::now() + Duration::from_secs(120)),
+                ..CachedFreshness::default()
+            },
         );
 
         assert!(matches!(cache.lookup(&key), CacheLookup::Hit(_)));
@@ -435,7 +447,7 @@ mod tests {
             Response::data(b"stale".to_vec())
                 .with_expires(SystemTime::UNIX_EPOCH)
                 .with_must_revalidate(true),
-            None,
+            CachedFreshness::default(),
         );
 
         assert!(matches!(cache.lookup(&key), CacheLookup::Revalidate(_)));
@@ -458,7 +470,7 @@ mod tests {
         cache.store(
             key.clone(),
             Response::data(b"stale".to_vec()).with_expires(SystemTime::UNIX_EPOCH),
-            None,
+            CachedFreshness::default(),
         );
 
         assert!(matches!(cache.lookup(&key), CacheLookup::Revalidate(_)));
@@ -479,13 +491,13 @@ mod tests {
             fresh.clone(),
             Response::data(b"fresh".to_vec())
                 .with_expires(SystemTime::now() + std::time::Duration::from_mins(1)),
-            None,
+            CachedFreshness::default(),
         );
         cache.store(
             expired.clone(),
             Response::data(b"expired".to_vec())
                 .with_expires(SystemTime::now() - std::time::Duration::from_secs(1)),
-            None,
+            CachedFreshness::default(),
         );
 
         assert_eq!(
@@ -505,7 +517,11 @@ mod tests {
             "https://resource.test/no-expiration",
             ResourceKind::Glyphs,
         ));
-        cache.store(key.clone(), Response::data(b"cached".to_vec()), None);
+        cache.store(
+            key.clone(),
+            Response::data(b"cached".to_vec()),
+            CachedFreshness::default(),
+        );
 
         assert!(matches!(cache.lookup(&key), CacheLookup::Hit(_)));
         assert!(

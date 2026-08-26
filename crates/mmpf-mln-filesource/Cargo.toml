@@ -22,4 +22,5 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["io-util", "test-util"] }
+tokio = { workspace = true, features = ["io-util", "test-util", "rt-multi-thread", "macros"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

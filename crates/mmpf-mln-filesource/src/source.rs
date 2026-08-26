@@ -46,6 +46,8 @@ use metrics::{
     UpstreamAttemptObservation, fs_metrics, kind_label, mark_metrics_started, note_caller_thread,
     outcome_label, priority_label,
 };
+#[cfg(test)]
+use response::CachedFreshness;
 use response::{
     CachePolicy, PriorResponse, RetryDirective, cache_policy_for_not_modified,
     cache_policy_for_response, materialize_not_modified, negative_cache_ttl,
@@ -657,12 +659,12 @@ impl NetworkFileSource {
             ..
         } = attempt;
         match cache_policy {
-            CachePolicy::Store { stale_until } => {
+            CachePolicy::Store { freshness } => {
                 // A 304 path already owns a separate materialized cache value;
                 // move it instead of cloning its potentially large body again.
                 let cached = cache_response.unwrap_or_else(|| response.clone());
                 self.resource_cache
-                    .store(Arc::clone(resource_key), cached, stale_until);
+                    .store(Arc::clone(resource_key), cached, freshness);
             }
             CachePolicy::Remove => self.resource_cache.invalidate(resource_key),
             CachePolicy::Unchanged => {}
@@ -714,7 +716,10 @@ impl NetworkFileSource {
         let prior = prior_response_with_cache(
             request,
             cached.as_ref().map(|entry| &entry.response),
-            cached.as_ref().and_then(|entry| entry.stale_until()),
+            cached
+                .as_ref()
+                .map(|entry| entry.freshness())
+                .unwrap_or_default(),
         );
         let mut builder = self.client.get(&request.url);
         if let Some(range) = &request.data_range {
@@ -998,7 +1003,7 @@ fn not_modified_attempt(
             ))
         };
     };
-    let cache_policy = cache_policy_for_not_modified(storage_policy, headers, prior.stale_until);
+    let cache_policy = cache_policy_for_not_modified(storage_policy, headers, prior.freshness);
     if prior.native_data.is_some() {
         // A prior body on the request means native withheld the representation
         // for revalidation — the consumer does NOT have it. The stock

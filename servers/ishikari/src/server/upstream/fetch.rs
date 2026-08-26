@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use bytes::BytesMut;
 use ishikari_core::storage::ObjectStoreRegistry;
 use object_store::{Attribute, Error as ObjectStoreError, GetOptions};
@@ -18,8 +18,9 @@ use crate::server::{
     conditional::Validators,
     provider_body::{BodyValidation, validate_body, validate_content_type},
     provider_cache_policy::{
-        cache_policy, cache_policy_values, cache_policy_with_freshness_values,
-        negative_cache_policy_values, negative_cache_policy_with_freshness_values,
+        UpstreamCacheControl, cache_policy, cache_policy_with_freshness,
+        negative_cache_policy_values, negative_cache_policy_with_freshness,
+        revalidated_cache_policy,
     },
 };
 
@@ -130,12 +131,8 @@ async fn fetch_http_provider(
         ));
     }
     if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
-        let (policy, has_explicit_freshness) = negative_cache_policy_with_freshness_values(
-            headers
-                .get_all(header::CACHE_CONTROL)
-                .iter()
-                .filter_map(|value| value.to_str().ok()),
-        );
+        let (policy, has_explicit_freshness) =
+            negative_cache_policy_with_freshness(upstream_cache_control(&headers));
         let initial_age = if has_explicit_freshness {
             corrected_initial_age(&headers, SystemTime::now(), request_started.elapsed())
         } else {
@@ -160,13 +157,8 @@ async fn fetch_http_provider(
         accepted_content_types,
         resource,
     )?;
-    let (policy, has_explicit_freshness) = cache_policy_with_freshness_values(
-        resource,
-        headers
-            .get_all(header::CACHE_CONTROL)
-            .iter()
-            .filter_map(|value| value.to_str().ok()),
-    );
+    let (policy, has_explicit_freshness) =
+        cache_policy_with_freshness(resource, upstream_cache_control(&headers));
     // Age accounting is only meaningful against an upstream-declared lifetime.
     // When the upstream sets no explicit freshness, Ishikari applies its own
     // default TTL, and charging the transported `Age`/`Date` against that
@@ -432,16 +424,13 @@ pub(super) fn revalidated_provider_resource(
     headers: Option<&HeaderMap>,
     response_delay: Duration,
 ) -> FetchedProviderResource {
-    let mut cache_control_values = headers
-        .into_iter()
-        .flat_map(|headers| headers.get_all(header::CACHE_CONTROL).iter())
-        .filter_map(|value| value.to_str().ok());
-    let policy = match cache_control_values.next() {
-        Some(first) => {
-            cache_policy_values(resource, std::iter::once(first).chain(cache_control_values))
-        }
-        None => cache_policy(resource, Some(cached.cache_control.as_ref())),
-    };
+    let upstream = UpstreamCacheControl::from_fields(
+        headers
+            .into_iter()
+            .flat_map(|headers| headers.get_all(header::CACHE_CONTROL).iter())
+            .map(HeaderValue::as_bytes),
+    );
+    let policy = revalidated_cache_policy(resource, upstream, cached.cache_control.as_ref());
     let validators = Validators::new(
         headers
             .and_then(|headers| header_value(headers, header::ETAG))
@@ -468,6 +457,15 @@ pub(super) fn revalidated_provider_resource(
         content_encoding,
         initial_age,
     }
+}
+
+fn upstream_cache_control(headers: &HeaderMap) -> UpstreamCacheControl<'_> {
+    UpstreamCacheControl::from_fields(
+        headers
+            .get_all(header::CACHE_CONTROL)
+            .iter()
+            .map(HeaderValue::as_bytes),
+    )
 }
 
 fn header_value(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {

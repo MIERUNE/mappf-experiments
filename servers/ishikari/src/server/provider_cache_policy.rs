@@ -53,6 +53,103 @@ impl CachePolicy {
             response_cache_control: Arc::from(default_response_cache_control(resource)),
         }
     }
+
+    /// Policy for a physically present `Cache-Control` field that cannot be
+    /// decoded: it may carry `no-store` or `private`, so the bytes are neither
+    /// retained by this shared cache nor re-advertised as cacheable.
+    fn unreadable() -> Self {
+        Self {
+            store: false,
+            fresh: Duration::ZERO,
+            swr: Duration::ZERO,
+            response_cache_control: Arc::from("no-store"),
+        }
+    }
+}
+
+/// Decoded state of the upstream `Cache-Control` field(s). `HeaderValue`
+/// accepts obs-text (0x80–0xFF) on construction while `to_str` refuses it, so
+/// a present-but-undecodable field is a real input, and dropping it would
+/// silently discard a `no-store`/`private` it may carry. Policy resolution
+/// therefore keeps three states distinct and fails `Unreadable` closed.
+pub(super) enum UpstreamCacheControl<'a> {
+    Absent,
+    Readable(Vec<&'a str>),
+    Unreadable,
+}
+
+impl<'a> UpstreamCacheControl<'a> {
+    /// Decodes every physical field. Any UTF-8 is readable (more tolerant
+    /// than `to_str`, which also rejects valid multi-byte text); one
+    /// undecodable field poisons the whole header, because directives in a
+    /// dropped field cannot be proven absent from the ones kept.
+    pub(super) fn from_fields(fields: impl IntoIterator<Item = &'a [u8]>) -> Self {
+        let mut values = Vec::new();
+        for field in fields {
+            match std::str::from_utf8(field) {
+                Ok(value) => values.push(value),
+                Err(_) => return Self::Unreadable,
+            }
+        }
+        if values.is_empty() {
+            Self::Absent
+        } else {
+            Self::Readable(values)
+        }
+    }
+}
+
+/// [`cache_policy_with_freshness_values`] with the unreadable state failed
+/// closed instead of defaulted.
+pub(super) fn cache_policy_with_freshness(
+    resource: &'static str,
+    upstream: UpstreamCacheControl<'_>,
+) -> (CachePolicy, bool) {
+    match upstream {
+        UpstreamCacheControl::Unreadable => (CachePolicy::unreadable(), false),
+        UpstreamCacheControl::Absent => (CachePolicy::defaulted(resource), false),
+        UpstreamCacheControl::Readable(values) => {
+            cache_policy_with_freshness_values(resource, values)
+        }
+    }
+}
+
+/// [`negative_cache_policy_with_freshness_values`] with the unreadable state
+/// failed closed instead of defaulted.
+pub(super) fn negative_cache_policy_with_freshness(
+    upstream: UpstreamCacheControl<'_>,
+) -> (NegativeCachePolicy, bool) {
+    match upstream {
+        UpstreamCacheControl::Unreadable => (
+            NegativeCachePolicy {
+                store: false,
+                fresh: Duration::ZERO,
+            },
+            false,
+        ),
+        UpstreamCacheControl::Absent => {
+            negative_cache_policy_with_freshness_values(std::iter::empty())
+        }
+        UpstreamCacheControl::Readable(values) => {
+            negative_cache_policy_with_freshness_values(values)
+        }
+    }
+}
+
+/// Effective policy after a revalidation response. An absent field inherits
+/// the stored policy (RFC 9111 §4.3.4); a readable field restates it; an
+/// unreadable field must become `no-store` — inheriting would resurrect a
+/// policy the origin may just have withdrawn.
+pub(super) fn revalidated_cache_policy(
+    resource: &'static str,
+    upstream: UpstreamCacheControl<'_>,
+    stored: &str,
+) -> CachePolicy {
+    match upstream {
+        UpstreamCacheControl::Unreadable => CachePolicy::unreadable(),
+        UpstreamCacheControl::Absent => cache_policy(resource, Some(stored)),
+        UpstreamCacheControl::Readable(values) => cache_policy_values(resource, values),
+    }
 }
 
 #[cfg(test)]
@@ -243,8 +340,10 @@ mod tests {
     use axum::http::HeaderValue;
 
     use super::{
-        MAX_PROVIDER_TTL, cache_policy, cache_policy_values, negative_cache_policy_values,
-        normalized_cache_control, parse_cache_control, positive_ttl,
+        MAX_PROVIDER_TTL, UpstreamCacheControl, cache_policy, cache_policy_values,
+        cache_policy_with_freshness, negative_cache_policy_values,
+        negative_cache_policy_with_freshness, normalized_cache_control, parse_cache_control,
+        positive_ttl, revalidated_cache_policy,
     };
 
     #[test]
@@ -361,6 +460,60 @@ mod tests {
         );
         assert_eq!(control.s_maxage, Some(30));
         assert_eq!(control.stale_while_revalidate, Some(10));
+    }
+
+    #[test]
+    fn an_unreadable_cache_control_field_fails_the_positive_policy_closed() {
+        // One invalid-UTF-8 byte in a physically present field. Decoding it
+        // as "absent" would default to store + public re-advertisement.
+        let upstream = UpstreamCacheControl::from_fields([b"private, ext=\"\xe9\"".as_slice()]);
+        let (policy, has_explicit_freshness) = cache_policy_with_freshness("glyph", upstream);
+        assert!(
+            !policy.store,
+            "an undecodable field may carry no-store/private and must fail closed"
+        );
+        assert_eq!(policy.response_cache_control.as_ref(), "no-store");
+        assert!(!has_explicit_freshness);
+    }
+
+    #[test]
+    fn an_unreadable_cache_control_field_fails_the_negative_policy_closed() {
+        let upstream = UpstreamCacheControl::from_fields([b"no-store, ext=\"\xe9\"".as_slice()]);
+        let (policy, _) = negative_cache_policy_with_freshness(upstream);
+        assert!(!policy.store);
+        assert_eq!(policy.fresh, Duration::ZERO);
+    }
+
+    #[test]
+    fn an_unreadable_cache_control_field_on_a_304_never_inherits_the_stored_policy() {
+        let policy = revalidated_cache_policy(
+            "style",
+            UpstreamCacheControl::from_fields([b"max-age=60, ext=\"\xe9\"".as_slice()]),
+            "public, max-age=300, s-maxage=3600",
+        );
+        assert!(
+            !policy.store,
+            "an undecodable restatement must not resurrect the stored policy"
+        );
+        assert_eq!(policy.response_cache_control.as_ref(), "no-store");
+
+        let inherited = revalidated_cache_policy(
+            "style",
+            UpstreamCacheControl::Absent,
+            "public, max-age=300, s-maxage=3600",
+        );
+        assert!(inherited.store, "a truly absent field still inherits");
+        assert_eq!(inherited.fresh, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn utf8_obs_text_stays_readable_and_its_directives_apply() {
+        // `HeaderValue::to_str` rejects any obs-text and would have dropped
+        // this whole field; UTF-8 decoding keeps its `no-store` effective.
+        let upstream = UpstreamCacheControl::from_fields(["no-store, ext=\"café\"".as_bytes()]);
+        let (policy, _) = cache_policy_with_freshness("style", upstream);
+        assert!(!policy.store);
+        assert_eq!(policy.response_cache_control.as_ref(), "no-store");
     }
 
     #[test]

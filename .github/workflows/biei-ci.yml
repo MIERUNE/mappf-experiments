@@ -68,6 +68,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
+      # Match the headless Mesa configuration used by the production image so
+      # native renderer integration tests do not depend on an X/DRM display.
+      EGL_PLATFORM: surfaceless
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      GALLIUM_DRIVER: llvmpipe
       # Fresh checkouts can make Cargo conservatively invoke rustc again. Cache
       # compiler outputs by content instead of fetching all Git history solely
       # to reconstruct source mtimes.

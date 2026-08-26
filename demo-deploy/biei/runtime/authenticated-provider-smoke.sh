@@ -448,6 +448,14 @@ curl -g -fsS --show-error --max-time 30 \
   "${BIEI_BASE}/auth-style/static/0,0,0/256x256.png?${BROAD_QUERY}" \
   --output "$WORK_DIR/broad-again.png"
 cmp "$WORK_DIR/broad.png" "$WORK_DIR/broad-again.png"
+
+# The first authorized render was admitted under the bootstrap revision. Once
+# its fetched content hash becomes current, the retry above seeds the output
+# cache under that revision; this request must then hit the stable key.
+curl -g -fsS --show-error --max-time 30 \
+  "${BIEI_BASE}/auth-style/static/0,0,0/256x256.png?${BROAD_QUERY}" \
+  --output "$WORK_DIR/broad-hit.png"
+cmp "$WORK_DIR/broad.png" "$WORK_DIR/broad-hit.png"
 wait_for_metric \
   "http://127.0.0.1:${BIEI_PUBLIC_PORT}/_internal/metrics" \
   'biei_render_output_cache_total\{[^}]*outcome="hit"[^}]*\} [1-9][0-9]*'

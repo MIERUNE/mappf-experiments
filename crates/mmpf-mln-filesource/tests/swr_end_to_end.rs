@@ -239,8 +239,10 @@ async fn a_stale_entry_is_served_while_revalidation_happens_in_the_background() 
         .lock()
         .unwrap()
         .expect("the delivered stale entries must pair background conditional refreshes");
+    let revalidation_nearly_done =
+        first_conditional_at + REVALIDATION_DELAY.saturating_sub(Duration::from_millis(100));
     assert!(
-        render_done < first_conditional_at + REVALIDATION_DELAY - Duration::from_millis(100),
+        render_done < revalidation_nearly_done,
         "the render must complete without waiting out the delayed revalidation"
     );
 

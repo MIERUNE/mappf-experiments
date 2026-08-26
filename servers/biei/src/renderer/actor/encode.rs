@@ -65,7 +65,7 @@ fn encode_webp_lossy(raw: &[u8], width: u32, height: u32) -> Vec<u8> {
 
 pub(super) fn rgba_to_rgb_on_white(raw: &[u8]) -> Vec<u8> {
     let mut rgb = Vec::with_capacity(raw.len() / 4 * 3);
-    for px in raw.chunks_exact(4) {
+    for px in raw.as_chunks::<4>().0 {
         let alpha = px[3] as u16;
         if alpha == 255 {
             rgb.extend_from_slice(&px[..3]);

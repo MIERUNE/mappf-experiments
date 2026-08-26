@@ -367,7 +367,7 @@ fn classify_path(scope: ListenerScope, path: &str) -> EndpointClassification {
             } else if path == INTERNAL_STATUS_PATH {
                 fixed(RequestEndpoint::Status)
             } else if path == "/_internal/forward" {
-                fixed(RequestEndpoint::InternalForward)
+                fixed(RequestEndpoint::NotFound)
             } else if path == "/_internal/refresh/style" {
                 fixed(RequestEndpoint::StyleRefresh)
             } else if path == "/metrics" || path == "/_internal" || path.starts_with("/_internal/")
@@ -391,23 +391,23 @@ fn public_content_routes() -> Router<HttpServerState> {
     Router::new().fallback(public_render)
 }
 
-/// The cluster-internal operational surface: health, metrics, peer forwarding,
-/// and the advisory refresh receiver. Defined once and composed by both the
-/// standalone listener (which serves the public health paths on the same socket)
-/// and the cluster-mode internal listener (which adds the not-found fallbacks and
-/// the internal metrics layer), so the route set — including the refresh body
-/// limit — cannot drift between the two.
-fn internal_operational_routes() -> Router<HttpServerState> {
+/// Operational routes shared by clustered and standalone deployments.
+/// Peer forwarding is deliberately separate: a single-node deployment has no
+/// peer wire and must not expose a request path that bypasses public ingress.
+fn shared_operational_routes() -> Router<HttpServerState> {
     Router::new()
         .route(INTERNAL_LIVENESS_PATH, get(healthz))
         .route(INTERNAL_READINESS_PATH, get(readyz))
         .route(INTERNAL_METRICS_PATH, get(metricsz))
         .route(INTERNAL_STATUS_PATH, get(statusz))
-        .route("/_internal/forward", post(forwardz))
         .route(
             "/_internal/refresh/style",
             post(refresh_style).route_layer(DefaultBodyLimit::max(MAX_STYLE_REFRESH_HINT_BYTES)),
         )
+}
+
+fn internal_operational_routes() -> Router<HttpServerState> {
+    shared_operational_routes().route("/_internal/forward", post(forwardz))
 }
 
 /// Operational and internal routes retained on the standalone listener. They
@@ -416,7 +416,10 @@ fn standalone_operational_routes() -> Router<HttpServerState> {
     Router::new()
         .route(PUBLIC_LIVENESS_PATH, get(healthz))
         .route(PUBLIC_READINESS_PATH, get(readyz))
-        .merge(internal_operational_routes())
+        // Keep the peer-only path an explicit 404 instead of allowing the
+        // public render fallback to reinterpret it.
+        .route("/_internal/forward", any(public_not_found))
+        .merge(shared_operational_routes())
 }
 
 /// Force `no-store` onto public failures so a shared cache cannot retain them.
@@ -1059,7 +1062,7 @@ mod tests {
                 Standalone,
                 "/_internal/forward",
                 StatusCode::NOT_FOUND,
-                InternalForward,
+                NotFound,
             ),
             (
                 Standalone,
@@ -1388,7 +1391,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_router_routes_public_and_internal_paths() {
+    async fn single_router_routes_public_and_operational_paths_but_refuses_forwarding() {
         let options =
             crate::options::test_options("http://style-api.test/styles/{style_id}/style.json", 1);
         let runtime = crate::runtime::Runtime::spawn_single_node(&options).expect("runtime");
@@ -1433,7 +1436,7 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert_eq!(internal.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(internal.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1842,13 +1845,24 @@ mod tests {
                 r#"biei_http_requests_total{endpoint="ready",status="200"} 1"#,
                 r#"biei_http_requests_total{endpoint="metrics",status="200"} 1"#,
                 r#"biei_http_requests_total{endpoint="status",status="200"} 1"#,
-                r#"biei_http_requests_total{endpoint="internal_forward",status="404"} 1"#,
             ] {
                 assert!(
                     rendered.contains(expected),
                     "missing {expected} for {scope:?}:\n{rendered}"
                 );
             }
+            let forward_endpoint = match scope {
+                ListenerScope::Internal => "internal_forward",
+                ListenerScope::Standalone => "not_found",
+                ListenerScope::Public => unreachable!(),
+            };
+            let expected = format!(
+                r#"biei_http_requests_total{{endpoint="{forward_endpoint}",status="404"}} 1"#
+            );
+            assert!(
+                rendered.contains(&expected),
+                "missing {expected} for {scope:?}:\n{rendered}"
+            );
         }
     }
 

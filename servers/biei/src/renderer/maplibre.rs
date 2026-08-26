@@ -709,6 +709,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_304_can_replace_the_style_validator() {
+        const ETAG_V1: &str = "\"style-v1\"";
+        const ETAG_V2: &str = "\"style-v2\"";
+        let body = r#"{"version":8,"name":"rotated-etag","sources":{},"layers":[]}"#;
+        let v1_requests = Arc::new(AtomicUsize::new(0));
+        let v2_requests = Arc::new(AtomicUsize::new(0));
+        let full_requests = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server binds");
+        let addr = listener.local_addr().expect("test server has local addr");
+        let server_v1 = Arc::clone(&v1_requests);
+        let server_v2 = Arc::clone(&v2_requests);
+        let server_full = Arc::clone(&full_requests);
+        let server = tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+                let server_v1 = Arc::clone(&server_v1);
+                let server_v2 = Arc::clone(&server_v2);
+                let server_full = Arc::clone(&server_full);
+                async move {
+                    use axum::response::IntoResponse;
+                    let validator = headers
+                        .get(axum::http::header::IF_NONE_MATCH)
+                        .and_then(|value| value.to_str().ok());
+                    if validator == Some(ETAG_V1) {
+                        server_v1.fetch_add(1, Ordering::SeqCst);
+                        return (
+                            axum::http::StatusCode::NOT_MODIFIED,
+                            [
+                                (axum::http::header::CACHE_CONTROL, "max-age=0"),
+                                (axum::http::header::ETAG, ETAG_V2),
+                            ],
+                            "",
+                        )
+                            .into_response();
+                    }
+                    if validator == Some(ETAG_V2) {
+                        server_v2.fetch_add(1, Ordering::SeqCst);
+                        return (
+                            axum::http::StatusCode::NOT_MODIFIED,
+                            [
+                                (axum::http::header::CACHE_CONTROL, "max-age=0"),
+                                (axum::http::header::ETAG, ETAG_V2),
+                            ],
+                            "",
+                        )
+                            .into_response();
+                    }
+                    server_full.fetch_add(1, Ordering::SeqCst);
+                    (
+                        axum::http::StatusCode::OK,
+                        [
+                            (axum::http::header::CACHE_CONTROL, "max-age=0"),
+                            (axum::http::header::ETAG, ETAG_V1),
+                        ],
+                        body,
+                    )
+                        .into_response()
+                }
+            });
+            axum::serve(listener, app).await.expect("test server runs");
+        });
+
+        let bootstrap = revision();
+        let catalog = Arc::new(StyleCatalog::with_minimum_revalidation_interval_for_tests(
+            Duration::from_millis(10),
+        ));
+        catalog.upsert_definition(
+            bootstrap.id.clone(),
+            StyleDefinition::new(format!("http://{addr}/style.json"), bootstrap.version),
+        );
+        let preparer = MapLibreProfilePreparer::for_tests(catalog);
+        let content_revision = StyleRevision {
+            id: bootstrap.id.clone(),
+            version: style_content_version(body),
+        };
+
+        preparer
+            .prepare_profile(&internal_task(bootstrap))
+            .await
+            .expect("initial fetch prepares");
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        preparer
+            .prepare_profile(&internal_task(content_revision.clone()))
+            .await
+            .expect("first revalidation prepares");
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        preparer
+            .prepare_profile(&internal_task(content_revision))
+            .await
+            .expect("second revalidation prepares");
+
+        assert_eq!(full_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(v1_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(v2_requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_full_style_response_without_an_etag_removes_the_old_validator() {
+        const ETAG: &str = "\"style-v1\"";
+        let body = r#"{"version":8,"name":"removed-etag","sources":{},"layers":[]}"#;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let first_revalidation = Arc::new(AtomicUsize::new(0));
+        let late_validators = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server binds");
+        let addr = listener.local_addr().expect("test server has local addr");
+        let server_requests = Arc::clone(&requests);
+        let server_first_revalidation = Arc::clone(&first_revalidation);
+        let server_late_validators = Arc::clone(&late_validators);
+        let server = tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+                let request = server_requests.fetch_add(1, Ordering::SeqCst);
+                let server_first_revalidation = Arc::clone(&server_first_revalidation);
+                let server_late_validators = Arc::clone(&server_late_validators);
+                async move {
+                    use axum::response::IntoResponse;
+                    let validator = headers
+                        .get(axum::http::header::IF_NONE_MATCH)
+                        .and_then(|value| value.to_str().ok());
+                    if request == 0 {
+                        return (
+                            axum::http::StatusCode::OK,
+                            [
+                                (axum::http::header::CACHE_CONTROL, "max-age=0"),
+                                (axum::http::header::ETAG, ETAG),
+                            ],
+                            body,
+                        )
+                            .into_response();
+                    }
+                    if request == 1 && validator == Some(ETAG) {
+                        server_first_revalidation.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if request >= 2 && validator.is_some() {
+                        server_late_validators.fetch_add(1, Ordering::SeqCst);
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        [(axum::http::header::CACHE_CONTROL, "max-age=0")],
+                        body,
+                    )
+                        .into_response()
+                }
+            });
+            axum::serve(listener, app).await.expect("test server runs");
+        });
+
+        let bootstrap = revision();
+        let catalog = Arc::new(StyleCatalog::with_minimum_revalidation_interval_for_tests(
+            Duration::from_millis(10),
+        ));
+        catalog.upsert_definition(
+            bootstrap.id.clone(),
+            StyleDefinition::new(format!("http://{addr}/style.json"), bootstrap.version),
+        );
+        let preparer = MapLibreProfilePreparer::for_tests(catalog);
+        let content_revision = StyleRevision {
+            id: bootstrap.id.clone(),
+            version: style_content_version(body),
+        };
+
+        preparer
+            .prepare_profile(&internal_task(bootstrap))
+            .await
+            .expect("initial fetch prepares");
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        preparer
+            .prepare_profile(&internal_task(content_revision.clone()))
+            .await
+            .expect("first revalidation prepares");
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        preparer
+            .prepare_profile(&internal_task(content_revision))
+            .await
+            .expect("second revalidation prepares");
+
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert_eq!(first_revalidation.load(Ordering::SeqCst), 1);
+        assert_eq!(late_validators.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn profile_preparer_activates_content_revision_without_a_duplicate_fetch() {
         let first_body = r#"{"version":8,"name":"first","sources":{},"layers":[]}"#;
         let second_body = r#"{"version":8,"name":"second","sources":{},"layers":[]}"#;

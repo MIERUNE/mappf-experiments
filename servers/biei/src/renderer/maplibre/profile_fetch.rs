@@ -31,10 +31,15 @@ pub(super) struct FetchedStyleJson {
 /// Outcome of a style fetch that may carry a stored validator.
 pub(super) enum StyleFetchOutcome {
     Fetched(FetchedStyleJson),
-    /// HTTP 304: the held bytes are current; only freshness advances.
+    /// HTTP 304: the held bytes are current and supplied metadata is updated.
     /// Possible only when a validator was sent.
     NotModified {
-        served_freshness: Duration,
+        /// Replacement freshness supplied by the 304. An absent field keeps
+        /// the lifetime of the stored representation.
+        served_freshness: Option<Duration>,
+        /// Replacement validator supplied by the 304. An absent field keeps
+        /// the validator from the stored representation.
+        etag: Option<String>,
     },
 }
 
@@ -501,8 +506,12 @@ async fn fetch_http_style_json(
             ));
         }
         let served_freshness =
-            style_response_freshness(response.headers(), request_started.elapsed());
-        return Ok(StyleFetchOutcome::NotModified { served_freshness });
+            style_response_freshness_update(response.headers(), request_started.elapsed());
+        let etag = header_str(response.headers(), reqwest::header::ETAG).map(str::to_owned);
+        return Ok(StyleFetchOutcome::NotModified {
+            served_freshness,
+            etag,
+        });
     }
     if !status.is_success() {
         tracing::debug!(
@@ -582,6 +591,16 @@ fn style_response_freshness(headers: &HeaderMap, response_delay: Duration) -> Du
     header_date(headers, EXPIRES)
         .and_then(|expires| expires.duration_since(SystemTime::now()).ok())
         .unwrap_or_default()
+}
+
+/// Freshness metadata supplied by a revalidation response. A sparse 304 does
+/// not replace the stored representation's freshness lifetime.
+fn style_response_freshness_update(
+    headers: &HeaderMap,
+    response_delay: Duration,
+) -> Option<Duration> {
+    (headers.contains_key(CACHE_CONTROL) || headers.contains_key(EXPIRES))
+        .then(|| style_response_freshness(headers, response_delay))
 }
 
 fn response_current_age(headers: &HeaderMap, response_delay: Duration) -> Duration {
@@ -836,6 +855,24 @@ mod tests {
         assert_eq!(
             style_response_freshness(&HeaderMap::new(), Duration::ZERO),
             Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn sparse_304_does_not_replace_stored_style_freshness() {
+        assert_eq!(
+            style_response_freshness_update(&HeaderMap::new(), Duration::ZERO),
+            None
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CACHE_CONTROL,
+            reqwest::header::HeaderValue::from_static("max-age=30"),
+        );
+        assert_eq!(
+            style_response_freshness_update(&headers, Duration::ZERO),
+            Some(Duration::from_secs(30))
         );
     }
 

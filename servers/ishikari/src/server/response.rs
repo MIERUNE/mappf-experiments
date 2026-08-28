@@ -34,28 +34,38 @@ pub(crate) fn bytes_response(
 /// Required whenever a response may carry a transport coding: without it a shared
 /// cache can serve a gzip body to a client that asked for identity.
 pub(crate) fn apply_accept_encoding_vary(headers: &mut HeaderMap) {
-    const ACCEPT_ENCODING: &str = "Accept-Encoding";
-    let already_listed = headers.get_all(header::VARY).iter().any(|value| {
-        value.to_str().is_ok_and(|value| {
-            value
-                .split(',')
-                .any(|part| part.trim().eq_ignore_ascii_case(ACCEPT_ENCODING))
-        })
-    });
-    if already_listed {
-        return;
-    }
-    // Append: another layer may already vary on something else, and replacing
-    // that value would drop a dimension from every shared cache key.
-    headers.append(header::VARY, HeaderValue::from_static(ACCEPT_ENCODING));
+    apply_vary_members(headers, &["Accept-Encoding"]);
 }
 
 /// Marks a generated document whose absolute URLs depend on request origin
 /// metadata supplied by the client or trusted reverse proxy.
 pub(crate) fn apply_origin_vary(headers: &mut HeaderMap) {
-    headers.insert(
+    apply_vary_members(headers, &["Origin", "X-Forwarded-Proto"]);
+}
+
+/// Appends the `members` missing from `Vary` as one comma-joined field.
+/// Append, never insert: another layer may already vary on something else, and
+/// replacing that value would drop a dimension from every shared cache key.
+fn apply_vary_members(headers: &mut HeaderMap, members: &[&'static str]) {
+    let missing = members
+        .iter()
+        .copied()
+        .filter(|name| {
+            !headers.get_all(header::VARY).iter().any(|value| {
+                value.to_str().is_ok_and(|value| {
+                    value
+                        .split(',')
+                        .any(|part| part.trim().eq_ignore_ascii_case(name))
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return;
+    }
+    headers.append(
         header::VARY,
-        HeaderValue::from_static("Origin, X-Forwarded-Proto"),
+        HeaderValue::from_str(&missing.join(", ")).expect("member names are valid header values"),
     );
 }
 
@@ -148,7 +158,39 @@ fn split_origin(origin: &str) -> Option<(&str, &str)> {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
 
-    use super::{get_origin, is_reflectable_host};
+    use super::{apply_accept_encoding_vary, apply_origin_vary, get_origin, is_reflectable_host};
+
+    #[test]
+    fn origin_vary_preserves_existing_vary_members() {
+        let mut headers = HeaderMap::new();
+        apply_accept_encoding_vary(&mut headers);
+        apply_origin_vary(&mut headers);
+
+        let members = headers
+            .get_all(header::VARY)
+            .iter()
+            .flat_map(|value| value.to_str().expect("readable Vary").split(','))
+            .map(|part| part.trim().to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        for expected in ["accept-encoding", "origin", "x-forwarded-proto"] {
+            assert!(
+                members.contains(&expected.to_string()),
+                "Vary must keep every dimension, got {members:?}"
+            );
+        }
+
+        // Reapplying adds nothing: every member is already listed.
+        apply_origin_vary(&mut headers);
+        apply_accept_encoding_vary(&mut headers);
+        assert_eq!(headers.get_all(header::VARY).iter().count(), 2);
+    }
+
+    #[test]
+    fn origin_vary_alone_keeps_the_contract_field_shape() {
+        let mut headers = HeaderMap::new();
+        apply_origin_vary(&mut headers);
+        assert_eq!(headers[header::VARY], "Origin, X-Forwarded-Proto");
+    }
 
     #[test]
     fn rejects_hosts_with_injection_chars() {

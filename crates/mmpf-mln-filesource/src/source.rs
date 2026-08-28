@@ -761,53 +761,47 @@ impl NetworkFileSource {
         };
         let status = response.status().as_u16();
         let headers = std::mem::take(response.headers_mut());
-        if status == 304 {
-            return not_modified_attempt(request.kind, request.storage_policy, &headers, prior);
-        }
-        if status != 200 && status != 206 {
-            tracing::debug!(
-                kind = kind_label(request.kind),
-                status,
-                resource_url = redacted_url_str(&request.url),
-                // Names only, never values: a provider refusal is usually either
-                // "wrong resource" or "no credential travelled", and the second
-                // is indistinguishable from the first once the query is dropped.
-                query_keys = redacted_query_keys(&request.url),
-                "resource provider returned a non-success status"
-            );
-            let mapped = response_from_http(status, &headers, Vec::new(), request.kind, prior);
-            if let Some(retry) = retry_directive(status, &headers) {
-                return FetchAttempt {
-                    response: mapped,
-                    cache_response: None,
-                    retry: Some(retry),
-                    negative_cache_ttl: None,
-                    cache_policy: CachePolicy::Unchanged,
-                };
-            }
-            return FetchAttempt {
-                response: mapped,
-                cache_response: None,
-                retry: None,
-                negative_cache_ttl: negative_cache_ttl(
-                    status,
-                    request.kind,
-                    request.storage_policy,
-                    &headers,
-                    NEGATIVE_CACHE_TTL,
-                ),
-                cache_policy: CachePolicy::Unchanged,
-            };
+        if let Some(attempt) = header_only_attempt(request, status, &headers, prior) {
+            return attempt;
         }
 
+        let body = match self
+            .read_bounded_body(request, &mut response, network_io, &mut network_budget)
+            .await
+        {
+            Ok(body) => body,
+            Err(attempt) => return attempt,
+        };
+        FetchAttempt::done_with_cache(
+            response_from_http(
+                status,
+                &headers,
+                body,
+                request.kind,
+                PriorResponse::default(),
+            ),
+            cache_policy_for_response(request.storage_policy, &headers),
+        )
+    }
+
+    /// Reads a `200`/`206` representation, bounded by the resource kind's size
+    /// limit. The body permit and in-flight guard are held only while bytes can
+    /// actually arrive. `Err` carries the attempt that ends this fetch.
+    async fn read_bounded_body(
+        &self,
+        request: &ResourceRequest,
+        response: &mut reqwest::Response,
+        network_io: &mut NetworkIoObservation<'_>,
+        network_budget: &mut NetworkAttemptBudget,
+    ) -> Result<Vec<u8>, FetchAttempt> {
         let max_resource_bytes = max_resource_bytes(request.kind);
         if let Some(length) = response.content_length()
             && length > max_resource_bytes
         {
-            return FetchAttempt::done(Response::error(
+            return Err(FetchAttempt::done(Response::error(
                 ErrorReason::Other,
                 format!("resource body too large: {length} bytes"),
-            ));
+            )));
         }
         let body_wait_started = std::time::Instant::now();
         let _body_permit = self
@@ -827,23 +821,23 @@ impl NetworkFileSource {
                 .min(max_resource_bytes) as usize,
         );
         loop {
-            match network_io.run(&mut network_budget, response.chunk()).await {
+            match network_io.run(network_budget, response.chunk()).await {
                 Ok(Ok(Some(chunk))) => {
                     let Some(new_len) = body.len().checked_add(chunk.len()) else {
-                        return FetchAttempt::done(Response::error(
+                        return Err(FetchAttempt::done(Response::error(
                             ErrorReason::Other,
                             "resource body too large",
-                        ));
+                        )));
                     };
                     if new_len > max_resource_bytes as usize {
-                        return FetchAttempt::done(Response::error(
+                        return Err(FetchAttempt::done(Response::error(
                             ErrorReason::Other,
                             format!("resource body exceeds {max_resource_bytes} bytes"),
-                        ));
+                        )));
                     }
                     body.extend_from_slice(&chunk);
                 }
-                Ok(Ok(None)) => break,
+                Ok(Ok(None)) => return Ok(body),
                 Ok(Err(error)) => {
                     tracing::debug!(
                         kind = kind_label(request.kind),
@@ -851,11 +845,11 @@ impl NetworkFileSource {
                         resource_url = redacted_url_str(&request.url),
                         "resource response body failed"
                     );
-                    return FetchAttempt::retryable(
+                    return Err(FetchAttempt::retryable(
                         response_from_reqwest_error(&error),
                         "transport",
                         None,
-                    );
+                    ));
                 }
                 Err(_) => {
                     tracing::debug!(
@@ -863,20 +857,85 @@ impl NetworkFileSource {
                         resource_url = redacted_url_str(&request.url),
                         "resource response body timed out"
                     );
-                    return FetchAttempt::retryable(request_timeout_response(), "timeout", None);
+                    return Err(FetchAttempt::retryable(
+                        request_timeout_response(),
+                        "timeout",
+                        None,
+                    ));
                 }
             }
         }
-        FetchAttempt::done_with_cache(
-            response_from_http(
-                status,
-                &headers,
-                body,
-                request.kind,
-                PriorResponse::default(),
-            ),
-            cache_policy_for_response(request.storage_policy, &headers),
-        )
+    }
+}
+
+/// Resolves the responses whose outcome the status and headers already decide.
+/// `None` means a representation still has to be read off the wire.
+fn header_only_attempt(
+    request: &ResourceRequest,
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    prior: PriorResponse<'_>,
+) -> Option<FetchAttempt> {
+    match status {
+        304 => Some(not_modified_attempt(
+            request.kind,
+            request.storage_policy,
+            headers,
+            prior,
+        )),
+        200 | 206 => None,
+        _ => Some(no_representation_attempt(request, status, headers, prior)),
+    }
+}
+
+/// Maps a status that carries no representation this source would store: a
+/// `204`, a retryable refusal, or a terminal one.
+fn no_representation_attempt(
+    request: &ResourceRequest,
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    prior: PriorResponse<'_>,
+) -> FetchAttempt {
+    if status == 204 {
+        tracing::debug!(
+            kind = kind_label(request.kind),
+            resource_url = redacted_url_str(&request.url),
+            "resource provider returned an empty representation"
+        );
+    } else {
+        tracing::debug!(
+            kind = kind_label(request.kind),
+            status,
+            resource_url = redacted_url_str(&request.url),
+            // Names only, never values: a provider refusal is usually either
+            // "wrong resource" or "no credential travelled", and the second
+            // is indistinguishable from the first once the query is dropped.
+            query_keys = redacted_query_keys(&request.url),
+            "resource provider returned a non-success status"
+        );
+    }
+    let mapped = response_from_http(status, headers, Vec::new(), request.kind, prior);
+    if let Some(retry) = retry_directive(status, headers) {
+        return FetchAttempt {
+            response: mapped,
+            cache_response: None,
+            retry: Some(retry),
+            negative_cache_ttl: None,
+            cache_policy: CachePolicy::Unchanged,
+        };
+    }
+    FetchAttempt {
+        response: mapped,
+        cache_response: None,
+        retry: None,
+        negative_cache_ttl: negative_cache_ttl(
+            status,
+            request.kind,
+            request.storage_policy,
+            headers,
+            NEGATIVE_CACHE_TTL,
+        ),
+        cache_policy: CachePolicy::Unchanged,
     }
 }
 

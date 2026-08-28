@@ -15,9 +15,10 @@ use super::{
     chunked_store::{BackendLatencyModel, ChunkedStore, ChunkedStoreConfig},
     generation::{ArchiveGeneration, ArchiveKey},
     peer::{
-        InternalTileSource, InternalTransport, Peer, PeerBackend, PeerDirectory, PeerFetchError,
-        ProviderRequest, ProviderRouteOutcome,
+        InternalTileSource, InternalTransport, PeerBackend, PeerFetchError, ProviderRequest,
+        ProviderRouteOutcome,
     },
+    peer_snapshot::{Peer, PeerDirectory},
     pmtiles::{DistributedPmtilesStorage, PmtilesReadSource},
     routing::HrwRouter,
     tuning::ResolverTuning,
@@ -1002,10 +1003,8 @@ mod tests {
     use super::*;
     use crate::metrics::NodeMetrics;
     use crate::storage::ObjectStoreRegistry;
-    use crate::storage::peer::Peer;
-    use crate::storage::peer::{
-        FetchFuture, InternalTransport, PeerBackend, PeerDirectory, PeerFetchError, PeerFuture,
-    };
+    use crate::storage::peer::{FetchFuture, InternalTransport, PeerBackend, PeerFetchError};
+    use crate::storage::peer_snapshot::{Peer, PeerDirectory, PeerFuture};
     use crate::storage::routing::HrwRouter;
 
     /// Peer directory returning a fixed peer set (none of them the local node).

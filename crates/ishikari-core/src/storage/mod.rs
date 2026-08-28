@@ -8,6 +8,7 @@ mod chunked_store;
 pub(crate) mod generation;
 #[cfg_attr(not(feature = "simulator-support"), allow(unreachable_pub))]
 mod peer;
+mod peer_snapshot;
 mod pmtiles;
 #[cfg_attr(not(feature = "simulator-support"), allow(unreachable_pub))]
 mod resolver;
@@ -31,12 +32,12 @@ pub use peer::{
     InternalFetchResponse, InternalProviderNegative, ProviderRequest, ProviderResourceKind,
     ProviderRouteOutcome, ProviderSpriteVariant,
 };
-pub use peer::{Peer, PeerDirectory, PeerFuture, PeerSnapshotCache};
 #[doc(hidden)]
 pub use peer::{
     internal_peer_request_timeout, internal_resource_kind, internal_response_body_limit,
     path_percent_encode, path_percent_encode_segments,
 };
+pub use peer_snapshot::{Peer, PeerDirectory, PeerFuture, PeerSnapshotCache};
 // The internal peer transport is injected by the `ishikari` server binary,
 // which owns the concrete (reqwest-based) implementation. These are the seam
 // types it needs; not a stable public API, hence `doc(hidden)`.

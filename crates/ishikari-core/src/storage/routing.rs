@@ -4,7 +4,7 @@ use std::{cmp::Ordering, collections::BinaryHeap, hash::Hasher};
 
 use twox_hash::XxHash64;
 
-use super::peer::Peer;
+use super::peer_snapshot::Peer;
 
 /// HRW placement over cluster peers for a given tileset and tile-locality group.
 #[derive(Clone)]

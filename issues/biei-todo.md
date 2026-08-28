@@ -6,11 +6,35 @@ No Biei-specific implementation item is currently active. This queue records bou
 
 The implemented contract — content-derived revisions, activation, the refresh receiver, fence semantics, hint idempotency, and convergence — is in [`../specs/biei-spec.md`](../specs/biei-spec.md) §8.3 and §9.1. What remains open:
 
-- Extend conditional revalidation to tileset JSON. Styles now revalidate with `If-None-Match` and reuse held bytes on `304`; the tileset fetch (`fetch_tileset_json_with_auth`, used by addlayer sources and base-source rewriting) still transfers the full body on every refresh even though Ishikari emits a derived `ETag` there too. Same shape as the style implementation.
 - Style-layer stale-while-revalidate stays deliberately unimplemented: the background refresh has no requester to borrow `provider_bearer_token` from, so implementing it would breach the credential-partition contract; conditional `If-None-Match` revalidation already reduces the request-path cost to one bodyless round trip. Sub-resources honor SWR in the FileSource. The remaining availability gap is served-last-known-good on failed refresh (below), not SWR.
 - Decide whether a failed refresh may serve the last-known-good revision, for how long, and how deletion differs from a transient provider failure.
 - Decide whether a future revision also covers resolved dependency identity. It currently covers the normalized style representation only.
 - Measure the number and memory cost of successfully observed dynamic style ids before imposing a catalog limit. `observed` is deliberately process-lifetime revision authority: LRU eviction could resurrect the bootstrap identity or reject current/previous peer work. If cardinality becomes material, add an explicit configurable admission/catalog limit before provider fetch rather than silently evicting revision state.
+
+## Deferred background refresh is cancelled by style churn (observed 2026-08-28)
+
+A 12-way concurrent burst over two styles against 41h-aged caches scheduled
+409 low-priority deferred glyph refreshes on one pod and 140 on the other, and
+**every one of them ended `outcome="cancelled"`** — zero reached `not_modified`.
+The gauge spiked (`refresh_deferred_inflight{glyphs}` 409) and drained within
+90s without producing a single revalidation.
+
+The cause is ordinary: a deferred refresh sleeps until expiry or the minimum
+update interval, and a style swap on that slot cancels the pending requests
+belonging to the style being swapped out. With more styles than renderer slots,
+swaps are the norm, so the deferred path schedules work it almost never
+completes.
+
+Not a defect: entries stay inside their freshness lifetime (glyph `s-maxage` is
+7 days), and the ordinary path revalidates at expiry. What it means in practice:
+
+- `refresh_deferred_inflight` spiking into the hundreds is benign under burst
+  traffic and must not be read as the 2026-08-17 fault, whose signature was
+  *renders blocked* while sleepers accumulated. Here every render returned 200.
+- The shared cache is effectively refreshed by expiry-driven revalidation, not
+  by the deferred pairing, whenever the workload swaps styles.
+- Do not tune the deferred path on this evidence. Measure whether completed
+  deferred refreshes ever matter for a single-style-per-slot workload first.
 
 ## Cold-render latency against the request deadline
 
@@ -18,12 +42,15 @@ The implemented contract — content-derived revisions, activation, the refresh 
 - **Controlled cold-stack measurement (2026-08-12):** fresh Biei and Ishikari processes rendered `mierune/jp_mierune_gray` plus the weather overlay at `600x500@2x` in 4.06 s on the deployed images. Native render residency was 3.16 s and profile preparation was 0.52 s. The render requested 152 glyph ranges (29.0 MiB decoded) and 12 tiles (2.7 MiB); glyph requests accumulated 67.5 s of overlapped request time, including 24.6 s waiting for Biei's resource permits, while Ishikari accumulated 41.9 s across the same cold glyph requests. On separate fresh Biei processes backed by already-warm public delivery, removing all 64 symbol layers reduced native render residency from 2.44 s to 1.39 s. Glyph and symbol work is therefore a material cold-path cost, but the current images did not reproduce the earlier 10-second outlier; do not attribute that tail to tile geometry or change the SLA from this one sample.
 - **Concurrent cold-cache fault isolated (2026-08-17):** one isolated cold render completed consistently in about 3.4 s and all FileSource I/O finished within about 0.8 s. Two identical cold renders could instead leave one or both native renders waiting past 10 s even though normal I/O, body, and retry gauges were zero. The blocked run had glyph Network requests sleeping in `refresh_deferred_inflight`: another renderer populated the shared Database cache between their Database miss and Network request, and the Network leaf parked a render-blocking callback under the false assumption that this requester had received the Database body. The fault disappeared with the Rust resource cache disabled and with MapLibre Native's default loader. Deferred refresh is valid only when Database already delivered a usable body. A miss, or a stale body carried as `priorData` because native withheld it for revalidation, receives the newly cached fresh body immediately. Regression coverage as it actually stands: the race branch is exercised directly
 against a real source and cache (`a_peer_cache_fill_is_served_to_every_requester_still_awaiting_bytes`),
-and deleting the early return that serves the body makes it fail. There is **no**
-concurrent cold-render probe in the suite, and none can be written today —
-`ResourceRequest` is `#[non_exhaustive]` with a crate-private constructor upstream,
-so `NetworkFileSource::request` cannot be driven from a test at all (tracked in
-`issues/mln-rs-wishlist.md`). The two-identical-cold-renders reproduction remains a
-manual procedure. Do not use this incident to justify a larger SLA or pre-warming.
+and deleting the early return that serves the body makes it fail. There is still **no**
+concurrent cold-render probe in the suite, but one is now writable: driving a real
+renderer against a local origin reaches `NetworkFileSource::request` end to end
+(`crates/mmpf-mln-filesource/tests/swr_end_to_end.rs` does exactly this for the
+stale-while-revalidate path). Direct `ResourceRequest` construction is still
+unavailable upstream, which only makes such a probe slower and less focused than
+a unit test — it is no longer a blocker (see `issues/mln-rs-wishlist.md`). Until
+someone writes it, the two-identical-cold-renders reproduction remains a manual
+procedure. Do not use this incident to justify a larger SLA or pre-warming.
 - **Treat ordinary cold latency separately:** the remaining roughly 3–4 s cold cost is mostly native glyph decode, symbol layout, shader/raster work, and encoding after network completion. Consider predictive warming only if that latency is a product problem; it is no longer a mitigation for the resolved 10-second cache-callback fault.
 - **Predictive warm handoff is planner-only.** `crates/biei-core/src/warm_plan.rs` accepts bounded recommendations pulled from other live nodes, reduces them to revision-independent `(style, mode, scale)` hints, resolves the current revision locally, and admits only the top two HRW owners. This intentionally treats peer advice as a replicated working-set hint: a primary teaches its likely successor early, while the receiver independently decides whether to spend work. No separate demand-history protocol is planned. The planner is not yet wired into runtime behaviour.
   - **Pull advice only while idle.** Add a versioned internal endpoint that returns the serving node's bounded, deduplicated loaded profiles. An idle node samples one live peer at a time in round-robin order with a short timeout; do not fan out to the whole cluster on every tick. The receiver unions only a small bounded window of replies, then recomputes HRW ownership and catalog revision locally. Advice is advisory, never a remote command.

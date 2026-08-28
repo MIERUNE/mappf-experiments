@@ -91,27 +91,31 @@ The process-global FileSource registration API landed in `maplibre_native` 0.8.4
 ## Constructing a `ResourceRequest` in tests
 
 `ResourceRequest` is `#[non_exhaustive]` and its only constructor is
-`pub(super) fn from_ffi`, so no downstream crate can build one. Every FileSource
-test therefore stops at helper functions and cannot drive `NetworkFileSource::request`
-end to end.
+`pub(super) fn from_ffi`, so no downstream crate can build one. A downstream test
+can still reach `NetworkFileSource::request` end to end by driving a real renderer
+against a local origin — `crates/mmpf-mln-filesource/tests/swr_end_to_end.rs` and
+this repository's own `tests/file_source_cache.rs` both do — so this is a cost, not
+a blocker: every such test pays a full render, a real socket, and native timing to
+assert one source-level branch that a constructed request would isolate.
 
 That gap has already cost us. The Database -> Network race handling was reviewed
 twice on the strength of unit tests over `native_database_state` and
 `resolve_fresh_cache_race`; the semantics of native's `priorData` were read
-backwards at one point, and no test could have caught it, because the only tests
-possible were over the same abstraction that encoded the misreading. Verifying a
-boundary requires exercising it from outside, and here the outside cannot be
-reached.
+backwards at one point, and no unit test could have caught it, because the only
+tests then written were over the same abstraction that encoded the misreading.
+Verifying a boundary requires exercising it from outside.
 
-What would fix it, in preference order:
+The outside is reachable, just expensively: `swr_end_to_end.rs` now covers the
+complete SWR sequence — stale Database delivery, the paired low-priority Network
+request, a delayed `304`, and the refreshed Database entry — by rendering against
+a real origin. That is the shape every boundary claim should take. The cost is a
+full renderer, a real socket, and native timing per assertion, which is why the
+suite has one such test rather than one per branch.
+
+What would make the focused ones possible, in preference order:
 
 - A `#[cfg(feature = "test-util")]` builder or `ResourceRequest::for_test(..)`.
 - Making the fields exhaustively constructible, so `..Default::default()` works.
-
-Until then, any claim about the Database -> Network sequence rests on reading
-`main_resource_loader.cpp` and on production observation, not on a regression test.
-That includes the complete SWR sequence: stale Database delivery, the paired
-low-priority Network request, a `304`, and the refreshed Database entry.
 
 ## Bridge-level 304 materialization (or document the contract)
 

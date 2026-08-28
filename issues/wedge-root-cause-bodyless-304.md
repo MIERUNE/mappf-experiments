@@ -106,14 +106,52 @@ exact coincidence is covered by the sequential observation plus four pre-fix
 wedges, not by an in-round fixed-binary sample. The overnight production soak
 covers the original real-world condition.
 
-## Confirmation still outstanding
+## Regression coverage
 
-- Overnight soak: the original real-world condition (idle hours, then render).
-- A full-path automated regression is blocked upstream: `ResourceRequest` is
-  `#[non_exhaustive]` with a `pub(super)` constructor, so the network source
-  cannot be driven end-to-end from tests (recorded in `mln-rs-wishlist.md`).
-  The in-cluster `mock304` deployment covers this gap operationally: a ~20s
-  deterministic cycle exists for future regression checks.
+Automated, in CI (this superseded the "blocked upstream" note kept here until
+2026-08-27; `ResourceRequest` still cannot be constructed directly, but a real
+renderer can drive the source end to end, which is what these do):
+
+- `crates/mmpf-mln-filesource/tests/swr_end_to_end.rs` renders against a live
+  HTTP origin that answers `304` after a delay, so a delivered stale body and
+  its paired background revalidation are exercised through native.
+- maplibre-native-rs PR #280 carries a native Database -> Network -> `304` ->
+  render test covering the bridge behavior this fix depends on.
+
+The `mock304` upstream (sprites with `s-maxage=10` + ETag, request log as
+witness) turned the 1h natural cycle into a ~20s one and produced the matrix
+above. Its deployment was removed on 2026-08-27 once the automated coverage
+landed; the manifests stay in `demo-deploy/biei/diagnostics/mock304/` so the
+deterministic in-cluster cycle can be recreated on demand.
+
+## Production soak: the original condition, cleared (2026-08-28)
+
+Both pods ran 41h on the fixed build (`62a8f7b` deploy) with essentially no
+traffic — 5 renders total, and the background-revalidation counters did not move
+for the last 33h of it. Idle time alone proves nothing here: the wedge needs a
+render to arrive *after* the caches age, so the aged state was used as the
+setup and the missing half was supplied deliberately.
+
+Burst against 41h-aged caches, 12-way concurrent, 24 requests per pod, two
+heavy styles each (the shape that wedged the pre-fix binary):
+
+| pod | styles | result |
+|-----|--------|--------|
+| `jc88b` | `mierune/jp_mierune_{streets,gray}` | 24/24 `200`, 0.07–3.6s |
+| `4pllq` | `carto/{voyager,dark-matter}-gl-style` | 24/24 `200` |
+
+Zero wedges, orphans, renderer replacements, rejections, 5xx, or `WARN`/`ERROR`
+lines on either pod. The aged-cache path was genuinely exercised, not skipped:
+profile preparations went 2 -> 17 (the 1h style-JSON entries had long expired
+and were refetched or revalidated), and the two pods pulled 168 and ~160
+foreground glyph fetches — 42.7 MB on `4pllq` alone — inserting new entries.
+
+This is the original real-world condition ("a pod left idle for hours can no
+longer render") and the fixed build handled it. Same residual caveat as the
+matrix above: no `prior_body=true` withheld-body 304 fired in-round (glyph 304
+counters were unchanged; see the deferred-refresh note in `biei-todo.md`), so
+that exact coincidence remains covered by the four pre-fix wedges plus
+`swr_end_to_end.rs`, not by an in-round fixed-binary sample.
 
 ## Unrelated open issue
 

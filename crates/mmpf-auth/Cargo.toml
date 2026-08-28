@@ -13,9 +13,13 @@ http.workspace = true
 mmpf-common.workspace = true
 moka.workspace = true
 object_store = { workspace = true, features = ["aws", "gcp", "http"] }
+prometheus.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

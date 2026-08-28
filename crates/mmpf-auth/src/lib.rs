@@ -6,145 +6,46 @@
 //! A service may also select one configured registry whose explicit anonymous
 //! grant applies only when the request contains no credential at all.
 
-use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fmt;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, bail};
+use anyhow::bail;
 use http::HeaderMap;
 use mmpf_common::singleflight::{Flight, SingleFlight};
 use mmpf_common::sync::lock_unpoisoned;
 use moka::sync::Cache;
 use object_store::path::Path as ObjectPath;
 use object_store::{Error as ObjectStoreError, GetOptions, ObjectStore, parse_url_opts};
-use serde::Deserialize;
+use prometheus::proto::MetricFamily;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 use url::Url;
 
-const CURRENT_OBJECT: &str = "current.json";
-const MAX_REGISTRIES: usize = 128;
-const MAX_REGISTRY_ID_BYTES: usize = 64;
-const MAX_CREDENTIAL_BYTES: usize = 4096;
+mod catalog;
+mod credential;
+mod metrics;
+mod policy;
+
+pub use catalog::RegistryCatalog;
+pub use credential::{AuthFailure, credential_sha256};
+pub use policy::DeliveryAction;
+
+use catalog::{RegistryConfig, validate_registry_id};
+use credential::{
+    anonymous_cache_partition, credential_cache_partition, credential_digest, delivery_token,
+    parse_token_envelope,
+};
+use metrics::AuthMetrics;
+use policy::{RegistrySnapshot, authorize_grant};
+
 const MAX_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 const AUTH_CACHE_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_CREDENTIALS_PER_REGISTRY: usize = 100_000;
 const MAX_CONCURRENT_REGISTRY_LOADS: usize = 8;
-const MAX_PRINCIPAL_ID_BYTES: usize = 256;
-const MAX_NAMESPACES_PER_CREDENTIAL: usize = 1024;
-const MAX_ORIGINS_PER_CREDENTIAL: usize = 128;
 const REFRESH_INTERVAL: Duration = Duration::from_mins(1);
 const REFRESH_FAILURE_COOLDOWN: Duration = Duration::from_secs(5);
 const OBJECT_STORE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
-const DIGEST_DOMAIN: &[u8] = b"mmpf-object-store-auth-v1\0";
-const CACHE_PARTITION_DOMAIN: &[u8] = b"mmpf-delivery-cache-partition-v1\0";
-const ANONYMOUS_CACHE_PARTITION_DOMAIN: &[u8] = b"mmpf-delivery-anonymous-cache-partition-v1\0";
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct RegistryCatalog {
-    entries: Arc<BTreeMap<String, RegistryConfig>>,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct RegistryConfig {
-    current_url: Url,
-}
-
-impl RegistryCatalog {
-    pub fn empty() -> Self {
-        Self {
-            entries: Arc::new(BTreeMap::new()),
-        }
-    }
-
-    /// Parses `registry_id=auth-root;...`. An empty string disables auth.
-    pub fn parse(spec: &str) -> anyhow::Result<Self> {
-        if spec.trim().is_empty() {
-            return Ok(Self::empty());
-        }
-
-        let mut entries = BTreeMap::new();
-        for raw_entry in spec.split(';') {
-            let (raw_id, raw_root) = raw_entry
-                .split_once('=')
-                .ok_or_else(|| anyhow::anyhow!("auth registry entry must be registry_id=URL"))?;
-            let registry_id = raw_id.trim();
-            validate_registry_id(registry_id)?;
-            let auth_root = parse_auth_root(raw_root.trim())?;
-            let current_url = auth_root
-                .join(CURRENT_OBJECT)
-                .context("resolve auth registry current.json")?;
-            if entries
-                .insert(registry_id.to_string(), RegistryConfig { current_url })
-                .is_some()
-            {
-                bail!("duplicate auth registry id {registry_id:?}");
-            }
-            if entries.len() > MAX_REGISTRIES {
-                bail!("too many auth registries; maximum is {MAX_REGISTRIES}");
-            }
-        }
-        Ok(Self {
-            entries: Arc::new(entries),
-        })
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    fn get(&self, registry_id: &str) -> Option<&RegistryConfig> {
-        self.entries.get(registry_id)
-    }
-}
-
-impl fmt::Debug for RegistryCatalog {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("RegistryCatalog")
-            .field("registry_ids", &self.entries.keys().collect::<Vec<_>>())
-            .finish()
-    }
-}
-
-fn parse_auth_root(raw: &str) -> anyhow::Result<Url> {
-    let url = Url::parse(raw).context("parse auth registry URL")?;
-    if !matches!(
-        url.scheme(),
-        "file" | "memory" | "gs" | "s3" | "http" | "https"
-    ) {
-        bail!(
-            "auth registry URL scheme {:?} is not supported",
-            url.scheme()
-        );
-    }
-    if url.cannot_be_a_base() || !url.path().ends_with('/') {
-        bail!("auth registry URL must be an absolute directory URL ending in `/`");
-    }
-    if !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        bail!("auth registry URL must not contain credentials, query, or fragment");
-    }
-    Ok(url)
-}
-
-fn validate_registry_id(registry_id: &str) -> anyhow::Result<()> {
-    if registry_id.is_empty() || registry_id.len() > MAX_REGISTRY_ID_BYTES {
-        bail!("auth registry id must contain 1..={MAX_REGISTRY_ID_BYTES} bytes");
-    }
-    if !registry_id.bytes().all(|byte| {
-        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
-    }) {
-        bail!("auth registry id must use lowercase ASCII letters, digits, `-`, or `_`");
-    }
-    Ok(())
-}
 
 #[derive(Clone)]
 pub struct DeliveryAuth {
@@ -160,6 +61,7 @@ struct DeliveryAuthInner {
     installed_revisions: Mutex<HashMap<String, InstalledRevision>>,
     refreshes: SingleFlight<String, AuthUnavailable>,
     refresh_permits: Arc<Semaphore>,
+    metrics: AuthMetrics,
 }
 
 #[derive(Clone)]
@@ -168,6 +70,15 @@ struct CachedRegistry {
     etag: Option<String>,
     refresh_after: Instant,
     source_bytes: u32,
+    /// When the backend last confirmed this snapshot current — a fetched body
+    /// or a `304`. Deliberately distinct from `refresh_after`, which only says
+    /// when the next attempt is due: a failing refresh keeps moving that
+    /// deadline while this stands still, and the gap is the revocation lag a
+    /// prolonged outage can accumulate.
+    validated_at: Instant,
+    /// First failure of the current failing streak, cleared by the next
+    /// successful validation. `None` means refresh is healthy.
+    refresh_failing_since: Option<Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -225,6 +136,7 @@ impl DeliveryAuth {
                 installed_revisions: Mutex::new(HashMap::new()),
                 refreshes: SingleFlight::default(),
                 refresh_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_REGISTRY_LOADS)),
+                metrics: AuthMetrics::new(),
             }),
         }))
     }
@@ -345,6 +257,7 @@ impl DeliveryAuth {
                 Flight::Leader(leader) => match self.refresh(registry_id, config).await {
                     Ok(snapshot) => return Ok(snapshot),
                     Err(error) => {
+                        self.inner.metrics.record_refresh(registry_id, "failure");
                         if let Some(stale) = self.defer_failed_refresh(registry_id) {
                             tracing::warn!(
                                 registry_id,
@@ -395,9 +308,17 @@ impl DeliveryAuth {
             Ok(Ok(result)) => result,
             Ok(Err(ObjectStoreError::NotModified { .. })) if previous.is_some() => {
                 let mut cached = previous.ok_or(AuthUnavailable)?;
-                cached.refresh_after = Instant::now() + REFRESH_INTERVAL;
+                let now = Instant::now();
+                cached.refresh_after = now + REFRESH_INTERVAL;
+                // A `304` is a successful validation: the entry is confirmed
+                // current, so its age restarts and any failing streak ends.
+                cached.validated_at = now;
+                cached.refresh_failing_since = None;
                 let snapshot = cached.snapshot.clone();
                 self.inner.cache.insert(registry_id.to_string(), cached);
+                self.inner
+                    .metrics
+                    .record_refresh(registry_id, "not_modified");
                 return Ok(snapshot);
             }
             Ok(Err(_)) | Err(_) => return Err(AuthUnavailable),
@@ -455,21 +376,29 @@ impl DeliveryAuth {
             },
         );
         lock_unpoisoned(&self.inner.cold_retry_after).remove(registry_id);
+        let now = Instant::now();
         self.inner.cache.insert(
             registry_id.to_string(),
             CachedRegistry {
                 snapshot: snapshot.clone(),
                 etag,
-                refresh_after: Instant::now() + REFRESH_INTERVAL,
+                refresh_after: now + REFRESH_INTERVAL,
                 source_bytes: body.len() as u32,
+                validated_at: now,
+                refresh_failing_since: None,
             },
         );
+        self.inner.metrics.record_refresh(registry_id, "success");
         Ok(snapshot)
     }
 
     fn defer_failed_refresh(&self, registry_id: &str) -> Option<Arc<RegistrySnapshot>> {
         if let Some(mut cached) = self.inner.cache.get(registry_id) {
-            cached.refresh_after = Instant::now() + REFRESH_FAILURE_COOLDOWN;
+            let now = Instant::now();
+            cached.refresh_after = now + REFRESH_FAILURE_COOLDOWN;
+            // Keep the streak's first failure: the streak length, not the last
+            // attempt, is how long this grant set has outlived its validation.
+            cached.refresh_failing_since.get_or_insert(now);
             let snapshot = cached.snapshot.clone();
             self.inner.cache.insert(registry_id.to_string(), cached);
             return Some(snapshot);
@@ -479,6 +408,38 @@ impl DeliveryAuth {
             Instant::now() + REFRESH_FAILURE_COOLDOWN,
         );
         None
+    }
+
+    /// Registry freshness families, sampled at scrape time because snapshot age
+    /// is only meaningful relative to the moment it is read.
+    ///
+    /// `registry_id` is a bounded label: ids come from validated configuration,
+    /// never from a request, and the catalog validation caps their count.
+    pub fn gather_metrics(&self) -> Vec<MetricFamily> {
+        let metrics = &self.inner.metrics;
+        let now = Instant::now();
+        let seconds_since = |since| now.saturating_duration_since(since).as_secs_f64();
+        for registry_id in self.inner.catalog.registry_ids() {
+            // Every configured registry reports, loaded or not: an absent series
+            // is indistinguishable from a healthy one, so a registry that never
+            // loaded — and therefore fails every request closed — would
+            // otherwise be invisible to alerting. Its timings read zero because
+            // an unloaded snapshot has no age, which is why `snapshot_loaded`
+            // has to be part of any staleness alert.
+            let cached = self.inner.cache.get(registry_id);
+            metrics.observe_snapshot(
+                registry_id,
+                cached.is_some(),
+                cached
+                    .as_ref()
+                    .map_or(0.0, |cached| seconds_since(cached.validated_at)),
+                cached.as_ref().map_or(0.0, |cached| {
+                    cached.refresh_failing_since.map_or(0.0, seconds_since)
+                }),
+                cached.as_ref().map_or(0, |cached| cached.snapshot.revision),
+            );
+        }
+        metrics.gather()
     }
 }
 
@@ -542,439 +503,6 @@ impl AuthorizedDelivery {
 #[derive(Clone, Debug)]
 struct AuthUnavailable;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AuthFailure {
-    InvalidCredential,
-    Forbidden,
-    Unavailable,
-}
-
-fn delivery_token<'a>(
-    headers: &'a HeaderMap,
-    query: Option<&'a str>,
-) -> Result<Option<PresentedCredential<'a>>, AuthFailure> {
-    let bearer = bearer_token(headers)?;
-    let query = access_token_from_query(query)?;
-    match (bearer, query) {
-        (Some(_), Some(_)) => Err(AuthFailure::InvalidCredential),
-        (Some(token), None) => Ok(Some(PresentedCredential {
-            value: Cow::Borrowed(token),
-            from_query: false,
-        })),
-        (None, Some(token)) => Ok(Some(PresentedCredential {
-            value: token,
-            from_query: true,
-        })),
-        (None, None) => Ok(None),
-    }
-}
-
-struct PresentedCredential<'a> {
-    value: Cow<'a, str>,
-    from_query: bool,
-}
-
-fn bearer_token(headers: &HeaderMap) -> Result<Option<&str>, AuthFailure> {
-    let mut values = headers.get_all(http::header::AUTHORIZATION).iter();
-    let Some(value) = values.next() else {
-        return Ok(None);
-    };
-    if values.next().is_some() {
-        return Err(AuthFailure::InvalidCredential);
-    }
-    let value = value.to_str().map_err(|_| AuthFailure::InvalidCredential)?;
-    let (scheme, token) = value
-        .split_once(' ')
-        .ok_or(AuthFailure::InvalidCredential)?;
-    if !scheme.eq_ignore_ascii_case("bearer")
-        || token.is_empty()
-        || token.contains(char::is_whitespace)
-    {
-        return Err(AuthFailure::InvalidCredential);
-    }
-    Ok(Some(token))
-}
-
-fn access_token_from_query(query: Option<&str>) -> Result<Option<Cow<'_, str>>, AuthFailure> {
-    let Some(query) = query else {
-        return Ok(None);
-    };
-    let mut token = None;
-    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-        if key != "access_token" {
-            continue;
-        }
-        if token.replace(value).is_some() {
-            return Err(AuthFailure::InvalidCredential);
-        }
-    }
-    Ok(token)
-}
-
-fn parse_token_envelope(token: &str) -> Result<(&str, &str), AuthFailure> {
-    let (registry_id, credential) = token
-        .split_once('.')
-        .ok_or(AuthFailure::InvalidCredential)?;
-    validate_registry_id(registry_id).map_err(|_| AuthFailure::InvalidCredential)?;
-    if credential.is_empty()
-        || credential.len() > MAX_CREDENTIAL_BYTES
-        || credential
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
-    {
-        return Err(AuthFailure::InvalidCredential);
-    }
-    Ok((registry_id, credential))
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Hash)]
-pub enum DeliveryAction {
-    #[serde(rename = "render.static")]
-    RenderStatic,
-    #[serde(rename = "read")]
-    Read,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RegistrySnapshotWire {
-    schema_version: u32,
-    registry_id: String,
-    revision: u64,
-    #[serde(default)]
-    anonymous: Option<AnonymousGrantWire>,
-    credentials: Vec<CredentialGrantWire>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AnonymousGrantWire {
-    enabled: bool,
-    namespaces: Vec<String>,
-    actions: Vec<DeliveryAction>,
-    #[serde(default)]
-    allowed_origins: Vec<String>,
-    allow_missing_origin: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CredentialGrantWire {
-    credential_sha256: String,
-    principal_id: String,
-    enabled: bool,
-    namespaces: Vec<String>,
-    actions: Vec<DeliveryAction>,
-    #[serde(default)]
-    allowed_origins: Vec<String>,
-    allow_missing_origin: bool,
-}
-
-struct RegistrySnapshot {
-    revision: u64,
-    anonymous: Option<AuthorizationGrant>,
-    credentials: HashMap<[u8; 32], CredentialGrant>,
-}
-
-struct CredentialGrant {
-    authorization: AuthorizationGrant,
-}
-
-struct AuthorizationGrant {
-    principal_id: String,
-    enabled: bool,
-    namespaces: Arc<[String]>,
-    actions: HashSet<DeliveryAction>,
-    allowed_origins: Vec<String>,
-    allow_missing_origin: bool,
-}
-
-impl RegistrySnapshot {
-    fn parse(expected_registry_id: &str, body: &[u8]) -> anyhow::Result<Self> {
-        let wire: RegistrySnapshotWire =
-            serde_json::from_slice(body).context("parse auth registry JSON")?;
-        if wire.schema_version != 1 {
-            bail!("unsupported auth registry schema_version");
-        }
-        if wire.registry_id != expected_registry_id {
-            bail!("auth registry id does not match configured registry");
-        }
-        if wire.credentials.len() > MAX_CREDENTIALS_PER_REGISTRY {
-            bail!("auth registry has too many credentials");
-        }
-        let anonymous = wire
-            .anonymous
-            .map(|grant| {
-                normalize_grant(
-                    "anonymous".to_string(),
-                    grant.enabled,
-                    grant.namespaces,
-                    grant.actions,
-                    grant.allowed_origins,
-                    grant.allow_missing_origin,
-                )
-            })
-            .transpose()?;
-        let mut credentials = HashMap::with_capacity(wire.credentials.len());
-        for grant in wire.credentials {
-            let digest = decode_sha256(&grant.credential_sha256)?;
-            if credentials.contains_key(&digest) {
-                bail!("auth registry contains a duplicate credential digest");
-            }
-            credentials.insert(
-                digest,
-                CredentialGrant {
-                    authorization: normalize_grant(
-                        grant.principal_id,
-                        grant.enabled,
-                        grant.namespaces,
-                        grant.actions,
-                        grant.allowed_origins,
-                        grant.allow_missing_origin,
-                    )?,
-                },
-            );
-        }
-        Ok(Self {
-            revision: wire.revision,
-            anonymous,
-            credentials,
-        })
-    }
-}
-
-fn normalize_grant(
-    principal_id: String,
-    enabled: bool,
-    mut namespaces: Vec<String>,
-    actions: Vec<DeliveryAction>,
-    allowed_origins: Vec<String>,
-    allow_missing_origin: bool,
-) -> anyhow::Result<AuthorizationGrant> {
-    validate_bounded_label("principal_id", &principal_id, MAX_PRINCIPAL_ID_BYTES)?;
-    if namespaces.is_empty() || namespaces.len() > MAX_NAMESPACES_PER_CREDENTIAL {
-        bail!("credential namespaces must be non-empty and bounded");
-    }
-    for namespace in &namespaces {
-        if namespace != "*" {
-            validate_bounded_label("namespace", namespace, 256)?;
-        }
-    }
-    namespaces.sort_unstable();
-    namespaces.dedup();
-    if namespaces
-        .binary_search_by(|value| value.as_str().cmp("*"))
-        .is_ok()
-    {
-        namespaces.clear();
-        namespaces.push("*".to_string());
-    }
-    let actions: HashSet<_> = actions.into_iter().collect();
-    if actions.is_empty() {
-        bail!("credential actions must not be empty");
-    }
-    if allowed_origins.len() > MAX_ORIGINS_PER_CREDENTIAL {
-        bail!("credential has too many allowed origins");
-    }
-    let allowed_origins = allowed_origins
-        .iter()
-        .map(|origin| normalize_declared_origin(origin))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(AuthorizationGrant {
-        principal_id,
-        enabled,
-        namespaces: namespaces.into(),
-        actions,
-        allowed_origins,
-        allow_missing_origin,
-    })
-}
-
-fn authorize_grant(
-    headers: &HeaderMap,
-    grant: &AuthorizationGrant,
-    namespace: Option<&str>,
-    action: DeliveryAction,
-) -> Result<(), AuthFailure> {
-    if namespace.is_some_and(|namespace| {
-        grant.namespaces.first().is_none_or(|first| first != "*")
-            && grant
-                .namespaces
-                .binary_search_by(|allowed| allowed.as_str().cmp(namespace))
-                .is_err()
-    }) || !grant.actions.contains(&action)
-    {
-        return Err(AuthFailure::Forbidden);
-    }
-    authorize_origin(headers, grant)
-}
-
-fn validate_bounded_label(name: &str, value: &str, max_bytes: usize) -> anyhow::Result<()> {
-    if value.is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
-        bail!("{name} must be non-empty, bounded, and contain no control characters");
-    }
-    Ok(())
-}
-
-fn authorize_origin(headers: &HeaderMap, grant: &AuthorizationGrant) -> Result<(), AuthFailure> {
-    if grant.allowed_origins.is_empty() {
-        return Ok(());
-    }
-    let origin = single_header(headers, http::header::ORIGIN)?
-        .map(normalize_declared_origin)
-        .transpose()
-        .map_err(|_| AuthFailure::Forbidden)?;
-    let origin = match origin {
-        Some(origin) => Some(origin),
-        None => single_header(headers, http::header::REFERER)?
-            .map(normalize_referer_origin)
-            .transpose()
-            .map_err(|_| AuthFailure::Forbidden)?,
-    };
-    match origin {
-        Some(origin)
-            if grant
-                .allowed_origins
-                .iter()
-                .any(|allowed| allowed == &origin) =>
-        {
-            Ok(())
-        }
-        None if grant.allow_missing_origin => Ok(()),
-        _ => Err(AuthFailure::Forbidden),
-    }
-}
-
-fn single_header(
-    headers: &HeaderMap,
-    name: http::header::HeaderName,
-) -> Result<Option<&str>, AuthFailure> {
-    let mut values = headers.get_all(name).iter();
-    let Some(value) = values.next() else {
-        return Ok(None);
-    };
-    if values.next().is_some() {
-        return Err(AuthFailure::Forbidden);
-    }
-    value.to_str().map(Some).map_err(|_| AuthFailure::Forbidden)
-}
-
-fn normalize_declared_origin(raw: &str) -> anyhow::Result<String> {
-    let url = Url::parse(raw).context("parse origin")?;
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.path() != "/"
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        bail!("origin must be HTTP(S)");
-    }
-    let origin = url.origin().ascii_serialization();
-    if origin == "null" {
-        bail!("opaque origins are not supported");
-    }
-    Ok(origin)
-}
-
-fn normalize_referer_origin(raw: &str) -> anyhow::Result<String> {
-    let url = Url::parse(raw).context("parse referer")?;
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
-        bail!("referer must be HTTP(S)");
-    }
-    let origin = url.origin().ascii_serialization();
-    if origin == "null" {
-        bail!("opaque origins are not supported");
-    }
-    Ok(origin)
-}
-
-fn credential_digest(registry_id: &str, credential: &str) -> [u8; 32] {
-    namespaced_digest(DIGEST_DOMAIN, registry_id, credential)
-}
-
-fn credential_cache_partition(
-    registry_id: &str,
-    credential: &str,
-    registry_revision: u64,
-) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(CACHE_PARTITION_DOMAIN);
-    hasher.update(registry_revision.to_be_bytes());
-    hasher.update((registry_id.len() as u64).to_be_bytes());
-    hasher.update(registry_id.as_bytes());
-    hasher.update((credential.len() as u64).to_be_bytes());
-    hasher.update(credential.as_bytes());
-    hasher.finalize().into()
-}
-
-fn anonymous_cache_partition(registry_id: &str, registry_revision: u64) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(ANONYMOUS_CACHE_PARTITION_DOMAIN);
-    hasher.update(registry_revision.to_be_bytes());
-    hasher.update((registry_id.len() as u64).to_be_bytes());
-    hasher.update(registry_id.as_bytes());
-    hasher.finalize().into()
-}
-
-fn namespaced_digest(domain: &[u8], registry_id: &str, credential: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(domain);
-    hasher.update((registry_id.len() as u64).to_be_bytes());
-    hasher.update(registry_id.as_bytes());
-    hasher.update((credential.len() as u64).to_be_bytes());
-    hasher.update(credential.as_bytes());
-    hasher.finalize().into()
-}
-
-/// Encodes the verifier digest stored in a registry snapshot for one opaque
-/// credential suffix. Registry tooling can use this without reimplementing the
-/// domain-separated hash contract.
-pub fn credential_sha256(registry_id: &str, credential: &str) -> String {
-    encode_sha256_bytes(credential_digest(registry_id, credential))
-}
-
-fn decode_sha256(value: &str) -> anyhow::Result<[u8; 32]> {
-    if value.len() != 64 {
-        bail!("credential_sha256 must be 64 lowercase hexadecimal characters");
-    }
-    let mut digest = [0_u8; 32];
-    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
-        let high = decode_lower_hex(pair[0])?;
-        let low = decode_lower_hex(pair[1])?;
-        digest[index] = (high << 4) | low;
-    }
-    Ok(digest)
-}
-
-fn decode_lower_hex(byte: u8) -> anyhow::Result<u8> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        _ => bail!("credential_sha256 must use lowercase hexadecimal"),
-    }
-}
-
-#[cfg(test)]
-fn encode_sha256(digest: [u8; 32]) -> String {
-    encode_sha256_bytes(digest)
-}
-
-fn encode_sha256_bytes(digest: [u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(64);
-    for byte in digest {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    encoded
-}
-
 struct ObjectStores {
     options: Arc<[(String, String)]>,
     stores: Mutex<HashMap<String, Arc<dyn ObjectStore>>>,
@@ -1023,7 +551,7 @@ impl ObjectStores {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::{HeaderName, HeaderValue};
+    use http::HeaderValue;
     use object_store::{ObjectStoreExt, PutPayload};
 
     fn headers(token: &str) -> HeaderMap {
@@ -1045,7 +573,7 @@ mod tests {
             "registry_id": registry_id,
             "revision": revision,
             "credentials": [{
-                "credential_sha256": encode_sha256(credential_digest(registry_id, credential)),
+                "credential_sha256": credential_sha256(registry_id, credential),
                 "principal_id": "demo-browser",
                 "enabled": true,
                 "namespaces": ["demo"],
@@ -1088,7 +616,7 @@ mod tests {
                 "allow_missing_origin": true
             },
             "credentials": [{
-                "credential_sha256": encode_sha256(credential_digest("public", "private")),
+                "credential_sha256": credential_sha256("public", "private"),
                 "principal_id": "private-user",
                 "enabled": true,
                 "namespaces": ["private"],
@@ -1109,19 +637,138 @@ mod tests {
         store.put(&path, PutPayload::from(body)).await.unwrap();
     }
 
-    #[test]
-    fn token_suffix_is_opaque_and_split_only_once() {
-        let (registry, credential) = parse_token_envelope("corp.aaa.bbb.ccc").unwrap();
-        assert_eq!(registry, "corp");
-        assert_eq!(credential, "aaa.bbb.ccc");
+    fn labelled_sample(
+        families: &[MetricFamily],
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> Option<f64> {
+        let family = families.iter().find(|family| family.name() == name)?;
+        let metric = family.get_metric().iter().find(|metric| {
+            labels.iter().all(|(expected_name, expected_value)| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == *expected_name && label.value() == *expected_value)
+            })
+        })?;
+        Some(match family.get_field_type() {
+            prometheus::proto::MetricType::COUNTER => metric.get_counter().value(),
+            _ => metric.get_gauge().value(),
+        })
     }
 
-    #[test]
-    fn registry_catalog_rejects_ambiguous_or_secret_urls() {
-        assert!(RegistryCatalog::parse("A=gs://bucket/auth/").is_err());
-        assert!(RegistryCatalog::parse("a=gs://bucket/auth").is_err());
-        assert!(RegistryCatalog::parse("a=https://user:secret@example/auth/").is_err());
-        assert!(RegistryCatalog::parse("a=gs://bucket/a/;a=gs://bucket/b/").is_err());
+    /// Reads one per-registry gauge or counter sample.
+    fn sample(families: &[MetricFamily], name: &str, registry_id: &str) -> Option<f64> {
+        labelled_sample(families, name, &[("registry_id", registry_id)])
+    }
+
+    fn headers_from_allowed_origin(token: &str) -> HeaderMap {
+        let mut headers = headers(token);
+        headers.insert(
+            http::header::ORIGIN,
+            HeaderValue::from_static("https://maps.example"),
+        );
+        headers
+    }
+
+    async fn delete_snapshot(auth: &DeliveryAuth, registry_id: &str) {
+        let config = auth.inner.catalog.get(registry_id).unwrap();
+        let (store, path) = auth.inner.stores.resolve(&config.current_url).unwrap();
+        store.delete(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_configured_registry_that_never_loaded_reports_itself_unloaded() {
+        let catalog = RegistryCatalog::parse("cold=memory:///auth/cold/").unwrap();
+        let auth = DeliveryAuth::new(catalog, std::iter::empty::<(String, String)>()).unwrap();
+
+        let families = auth.gather_metrics();
+        assert_eq!(
+            sample(&families, "mmpf_auth_registry_snapshot_loaded", "cold"),
+            Some(0.0),
+            "a registry with no snapshot fails every request closed and must be visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_validated_snapshot_reports_no_unvalidated_time() {
+        let auth = configured_auth("corp", "secret").await;
+        auth.authorize_static(&headers_from_allowed_origin("corp.secret"), None, "demo")
+            .await
+            .expect("the snapshot authorizes this credential");
+
+        let families = auth.gather_metrics();
+        assert_eq!(
+            sample(&families, "mmpf_auth_registry_snapshot_loaded", "corp"),
+            Some(1.0)
+        );
+        assert_eq!(
+            sample(&families, "mmpf_auth_registry_unvalidated_seconds", "corp"),
+            Some(0.0),
+            "a freshly validated snapshot has no unvalidated window"
+        );
+        assert_eq!(
+            sample(&families, "mmpf_auth_registry_revision", "corp"),
+            Some(1.0)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_refresh_ages_the_snapshot_it_keeps_serving() {
+        let auth = configured_auth("corp", "secret").await;
+        auth.authorize_static(&headers_from_allowed_origin("corp.secret"), None, "demo")
+            .await
+            .expect("the first authorization loads the snapshot");
+
+        // The backend loses the object: refresh now fails while the loaded
+        // snapshot stays authoritative (the read tier serves last known good).
+        delete_snapshot(&auth, "corp").await;
+        tokio::time::advance(REFRESH_INTERVAL + Duration::from_secs(1)).await;
+        auth.authorize_static(&headers_from_allowed_origin("corp.secret"), None, "demo")
+            .await
+            .expect("a failed refresh must not revoke a live grant");
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let families = auth.gather_metrics();
+        let first_streak = sample(&families, "mmpf_auth_registry_unvalidated_seconds", "corp")
+            .expect("the failing streak is reported");
+        assert!(
+            first_streak >= 10.0,
+            "a snapshot served past a failed refresh is no longer validated, got {first_streak}"
+        );
+        assert!(
+            sample(&families, "mmpf_auth_registry_snapshot_age_seconds", "corp")
+                .is_some_and(|age| age >= 71.0),
+            "age accrues from the last successful validation, not the last attempt"
+        );
+
+        // A second failure must extend the same streak rather than restart it:
+        // the accumulated revocation lag is the whole outage, not one attempt.
+        tokio::time::advance(REFRESH_FAILURE_COOLDOWN + Duration::from_secs(1)).await;
+        auth.authorize_static(&headers_from_allowed_origin("corp.secret"), None, "demo")
+            .await
+            .expect("still served from last known good");
+        let families = auth.gather_metrics();
+        let second_streak = sample(&families, "mmpf_auth_registry_unvalidated_seconds", "corp")
+            .expect("the failing streak is reported");
+        assert!(
+            second_streak > first_streak,
+            "the streak must accumulate across attempts, got {first_streak} then {second_streak}"
+        );
+        assert!(
+            labelled_sample(
+                &families,
+                "mmpf_auth_registry_refresh_total",
+                &[("registry_id", "corp"), ("outcome", "failure")],
+            )
+            .is_some_and(|n| n >= 1.0),
+            "refresh failures must be counted"
+        );
+        assert_eq!(
+            sample(&families, "mmpf_auth_registry_snapshot_loaded", "corp"),
+            Some(1.0),
+            "the entry is still serving, which is exactly why its age matters"
+        );
     }
 
     #[test]
@@ -1134,18 +781,6 @@ mod tests {
                 std::iter::empty::<(String, String)>(),
             )
             .is_err()
-        );
-    }
-
-    #[test]
-    fn anonymous_cache_partition_is_revision_scoped_and_domain_separated() {
-        assert_ne!(
-            anonymous_cache_partition("public", 1),
-            anonymous_cache_partition("public", 2)
-        );
-        assert_ne!(
-            anonymous_cache_partition("public", 1),
-            credential_cache_partition("public", "anonymous", 1)
         );
     }
 
@@ -1311,38 +946,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_load_normalizes_namespace_grants_once() {
-        let catalog = RegistryCatalog::parse("public=memory:///auth/public/").unwrap();
-        let auth = DeliveryAuth::new(catalog, std::iter::empty::<(String, String)>()).unwrap();
-        let body = serde_json::json!({
-            "schema_version": 1,
-            "registry_id": "public",
-            "revision": 1,
-            "credentials": [{
-                "credential_sha256": credential_sha256("public", "reader"),
-                "principal_id": "reader",
-                "enabled": true,
-                "namespaces": ["terrain", "*", "basemap", "basemap"],
-                "actions": ["read"],
-                "allow_missing_origin": true
-            }]
-        });
-        put_snapshot(&auth, "public", body.to_string().into_bytes()).await;
-
-        let authorized = auth
-            .authorize(
-                &headers("public.reader"),
-                None,
-                Some("anything"),
-                DeliveryAction::Read,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(authorized.readable_namespaces(), &["*".to_string()]);
-    }
-
-    #[tokio::test]
     async fn wrong_credential_namespace_and_origin_are_rejected() {
         let auth = configured_auth("public", "secret").await;
         let mut valid = headers("public.secret");
@@ -1461,64 +1064,6 @@ mod tests {
             auth.authorize_static(&headers("public.replacement"), None, "demo")
                 .await,
             Err(AuthFailure::Unavailable)
-        ));
-    }
-
-    #[test]
-    fn malformed_snapshots_are_rejected_as_a_whole() {
-        let duplicate = encode_sha256([7; 32]);
-        let body = serde_json::json!({
-            "schema_version": 1,
-            "registry_id": "public",
-            "revision": 1,
-            "credentials": [
-                {"credential_sha256": duplicate, "principal_id": "a", "enabled": true, "namespaces": ["a"], "actions": ["render.static"], "allow_missing_origin": true},
-                {"credential_sha256": duplicate, "principal_id": "b", "enabled": true, "namespaces": ["b"], "actions": ["render.static"], "allow_missing_origin": true}
-            ]
-        });
-        assert!(RegistrySnapshot::parse("public", body.to_string().as_bytes()).is_err());
-    }
-
-    #[test]
-    fn duplicate_security_headers_are_rejected() {
-        let mut headers = HeaderMap::new();
-        headers.append(
-            http::header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer public.one"),
-        );
-        headers.append(
-            http::header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer public.two"),
-        );
-        assert!(matches!(
-            bearer_token(&headers),
-            Err(AuthFailure::InvalidCredential)
-        ));
-
-        let name = HeaderName::from_static("origin");
-        headers.append(name.clone(), HeaderValue::from_static("https://a.example"));
-        headers.append(name.clone(), HeaderValue::from_static("https://b.example"));
-        assert!(matches!(
-            single_header(&headers, name),
-            Err(AuthFailure::Forbidden)
-        ));
-    }
-
-    #[test]
-    fn query_tokens_are_decoded_once_and_cannot_be_mixed_or_repeated() {
-        assert_eq!(
-            access_token_from_query(Some("x=1&access_token=public.a%2Bb.c"))
-                .unwrap()
-                .as_deref(),
-            Some("public.a+b.c")
-        );
-        assert!(matches!(
-            access_token_from_query(Some("access_token=one&access_token=two")),
-            Err(AuthFailure::InvalidCredential)
-        ));
-        assert!(matches!(
-            delivery_token(&headers("public.header"), Some("access_token=public.query")),
-            Err(AuthFailure::InvalidCredential)
         ));
     }
 }

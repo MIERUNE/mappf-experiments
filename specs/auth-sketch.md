@@ -332,6 +332,17 @@ This is a control-plane distribution and availability mechanism, not a reason to
 
 Registry freshness and token-revocation latency need explicit metrics and an alerting threshold before a registry is relied on operationally.
 
+Freshness telemetry is implemented. Both delivery servers fold the shared auth crate's families into their existing `/_internal/metrics` scrape, one series per configured registry whether or not it ever loaded:
+
+- `mmpf_auth_registry_snapshot_age_seconds` — since the last successful validation, where a `304` counts as one.
+- `mmpf_auth_registry_unvalidated_seconds` — length of the current failing-refresh streak, accumulated across attempts rather than restarted by each one; zero when refresh is healthy.
+- `mmpf_auth_registry_snapshot_loaded` — zero means no usable snapshot, so that registry fails its requests closed.
+- `mmpf_auth_registry_revision`, and `mmpf_auth_registry_refresh_total{outcome}` over `success`/`not_modified`/`failure`.
+
+**Alert on `unvalidated_seconds` and `snapshot_loaded == 0`, not on age.** Refresh is lazy — it is driven by arriving requests — so on a low-traffic deployment age grows merely because nothing asked for authorization, which is harmless precisely because no stale grant is being used. The dangerous state is a revalidation that was attempted, failed, and is being served through anyway; that is exactly what `unvalidated_seconds` measures. Age remains the quantity a tier bound is eventually expressed in, and is the only way to see accumulated lag across a refresh that recovers and fails again.
+
+The threshold and any fail-closed bound remain the tier decision below; the metrics deliberately encode no policy.
+
 The maximum acceptable snapshot age is a tier-specific availability decision, not a universal hard-coded timeout. Commodity delivery may intentionally keep serving a last-known-good snapshot while raising a loud stale-registry alert; strong/private access should fail closed after its documented bound.
 
 ### 10.1 Registry-local current object

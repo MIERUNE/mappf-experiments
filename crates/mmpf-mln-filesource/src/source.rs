@@ -50,7 +50,7 @@ use metrics::{
 use response::CachedFreshness;
 use response::{
     CachePolicy, PriorResponse, RetryDirective, cache_policy_for_not_modified,
-    cache_policy_for_response, materialize_not_modified, negative_cache_ttl,
+    cache_policy_for_response, declares_freshness, materialize_not_modified, negative_cache_ttl,
     prior_response_with_cache, response_from_http, response_from_reqwest_error, retry_directive,
 };
 #[cfg(test)]
@@ -908,17 +908,26 @@ fn empty_representation_attempt(
         resource_url = redacted_url_str(&request.url),
         "resource provider returned an empty representation"
     );
-    let response = response_from_http(
-        204,
-        headers,
-        Vec::new(),
-        request.kind,
-        PriorResponse::default(),
-    );
     FetchAttempt::done_with_cache(
-        response,
+        empty_representation(request.kind, headers),
         empty_representation_cache_policy(request.kind, request.storage_policy, headers),
     )
+}
+
+/// The empty representation handed to native and to the shared cache.
+///
+/// A provider that declares freshness is honoured as it stands. One that
+/// declares none would otherwise fall to the heuristic window a body gets,
+/// which is minutes; that is too generous for a fabricated "this tile is
+/// empty", so it is capped at the bound the identical fact already gets when
+/// it arrives as a 404, because an empty area can fill in.
+fn empty_representation(kind: ResourceKind, headers: &reqwest::header::HeaderMap) -> Response {
+    let response = response_from_http(204, headers, Vec::new(), kind, PriorResponse::default());
+    if declares_freshness(headers) {
+        response
+    } else {
+        response.with_expires(SystemTime::now() + NEGATIVE_CACHE_TTL)
+    }
 }
 
 /// Only tiles have an empty representation worth keeping: a required resource

@@ -1912,3 +1912,21 @@ fn an_empty_required_resource_or_volatile_request_is_never_retained() {
         "a volatile request never populates the shared cache"
     );
 }
+
+#[test]
+fn an_undeclared_empty_tile_is_capped_at_the_negative_cache_bound() {
+    // Nothing declared, so the body heuristic would grant minutes. The same
+    // "this area is empty" fact arriving as a 404 is capped at 15s because an
+    // empty tile can fill in, and a 204 must not be retained longer just for
+    // having a different status.
+    let response = empty_representation(ResourceKind::Tile, &HeaderMap::new());
+    let remaining = response
+        .expires
+        .expect("an empty tile still carries a bounded expiry")
+        .duration_since(SystemTime::now())
+        .expect("the expiry is in the future");
+    assert!(
+        remaining <= NEGATIVE_CACHE_TTL,
+        "undeclared empty-tile freshness must not exceed the negative-cache bound, got {remaining:?}"
+    );
+}

@@ -101,7 +101,7 @@ pub(super) fn cache_policy_for_not_modified(
     prior_freshness: CachedFreshness,
 ) -> CachePolicy {
     let policy = cache_policy_for_response(storage_policy, headers);
-    if headers.contains_key(CACHE_CONTROL) || headers.contains_key(EXPIRES) {
+    if declares_freshness(headers) {
         policy
     } else {
         match policy {
@@ -111,6 +111,13 @@ pub(super) fn cache_policy_for_not_modified(
             other => other,
         }
     }
+}
+
+/// Whether the response states its own freshness. A `304` that does replaces
+/// the stored policy; an empty representation that does not may only be
+/// retained on a fabricated lifetime.
+pub(super) fn declares_freshness(headers: &reqwest::header::HeaderMap) -> bool {
+    headers.contains_key(CACHE_CONTROL) || headers.contains_key(EXPIRES)
 }
 
 /// Derives the effective freshness policy — lifetime, grant, and the absolute

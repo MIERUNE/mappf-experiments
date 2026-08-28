@@ -709,6 +709,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_matching_validator_turns_tileset_revalidation_into_a_304() {
+        let (style_url, _style_requests, style_server) = spawn_counting_style_server(
+            axum::http::StatusCode::OK,
+            r#"{"version":8,"sources":{},"layers":[]}"#,
+            Duration::ZERO,
+        )
+        .await;
+        let tilejson = r#"{"tiles":["tiles/{z}/{x}/{y}.pbf"]}"#;
+        let (tileset_url, full, not_modified, tileset_server) =
+            spawn_etag_style_server(tilejson).await;
+        let revision = revision();
+        let catalog = Arc::new(StyleCatalog::new());
+        catalog.upsert_definition(
+            revision.id.clone(),
+            StyleDefinition::new(style_url, revision.version),
+        );
+        let preparer = MapLibreProfilePreparer::for_tests(catalog);
+        let mut task = internal_task(revision);
+        attach_addlayer_source(&mut task, tileset_url.clone());
+
+        let first = preparer
+            .prepare_profile(&task)
+            .await
+            .expect("initial profile prepares")
+            .expect("prepared profile");
+        assert!(first.addlayer_source.is_some());
+        assert_eq!(full.load(Ordering::SeqCst), 1);
+        assert_eq!(not_modified.load(Ordering::SeqCst), 0);
+
+        preparer.expire_cached_tileset(&tileset_url);
+        let second = preparer
+            .prepare_profile(&task)
+            .await
+            .expect("revalidated profile prepares")
+            .expect("prepared profile");
+
+        assert!(second.addlayer_source.is_some());
+        assert_eq!(
+            not_modified.load(Ordering::SeqCst),
+            1,
+            "the revalidation must send the stored TileJSON validator"
+        );
+        assert_eq!(
+            full.load(Ordering::SeqCst),
+            1,
+            "an unchanged TileJSON document must not transfer its body again"
+        );
+        style_server.abort();
+        tileset_server.abort();
+    }
+
+    #[tokio::test]
     async fn a_304_can_replace_the_style_validator() {
         const ETAG_V1: &str = "\"style-v1\"";
         const ETAG_V2: &str = "\"style-v2\"";

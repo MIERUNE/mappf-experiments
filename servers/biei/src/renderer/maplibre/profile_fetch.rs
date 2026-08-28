@@ -2,7 +2,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use reqwest::header::{AGE, CACHE_CONTROL, DATE, EXPIRES, HeaderMap, IF_NONE_MATCH};
+use reqwest::header::{AGE, CACHE_CONTROL, DATE, ETAG, EXPIRES, HeaderMap, IF_NONE_MATCH};
 use tokio::time::Instant;
 
 use biei_core::types::{
@@ -39,6 +39,22 @@ pub(super) enum StyleFetchOutcome {
         served_freshness: Option<Duration>,
         /// Replacement validator supplied by the 304. An absent field keeps
         /// the validator from the stored representation.
+        etag: Option<String>,
+    },
+}
+
+/// A validated TileJSON representation and its provider validator.
+pub(super) struct FetchedTilesetJson {
+    pub(super) json: String,
+    pub(super) etag: Option<String>,
+}
+
+/// Outcome of a TileJSON fetch that may carry a stored validator.
+pub(super) enum TilesetFetchOutcome {
+    Fetched(FetchedTilesetJson),
+    /// HTTP 304: the held bytes are current. A supplied validator replaces the
+    /// stored one; an omitted validator retains it.
+    NotModified {
         etag: Option<String>,
     },
 }
@@ -104,11 +120,20 @@ pub(super) async fn fetch_tileset_json(
         tileset_url,
         None,
         None,
+        None,
         deadline,
     )
     .await
+    .and_then(|outcome| match outcome {
+        TilesetFetchOutcome::Fetched(fetched) => Ok(fetched.json),
+        TilesetFetchOutcome::NotModified { .. } => Err(ProfileFetchError::transient_load(
+            style_id,
+            "provider answered 304 without a held TileJSON representation",
+        )),
+    })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn fetch_tileset_json_with_auth(
     client: &reqwest::Client,
     url_policy: &mmpf_mln_filesource::policy::ResourceUrlPolicy,
@@ -116,8 +141,9 @@ pub(super) async fn fetch_tileset_json_with_auth(
     tileset_url: &str,
     provider_token: Option<&ProviderBearerToken>,
     auth_provider_origin: Option<&url::Url>,
+    if_none_match: Option<&str>,
     deadline: Instant,
-) -> Result<String, ProfileFetchError> {
+) -> Result<TilesetFetchOutcome, ProfileFetchError> {
     let safe_input = redacted_url_str(tileset_url);
     let mut url = url::Url::parse(tileset_url).map_err(|err| {
         ProfileFetchError::permanent_invalid(
@@ -145,7 +171,11 @@ pub(super) async fn fetch_tileset_json_with_auth(
         "tileset",
     )?;
     let safe_url = redacted_url(&url);
-    let response = tokio::time::timeout_at(deadline, client.get(url.clone()).send())
+    let mut request = client.get(url.clone());
+    if let Some(validator) = if_none_match {
+        request = request.header(IF_NONE_MATCH, validator);
+    }
+    let response = tokio::time::timeout_at(deadline, request.send())
         .await
         .map_err(|_| ProfileFetchError::caller_deadline())?
         .map_err(|err| {
@@ -162,6 +192,16 @@ pub(super) async fn fetch_tileset_json_with_auth(
             )
         })?;
     let status = response.status();
+    if status == reqwest::StatusCode::NOT_MODIFIED {
+        if if_none_match.is_none() {
+            return Err(ProfileFetchError::transient_load(
+                style_id,
+                format!("unsolicited TileJSON 304 for {safe_url}"),
+            ));
+        }
+        let etag = header_str(response.headers(), ETAG).map(str::to_owned);
+        return Ok(TilesetFetchOutcome::NotModified { etag });
+    }
     if !status.is_success() {
         tracing::debug!(
             style_id = style_id.as_str(),
@@ -179,6 +219,7 @@ pub(super) async fn fetch_tileset_json_with_auth(
             ProfileFetchError::transient(error)
         });
     }
+    let etag = header_str(response.headers(), ETAG).map(str::to_owned);
     let bytes = read_bounded_body(response, MAX_TILESET_JSON_BYTES, deadline)
         .await
         .map_err(|err| match err {
@@ -195,7 +236,10 @@ pub(super) async fn fetch_tileset_json_with_auth(
         ProfileFetchError::permanent_invalid(style_id, format!("tileset JSON is not UTF-8: {err}"))
     })?;
     validate_tileset_json(style_id, &json)?;
-    Ok(json)
+    Ok(TilesetFetchOutcome::Fetched(FetchedTilesetJson {
+        json,
+        etag,
+    }))
 }
 
 fn validate_tileset_json(style_id: &StyleId, json: &str) -> Result<(), ProfileFetchError> {

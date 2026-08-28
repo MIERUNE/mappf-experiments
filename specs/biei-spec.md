@@ -251,6 +251,8 @@ Direct HTTP(S) URLs are rejected. The tileset catalog resolves the id to a TileJ
 
 Style revalidation is conditional: the coordinator stores the provider's validator and freshness lifetime beside the cached representation and revalidates with `If-None-Match`. A `304` reuses the held bytes without re-transfer or re-hashing a changed revision into existence; it replaces metadata fields it supplies and retains omitted fields from the stored representation. A full response replaces the stored metadata, including removal of a missing `ETag`.
 
+TileJSON revalidation is also conditional. A hot entry is checked after one hour with its stored `ETag`; a `304` reuses the held bytes and restarts that interval, while a full response replaces both bytes and validator. The cache remains weighted and cold entries leave after 30 minutes, so an evicted entry is fetched normally rather than retaining a validator without its representation.
+
 `before_layer` repositions the request overlay band. Missing-layer validation is limited by the current binding's introspection API. `setfilter` for an existing base-style layer remains blocked on the binding operation tracked in [`../issues/mln-rs-wishlist.md`](../issues/mln-rs-wishlist.md).
 
 ### 7.4 Input and resource limits

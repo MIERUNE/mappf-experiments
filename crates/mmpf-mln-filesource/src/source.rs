@@ -885,7 +885,55 @@ fn header_only_attempt(
             prior,
         )),
         200 | 206 => None,
+        204 => Some(empty_representation_attempt(request, headers)),
         _ => Some(no_representation_attempt(request, status, headers, prior)),
+    }
+}
+
+/// Retains an empty tile under the provider's own freshness.
+///
+/// Ishikari answers a stored zero-byte tile with `204` plus its full tile
+/// policy (`s-maxage=86400` and a stale-while-revalidate grant). Dropping that
+/// made every render re-fetch every empty tile: the response is not storable as
+/// a body, and the 404/410 negative cache never sees a `204`. Only tiles get
+/// this treatment — a required resource answering `204` is a provider fault,
+/// not a fact worth keeping — and the shared storage policy still decides,
+/// so `no-store` and `private` remove the entry as usual.
+fn empty_representation_attempt(
+    request: &ResourceRequest,
+    headers: &reqwest::header::HeaderMap,
+) -> FetchAttempt {
+    tracing::debug!(
+        kind = kind_label(request.kind),
+        resource_url = redacted_url_str(&request.url),
+        "resource provider returned an empty representation"
+    );
+    let response = response_from_http(
+        204,
+        headers,
+        Vec::new(),
+        request.kind,
+        PriorResponse::default(),
+    );
+    FetchAttempt::done_with_cache(
+        response,
+        empty_representation_cache_policy(request.kind, request.storage_policy, headers),
+    )
+}
+
+/// Only tiles have an empty representation worth keeping: a required resource
+/// (style, glyphs, sprite, source, image) answering `204` is a provider fault,
+/// not a fact. Tiles defer to the ordinary storage policy, so `no-store` and
+/// `private` still remove the entry and a volatile request stores nothing.
+fn empty_representation_cache_policy(
+    kind: ResourceKind,
+    storage_policy: maplibre_native::file_source::StoragePolicy,
+    headers: &reqwest::header::HeaderMap,
+) -> CachePolicy {
+    if kind == ResourceKind::Tile {
+        cache_policy_for_response(storage_policy, headers)
+    } else {
+        CachePolicy::Unchanged
     }
 }
 
@@ -897,24 +945,16 @@ fn no_representation_attempt(
     headers: &reqwest::header::HeaderMap,
     prior: PriorResponse<'_>,
 ) -> FetchAttempt {
-    if status == 204 {
-        tracing::debug!(
-            kind = kind_label(request.kind),
-            resource_url = redacted_url_str(&request.url),
-            "resource provider returned an empty representation"
-        );
-    } else {
-        tracing::debug!(
-            kind = kind_label(request.kind),
-            status,
-            resource_url = redacted_url_str(&request.url),
-            // Names only, never values: a provider refusal is usually either
-            // "wrong resource" or "no credential travelled", and the second
-            // is indistinguishable from the first once the query is dropped.
-            query_keys = redacted_query_keys(&request.url),
-            "resource provider returned a non-success status"
-        );
-    }
+    tracing::debug!(
+        kind = kind_label(request.kind),
+        status,
+        resource_url = redacted_url_str(&request.url),
+        // Names only, never values: a provider refusal is usually either
+        // "wrong resource" or "no credential travelled", and the second is
+        // indistinguishable from the first once the query is dropped.
+        query_keys = redacted_query_keys(&request.url),
+        "resource provider returned a non-success status"
+    );
     let mapped = response_from_http(status, headers, Vec::new(), request.kind, prior);
     if let Some(retry) = retry_directive(status, headers) {
         return FetchAttempt {

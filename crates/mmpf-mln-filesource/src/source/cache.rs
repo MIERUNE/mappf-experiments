@@ -236,10 +236,14 @@ fn cache_miss() -> Response {
 }
 
 fn is_cacheable_response(response: &Response) -> bool {
-    response.error.is_none()
-        && !response.no_content
-        && !response.not_modified
-        && response.data.is_some()
+    if response.error.is_some() || response.not_modified {
+        return false;
+    }
+    // An empty representation is storable even with no body: a provider that
+    // answers `204` is asserting the resource exists and is empty. A cache miss
+    // also sets `no_content`, but always alongside an error, which the guard
+    // above has already rejected.
+    response.no_content || response.data.is_some()
 }
 
 fn resource_weight(key: &ResourceRequestKey, response: &Response) -> usize {
@@ -351,7 +355,10 @@ mod tests {
             ErrorReason::Server,
             "failed",
         )));
-        assert!(!is_cacheable_response(&Response::no_content()));
+        // A cache miss is `no_content` *plus* an error; an error-free empty
+        // representation is a storable fact about the resource.
+        assert!(!is_cacheable_response(&cache_miss()));
+        assert!(is_cacheable_response(&Response::no_content()));
         assert!(!is_cacheable_response(&Response::not_modified()));
         assert!(is_cacheable_response(&Response::data(Vec::new())));
     }

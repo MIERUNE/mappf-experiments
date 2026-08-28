@@ -305,7 +305,10 @@ pub(super) fn response_from_http(
 ) -> Response {
     match status {
         200 | 206 => with_cache_metadata(Response::data(body), headers, PriorResponse::default()),
-        204 => Response::no_content(),
+        // A 204 is a positive fact — the resource exists and is empty — so its
+        // freshness is read exactly like a body's. Whether the empty
+        // representation is retained is the caller's policy decision.
+        204 => with_cache_metadata(Response::no_content(), headers, PriorResponse::default()),
         304 => with_cache_metadata(Response::not_modified(), headers, prior),
         404 | 410 if kind == ResourceKind::Tile => Response::no_content(),
         404 | 410 => Response::error(ErrorReason::NotFound, format!("HTTP {status}")),

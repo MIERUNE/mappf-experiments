@@ -1795,3 +1795,120 @@ async fn offline_usage_is_never_parked_even_at_low_priority() {
         "an offline download awaiting bytes must not be parked"
     );
 }
+
+/// Ishikari's own tile policy, which a stored zero-byte tile carries on its 204.
+fn empty_tile_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static(
+            "public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800",
+        ),
+    );
+    headers
+}
+
+#[test]
+fn an_empty_tile_is_retained_under_the_provider_freshness() {
+    // Without this the 204 was neither stored as a body nor negative-cached,
+    // so every render re-fetched every empty tile despite the provider
+    // declaring a day of shared freshness.
+    let headers = empty_tile_headers();
+    let CachePolicy::Store { freshness } = empty_representation_cache_policy(
+        ResourceKind::Tile,
+        maplibre_native::file_source::StoragePolicy::Permanent,
+        &headers,
+    ) else {
+        panic!("an empty tile is retained");
+    };
+    assert_eq!(freshness.lifetime, Some(Duration::from_secs(86_400)));
+    assert_eq!(
+        freshness.stale_while_revalidate,
+        Some(Duration::from_secs(604_800))
+    );
+
+    let response = map_response(204, &headers, &[], ResourceKind::Tile);
+    assert!(response.no_content, "native still sees an empty tile");
+    assert!(response.data.is_none());
+    assert!(
+        response
+            .expires
+            .is_some_and(|expires| expires > SystemTime::now()),
+        "the entry carries the provider's expiry, not a fabricated one"
+    );
+}
+
+#[test]
+fn an_empty_tile_is_served_back_from_the_shared_cache() {
+    let headers = empty_tile_headers();
+    let cache = cache::ResourceCache::new(4096);
+    let key = Arc::new(ResourceRequestKey::test_key(
+        "https://resource.test/empty.pbf",
+        ResourceKind::Tile,
+    ));
+    let CachePolicy::Store { freshness } = empty_representation_cache_policy(
+        ResourceKind::Tile,
+        maplibre_native::file_source::StoragePolicy::Permanent,
+        &headers,
+    ) else {
+        panic!("an empty tile is retained");
+    };
+
+    assert!(
+        cache.store(
+            Arc::clone(&key),
+            map_response(204, &headers, &[], ResourceKind::Tile),
+            freshness,
+        ),
+        "an error-free empty representation is storable"
+    );
+    let entry = cache
+        .fresh_response(&key)
+        .expect("the stored empty tile answers the next lookup");
+    assert!(entry.response.no_content);
+}
+
+#[test]
+fn an_empty_tile_the_provider_refuses_to_share_is_not_retained() {
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    assert_eq!(
+        empty_representation_cache_policy(
+            ResourceKind::Tile,
+            maplibre_native::file_source::StoragePolicy::Permanent,
+            &headers,
+        ),
+        CachePolicy::Remove
+    );
+}
+
+#[test]
+fn an_empty_required_resource_or_volatile_request_is_never_retained() {
+    let headers = empty_tile_headers();
+    // A required resource answering 204 is a provider fault, not an empty tile.
+    for kind in [
+        ResourceKind::Glyphs,
+        ResourceKind::SpriteJSON,
+        ResourceKind::Style,
+        ResourceKind::Source,
+    ] {
+        assert_eq!(
+            empty_representation_cache_policy(
+                kind,
+                maplibre_native::file_source::StoragePolicy::Permanent,
+                &headers,
+            ),
+            CachePolicy::Unchanged,
+            "{kind:?}"
+        );
+    }
+    assert_eq!(
+        empty_representation_cache_policy(
+            ResourceKind::Tile,
+            maplibre_native::file_source::StoragePolicy::Volatile,
+            &headers,
+        ),
+        CachePolicy::Unchanged,
+        "a volatile request never populates the shared cache"
+    );
+}

@@ -353,20 +353,7 @@ impl StylePublisher {
 
     /// Lists canonical delivery tilesets without exposing storage locations.
     pub async fn list_tilesets(&self) -> anyhow::Result<Vec<PublishedTileset>> {
-        let mut tilesets = Vec::new();
-        for object in self.list_state_prefix("tilesets").await? {
-            let relative = format!("tilesets/{}", object.relative);
-            let Ok(location) = TilesetObjectPath::try_new(&relative) else {
-                continue;
-            };
-            tilesets.push(PublishedTileset {
-                tileset_id: location.delivery_tileset_id().to_owned(),
-                size_bytes: object.size_bytes,
-                updated_at: object.updated_at,
-            });
-        }
-        tilesets.sort_unstable_by(|left, right| left.tileset_id.cmp(&right.tileset_id));
-        Ok(tilesets)
+        self.list_tilesets_below("tilesets").await
     }
 
     /// Lists canonical delivery tilesets within one validated namespace.
@@ -376,8 +363,12 @@ impl StylePublisher {
     ) -> anyhow::Result<Vec<PublishedTileset>> {
         validate_namespace(namespace)?;
         let prefix = format!("tilesets/{namespace}");
+        self.list_tilesets_below(&prefix).await
+    }
+
+    async fn list_tilesets_below(&self, prefix: &str) -> anyhow::Result<Vec<PublishedTileset>> {
         let mut tilesets = Vec::new();
-        for object in self.list_state_prefix(&prefix).await? {
+        for object in self.list_state_prefix(prefix).await? {
             let relative = format!("{prefix}/{}", object.relative);
             let Ok(location) = TilesetObjectPath::try_new(&relative) else {
                 continue;
@@ -397,23 +388,7 @@ impl StylePublisher {
         &self,
         layout: StyleObjectLayout,
     ) -> anyhow::Result<Vec<PublishedStyleResource>> {
-        let mut styles = Vec::new();
-        for object in self.list_state_prefix("styles").await? {
-            let relative = format!("styles/{}", object.relative);
-            let Ok(location) = StyleObjectPath::try_new(&relative) else {
-                continue;
-            };
-            if location.layout() != layout {
-                continue;
-            }
-            styles.push(PublishedStyleResource {
-                delivery_style_id: location.delivery_style_id().to_owned(),
-                size_bytes: object.size_bytes,
-                updated_at: object.updated_at,
-            });
-        }
-        styles.sort_unstable_by(|left, right| left.delivery_style_id.cmp(&right.delivery_style_id));
-        Ok(styles)
+        self.list_styles_below("styles", layout).await
     }
 
     /// Lists canonical style documents within one validated namespace.
@@ -424,8 +399,16 @@ impl StylePublisher {
     ) -> anyhow::Result<Vec<PublishedStyleResource>> {
         validate_namespace(namespace)?;
         let prefix = format!("styles/{namespace}");
+        self.list_styles_below(&prefix, layout).await
+    }
+
+    async fn list_styles_below(
+        &self,
+        prefix: &str,
+        layout: StyleObjectLayout,
+    ) -> anyhow::Result<Vec<PublishedStyleResource>> {
         let mut styles = Vec::new();
-        for object in self.list_state_prefix(&prefix).await? {
+        for object in self.list_state_prefix(prefix).await? {
             let relative = format!("{prefix}/{}", object.relative);
             let Ok(location) = StyleObjectPath::try_new(&relative) else {
                 continue;

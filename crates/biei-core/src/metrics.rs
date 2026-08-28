@@ -5,7 +5,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use mmpf_common::metrics::{
-    counter_vec, encode_metric_families, histogram_vec_buckets, register_collectors,
+    ExtraMetricFamilies, MetricFamiliesSource, counter_vec, encode_metric_families,
+    histogram_vec_buckets, register_collectors,
 };
 use moka::notification::RemovalCause;
 use prometheus::{
@@ -92,7 +93,7 @@ pub struct NodeMetrics {
     // FileSource families). Installed by the composition root so `biei-core`
     // stays independent of any MapLibre-backed collector; left unset in
     // embedders (e.g. the simulator) that have no such source.
-    extra_metrics: OnceLock<Box<dyn Fn() -> Vec<MetricFamily> + Send + Sync>>,
+    extra_metrics: ExtraMetricFamilies,
 }
 
 impl NodeMetrics {
@@ -263,7 +264,7 @@ impl NodeMetrics {
             admission_overflow,
             deadline_exceeded,
             render_admission_shed,
-            extra_metrics: OnceLock::new(),
+            extra_metrics: ExtraMetricFamilies::default(),
         };
         metrics.init_zero_series();
         metrics
@@ -348,13 +349,11 @@ impl NodeMetrics {
             .observe(seconds(duration));
     }
 
-    /// Install a process-global metrics source folded into every scrape (e.g.
-    /// the Rust FileSource families). Idempotent: only the first source wins.
-    pub fn set_extra_metrics_source(
-        &self,
-        source: Box<dyn Fn() -> Vec<MetricFamily> + Send + Sync>,
-    ) {
-        let _ = self.extra_metrics.set(source);
+    /// Add a metrics source folded into every scrape (e.g. the Rust FileSource
+    /// or delivery-auth families). Sources accumulate: they are owned by
+    /// independent subsystems that the composition root installs separately.
+    pub fn add_extra_metrics_source(&self, source: MetricFamiliesSource) {
+        self.extra_metrics.add(source);
     }
 
     pub fn gather(&self) -> Vec<MetricFamily> {
@@ -368,9 +367,7 @@ impl NodeMetrics {
         // Node-scoped metrics plus any injected process-global families (e.g.
         // the Rust FileSource metrics), empty until a source is installed.
         let mut families = self.registry.gather();
-        if let Some(source) = self.extra_metrics.get() {
-            families.extend(source());
-        }
+        self.extra_metrics.extend_into(&mut families);
         families
     }
 
@@ -607,6 +604,20 @@ fn seconds(duration: Duration) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_installed_extra_source_reaches_the_scrape() {
+        // Accumulation across sources is covered by `ExtraMetricFamilies`;
+        // this pins that this crate's scrape actually folds them in.
+        let metrics = NodeMetrics::new();
+        metrics.add_extra_metrics_source(Box::new(|| {
+            let gauge = IntGauge::new("extra_family", "test family").expect("valid test gauge");
+            gauge.set(1);
+            prometheus::core::Collector::collect(&gauge)
+        }));
+
+        assert!(metrics.render_prometheus().contains("extra_family 1"));
+    }
     use crate::types::{
         CompletedInfo, ImageFormat, NodeId, RenderMode, RenderObservation, RenderOutput, RequestId,
         Scale, TaskOutcome,

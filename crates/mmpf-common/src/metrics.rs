@@ -1,9 +1,43 @@
 //! Constructors for fixed Prometheus metric descriptors.
 
+use std::sync::Mutex;
+
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
     core::Collector, proto::MetricFamily,
 };
+
+use crate::sync::lock_unpoisoned;
+
+/// A producer of metric families, sampled at each scrape.
+pub type MetricFamiliesSource = Box<dyn Fn() -> Vec<MetricFamily> + Send + Sync>;
+
+/// Metric families produced by subsystems that do not own the node's registry
+/// — the MapLibre FileSource, the shared delivery-auth registry — and folded
+/// into every scrape by the composition root.
+///
+/// Sources accumulate. Each belongs to an independent subsystem installed at a
+/// different point in startup, so letting the first registration win would
+/// silently drop whichever came later.
+#[derive(Default)]
+pub struct ExtraMetricFamilies {
+    sources: Mutex<Vec<MetricFamiliesSource>>,
+}
+
+impl ExtraMetricFamilies {
+    pub fn add(&self, source: MetricFamiliesSource) {
+        lock_unpoisoned(&self.sources).push(source);
+    }
+
+    /// Appends each installed source's current families. Sources are sampled
+    /// here, at scrape time, because gauges such as a cache age are only
+    /// meaningful relative to the moment they are read.
+    pub fn extend_into(&self, families: &mut Vec<MetricFamily>) {
+        for source in lock_unpoisoned(&self.sources).iter() {
+            families.extend(source());
+        }
+    }
+}
 
 /// Encodes metric families in Prometheus text exposition format.
 ///
@@ -127,6 +161,29 @@ mod tests {
             &registry,
             [Box::new(counter) as Box<dyn Collector>],
             "register service metric",
+        );
+    }
+
+    #[test]
+    fn extra_metric_families_accumulate_every_source() {
+        use prometheus::IntGauge;
+
+        let extra = ExtraMetricFamilies::default();
+        for name in ["first_extra_family", "second_extra_family"] {
+            extra.add(Box::new(move || {
+                let gauge = IntGauge::new(name, "test family").expect("valid test gauge");
+                gauge.set(1);
+                gauge.collect()
+            }));
+        }
+
+        let mut families = Vec::new();
+        extra.extend_into(&mut families);
+        let rendered = encode_metric_families(&families);
+        assert!(rendered.contains("first_extra_family 1"), "{rendered}");
+        assert!(
+            rendered.contains("second_extra_family 1"),
+            "a later source must not be dropped: {rendered}"
         );
     }
 }

@@ -68,6 +68,15 @@ where
     // The client request deadline is intentionally larger than the routing SLA
     // (`options.sla`), so a cold render's one-time resource I/O does not time out
     // at the routing target. Routing still keys on `options.sla` via `costs`.
+    // Registry freshness must be visible on the scrape that also carries the
+    // authorization outcomes it explains: during a registry outage the grants
+    // in use are older than they look, and only this age says how much older.
+    if let Some(auth) = auth.clone() {
+        runtime
+            .node
+            .metrics()
+            .add_extra_metrics_source(Box::new(move || auth.gather_metrics()));
+    }
     let ingress = runtime.http_ingress_with_auth(options.request_deadline, auth);
     let (shutdown, shutdown_task) = install_shutdown_handler(runtime.clone(), shutdown_requested);
     let shutdown_observer = shutdown.clone();

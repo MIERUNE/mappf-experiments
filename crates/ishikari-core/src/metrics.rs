@@ -9,7 +9,8 @@
 use std::{sync::Arc, time::Duration};
 
 use mmpf_common::metrics::{
-    counter_vec, encode_metric_families, gauge_vec, histogram_vec_buckets, register_collectors,
+    ExtraMetricFamilies, MetricFamiliesSource, counter_vec, encode_metric_families, gauge_vec,
+    histogram_vec_buckets, register_collectors,
 };
 use prometheus::{
     Gauge, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
@@ -22,6 +23,10 @@ pub struct NodeMetrics(Arc<Inner>);
 
 struct Inner {
     registry: Registry,
+    /// Families owned by subsystems outside this crate (e.g. the shared
+    /// delivery-auth registry telemetry), folded into every scrape by the
+    /// composition root so `ishikari-core` stays independent of them.
+    extra_metrics: ExtraMetricFamilies,
     egress_bytes: IntCounter,
     internal_bytes: IntCounter,
     http_requests: IntCounterVec,
@@ -491,6 +496,7 @@ impl NodeMetrics {
 
         Self(Arc::new(Inner {
             registry,
+            extra_metrics: ExtraMetricFamilies::default(),
             egress_bytes,
             internal_bytes,
             http_requests,
@@ -1021,8 +1027,16 @@ impl NodeMetrics {
     }
 
     /// Encodes the registry in Prometheus text exposition format.
+    /// Add a metrics source folded into every scrape. Sources accumulate:
+    /// each belongs to an independent subsystem installed separately.
+    pub fn add_extra_metrics_source(&self, source: MetricFamiliesSource) {
+        self.0.extra_metrics.add(source);
+    }
+
     pub fn encode(&self) -> String {
-        encode_metric_families(&self.0.registry.gather())
+        let mut families = self.0.registry.gather();
+        self.0.extra_metrics.extend_into(&mut families);
+        encode_metric_families(&families)
     }
 }
 
@@ -1071,5 +1085,25 @@ fn histogram_snapshot(histogram: &Histogram) -> HistogramSnapshot {
 impl Default for NodeMetrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod extra_metrics_tests {
+    use super::NodeMetrics;
+    use prometheus::{IntGauge, core::Collector};
+
+    #[test]
+    fn an_installed_extra_source_reaches_the_scrape() {
+        // Accumulation across sources is covered by `ExtraMetricFamilies`;
+        // this pins that this crate's scrape actually folds them in.
+        let metrics = NodeMetrics::new();
+        metrics.add_extra_metrics_source(Box::new(|| {
+            let gauge = IntGauge::new("extra_family", "test family").expect("valid test gauge");
+            gauge.set(1);
+            gauge.collect()
+        }));
+
+        assert!(metrics.encode().contains("extra_family 1"));
     }
 }

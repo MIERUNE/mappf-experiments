@@ -309,7 +309,7 @@ fn spawn_node_with_backends(
     // root injects the MapLibre-backed collector so `biei-core` (and the
     // simulator) stay independent of `mmpf-mln-filesource`.
     node.metrics()
-        .set_extra_metrics_source(Box::new(mmpf_mln_filesource::gather_metrics));
+        .add_extra_metrics_source(Box::new(mmpf_mln_filesource::gather_metrics));
 
     Ok(Runtime {
         node,

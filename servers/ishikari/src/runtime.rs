@@ -135,6 +135,12 @@ where
         )
     });
 
+    // Registry freshness must be visible on the scrape that also carries the
+    // authorization outcomes it explains: during a registry outage the grants
+    // in use are older than they look, and only this age says how much older.
+    if let Some(auth) = auth.clone() {
+        metrics.add_extra_metrics_source(Box::new(move || auth.gather_metrics()));
+    }
     let app_state = AppState::new(
         membership.clone(),
         metrics,

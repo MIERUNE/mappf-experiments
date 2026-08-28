@@ -770,7 +770,7 @@ impl NetworkFileSource {
             .await
         {
             Ok(body) => body,
-            Err(attempt) => return attempt,
+            Err(attempt) => return *attempt,
         };
         FetchAttempt::done_with_cache(
             response_from_http(
@@ -786,22 +786,23 @@ impl NetworkFileSource {
 
     /// Reads a `200`/`206` representation, bounded by the resource kind's size
     /// limit. The body permit and in-flight guard are held only while bytes can
-    /// actually arrive. `Err` carries the attempt that ends this fetch.
+    /// actually arrive. `Err` carries the attempt that ends this fetch, boxed
+    /// because it is far larger than the body handle and only failures pay it.
     async fn read_bounded_body(
         &self,
         request: &ResourceRequest,
         response: &mut reqwest::Response,
         network_io: &mut NetworkIoObservation<'_>,
         network_budget: &mut NetworkAttemptBudget,
-    ) -> Result<Vec<u8>, FetchAttempt> {
+    ) -> Result<Vec<u8>, Box<FetchAttempt>> {
         let max_resource_bytes = max_resource_bytes(request.kind);
         if let Some(length) = response.content_length()
             && length > max_resource_bytes
         {
-            return Err(FetchAttempt::done(Response::error(
+            return Err(Box::new(FetchAttempt::done(Response::error(
                 ErrorReason::Other,
                 format!("resource body too large: {length} bytes"),
-            )));
+            ))));
         }
         let body_wait_started = std::time::Instant::now();
         let _body_permit = self
@@ -824,16 +825,16 @@ impl NetworkFileSource {
             match network_io.run(network_budget, response.chunk()).await {
                 Ok(Ok(Some(chunk))) => {
                     let Some(new_len) = body.len().checked_add(chunk.len()) else {
-                        return Err(FetchAttempt::done(Response::error(
+                        return Err(Box::new(FetchAttempt::done(Response::error(
                             ErrorReason::Other,
                             "resource body too large",
-                        )));
+                        ))));
                     };
                     if new_len > max_resource_bytes as usize {
-                        return Err(FetchAttempt::done(Response::error(
+                        return Err(Box::new(FetchAttempt::done(Response::error(
                             ErrorReason::Other,
                             format!("resource body exceeds {max_resource_bytes} bytes"),
-                        )));
+                        ))));
                     }
                     body.extend_from_slice(&chunk);
                 }
@@ -845,11 +846,11 @@ impl NetworkFileSource {
                         resource_url = redacted_url_str(&request.url),
                         "resource response body failed"
                     );
-                    return Err(FetchAttempt::retryable(
+                    return Err(Box::new(FetchAttempt::retryable(
                         response_from_reqwest_error(&error),
                         "transport",
                         None,
-                    ));
+                    )));
                 }
                 Err(_) => {
                     tracing::debug!(
@@ -857,11 +858,11 @@ impl NetworkFileSource {
                         resource_url = redacted_url_str(&request.url),
                         "resource response body timed out"
                     );
-                    return Err(FetchAttempt::retryable(
+                    return Err(Box::new(FetchAttempt::retryable(
                         request_timeout_response(),
                         "timeout",
                         None,
-                    ));
+                    )));
                 }
             }
         }

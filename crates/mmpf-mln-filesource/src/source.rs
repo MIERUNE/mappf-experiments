@@ -890,15 +890,10 @@ fn header_only_attempt(
     }
 }
 
-/// Retains an empty tile under the provider's own freshness.
+/// Retains an empty tile under the provider's freshness policy.
 ///
-/// Ishikari answers a stored zero-byte tile with `204` plus its full tile
-/// policy (`s-maxage=86400` and a stale-while-revalidate grant). Dropping that
-/// made every render re-fetch every empty tile: the response is not storable as
-/// a body, and the 404/410 negative cache never sees a `204`. Only tiles get
-/// this treatment — a required resource answering `204` is a provider fault,
-/// not a fact worth keeping — and the shared storage policy still decides,
-/// so `no-store` and `private` remove the entry as usual.
+/// MLN falls through to Network for cached `noContent`, where the adapter's
+/// shared-cache check can return it without another provider fetch.
 fn empty_representation_attempt(
     request: &ResourceRequest,
     headers: &reqwest::header::HeaderMap,

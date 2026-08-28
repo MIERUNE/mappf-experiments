@@ -1838,10 +1838,18 @@ fn an_empty_tile_is_retained_under_the_provider_freshness() {
     );
 }
 
-#[test]
-fn an_empty_tile_is_served_back_from_the_shared_cache() {
+#[tokio::test]
+async fn a_fresh_empty_tile_is_reused_after_mln_falls_through_to_network() {
     let headers = empty_tile_headers();
     let cache = cache::ResourceCache::new(4096);
+    let source = NetworkFileSource::new(
+        cache.clone(),
+        vec!["resource.test".to_string()],
+        FileSourceIoPermits::default(),
+        ProviderHealthTracker::default(),
+        "test-agent",
+    )
+    .expect("file source builds");
     let key = Arc::new(ResourceRequestKey::test_key(
         "https://resource.test/empty.pbf",
         ResourceKind::Tile,
@@ -1862,10 +1870,28 @@ fn an_empty_tile_is_served_back_from_the_shared_cache() {
         ),
         "an error-free empty representation is storable"
     );
-    let entry = cache
-        .fresh_response(&key)
-        .expect("the stored empty tile answers the next lookup");
-    assert!(entry.response.no_content);
+
+    // MainResourceLoader falls through to Network when Database returns
+    // `noContent`. The Network adapter must close that gap from the shared
+    // cache instead of issuing another HTTP request.
+    let mut observation = RequestObservation::for_test("tile");
+    let response = source
+        .resolve_shared_cache_race(
+            &key,
+            SharedCacheRaceInputs {
+                consults_shared_cache: true,
+                prior_data_present: false,
+                prior_metadata_present: false,
+                kind: "tile",
+                is_low_priority: false,
+                is_online: true,
+                minimum_update_interval: Duration::ZERO,
+            },
+            &mut observation,
+        )
+        .await
+        .expect("the fresh empty result must resolve before provider I/O");
+    assert!(response.no_content);
 }
 
 #[test]

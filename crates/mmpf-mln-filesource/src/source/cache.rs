@@ -78,12 +78,7 @@ impl ResourceCache {
         let Some(entry) = self.lookup_shared(key) else {
             return false;
         };
-        let now = SystemTime::now();
-        entry.response.expires.is_some_and(|expires| expires <= now)
-            && entry
-                .freshness
-                .stale_until
-                .is_some_and(|stale_until| now < stale_until)
+        can_serve_stale(&entry, SystemTime::now())
     }
 
     fn lookup(&self, key: &SharedResourceRequestKey) -> CacheLookup {
@@ -94,11 +89,7 @@ impl ResourceCache {
         let now = SystemTime::now();
         let expired = response.expires.is_some_and(|expires| expires <= now);
         if expired {
-            if entry
-                .freshness
-                .stale_until
-                .is_some_and(|stale_until| now < stale_until)
-            {
+            if can_serve_stale(&entry, now) {
                 return CacheLookup::ServeStaleWhileRevalidating(response);
             }
             return CacheLookup::Revalidate(response);
@@ -156,6 +147,17 @@ impl ResourceCache {
             .entries
             .set(self.cache.entry_count().min(i64::MAX as u64) as i64);
     }
+}
+
+fn can_serve_stale(entry: &CachedResource, now: SystemTime) -> bool {
+    // MainResourceLoader falls through to Network for Database `noContent`, so
+    // it cannot deliver an empty stale result while Network revalidates it.
+    !entry.response.no_content
+        && entry.response.expires.is_some_and(|expires| expires <= now)
+        && entry
+            .freshness
+            .stale_until
+            .is_some_and(|stale_until| now < stale_until)
 }
 
 enum CacheLookup {
@@ -400,6 +402,28 @@ mod tests {
             cache.lookup(&key),
             CacheLookup::ServeStaleWhileRevalidating(_)
         ));
+    }
+
+    #[test]
+    fn an_expired_empty_entry_revalidates_instead_of_reporting_stale_delivery() {
+        let cache = ResourceCache::new(1024);
+        let key = Arc::new(ResourceRequestKey::test_key(
+            "https://resource.test/empty-swr",
+            ResourceKind::Tile,
+        ));
+        cache.store(
+            key.clone(),
+            Response::no_content()
+                .with_expires(SystemTime::now() - Duration::from_secs(1))
+                .with_must_revalidate(true),
+            CachedFreshness {
+                stale_until: Some(SystemTime::now() + Duration::from_secs(59)),
+                ..CachedFreshness::default()
+            },
+        );
+
+        assert!(matches!(cache.lookup(&key), CacheLookup::Revalidate(_)));
+        assert!(!cache.is_stale_while_revalidating(&key));
     }
 
     #[test]

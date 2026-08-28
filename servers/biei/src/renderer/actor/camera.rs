@@ -21,44 +21,38 @@ pub(super) fn auto_padding_for_overlays(
     width: u16,
     height: u16,
 ) -> Padding {
+    // Only pins ever add padding; without one there is nothing to protect, so
+    // skip the bounds sweep over path and GeoJSON geometry entirely.
+    if !overlays
+        .iter()
+        .any(|overlay| matches!(overlay, StaticOverlay::Pin(_)))
+    {
+        return padding;
+    }
     let Some(bounds) = overlay_bounds(overlays) else {
         return padding;
     };
-    let pin_inset = overlays.iter().fold(Padding::default(), |acc, overlay| {
+    let fit = ProjectedFit::new(padding, bounds, width, height);
+    let pin_deficit = overlays.iter().fold(Padding::default(), |acc, overlay| {
         let StaticOverlay::Pin(pin) = overlay else {
             return acc;
         };
         let inset = pin_auto_padding_inset(pin.size);
-        let deficit = pin_padding_deficit(padding, bounds, pin.coordinate, inset, width, height);
+        let clearance = fit.clearance(pin.coordinate);
         Padding {
-            top: acc.top.max(deficit.top),
-            right: acc.right.max(deficit.right),
-            bottom: acc.bottom.max(deficit.bottom),
-            left: acc.left.max(deficit.left),
+            top: acc.top.max(missing_padding(inset.top, clearance.top)),
+            right: acc.right.max(missing_padding(inset.right, clearance.right)),
+            bottom: acc
+                .bottom
+                .max(missing_padding(inset.bottom, clearance.bottom)),
+            left: acc.left.max(missing_padding(inset.left, clearance.left)),
         }
     });
-    padding.top = padding.top.saturating_add(pin_inset.top);
-    padding.right = padding.right.saturating_add(pin_inset.right);
-    padding.bottom = padding.bottom.saturating_add(pin_inset.bottom);
-    padding.left = padding.left.saturating_add(pin_inset.left);
+    padding.top = padding.top.saturating_add(pin_deficit.top);
+    padding.right = padding.right.saturating_add(pin_deficit.right);
+    padding.bottom = padding.bottom.saturating_add(pin_deficit.bottom);
+    padding.left = padding.left.saturating_add(pin_deficit.left);
     padding
-}
-
-fn pin_padding_deficit(
-    padding: Padding,
-    bounds: OverlayBounds,
-    point: biei_core::types::LngLat,
-    inset: Padding,
-    width: u16,
-    height: u16,
-) -> Padding {
-    let clearance = projected_pin_clearance(padding, bounds, point, width, height);
-    Padding {
-        top: missing_padding(inset.top, clearance.top),
-        right: missing_padding(inset.right, clearance.right),
-        bottom: missing_padding(inset.bottom, clearance.bottom),
-        left: missing_padding(inset.left, clearance.left),
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -69,39 +63,71 @@ struct EdgeClearance {
     left: f64,
 }
 
-fn projected_pin_clearance(
+/// Approximate MapLibre's axis-aligned auto fit once per request.
+/// Auto always uses zero bearing and pitch; rotated or tilted cameras need
+/// different projection math.
+#[derive(Clone, Copy, Debug)]
+struct ProjectedFit {
     padding: Padding,
-    bounds: OverlayBounds,
-    point: biei_core::types::LngLat,
-    width: u16,
-    height: u16,
-) -> EdgeClearance {
-    let inner_width = f64::from(
-        u32::from(width)
-            .saturating_sub(u32::from(padding.left) + u32::from(padding.right))
-            .max(1),
-    );
-    let inner_height = f64::from(
-        u32::from(height)
-            .saturating_sub(u32::from(padding.top) + u32::from(padding.bottom))
-            .max(1),
-    );
+    scale: f64,
+    horizontal_slack: f64,
+    vertical_slack: f64,
+    min_x: f64,
+    max_x: f64,
+    min_y: f64,
+    max_y: f64,
+}
 
-    let min_x = mercator_x(bounds.min_lon);
-    let max_x = mercator_x(bounds.max_lon);
-    let point_x = mercator_x(point.lon);
-    let x_span = (max_x - min_x).max(0.0);
-    let (min_y, max_y, point_y) = mercator_coordinates(bounds, point);
-    let y_span = (max_y - min_y).max(0.0);
-    let scale = projected_fit_scale(x_span, y_span, inner_width, inner_height);
-    let horizontal_slack = ((inner_width - x_span * scale) / 2.0).max(0.0);
-    let vertical_slack = ((inner_height - y_span * scale) / 2.0).max(0.0);
+impl ProjectedFit {
+    fn new(padding: Padding, bounds: OverlayBounds, width: u16, height: u16) -> Self {
+        let inner_width = f64::from(
+            u32::from(width)
+                .saturating_sub(u32::from(padding.left) + u32::from(padding.right))
+                .max(1),
+        );
+        let inner_height = f64::from(
+            u32::from(height)
+                .saturating_sub(u32::from(padding.top) + u32::from(padding.bottom))
+                .max(1),
+        );
 
-    EdgeClearance {
-        top: f64::from(padding.top) + vertical_slack + ((max_y - point_y).max(0.0) * scale),
-        right: f64::from(padding.right) + horizontal_slack + ((max_x - point_x).max(0.0) * scale),
-        bottom: f64::from(padding.bottom) + vertical_slack + ((point_y - min_y).max(0.0) * scale),
-        left: f64::from(padding.left) + horizontal_slack + ((point_x - min_x).max(0.0) * scale),
+        let min_x = mercator_x(bounds.min_lon);
+        let max_x = mercator_x(bounds.max_lon);
+        let min_y = mercator_y(bounds.min_lat);
+        let max_y = mercator_y(bounds.max_lat);
+        let x_span = (max_x - min_x).max(0.0);
+        let y_span = (max_y - min_y).max(0.0);
+        let scale = projected_fit_scale(x_span, y_span, inner_width, inner_height);
+        Self {
+            padding,
+            scale,
+            horizontal_slack: ((inner_width - x_span * scale) / 2.0).max(0.0),
+            vertical_slack: ((inner_height - y_span * scale) / 2.0).max(0.0),
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+        }
+    }
+
+    /// Pixels between this point and each image edge under the predicted fit.
+    fn clearance(&self, point: biei_core::types::LngLat) -> EdgeClearance {
+        let point_x = mercator_x(point.lon);
+        let point_y = mercator_y(point.lat);
+        EdgeClearance {
+            top: f64::from(self.padding.top)
+                + self.vertical_slack
+                + ((self.max_y - point_y).max(0.0) * self.scale),
+            right: f64::from(self.padding.right)
+                + self.horizontal_slack
+                + ((self.max_x - point_x).max(0.0) * self.scale),
+            bottom: f64::from(self.padding.bottom)
+                + self.vertical_slack
+                + ((point_y - self.min_y).max(0.0) * self.scale),
+            left: f64::from(self.padding.left)
+                + self.horizontal_slack
+                + ((point_x - self.min_x).max(0.0) * self.scale),
+        }
     }
 }
 
@@ -112,14 +138,6 @@ fn projected_fit_scale(x_span: f64, y_span: f64, inner_width: f64, inner_height:
         (false, true) => inner_height / y_span,
         (false, false) => 1.0,
     }
-}
-
-fn mercator_coordinates(bounds: OverlayBounds, point: biei_core::types::LngLat) -> (f64, f64, f64) {
-    (
-        mercator_y(bounds.min_lat),
-        mercator_y(bounds.max_lat),
-        mercator_y(point.lat),
-    )
 }
 
 fn mercator_x(lon: f64) -> f64 {
@@ -203,6 +221,8 @@ fn collect_geojson_bounds(value: &serde_json::Value, bounds: &mut Option<Overlay
                 collect_geojson_bounds(geometry, bounds);
             }
         }
+        // Ingress validation accepts this same geometry whitelist. Keep the
+        // two lists together so auto-fit never ignores accepted geometry.
         Some("Point")
         | Some("MultiPoint")
         | Some("LineString")
@@ -296,7 +316,18 @@ mod tests {
     #[test]
     fn auto_padding_ignores_non_pin_overlays() {
         let base = Padding::all(10);
-        assert_eq!(auto_padding_for_overlays(base, &[], 300, 190), base);
+        let overlays = vec![StaticOverlay::GeoJson(biei_core::types::GeoJsonOverlay {
+            feature_collection: serde_json::json!({
+                "type": "Feature",
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[139.0, 35.0], [140.0, 36.0]]
+                },
+                "properties": {}
+            }),
+        })];
+
+        assert_eq!(auto_padding_for_overlays(base, &overlays, 300, 190), base);
     }
 
     #[test]

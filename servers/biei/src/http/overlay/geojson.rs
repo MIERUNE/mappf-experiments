@@ -75,11 +75,9 @@ fn validate_feature(
         .get("type")
         .and_then(serde_json::Value::as_str)
         .ok_or(OverlayParseError::InvalidGeoJsonSyntax)?;
-    // Whitelist the six geometry types simplestyle covers. `GeometryCollection`
-    // is rejected explicitly because its nested-geometries shape would skip
-    // the `coordinates` array entirely and bypass our coordinate-count cap
-    // (§7.5). Unknown geometry types are also rejected at ingress so they
-    // never reach the renderer's mbgl validation path.
+    // Keep this whitelist aligned with `camera::collect_geojson_bounds`, which
+    // uses it for auto-fit. `GeometryCollection` is rejected because its nested
+    // shape would bypass the coordinate-count cap (§7.5).
     if !matches!(
         g_type,
         "Point" | "LineString" | "Polygon" | "MultiPoint" | "MultiLineString" | "MultiPolygon"

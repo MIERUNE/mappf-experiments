@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use biei_core::types::{Padding, PinOverlay, PinSize, StaticOverlay};
 
 const PIN_AUTO_TOP_MARGIN_PX: u16 = 3;
+const PIN_IMAGE_PIXEL_RATIO: u16 = 2;
 
 pub(super) fn pin_image_ids(overlays: &[StaticOverlay]) -> Vec<String> {
     let mut ids = Vec::new();
@@ -35,7 +36,9 @@ pub(super) fn register_pin_images(
             continue;
         }
         let image = render_pin_image(pin).map_err(maplibre_native::StyleError::Native)?;
-        if let Err(err) = style.add_image(id.clone(), &image, 2.0, false) {
+        if let Err(err) =
+            style.add_image(id.clone(), &image, f32::from(PIN_IMAGE_PIXEL_RATIO), false)
+        {
             // Roll back only images this call actually installed. Removing
             // candidate IDs that were never present makes MapLibre emit a
             // warning on every normal pin render.
@@ -56,21 +59,21 @@ pub(super) fn pin_image_id(pin: &PinOverlay) -> String {
         PinSize::Large => "l",
     };
     let label = pin.label.as_deref().unwrap_or("dot");
-    format!("biei-pin-{size}-{label}-{}-x2", pin.color)
+    format!(
+        "biei-pin-{size}-{label}-{}-x{PIN_IMAGE_PIXEL_RATIO}",
+        pin.color
+    )
 }
 
 pub(crate) fn pin_auto_padding_inset(size: PinSize) -> Padding {
     let (width, height, _) = pin_image_metrics(size);
     Padding {
-        // Pin images are registered with pixel_ratio = 2.0 and anchored at
-        // the bottom. Use the logical icon height plus a fixed visual margin
-        // above it; exact clipping avoidance leaves top-edge pins feeling too
-        // tight in auto-fitted views, but the margin itself should not grow
-        // with pin size. Horizontal clearance uses the logical
-        // half-width plus a small visual margin because the icon is centered
-        // on the anchor and edge-aligned pins otherwise feel cramped.
-        top: ceil_div_u32(height, 2).saturating_add(PIN_AUTO_TOP_MARGIN_PX),
+        // Pins are bottom-anchored. Protect their full logical height above
+        // the anchor, with a small visual margin at the top and sides.
+        top: ceil_div_u32(height, u32::from(PIN_IMAGE_PIXEL_RATIO))
+            .saturating_add(PIN_AUTO_TOP_MARGIN_PX),
         right: ceil_div_u32(width, 3),
+        // A bottom-anchored pin has no image below its coordinate.
         bottom: 0,
         left: ceil_div_u32(width, 3),
     }
@@ -474,9 +477,9 @@ fn blend_pixel(pixel: &mut image::Rgba<u8>, rgb: [u8; 3], alpha: f32) {
 
 #[cfg(test)]
 mod tests {
-    use biei_core::types::{LngLat, PinOverlay, PinSize};
+    use biei_core::types::{LngLat, Padding, PinOverlay, PinSize};
 
-    use super::{label_color_for_pin, render_pin_image};
+    use super::{label_color_for_pin, pin_auto_padding_inset, render_pin_image};
 
     fn pin(label: Option<&str>) -> PinOverlay {
         PinOverlay {
@@ -495,6 +498,37 @@ mod tests {
         let image = render_pin_image(&pin(None)).expect("pin image renders");
         assert_eq!(image.width(), 48);
         assert_eq!(image.height(), 56);
+    }
+
+    #[test]
+    fn auto_padding_preserves_the_size_specific_insets() {
+        assert_eq!(
+            pin_auto_padding_inset(PinSize::Small),
+            Padding {
+                top: 31,
+                right: 16,
+                bottom: 0,
+                left: 16,
+            }
+        );
+        assert_eq!(
+            pin_auto_padding_inset(PinSize::Medium),
+            Padding {
+                top: 37,
+                right: 20,
+                bottom: 0,
+                left: 20,
+            }
+        );
+        assert_eq!(
+            pin_auto_padding_inset(PinSize::Large),
+            Padding {
+                top: 46,
+                right: 26,
+                bottom: 0,
+                left: 26,
+            }
+        );
     }
 
     #[test]

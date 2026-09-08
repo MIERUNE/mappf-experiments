@@ -10,7 +10,7 @@
 # the target cluster supports Arm nodes. The checked-in GKE demo currently uses
 # linux/amd64 because its asia-northeast1 Autopilot cluster cannot provision Arm
 # workloads.
-FROM rust:1.96-slim-trixie@sha256:31ee7fc65186be7e0e0ccb3f2ca305f14e4739e7642a1ae65753aa5d7b874523 AS chef
+FROM rust:1.98-slim-trixie@sha256:17d1ba895198f9934c6314ec5346a0d5115372f3243390c3d731e242f35c2f27 AS chef
 WORKDIR /app
 
 RUN apt-get update \
@@ -66,7 +66,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked -p ishikari \
     && cp target/release/ishikari /ishikari
 
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:c31ff9abcb1910f3ab25c7957bdaf0bfe12a01eb546e8df2282f1c8f682b606c
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /ishikari /ishikari
 # Public HTTP ingress + cluster-internal listener (/_internal/*, metrics, peer

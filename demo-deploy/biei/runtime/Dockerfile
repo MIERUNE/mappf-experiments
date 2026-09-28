@@ -4,7 +4,7 @@
 # Linux userspace generation. It builds and links on newer Ubuntu releases, but
 # has been observed to crash at render time there. Keep build and runtime on the
 # same 24.04 base unless mbgl is built from source.
-FROM ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 AS chef
+FROM ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78 AS chef
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -114,7 +114,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     cargo build --release --locked -p biei --features gl-opengl \
     && cp target/release/biei /biei
 
-FROM ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90 AS runtime
+FROM ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78 AS runtime
 
 # Mesa EGL + software GL (llvmpipe). The `opengl` backend renders through an EGL
 # surfaceless context — no GPU, no X server.
